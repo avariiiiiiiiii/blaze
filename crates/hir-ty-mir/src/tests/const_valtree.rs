@@ -45,7 +45,7 @@ struct Big<const N: [u8; 100001]>;
 struct Small<const M: u8>;
 fn big(_: Big<{ [0u8; 100001] }>) {}
 fn small(_: Small<{ 1 + 2 }>) {}
-fn generic<T>(_: Small<{ 3 }>, _: T) {}
+fn generic<T>(_: Small<{ 1 + 3 }>, _: T) {}
 "#,
     )
     .into_db();

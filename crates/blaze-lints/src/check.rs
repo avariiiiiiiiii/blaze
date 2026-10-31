@@ -1415,7 +1415,8 @@ impl<'q: 't, 't> Cx<'q, 't> {
             }
         };
         let name = name.rsplit("::").next()?.trim().to_owned();
-        Some(Expansion { call_site: diag::in_query(call_site), kind, name, def_site })
+        let opaque = !matches!(call.loc(db).def.kind, MacroDefKind::Declarative(..) | MacroDefKind::ProcMacro(..));
+        Some(Expansion { call_site: diag::in_query(call_site), kind, name, def_site, opaque })
     }
 
     /// `range` of the tree walked, when that is the tree of [`Cx::text`].

@@ -1,10 +1,11 @@
 //! Writing a running PE image on Windows x86-64.
 //!
-//! Pages are made writable for a write with `VirtualProtect` and given their protection
-//! back, once per run of pages of one protection that a patch writes; code stays runnable
-//! while written, for a thread running an older generation's code on the same pages. Pages
-//! already writable (a patch code section linked runnable and writable) are written in place
-//! with no system call. The image's regions and protections are read once, at start
+//! The patch code region is the daemon's code memory (blaze-inproc), mapped by the start hook
+//! before the CRT starts: the commit writes the code there, and nothing here writes it.
+//!
+//! Pages of data are made writable for a write with `VirtualProtect` and given their
+//! protection back, once per run of pages of one protection that a patch writes; pages
+//! already writable are written in place with no system call. The image's regions and protections are read once, at start
 //! ([`Regions`]): every write gives pages back the protection they had, so they stay true,
 //! and checking a patch's writes takes no `VirtualQuery`.
 //! Unwinding goes by `RUNTIME_FUNCTION`s, added with `RtlAddFunctionTable`. Data is written
@@ -12,21 +13,16 @@
 //! space for the switch's columns is reserved and committed with `VirtualAlloc`
 //! ([`Reserved`]).
 
-#![allow(unsafe_code, reason = "the jump table's executable memory, protections and unwind registration")]
+#![allow(unsafe_code, reason = "the image's protections, data writes and unwind registration")]
 
 use std::{
     ffi::c_void,
     ops::Range,
-    os::windows::ffi::OsStrExt,
-    path::Path,
-    sync::{
-        Arc,
-        atomic::{AtomicU64, Ordering},
-    },
+    sync::atomic::{AtomicU64, Ordering},
 };
 
 use super::{
-    Events, Unwatched, image,
+    image,
     switch::{Dwarf, Layout, Memory, Writes},
 };
 use crate::patch::{DESCRIPTOR, Descriptor};
@@ -70,10 +66,6 @@ unsafe extern "system" {
         frames: *mut *mut c_void,
         hash: *mut u32,
     ) -> u16;
-    fn FindFirstChangeNotificationW(path: *const u16, subtree: i32, filter: u32) -> *mut c_void;
-    fn FindNextChangeNotification(handle: *mut c_void) -> i32;
-    fn FindCloseChangeNotification(handle: *mut c_void) -> i32;
-    fn WaitForSingleObject(handle: *mut c_void, milliseconds: u32) -> u32;
 }
 
 const FROM_ADDRESS: u32 = 0x4;
@@ -90,13 +82,6 @@ const PAGE_EXECUTE_WRITECOPY: u32 = 0x80;
 const EXECUTABLE: u32 = 0xf0;
 const WRITABLE: u32 =
     PAGE_READWRITE | PAGE_WRITECOPY | PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY;
-const FILE_NOTIFY_CHANGE_FILE_NAME: u32 = 0x1;
-const FILE_NOTIFY_CHANGE_LAST_WRITE: u32 = 0x10;
-const INVALID_HANDLE_VALUE: *mut c_void = !0usize as *mut c_void;
-const WAIT_OBJECT_0: u32 = 0;
-const WAIT_FAILED: u32 = 0xffff_ffff;
-/// How long the watching thread blocks before it looks whether to stop.
-const WAKE_EVERY_MS: u32 = 1000;
 const PAGE: u64 = 0x1000;
 /// What `RtlCaptureStackBackTrace` takes at most on every Windows.
 const FRAMES: usize = 62;
@@ -179,52 +164,6 @@ pub(super) fn backtrace(pcs: &mut Vec<u64>) {
     pcs.extend(frames[..count].iter().map(|it| (*it as u64).wrapping_sub(1)));
 }
 
-/// Watches `dir` on a thread of its own: each change of its file names (a message renamed
-/// into place) is told to `events`.
-pub(super) fn watch(dir: &Path, events: Arc<Events>) -> Result<(), String> {
-    // alloc: setup, the directory's name, watched from start
-    let path: Vec<u16> = dir.as_os_str().encode_wide().chain([0]).collect();
-    let first = |path: &[u16]| {
-        let filter = FILE_NOTIFY_CHANGE_FILE_NAME | FILE_NOTIFY_CHANGE_LAST_WRITE;
-        // SAFETY: the path ends in a zero.
-        let handle = unsafe { FindFirstChangeNotificationW(path.as_ptr(), 0, filter) };
-        (handle != INVALID_HANDLE_VALUE).then_some(handle as usize)
-    };
-    let Some(handle) = first(&path) else {
-        // alloc: error path
-        return Err(format!("watching {}: {}", dir.display(), std::io::Error::last_os_error()));
-    };
-    // A handle is an address the thread is given to use alone.
-    let watching = move || {
-        let handle = handle as *mut c_void;
-        while !events.stopped() {
-            // SAFETY: the thread's own notification handle.
-            let waited = unsafe { WaitForSingleObject(handle, WAKE_EVERY_MS) };
-            if waited == WAIT_FAILED {
-                events.lose(Unwatched::failed("WaitForSingleObject on the directory's notification"));
-                break;
-            }
-            if waited == WAIT_OBJECT_0 {
-                events.tell();
-                // SAFETY: as above. It fails once the directory is gone.
-                if unsafe { FindNextChangeNotification(handle) } == 0 {
-                    events.lose(Unwatched::failed("FindNextChangeNotification on the directory"));
-                    break;
-                }
-            }
-        }
-        // SAFETY: as above, closed once.
-        unsafe { FindCloseChangeNotification(handle) };
-    };
-    std::thread::Builder::new()
-        // alloc: setup, the thread's name, once
-        .name("blaze-live-slots".to_owned())
-        .spawn(watching)
-        .map(drop)
-        // alloc: error path
-        .map_err(|it| format!("starting the thread that watches for patches: {it}"))
-}
-
 pub(super) struct Os {
     /// Where the image is loaded, which `RUNTIME_FUNCTION`s are relative to.
     base: u64,
@@ -242,7 +181,9 @@ impl Os {
         Ok(Os { base, regions })
     }
 
-    fn write(&mut self, writes: &Writes<'_>, kind: Kind) -> Result<(), String> {
+    /// Writes data anywhere in the image with [`Writes::store`], since other threads may read
+    /// or write it meanwhile.
+    fn write(&mut self, writes: &Writes<'_>) -> Result<(), String> {
         let base = self.base;
         let mut run: Option<(Range<u64>, Region)> = None;
         for span in writes.spans {
@@ -261,9 +202,9 @@ impl Os {
                 }
                 if protect & WRITABLE != 0 {
                     // SAFETY: the piece is the image's, committed and writable (`Regions` read
-                    // it), and stays committed.
-                    unsafe { kind.write(writes, &piece) };
-                    if protect & EXECUTABLE != 0 && kind.flushes() {
+                    // it), and stays committed; `store` allows other threads to use the bytes.
+                    unsafe { writes.store(&piece, piece.start as *mut u8) };
+                    if protect & EXECUTABLE != 0 {
                         flush(&piece);
                     }
                     return Ok(());
@@ -276,7 +217,7 @@ impl Os {
                     }
                     _ => {
                         if let Some((done, region)) = run.replace((pages, region)) {
-                            protected(writes, &done, region.protect & 0xff, kind)?;
+                            protected(writes, &done, region.protect & 0xff)?;
                         }
                     }
                 }
@@ -284,42 +225,9 @@ impl Os {
             })?;
         }
         if let Some((done, region)) = run {
-            protected(writes, &done, region.protect & 0xff, kind)?;
+            protected(writes, &done, region.protect & 0xff)?;
         }
         Ok(())
-    }
-}
-
-/// What a write is of, which says how it may be written.
-#[derive(Clone, Copy)]
-enum Kind {
-    /// Patch code: over no code the cell ever pointed at nor any registered unwind entry
-    /// (the switch's `Lasting`), so no thread runs or reads the bytes, and plain copies do.
-    Code,
-    /// The image's data, which other threads may read or write meanwhile: atomic stores.
-    Data,
-}
-
-impl Kind {
-    /// Whether runnable pages written need `FlushInstructionCache`. x86-64 keeps instruction
-    /// fetch coherent with stores, and patch code is over bytes no thread ran (`Kind::Code`),
-    /// so it needs none, as on Linux; data written over runnable pages keeps the call.
-    fn flushes(self) -> bool {
-        matches!(self, Kind::Data)
-    }
-
-    /// Writes what `writes` has within `range`.
-    ///
-    /// # Safety
-    ///
-    /// `range` is committed memory of the image, writable while this runs.
-    unsafe fn write(self, writes: &Writes<'_>, range: &Range<u64>) {
-        match self {
-            // SAFETY: the caller's; no thread uses the bytes (`Kind::Code`).
-            Kind::Code => unsafe { writes.put(range, range.start as *mut u8) },
-            // SAFETY: the caller's; `store` allows other threads to use the bytes.
-            Kind::Data => unsafe { writes.store(range, range.start as *mut u8) },
-        }
     }
 }
 
@@ -353,12 +261,8 @@ impl Memory for Os {
         unsafe { image::words(at, slots as usize) }
     }
 
-    fn code(&mut self, writes: &Writes<'_>) -> Result<(), String> {
-        self.write(writes, Kind::Code)
-    }
-
     fn data(&mut self, writes: &Writes<'_>) -> Result<(), String> {
-        self.write(writes, Kind::Data)
+        self.write(writes)
     }
 
     fn frames(&mut self, starts: &[u64]) -> Result<(), String> {
@@ -558,20 +462,15 @@ fn regions_from(
 
 /// Writes what `writes` has within `pages`, committed memory of the image with `protect`,
 /// which isn't writable: made writable once for the write, then given it back.
-fn protected(
-    writes: &Writes<'_>,
-    pages: &Range<u64>,
-    protect: u32,
-    kind: Kind,
-) -> Result<(), String> {
+fn protected(writes: &Writes<'_>, pages: &Range<u64>, protect: u32) -> Result<(), String> {
     let put = || {
         // SAFETY: the pages are the image's, committed and writable while this runs
-        // (`writable`).
-        unsafe { kind.write(writes, pages) }
+        // (`writable`); `store` allows other threads to use the bytes.
+        unsafe { writes.store(pages, pages.start as *mut u8) }
     };
     // SAFETY: the pages are the image's, committed with `protect` (`regions` read it).
     unsafe { writable(pages, protect, put)? };
-    if protect & EXECUTABLE != 0 && kind.flushes() {
+    if protect & EXECUTABLE != 0 {
         flush(pages);
     }
     Ok(())

@@ -6,7 +6,7 @@ use std::sync::Arc;
 
 use blaze_codegen::{CompiledFunction, Target};
 use blaze_inproc::{CodeMemory, CodeRange};
-use blaze_live::patch::message_file;
+use blaze_live::patch::{Message, hash};
 use object::read::elf::ProgramHeader as _;
 use object::write::{Object as Builder, Relocation, StandardSection, Symbol as Def, SymbolSection};
 use object::{
@@ -15,8 +15,8 @@ use object::{
 };
 
 use super::{
-    Change, Disk, Image, Linked, Native, NativeKind, Output, OutputKind, PAGE, Sparse, TO, edit, first, function, id,
-    key, live, name, output, program, returns,
+    Change, Disk, Image, Linked, Native, NativeKind, Output, OutputKind, PAGE, Sparse, TO, code_memory, edit, first,
+    function, id, key, live, name, output, patch_in, program, returns,
 };
 use crate::DevRun;
 use crate::model::{Class, Reserve};
@@ -184,40 +184,17 @@ fn reservations_follow_everything_page_aligned_in_order_and_stay_where_they_are(
     assert_eq!(after[after.len() - 2..], *tail);
 }
 
-const SUPPORTED: bool = cfg!(any(
-    all(target_os = "linux", any(target_arch = "x86_64", target_arch = "aarch64")),
-    all(target_os = "macos", target_arch = "aarch64"),
-    all(windows, target_arch = "x86_64"),
-));
-
-/// A code memory whose image part has room for `len` bytes, or none where blaze-inproc does
-/// not run (and then making one says so).
-fn code_memory(name: &str, len: u64) -> Option<CodeMemory> {
-    match CodeMemory::new(name, len, 0) {
-        Ok(memory) => Some(memory),
-        Err(error) => {
-            assert!(!SUPPORTED, "{error}");
-            assert!(error.what.contains("blaze-inproc runs on"), "{error}");
-            None
-        }
-    }
-}
-
 /// Whether `memory`'s image part holds `file`'s bytes, and zeros past its end.
 fn holds(memory: &CodeMemory, file: &Sparse) -> bool {
     let bytes = memory.bytes(CodeRange { offset: 0, len: memory.image_len() }).unwrap();
     bytes.chunks(PAGE as usize).enumerate().all(|(page, it)| *it == file.page(page as u64)[..it.len()])
 }
 
-fn contents(file: &Sparse) -> Vec<u8> {
-    (0..file.len).map(|at| file.page(at / PAGE)[(at % PAGE) as usize]).collect()
-}
-
 #[test]
 fn a_commit_into_a_code_memory_holds_the_file_and_a_rollback_restores_it() {
     let (start, g) = program(Target::Function);
     let (hook, g2) = (hook(), function(3, &returns(2), Vec::new()));
-    let out = dev(live(), DevRun { arena: PAGE, cells: 0, fixed: 0 });
+    let out = dev(output(true), DevRun { arena: PAGE, cells: 0, fixed: 0 });
     let mut on_disk = Image::new(name(TO), out.clone()).unwrap();
     let mut image = Image::new(name(TO), out).unwrap();
     let mut disk = Disk::default();
@@ -242,13 +219,52 @@ fn a_commit_into_a_code_memory_holds_the_file_and_a_rollback_restores_it() {
     let message =
         blaze_alloc_count::assert_at_most(0, "a commit into a code memory", || image.commit_into(staged, &mut memory));
     assert!(holds(&memory, disk.file(TO)), "the patch's bytes, as the file commit wrote them");
-    assert_eq!(message, Ok(Some(contents(disk.file(&format!("live/{}", message_file(1)))))));
+    assert_eq!(message, Ok(None), "an image that is not live tells no program");
     assert_eq!(image.generation(), on_disk.generation());
 
     disk.roll_back(&mut on_disk).unwrap();
     let message = image.roll_back_into(&mut memory);
     assert!(holds(&memory, disk.file(TO)), "the file before the patch");
-    assert_eq!(message, Ok(Some(contents(disk.file(&format!("live/{}", message_file(2)))))));
+    assert_eq!(message, Ok(None));
     assert_eq!(image.generation(), on_disk.generation());
     assert!(image.roll_back_into(&mut memory).is_err(), "nothing before the first commit");
+}
+
+/// A live dev run's patches reach its programs only through the code memory: its file commit
+/// and file rollback are refused, and the message a commit into the memory gives names code
+/// the memory holds, by hash.
+#[test]
+fn a_live_dev_runs_message_names_the_code_its_memory_holds() {
+    let (start, g) = program(Target::Function);
+    let (hook, g2) = (hook(), function(3, &returns(2), Vec::new()));
+    let out = dev(live(), DevRun { arena: PAGE, cells: 0, fixed: 0 });
+    let mut on_disk = Image::new(name(TO), out.clone()).unwrap();
+    let mut image = Image::new(name(TO), out).unwrap();
+    let mut disk = Disk::default();
+    disk.link(&mut on_disk, hooked(&start, &g, &hook)).unwrap();
+
+    let staged = image.stage(hooked(&start, &g, &hook)).unwrap();
+    let Some(mut memory) = code_memory("blaze-link-live-dev-run", 2 * staged.writes.len) else { return };
+    assert_eq!(image.commit_into(staged, &mut memory), Ok(None), "no program runs the first link");
+    assert!(holds(&memory, disk.file(TO)), "the first link's file, its descriptor in it");
+
+    let error = disk.link(&mut on_disk, edit(&g2)).unwrap_err();
+    assert!(error.what.contains("only through the code memory") && error.what.contains("`commit_into`"), "{error}");
+    assert_eq!(on_disk.generation(), 1, "a refused commit leaves the image as it was");
+    let staged = image.stage(edit(&g2)).unwrap();
+    let message =
+        blaze_alloc_count::assert_at_most(0, "a commit into a code memory", || image.commit_into(staged, &mut memory));
+    let message = message.unwrap().expect("a message for the programs running generation 1");
+    let patch = patch_in(&message, &memory);
+    assert_eq!((patch.base, patch.generation), (1, 2));
+    assert!(patch.code.iter().any(|it| (it.len, it.hash) == (6, hash(&returns(2)))), "g2's code: {:?}", patch.code);
+
+    let mut effects = Vec::new();
+    let error = image.roll_back(&mut effects).unwrap_err();
+    assert!(error.what.contains("`roll_back_into`"), "{error}");
+    assert!(effects.is_empty() && image.generation() == 2, "a refused rollback leaves the image as it was");
+    let message = image.roll_back_into(&mut memory).unwrap().expect("a live image's rollback tells its programs");
+    assert_eq!(Message::decode(&message), Ok(Message::RollBack { id: patch.id, to: 1 }));
+    assert!(holds(&memory, disk.file(TO)), "the first link's file again");
+    assert_eq!(image.generation(), 1);
 }

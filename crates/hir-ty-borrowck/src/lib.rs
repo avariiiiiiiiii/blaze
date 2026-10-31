@@ -45,6 +45,8 @@ mod budget;
 #[cfg(test)]
 mod differential;
 #[cfg(test)]
+mod missing_body_tests;
+#[cfg(test)]
 mod served;
 
 #[cfg(test)]
@@ -323,16 +325,41 @@ pub fn borrowck_in_mode(db: &Db, def: DefWithBodyId, mode: Mode) -> BorrowckResu
     blaze_mem::frame::task(blaze_mem::Tag::Mir, |frame| check_def(db, def, mode, frame))
 }
 
+/// Whether `def`'s source has a body: a fn's block, a const's or static's value, a variant's
+/// discriminant. Read from its signature, not from the lowered body.
+fn written_with_body(db: &Db, def: DefWithBodyId) -> bool {
+    use hir_def::signatures::{ConstSignature, FunctionSignature, StaticFlags, StaticSignature};
+    match def {
+        DefWithBodyId::FunctionId(it) => FunctionSignature::of(db, it).has_body(),
+        DefWithBodyId::ConstId(it) => ConstSignature::of(db, it).has_body(),
+        DefWithBodyId::StaticId(it) => {
+            StaticSignature::of(db, it).flags.contains(StaticFlags::HAS_BODY)
+        }
+        DefWithBodyId::VariantId(it) => {
+            it.loc(db).parent.enum_variants(db).has_explicit_discriminant(it)
+        }
+    }
+}
+
 fn check_def(db: &Db, def: DefWithBodyId, mode: Mode, frame: &Frame) -> BorrowckResult {
     let mut result = BorrowckResult::default();
     if mode == Mode::Off {
         result.not_checked = Some(NotChecked::Off);
         return result;
     }
-    // A fn or associated item without a body, or a variant without a discriminant: rustc builds
-    // no MIR for it, so there is nothing to check and nothing to refuse.
+    // A fn, const or static written without a body, or a variant without a discriminant: rustc
+    // builds no MIR for it, so there is nothing to check and nothing to refuse (where Rust
+    // requires a body, AST validation reports its absence). A body that is written but lowered
+    // to nothing (`#[rust_analyzer::skip]`, a `#[cfg]`d-out body expression) is refused:
+    // rustc checks what is written.
     let body = hir_def::expr_store::Body::of(db, def);
     if matches!(body.expr(body.root_expr()), hir_def::hir::Expr::Missing) {
+        if !written_with_body(db, def) {
+            return result;
+        }
+        // alloc: the owned result, once, when the body is refused
+        result.skipped =
+            Some("a body that is written but lowered to no expression: nothing to check".into());
         return result;
     }
     let owner = InferBodyId::DefWithBodyId(def);

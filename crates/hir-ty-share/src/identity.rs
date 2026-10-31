@@ -17,16 +17,21 @@
 use base_db::Db;
 use blaze_ids::{ContentId, Hasher};
 use blaze_items::{ItemId, ItemKey, Unhashable, interface_hash, item_key, key, layout_hash};
-use hir_def::{AdtId, CallableDefId};
+use hir_def::{AdtId, CallableDefId, HasModule};
 use hir_ty::{
+    ParamEnvAndCrate,
     db::HirDatabase,
     mir::is_by_move_coroutine,
-    next_solver::{Binder, Const, ConstKind, GenericArgs, Pattern, TermId, Ty, TyKind, ValTree},
+    next_solver::{
+        AliasConst, AliasConstKind, Binder, Const, ConstExt as _, ConstKind, DbInterner,
+        FreeConstAliasId, GenericArgs, InherentAssocConstId, ParamEnv, Pattern, TermId, Ty,
+        TyKind, ValTree,
+    },
 };
 use rustc_hash::FxHashSet;
 use rustc_type_ir::{
     AliasTyKind, BoundTyKind, BoundVarIndexKind, ExistentialPredicate, GenericArgKind, InferConst,
-    PatternKind, TermKind, ValTreeKind,
+    PatternKind, TermKind, TypeVisitableExt as _, ValTreeKind,
     inherent::{GenericArgs as _, IntoKind},
 };
 use smallvec::SmallVec;
@@ -439,8 +444,11 @@ impl<'db> Spell<'db> {
                 self.bound_index(index);
                 self.u32(bound.var.as_u32());
             }
-            ConstKind::Alias(..) => {
-                return Err(no_content(format!("the constant `{konst:?}` is not evaluated"))); // alloc: error path
+            // As rustc normalizes it before codegen: `[u8; HALF_USIZE]` is `[u8; 4]`, one type,
+            // one `TypeId`.
+            ConstKind::Alias(_, alias) => {
+                let value = self.evaluated(konst, alias)?;
+                self.konst(value)?;
             }
             ConstKind::Expr(_) => {
                 return Err(no_content(format!("the constant expression `{konst:?}`"))); // alloc: error path
@@ -456,6 +464,36 @@ impl<'db> Spell<'db> {
             }
         }
         Ok(())
+    }
+
+    /// The value tree of a constant named by a path (a free, inherent or anonymous constant)
+    /// with no generic parameter left, evaluated in its own crate.
+    fn evaluated(&self, konst: Const<'db>, alias: AliasConst<'db>) -> Result<Const<'db>, Unshared> {
+        let db = self.db;
+        // alloc: error path
+        let unevaluated = || no_content(format!("the constant `{konst:?}` is not evaluated"));
+        if alias.args.has_non_region_param() || alias.args.has_infer() {
+            return Err(unevaluated());
+        }
+        let (krate, allocation) = match alias.kind {
+            AliasConstKind::Free { def_id: FreeConstAliasId(id) }
+            | AliasConstKind::InherentImpl { def_id: InherentAssocConstId(id) } => {
+                (id.module(db).krate(db), db.const_eval(id, alias.args, None))
+            }
+            AliasConstKind::Anon { def_id } => {
+                (def_id.0.module(db).krate(db), db.anon_const_eval(def_id.0, alias.args, None))
+            }
+            // A trait's constant is its impl's, which needs the trait solver to find.
+            AliasConstKind::Projection { .. } | AliasConstKind::InherentSelf { .. } => {
+                return Err(unevaluated());
+            }
+        };
+        // alloc: error path
+        let allocation = allocation.map_err(|error| Unshared::ConstEval(format!("`{konst:?}`: {error:?}")))?;
+        let env = ParamEnvAndCrate { param_env: ParamEnv::empty(), krate };
+        Const::new_from_allocation(DbInterner::new_with(db, krate), &allocation, env)
+            // alloc: error path
+            .map_err(|error| no_content(format!("the constant `{konst:?}` has no value tree: {error:?}")))
     }
 
     fn valtree(&mut self, value: ValTree<'db>) -> Result<(), Unshared> {

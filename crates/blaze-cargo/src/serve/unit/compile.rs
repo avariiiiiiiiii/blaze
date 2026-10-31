@@ -1,6 +1,8 @@
 //! One unit's compile ([`Front::compile`](crate::serve::work::Front::compile)): its
 //! diagnostics as rustc gives them and cargo shows them, then, unless it is a check, its code
-//! compiled and linked by blaze, and every file cargo would write for it.
+//! compiled and linked by blaze, and every file cargo would write for it. Each of its
+//! [`Phase`]s is a node of the plane of its own, timed by what it does: what one made waits
+//! for the next in the unit's [`Phases`].
 //!
 //! A unit's result is kept in the store as its record, under what it was made from: the
 //! front end's identity of the unit's inputs (its sources, cfgs, env, its dependencies' and
@@ -11,10 +13,12 @@
 
 #![forbid(unsafe_code)]
 
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
+
 use blaze_api::{ApiError, Artifact, Diagnostic, Level};
 use blaze_cas::{Key, Kind};
 use blaze_codegen::settings::Pgo;
-use blaze_diagnostics::{Options, lints::CommandLine};
+use blaze_diagnostics::{Diag, Options, lints::CommandLine};
 use blaze_ids::{ContentId, Hasher};
 use blaze_items::CodeHash;
 use blaze_units::schema::Unit;
@@ -30,7 +34,7 @@ use super::{
     files::Mounted,
     say, script,
 };
-use crate::serve::work::{Compiled, Failed, Goal, Output, Put};
+use crate::serve::work::{Compiled, Failed, Goal, Linking, Output, Phase, Put};
 
 type Image = crate::serve::work::Image<Real>;
 
@@ -339,13 +343,102 @@ fn kept(job: &Job, unit: usize) -> Option<Record> {
     blaze_protocol::cbor::from_slice(&entry.bytes[body..]).ok()
 }
 
-/// `unit` checked and, unless it is a check, compiled and linked, reading the front end through
-/// `reader` and relinking the kept `images`. A proc macro's compile gives its expanders
-/// ([`Compiled::macros`]).
-pub(crate) fn compile(job: &Job, reader: &UnitReader, unit: usize, images: &mut Vec<Image>) -> Result<Compiled, Failed> {
+/// What a unit's phases made so far, for the phases after them ([`Phase`]), under the unit's
+/// lock in [`Job::phases`]. A phase takes what it read only once nothing of it can give way,
+/// so a phase posted again finds the unit as it was.
+#[derive(Default)]
+pub(crate) struct Phases {
+    /// Its compile replayed from its record: the phases after [`Phase::Names`] make nothing.
+    kept: Option<Compiled>,
+    /// What [`Phase::Names`] found the unit does.
+    does: Option<Does>,
+    /// The check of every body of its crate, when one runs: [`Phase::Bodies`] runs it, and
+    /// [`Phase::Codegen`] beside it is told what it reaches first and whether it failed
+    /// ([`super::checks`]).
+    checking: Option<Arc<Checking>>,
+    /// The check's diagnostics, or those of the check served for it.
+    diags: Option<Vec<Diag>>,
+    /// What [`Phase::Codegen`] gave; none when the unit compiles no code.
+    generated: Option<Generated>,
+    /// The unit as [`Phase::Link`] left it, for [`Phase::Store`].
+    linked: Option<Linked>,
+}
+
+/// What a unit does, as [`Phase::Names`] finds it.
+#[derive(Clone, Copy)]
+struct Does {
+    /// A build script found to do nothing: neither built nor run.
+    inert: bool,
+    /// It compiles code of its own: it is no check, and not a library compiled only as a
+    /// program reaches it.
+    builds_code: bool,
+}
+
+/// What codegen gave: what the unit makes and the code generator's result, or why the unit
+/// makes nothing codegen can say.
+type Generated = Result<(Makes, Result<Result<codegen::Parts, Vec<String>>, String>), String>;
+
+/// A unit as [`Phase::Link`] left it.
+enum Linked {
+    /// Replayed from its record, a proc macro's expanders loaded.
+    Kept(Compiled),
+    // alloc: once per unit made
+    Made(Box<Making>),
+}
+
+/// What a unit made, before its outputs are hashed for the store.
+struct Making {
+    diagnostics: Vec<Diagnostic>,
+    ok: bool,
+    made: Made,
+    /// No file at all: it failed, or it is a build script that does nothing.
+    nothing: bool,
+    /// Each file rustc would write: its path, bytes, and whether it is executable.
+    files: Vec<(String, Vec<u8>, bool)>,
+    /// What codegen put, the outputs to follow.
+    puts: Vec<Put>,
+    natives: Vec<(String, ContentId)>,
+    links: Vec<(String, Linking)>,
+    macros: Option<ProcMacroLoadResult>,
+}
+
+/// Phase `phase` of `unit`'s compile, reading the front end through `reader`; the compile
+/// itself once its last, [`Phase::Store`], is done. `images` are the kept images
+/// [`Phase::Link`] relinks. A proc macro's compile gives its expanders ([`Compiled::macros`]).
+pub(crate) fn compile(
+    job: &Job,
+    reader: &UnitReader,
+    unit: usize,
+    phase: Phase,
+    images: &mut Vec<Image>,
+) -> Result<Option<Compiled>, Failed> {
+    let Some(slot) = job.phases.get(unit) else {
+        // alloc: error path
+        return Err(ApiError::new(format!("unit {unit} has no phases in the job"), None).into());
+    };
+    match phase {
+        Phase::Names => names(job, reader, unit, slot)?,
+        Phase::Bodies => bodies(job, reader, unit, slot)?,
+        Phase::Codegen => generate(job, reader, unit, slot)?,
+        Phase::Link => link(job, reader, unit, &mut lock(slot), images)?,
+        Phase::Store => return store(job, reader, unit, &mut lock(slot)).map(Some),
+    }
+    Ok(None)
+}
+
+/// A unit's phases, each holding the lock while it changes them. Only [`Phase::Bodies`] and
+/// [`Phase::Codegen`], side by side, ever wait on it, each only to read or leave a field.
+fn lock(slot: &Mutex<Phases>) -> MutexGuard<'_, Phases> {
+    // A phase that panicked took nothing it read: it changes the unit's only once it is done.
+    slot.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+/// [`Phase::Names`]: the unit's record, replayed when the store keeps it; otherwise its
+/// lint flags, its crate's def map, what it does, and its check: served from the store, none
+/// (what a program reaches of the crate is type-checked by its walk), or of every body.
+fn names(job: &Job, reader: &UnitReader, unit: usize, slot: &Mutex<Phases>) -> Result<(), Failed> {
     if let Some(record) = kept(job, unit) {
-        let artifact = record.artifact.map(|it| Artifact { fresh: true, ..it });
-        let mut compiled = Compiled {
+        let compiled = Compiled {
             diagnostics: record.diagnostics,
             ok: record.ok,
             puts: Vec::new(),
@@ -354,20 +447,186 @@ pub(crate) fn compile(job: &Job, reader: &UnitReader, unit: usize, images: &mut 
                 .into_iter()
                 .map(|(path, key, executable)| Output { path, key, executable })
                 .collect(),
-            artifact,
+            artifact: record.artifact.map(|it| Artifact { fresh: true, ..it }),
             macros: None,
             links: Vec::new(),
         };
-        compiled.macros = macros(job, reader, unit, &compiled);
-        if let Some(slot) = job.made.get(unit) {
-            let _ = slot.set(record.made);
+        if let Some(made) = job.made.get(unit) {
+            let _ = made.set(record.made);
         }
-        return Ok(compiled);
+        lock(slot).kept = Some(compiled);
+        return Ok(());
     }
-    let made = make(job, reader, unit, images)?;
+    let u = job.unit(unit)?;
+    let krate = crate_of(job, unit, u)?;
+    options(job, unit, u)?;
+    let db = reader.db();
+    let _ = hir_def::nameres::crate_def_map(db, krate);
+    let inert = elided_unbuilt(job, unit)? || script::pure::unbuilt(job, reader, unit)?;
+    let reached = reached_only(job, u)?;
+    // A library compiled only as a program reaches it has no code of its own to build.
+    let library_reached = reached && codegen::makes(u).is_ok_and(|it| it == Makes::Library);
+    let builds_code = !inert && !checks_only(job.input.goal, u) && !library_reached;
+    let (checking, diags) = match blaze_diagnostics::cache::read(db, reader.checks(), krate, job.mounted.root()) {
+        Some(Err(why)) => return Err(ApiError::new(why, Some(u.target.name.clone())).into()),
+        // A dependency's check outcome from the store: no check runs, and codegen reads the
+        // bodies' records served with it.
+        Some(Ok(outcome)) => (None, Some(outcome.diags)),
+        // alloc: none: an empty `Vec` holds no buffer
+        None if reached => (None, Some(Vec::new())),
+        // alloc: once per unit checked, shared by its check and its codegen
+        None => (Some(Arc::new(Checking::new(db, hir::Crate::from(krate)))), None),
+    };
+    let mut phases = lock(slot);
+    phases.does = Some(Does { inert, builds_code });
+    (phases.checking, phases.diags) = (checking, diags);
+    Ok(())
+}
+
+/// [`Phase::Bodies`]: the check of every body of the unit's crate, when one runs, its outcome
+/// kept to be stored as a dependency crate's.
+fn bodies(job: &Job, reader: &UnitReader, unit: usize, slot: &Mutex<Phases>) -> Result<(), Failed> {
+    // clone: a refcount, once per unit checked
+    let Some(checking) = lock(slot).checking.clone() else { return Ok(()) };
+    let u = job.unit(unit)?;
+    let krate = crate_of(job, unit, u)?;
+    let (flags, options) = options(job, unit, u)?;
+    let db = reader.db();
+    let files = blaze_diagnostics::Files::new(reader.paths(), job.mounted.root());
+    let diags = checking.check(db, files, &options);
+    if hir_def::deps::eligible(db, krate) {
+        let paths = blaze_diagnostics::cache::Paths::of(db, krate);
+        // alloc: the outcome encoded once more per dependency crate checked, for its report line
+        let refused = blaze_diagnostics::cache::encode(&diags, &paths, job.mounted.root()).err().map(|it| it.to_string());
+        // clone: once per dependency crate checked this build
+        job.check_later(krate, flags, diags.clone(), refused);
+    }
+    lock(slot).diags = Some(diags);
+    Ok(())
+}
+
+/// [`Phase::Codegen`]: the unit's functions compiled from its roots, when it compiles code,
+/// told by its check beside it what fails.
+fn generate(job: &Job, reader: &UnitReader, unit: usize, slot: &Mutex<Phases>) -> Result<(), Failed> {
+    let (does, checking) = {
+        let phases = lock(slot);
+        // clone: a refcount, once per unit compiled
+        (phases.does, phases.checking.clone())
+    };
+    let Some(Does { builds_code: true, .. }) = does else { return Ok(()) };
+    let u = job.unit(unit)?;
+    // dyn: `HirFrontend::with_checks` takes it; called once a level of the walk
+    let checks = checking.as_deref().map(|it| it as &dyn BodyChecks);
+    let generated = codegen::makes(u).map(|makes| {
+        let generated = codegen::generate(job, reader, unit, &makes, &job.mounted, checks);
+        (makes, generated)
+    });
+    lock(slot).generated = Some(generated);
+    Ok(())
+}
+
+/// [`Phase::Link`]: the unit's diagnostics as cargo shows them and, unless its check failed,
+/// its images linked from what codegen made (relinking `images`) or a library's record; a
+/// proc macro's expanders loaded. A unit that has no link phase has this done by its store.
+fn link(job: &Job, reader: &UnitReader, unit: usize, phases: &mut Phases, images: &mut Vec<Image>) -> Result<(), Failed> {
+    if let Some(ok) = phases.kept.as_ref().map(|it| it.ok) {
+        let macros = macros(job, reader, unit, ok);
+        if let Some(mut kept) = phases.kept.take() {
+            kept.macros = macros;
+            phases.linked = Some(Linked::Kept(kept));
+        }
+        return Ok(());
+    }
+    let mut making = assemble(job, reader, unit, phases, images)?;
+    making.macros = macros(job, reader, unit, making.ok);
+    if !making.nothing
+        && let Some(Ok((_, Ok(Ok(parts))))) = &mut phases.generated
+    {
+        // Moved, not copied: the store keeps them as they are.
+        let built = std::mem::take(&mut parts.built.puts);
+        making.puts.extend(built.into_iter().map(|it| Put { key: it.key, kind: it.kind, bytes: it.bytes }));
+    }
+    phases.linked = Some(Linked::Made(Box::new(making)));
+    Ok(())
+}
+
+/// [`Phase::Store`]: each output of the unit hashed into one put, its record encoded, and its
+/// compile.
+fn store(job: &Job, reader: &UnitReader, unit: usize, phases: &mut Phases) -> Result<Compiled, Failed> {
+    if phases.linked.is_none() {
+        link(job, reader, unit, phases, &mut Vec::new())?;
+    }
+    if matches!(phases.linked, Some(Linked::Kept(_)))
+        && let Some(Linked::Kept(kept)) = phases.linked.take()
+    {
+        return Ok(kept);
+    }
+    let u = job.unit(unit)?;
+    let plan = job.plan(unit)?;
+    let package = job.package(u)?;
+    // Read before the unit's is taken, so a give-way finds it as it was.
+    let sources = crate_files(reader, crate_of(job, unit, u)?);
     let key = record_key(job, unit)?;
-    let Made2 { mut compiled, made, natives } = made;
-    compiled.macros = macros(job, reader, unit, &compiled);
+    let Some(Linked::Made(making)) = phases.linked.take() else {
+        // alloc: error path
+        return Err(ApiError::new(format!("unit {unit} (`{}`) is stored before it is linked", u.target.name), None).into());
+    };
+    let Making { diagnostics, ok, mut made, nothing, files, mut puts, natives, links, macros } = *making;
+    let mut outputs = Vec::new();
+    let mut artifact = None;
+    if !nothing {
+        let mounted = &job.mounted;
+        // Each file's bytes go into the store once, moved, under their key; a copy cargo makes
+        // of one (`target/debug/foo` of `deps/foo-0123`) is the same key.
+        let mut keyed: Vec<(String, Key, bool)> = Vec::with_capacity(files.len());
+        let mut output_keys: Vec<Key> = Vec::with_capacity(plan.outputs.len());
+        let mut put_output = |puts: &mut Vec<Put>, bytes: Vec<u8>| {
+            let key = Key(ContentId::of(OUTPUT, &bytes));
+            if !output_keys.contains(&key) {
+                output_keys.push(key);
+                puts.push(Put { key, kind: Kind::Output, bytes });
+            }
+            key
+        };
+        let main_file = files.first().map(|it| it.0.clone());
+        for (path, bytes, executable) in files {
+            let key = put_output(&mut puts, bytes);
+            keyed.push((path, key, executable));
+        }
+        outputs.reserve(plan.outputs.len());
+        for path in &plan.outputs {
+            let found = keyed
+                .iter()
+                .find(|it| it.0 == *path)
+                .or_else(|| keyed.iter().find(|it| artifact::uplifted(&it.0, plan) == Some(path.as_str())));
+            let (key, executable) = match found {
+                Some((_, key, executable)) => (*key, *executable),
+                None if path.ends_with(".d") => {
+                    let text = dep_info(path, plan, main_file.as_deref(), &sources, mounted);
+                    (put_output(&mut puts, text.into_bytes()), false)
+                }
+                // Debug info beside an image (`.dSYM`, `.pdb`, `.dwp`): blaze's images carry
+                // their line tables, and write none beside them.
+                None => continue,
+            };
+            outputs.push(Output { path: path.clone(), key, executable });
+        }
+        let main = artifact::main(u, plan);
+        let main_key = main.as_ref().and_then(|main| outputs.iter().find(|it| it.path == *main)).map(|it| it.key);
+        made.main = match (&main, main_key) {
+            (Some(path), Some(key)) => Some((path.clone(), key.0)),
+            _ => None,
+        };
+        artifact = match (&main, main_key) {
+            (Some(path), Some(key)) => Some(artifact::artifact(u, plan, package, path, key.0, false, runs(job, unit))?),
+            _ => None,
+        };
+        // The native code linked in is in no code hash a test reaches: a change of it runs them all.
+        if let Some(context) = &mut made.context {
+            *context = with_natives(*context, &natives);
+        }
+    }
+    let mut compiled = Compiled { diagnostics, ok, puts, outputs, artifact, macros, links };
     if let Some(key) = key && !script::pure::built_nothing(job, unit) {
         let record = RecordRef {
             ok: compiled.ok,
@@ -389,20 +648,14 @@ pub(crate) fn compile(job: &Job, reader: &UnitReader, unit: usize, images: &mut 
     Ok(compiled)
 }
 
-struct Made2 {
-    compiled: Compiled,
-    made: Made,
-    natives: Vec<(String, ContentId)>,
-}
-
 /// The expanders of proc-macro unit `unit`, for the crates that use it
 /// ([`crate::serve::work::Writer::macros`]); none for a unit that is no proc macro or did not
 /// build. Each runs the macro's own code on blaze's compiler in this process
 /// ([`blaze_macro_eval::load`], docs/v2/plan/design/compile-time.md change 20), isolated by
 /// construction: nothing it compiled to is loaded, and no process is started. Asked again each
 /// time the unit compiles or its record is reused, as the front end it reads may have changed.
-fn macros(job: &Job, reader: &UnitReader, unit: usize, compiled: &Compiled) -> Option<ProcMacroLoadResult> {
-    if !compiled.ok || !job.crates.is_proc_macro(unit) {
+fn macros(job: &Job, reader: &UnitReader, unit: usize, ok: bool) -> Option<ProcMacroLoadResult> {
+    if !ok || !job.crates.is_proc_macro(unit) {
         return None;
     }
     let name = job.unit(unit).map_or("", |it| it.target.name.as_str());
@@ -417,7 +670,7 @@ fn macros(job: &Job, reader: &UnitReader, unit: usize, compiled: &Compiled) -> O
     Some(blaze_macro_eval::load(reader.db(), krate, toolchain))
 }
 
-/// The lint flags of unit `unit`'s check, as `make` gives them.
+/// The lint flags of unit `unit`'s check, as its check is given them.
 pub(crate) fn unit_lint_flags(job: &Job, unit: usize) -> Result<Vec<String>, ApiError> {
     let u = job.unit(unit)?;
     let package = job.package(u)?;
@@ -436,103 +689,62 @@ pub(crate) fn cargo_hides(message: &str) -> bool {
 
 
 
-fn make(job: &Job, reader: &UnitReader, unit: usize, images: &mut Vec<Image>) -> Result<Made2, Failed> {
-    let u = job.unit(unit)?;
-    let plan = job.plan(unit)?;
-    let package = job.package(u)?;
-    let unit_of = job.unit_of(unit)?;
-    let color = job.input.color;
-    let krate = job.crates.krate(unit).ok_or_else(|| {
+/// `unit`'s crate in the front end.
+fn crate_of(job: &Job, unit: usize, u: &Unit) -> Result<base_db::Crate, ApiError> {
+    job.crates.krate(unit).ok_or_else(|| {
+        // alloc: error path
         ApiError::new(format!("unit {unit} (`{}`) has no crate in the front end", u.target.name), None)
-    })?;
-    let mounted = &job.mounted;
-    let files = blaze_diagnostics::Files::new(reader.paths(), mounted.root());
-    let flags = lint_flags(u, plan, local(package.source.as_deref()));
+    })
+}
+
+/// The lint flags of `unit`'s check, and the options they give it: an error for flags that
+/// name no lint blaze has, whether or not a check runs.
+fn options(job: &Job, unit: usize, u: &Unit) -> Result<(Vec<String>, Options), ApiError> {
+    let package = job.package(u)?;
+    let flags = lint_flags(u, job.plan(unit)?, local(package.source.as_deref()));
     let mut lints = CommandLine::parse(&flags)
         .map_err(|why| ApiError::new(why, Some(format!("the lint flags of `{}`", u.target.name))))?;
     // Every crate blaze builds is built as cargo builds it, with `CARGO_CRATE_NAME` set.
     lints.check_cfg.cargo = true;
-    let options = Options { lints, ..Options::default() };
-    let db = reader.db();
-    let inert = elided_unbuilt(job, unit)? || script::pure::unbuilt(job, reader, unit)?;
-    let reached = reached_only(job, u)?;
-    // A library compiled only as a program reaches it has no code of its own to build.
-    let library_reached = reached && codegen::makes(u).is_ok_and(|it| it == Makes::Library);
-    let builds_code = !inert && !checks_only(job.input.goal, u) && !library_reached;
-    let served = blaze_diagnostics::cache::read(db, reader.checks(), krate, mounted.root());
-    // Declared before `generated`: the build's front end borrows it until `generated` is dropped.
-    let checking;
-    let (diags, generated) = match served {
-        Some(Err(why)) => return Err(ApiError::new(why, Some(u.target.name.clone())).into()),
-        // A dependency's check outcome from the store: no check runs, and codegen reads the
-        // bodies' records served with it.
-        Some(Ok(outcome)) => {
-            let generated = builds_code.then(|| {
-                let makes = codegen::makes(u)?;
-                let generated = codegen::generate(job, reader, unit, &makes, mounted, None);
-                Ok::<_, String>((makes, generated))
-            });
-            (outcome.diags, generated)
-        }
-        // No check: what a program reaches of the crate is type-checked by its walk.
-        None if reached => {
-            let generated = builds_code.then(|| {
-                let makes = codegen::makes(u)?;
-                let generated = codegen::generate(job, reader, unit, &makes, mounted, None);
-                Ok::<_, String>((makes, generated))
-            });
-            // alloc: none: an empty `Vec` holds no buffer
-            (Vec::new(), generated)
-        }
-        None => {
-            checking = Checking::new(db, hir::Crate::from(krate));
-            let (diags, generated) = match builds_code {
-                false => (checking.alone(db, files, &options), None),
-                true => {
-                    let (diags, generated) = checking.alongside(db, files, &options, || {
-                        let makes = codegen::makes(u)?;
-                        // dyn: `HirFrontend::with_checks` takes it; called once a level of the walk
-                        let checks: &dyn BodyChecks = &checking;
-                        let generated = codegen::generate(job, reader, unit, &makes, mounted, Some(checks));
-                        Ok::<_, String>((makes, generated))
-                    });
-                    (diags, Some(generated))
-                }
-            };
-            if hir_def::deps::eligible(db, krate) {
-                let paths = blaze_diagnostics::cache::Paths::of(db, krate);
-                // alloc: the outcome encoded once more per dependency crate checked, for its report line
-                let refused = blaze_diagnostics::cache::encode(&diags, &paths, mounted.root()).err().map(|it| it.to_string());
-                // clone: once per dependency crate checked this build
-                job.check_later(krate, flags, diags.clone(), refused);
-            }
-            (diags, generated)
-        }
+    Ok((flags, Options { lints, ..Options::default() }))
+}
+
+/// [`Phase::Link`]'s making of the unit, from what its phases before left in `phases`, which
+/// it only reads: its diagnostics as cargo shows them, then, unless they fail it, the files
+/// rustc would write, each image linked (relinking `images`).
+fn assemble(job: &Job, reader: &UnitReader, unit: usize, phases: &Phases, images: &mut Vec<Image>) -> Result<Making, Failed> {
+    let u = job.unit(unit)?;
+    let plan = job.plan(unit)?;
+    let unit_of = job.unit_of(unit)?;
+    let color = job.input.color;
+    let mounted = &job.mounted;
+    let (Some(Does { inert, .. }), Some(diags)) = (phases.does, &phases.diags) else {
+        // alloc: error path
+        let what = format!("unit {unit} (`{}`) is linked before its names are read and its check is done", u.target.name);
+        return Err(ApiError::new(what, None).into());
     };
-    let sources = mounted.sources(&diags);
+    let sources = mounted.sources(diags);
     let mut style = blaze_diagnostics::emit::Style { ansi: color, short: job.input.short, ..Default::default() };
     if let Some(width) = job.input.width {
         style.width = usize::try_from(width).unwrap_or(usize::MAX);
     }
-    let diagnostics: Vec<Diagnostic> = diags
+    let mut diagnostics: Vec<Diagnostic> = diags
         .iter()
         .filter(|it| !cargo_hides(&it.message))
         .map(|it| blaze_diagnostics::api::diagnostic(it, &sources, style, Some(unit_of.clone())))
         .collect();
     let failed = diagnostics.iter().any(|it| it.level == Level::Error);
     let mut made = Made::default();
-    let nothing = |diagnostics: Vec<Diagnostic>, ok: bool, made: Made| Made2 {
-        compiled: Compiled {
-            diagnostics,
-            ok,
-            puts: Vec::new(),
-            outputs: Vec::new(),
-            artifact: None,
-            macros: None,
-            links: Vec::new(),
-        },
+    let nothing = |diagnostics: Vec<Diagnostic>, ok: bool, made: Made| Making {
+        diagnostics,
+        ok,
         made,
+        nothing: true,
+        files: Vec::new(),
+        puts: Vec::new(),
         natives: Vec::new(),
+        links: Vec::new(),
+        macros: None,
     };
     if failed {
         return Ok(nothing(diagnostics, false, made));
@@ -540,9 +752,6 @@ fn make(job: &Job, reader: &UnitReader, unit: usize, images: &mut Vec<Image>) ->
     if job.cancelled() {
         return Err(Failed::Again);
     }
-    let mut diagnostics = diagnostics;
-    let mut puts = Vec::new();
-    let mut outputs = Vec::new();
     let mut natives = Vec::new();
     let mut links = Vec::new(); // alloc: none until a link
     // What each file rustc would write holds: (path, bytes, executable).
@@ -552,33 +761,32 @@ fn make(job: &Job, reader: &UnitReader, unit: usize, images: &mut Vec<Image>) ->
         // A build script that does nothing is not run, so not built: what it prints is known.
         return Ok(nothing(diagnostics, true, made));
     }
-    match generated {
+    match &phases.generated {
         None => {
             for path in artifact::made(plan) {
                 files.push((path.to_owned(), crate_record(u, identity, &[]), false));
             }
         }
         Some(Err(what)) => {
-            diagnostics.push(say::refused(what, Some(unit_of), color));
+            // clone: error path
+            diagnostics.push(say::refused(what.clone(), Some(unit_of), color));
             return Ok(nothing(diagnostics, false, made));
         }
         Some(Ok((makes, generated))) => {
-            let mut generated =
-                match generated.map_err(|what| ApiError::new(what, Some(u.target.name.clone())))? {
-                    Ok(it) => it,
-                    Err(errors) => {
-                        let what = crate::refused_error(&u.target.name, errors.len(), errors.into_iter());
-                        diagnostics.push(say::refused(what, Some(unit_of), color));
-                        return Ok(nothing(diagnostics, false, made));
-                    }
-                };
+            let parts = match generated.as_ref().map_err(|what| ApiError::new(what.clone(), Some(u.target.name.clone())))? {
+                Ok(it) => it,
+                Err(errors) => {
+                    // clone: error path
+                    let what = crate::refused_error(&u.target.name, errors.len(), errors.iter().cloned());
+                    diagnostics.push(say::refused(what, Some(unit_of), color));
+                    return Ok(nothing(diagnostics, false, made));
+                }
+            };
             if job.cancelled() {
                 return Err(Failed::Again);
             }
-            let built_puts = std::mem::take(&mut generated.built.puts);
-            puts.reserve(built_puts.len() + plan.outputs.len());
-            puts.extend(built_puts.into_iter().map(|it| Put { key: it.key, kind: it.kind, bytes: it.bytes }));
-            made.context = Some(context(&generated.policy));
+            let generated = parts.over(job, reader, mounted);
+            made.context = Some(context(generated.policy));
             made.inputs = generated.built.inputs.iter().map(|(key, code)| (key.0, code.0)).collect();
             // A test's output prints positions (a panic's `file:line:col`), which no code hash
             // has: a reformat that moves a `panic!` changes its message. Every span table of the
@@ -621,11 +829,11 @@ fn make(job: &Job, reader: &UnitReader, unit: usize, images: &mut Vec<Image>) ->
             let roots: Vec<ContentId> = generated.built.roots.iter().map(|it| it.0).collect();
             for path in artifact::made(plan) {
                 let library = path.ends_with(".rlib") || path.ends_with(".rmeta");
-                if library || makes == Makes::Library {
+                if library || *makes == Makes::Library {
                     files.push((path.to_owned(), crate_record(u, identity, &roots), false));
                     continue;
                 }
-                match codegen::link(job, unit, path, &makes, &generated, images) {
+                match codegen::link(job, unit, path, makes, &generated, images) {
                     Ok(linked) => {
                         natives.extend(linked.read);
                         if linked.table.is_some() {
@@ -644,57 +852,8 @@ fn make(job: &Job, reader: &UnitReader, unit: usize, images: &mut Vec<Image>) ->
             }
         }
     }
-    // Each file's bytes go into the store once, moved, under their key; a copy cargo makes of
-    // one (`target/debug/foo` of `deps/foo-0123`) is the same key.
-    let sources = crate_files(reader, krate);
-    let mut keyed: Vec<(String, Key, bool)> = Vec::with_capacity(files.len());
-    let mut output_keys: Vec<Key> = Vec::with_capacity(plan.outputs.len());
-    let mut put_output = |puts: &mut Vec<Put>, bytes: Vec<u8>| {
-        let key = Key(ContentId::of(OUTPUT, &bytes));
-        if !output_keys.contains(&key) {
-            output_keys.push(key);
-            puts.push(Put { key, kind: Kind::Output, bytes });
-        }
-        key
-    };
-    let main_file = files.first().map(|it| it.0.clone());
-    for (path, bytes, executable) in files {
-        let key = put_output(&mut puts, bytes);
-        keyed.push((path, key, executable));
-    }
-    outputs.reserve(plan.outputs.len());
-    for path in &plan.outputs {
-        let found = keyed
-            .iter()
-            .find(|it| it.0 == *path)
-            .or_else(|| keyed.iter().find(|it| artifact::uplifted(&it.0, plan) == Some(path.as_str())));
-        let (key, executable) = match found {
-            Some((_, key, executable)) => (*key, *executable),
-            None if path.ends_with(".d") => {
-                let text = dep_info(path, plan, main_file.as_deref(), &sources, mounted);
-                (put_output(&mut puts, text.into_bytes()), false)
-            }
-            // Debug info beside an image (`.dSYM`, `.pdb`, `.dwp`): blaze's images carry
-            // their line tables, and write none beside them.
-            None => continue,
-        };
-        outputs.push(Output { path: path.clone(), key, executable });
-    }
-    let main = artifact::main(u, plan);
-    let main_key = main.as_ref().and_then(|main| outputs.iter().find(|it| it.path == *main)).map(|it| it.key);
-    made.main = match (&main, main_key) {
-        (Some(path), Some(key)) => Some((path.clone(), key.0)),
-        _ => None,
-    };
-    let artifact = match (&main, main_key) {
-        (Some(path), Some(key)) => Some(artifact::artifact(u, plan, package, path, key.0, false, runs(job, unit))?),
-        _ => None,
-    };
-    // The native code linked in is in no code hash a test reaches: a change of it runs them all.
-    if let Some(context) = &mut made.context {
-        *context = with_natives(*context, &natives);
-    }
-    Ok(Made2 { compiled: Compiled { diagnostics, ok: true, puts, outputs, artifact, macros: None, links }, made, natives })
+    // alloc: none: the built puts are moved in after, and the outputs by the store
+    Ok(Making { diagnostics, ok: true, made, nothing: false, files, puts: Vec::new(), natives, links, macros: None })
 }
 
 /// A test binary's `context` with the content of each native input its link read, in link

@@ -966,6 +966,7 @@ impl ExpressionStoreDiagnostics {
                 FruInDestructuringAssignment { node: mv.ptr(*node) }
             }
             MissingBody { node, kind } => MissingBody { node: mv.raw(*node), kind: *kind },
+            IntLiteralTooLarge { node } => IntLiteralTooLarge { node: mv.ptr(*node) },
         }
     }
 }

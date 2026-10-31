@@ -617,9 +617,11 @@ impl Edit<'_> {
             joint.push_str(before);
             joint.push_str(new.as_str());
             joint.push_str(after);
+            // Locals drop in reverse, so each lexing's columns go back to the shelf in the
+            // order the next reparse takes them.
             let joint = LexedStr::new(self.edition, joint);
-            let (before, after) =
-                (LexedStr::new(self.edition, before), LexedStr::new(self.edition, after));
+            let before = LexedStr::new(self.edition, before);
+            let after = LexedStr::new(self.edition, after);
             let alone = [&before, new, &after].into_iter().flat_map(token_lengths);
             alone.eq(token_lengths(&joint))
         })

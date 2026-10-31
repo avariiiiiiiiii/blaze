@@ -3,8 +3,10 @@
 //! An [`Image`] is an executable or shared library kept linked. A [`Change`] says which
 //! functions, statics, names and native inputs came or went; [`Image::stage`] places the new
 //! pieces in room the image keeps and relocates them in parallel, on a copy of the image's
-//! state, and nothing is visible until [`Image::commit`]: one atomic rename of the file, then
-//! one message to running programs, which switch every jump-table slot at once. Callers reach
+//! state, and nothing is visible until [`Image::commit`]: one atomic rename of the file. A
+//! live image is committed into the code memory its running programs map instead
+//! ([`Image::commit_into`]), which gives the one message they take to switch every jump-table
+//! slot at once. Callers reach
 //! a function through its [`Slot`]'s stub, so a function that moved changes one table entry.
 //! [`Image::roll_back`] returns to the image before the last commit: a patch that panicked.
 //! Positions the program observes (`line!()`, `Location`) and debug info are filled here
@@ -464,7 +466,6 @@ impl Image {
         stage.relocate_all()?;
         let base = self.state.generation;
         let finished = stage.finish()?;
-        let message = finished.message.map(|it| (base, it));
         Ok(Staged {
             base,
             state: finished.state,
@@ -473,15 +474,16 @@ impl Image {
                 len: finished.len,
                 old_len: finished.old_len,
                 writes: finished.writes,
-                remove: None,
-                message: if self.state.laid_out { message } else { None },
+                message: if self.state.laid_out { finished.message } else { None },
             },
             undo: finished.undo,
         })
     }
 
     /// Makes `staged` the image, all at once, through effects: the new file renamed over the
-    /// old, then the message to running programs. Completions go to [`Image::complete`].
+    /// old. Completions go to [`Image::complete`]. A commit with a message for running
+    /// programs (a later link of a [`Output::live`] image) is refused before anything
+    /// changes: its patches reach them only through the code memory ([`Image::commit_into`]).
     pub fn commit(&mut self, mut staged: Staged, effects: &mut Vec<Effect>) -> Result<(), LinkError> {
         self.can_commit(&staged)?;
         self.carry_placed_pairs(&mut staged.state)?;
@@ -518,7 +520,8 @@ impl Image {
     /// ([`blaze_inproc::CodeMemory`]). The image's first commit is into a new memory; each
     /// later one into the memory that holds its last, which keeps zeros past the file's end.
     /// The history is [`Image::commit`]'s, so [`Image::roll_back_into`] undoes it. Gives the
-    /// encoded message for running programs that the file commit writes (`None` for the
+    /// encoded message that takes programs running the memory to the new image: its code is
+    /// in the memory, the message names it by address, length and hash (`None` for the
     /// image's first commit, which no program runs yet, and without [`Output::live`]).
     pub fn commit_into(
         &mut self,
@@ -529,7 +532,7 @@ impl Image {
         self.carry_placed_pairs(&mut staged.state)?;
         let cells = self.cells_in(memory)?;
         self.write_into(&staged.writes, memory)?;
-        let message = staged.writes.message.map(|(_, bytes)| bytes);
+        let message = staged.writes.message;
         self.take(staged.state, staged.writes.full, staged.undo);
         self.placed_pairs.clear();
         self.cells = Some(cells);
@@ -570,10 +573,12 @@ impl Image {
     }
 
     /// Back to the image before the last commit: a patch that panicked, or one whose borrow
-    /// check, run beside it, refused its body. Running programs switch back to its table.
-    /// Each call undoes one more commit, so a refusal that comes in after later commits rolls
-    /// them back too; their changes are then staged again without the refused body. A commit
-    /// in flight must complete first.
+    /// check, run beside it, refused its body. Each call undoes one more commit, so a refusal
+    /// that comes in after later commits rolls them back too; their changes are then staged
+    /// again without the refused body. A commit in flight must complete first. The rollback
+    /// of a [`Output::live`] image is refused before anything changes, as [`Image::commit`]
+    /// of one is: running programs switch back only through the code memory
+    /// ([`Image::roll_back_into`]).
     pub fn roll_back(&mut self, effects: &mut Vec<Effect>) -> Result<(), LinkError> {
         let writes = self.roll_back_writes()?;
         let steps = self.steps(writes)?;
@@ -594,22 +599,22 @@ impl Image {
 
     /// [`Image::roll_back`] into the code memory the image is committed into
     /// ([`Image::commit_into`]): the undo's bytes written and published there, the image back
-    /// at once. Gives the encoded message for running programs that the file rollback writes
-    /// (`None` without [`Output::live`]).
+    /// at once. Gives the encoded message that switches programs running the memory back to
+    /// its table (`None` without [`Output::live`]).
     pub fn roll_back_into(&mut self, memory: &mut blaze_inproc::CodeMemory) -> Result<Option<Vec<u8>>, LinkError> {
         let writes = self.roll_back_writes()?;
         let cells = self.cells_in(memory)?;
         self.write_into(&writes, memory)?;
         self.take_undo_keeping_pairs();
         self.cells = Some(cells);
-        Ok(writes.message.map(|(_, bytes)| bytes))
+        Ok(writes.message)
     }
 
     /// Makes `staged` the image at once, as [`Image::commit`] does (the same checks and
     /// history, so [`Image::roll_back`] undoes it), and gives the whole file's bytes instead
     /// of writing it: for a caller that puts the file in its store. A commit that would tell
-    /// running programs (a later link of a [`Output::live`] image) is refused, since no
-    /// message reaches them this way.
+    /// running programs (a later link of a [`Output::live`] image) is refused, since its
+    /// patches reach them only through the code memory ([`Image::commit_into`]).
     pub fn bytes(&mut self, mut staged: Staged) -> Result<Vec<u8>, LinkError> {
         self.can_commit(&staged)?;
         self.carry_placed_pairs(&mut staged.state)?;
@@ -618,7 +623,11 @@ impl Image {
                 function: None,
                 refusal: None,
                 // alloc: error path
-                what: format!("{}: a live image's link tells running programs: commit it with `commit` or `commit_into`", self.to),
+                what: format!(
+                    "{}: a live image's patches reach running programs only through the code memory: commit it with \
+                     `commit_into`",
+                    self.to
+                ),
             });
         }
         let runs = if staged.writes.full { staged.writes.writes } else { file::whole(&staged.state) };

@@ -309,6 +309,10 @@ pub enum ExpressionStoreDiagnostics {
     PatternArgInExternFn { node: InFile<AstPtr<ast::Pat>> },
     FruInDestructuringAssignment { node: InFile<AstPtr<ast::Expr>> },
     MissingBody { node: InFile<SyntaxNodePtr>, kind: MissingBodyItemKind },
+    /// An integer literal whose digits do not fit `u128`, lowered as `0`: rustc's
+    /// `LitError::IntTooLarge`, reported by `rustc_ast_lowering`'s `lower_lit` (so only for
+    /// code cfg keeps), whose `LitKind::Err` taints the body.
+    IntLiteralTooLarge { node: InFile<AstPtr<ast::Literal>> },
 }
 
 /// The stacks lowering collects a node's children on before it allocates the node, one per

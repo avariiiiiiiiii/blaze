@@ -1571,19 +1571,36 @@ pub fn map_node_range_up(
     if let Some(span) = exp_map.fragment_span(range) {
         return Some((resolve_span(db, span), span.ctx));
     }
-    let mut spans = exp_map.spans_for_range(range);
-    let Span { range, anchor, ctx } = spans.next()?;
-    let mut start = range.start();
-    let mut end = range.end();
-
-    for span in spans {
-        if span.anchor != anchor || span.ctx != ctx {
+    // A fragment inside the node is its metavariable too (rustc spans a substituted `$e` as the
+    // invisible group's span): `let $p = $e` is the macro's, though `$p` and `$e` hold the call
+    // site's tokens. What is between the fragments is the tokens'.
+    let mut merged: Option<Span> = None;
+    let mut merge = |span: Span| match &mut merged {
+        None => {
+            merged = Some(span);
+            true
+        }
+        Some(it) if it.anchor == span.anchor && it.ctx == span.ctx => {
+            it.range = it.range.cover(span.range);
+            true
+        }
+        Some(_) => false,
+    };
+    let gap = |from: TextSize, to: TextSize| {
+        (from < to).then(|| exp_map.spans_for_range(TextRange::new(from, to))).into_iter().flatten()
+    };
+    let mut from = range.start();
+    for (fragment, span) in exp_map.outermost_fragments_in(range) {
+        if !gap(from, fragment.start()).all(&mut merge) || !merge(span) {
             return None;
         }
-        start = start.min(span.range.start());
-        end = end.max(span.range.end());
+        from = fragment.end();
     }
-    Some((resolve_span(db, Span { range: TextRange::new(start, end), anchor, ctx }), ctx))
+    if !gap(from, range.end()).all(&mut merge) {
+        return None;
+    }
+    let span = merged?;
+    Some((resolve_span(db, span), span.ctx))
 }
 
 /// Looks up the span at the given offset.

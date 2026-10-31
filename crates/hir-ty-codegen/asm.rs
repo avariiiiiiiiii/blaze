@@ -1698,8 +1698,22 @@ fn run_cc(triple: &str, text: &str, key: &[u8; 32]) -> Option<Result<Assembled, 
         Ok(output) if output.status.success() => {
             std::fs::read(&object).map_err(|e| failed("no object", &e)).and_then(|it| code(&it))
         }
-        // alloc: the error's message
-        Ok(output) => Err(failed(&said, &String::from_utf8_lossy(&output.stderr).trim())),
+        // An `xcrun` shim (`/usr/bin/clang` without the command line tools) is one that runs
+        // and assembles nothing: the error names it and what would.
+        Ok(output) => {
+            // alloc: the error's message
+            let said_why = String::from_utf8_lossy(&output.stderr);
+            Err(failed(
+                // alloc: the error's message
+                &format!("{said}, the C compiler this blaze without LLVM assembles `asm!` with, failed"),
+                // alloc: the error's message
+                &format!(
+                    "{}; install a working clang or cc on PATH, or use a build of blaze with LLVM \
+                     (`--features llvm`)",
+                    said_why.trim()
+                ),
+            ))
+        }
         // alloc: the error's message
         Err(e) => Err(failed(&format!("{said} did not run"), &e)),
     };

@@ -1,9 +1,11 @@
 //! Applies blaze's edits to a program while it runs.
 //!
 //! A program blaze-link linked calls every function a patch can replace through a slot of a
-//! jump table, and [`Live::start`] readies it to take patches: blaze-link writes each patch's
-//! code and data where it placed them, and the program switches to it in one atomic store
-//! ([`slots`]). No thread is stopped and no code a thread can be in is written over.
+//! jump table, and [`Live::start`] readies it to take patches. The program runs from the
+//! daemon's code memory (blaze-inproc), where each commit writes a patch's code; the program
+//! asks the daemon for the patch's message over blaze-inproc's channel, writes its data, and
+//! switches to it in one atomic store ([`slots`]). No thread is stopped and no code a thread
+//! can be in is written over.
 //!
 //! [`Live::poll`] takes what came in since it was last called. Call it where nothing of the
 //! program's is half done, such as between two frames: a function the calling thread is
@@ -25,8 +27,6 @@
 
 #![deny(unsafe_code)]
 
-use std::{path::PathBuf, sync::OnceLock};
-
 #[cfg(test)]
 #[global_allocator]
 static ALLOC: blaze_alloc_count::Counting = blaze_alloc_count::Counting;
@@ -37,6 +37,7 @@ fn setting(name: &str) -> Option<std::ffi::OsString> {
     std::env::var_os(format!("BLAZE_{name}"))
 }
 
+mod ask;
 pub mod format;
 pub mod patch;
 pub mod slots;
@@ -44,10 +45,7 @@ pub mod slots;
 #[cfg(all(windows, target_arch = "x86_64"))]
 mod socket;
 
-pub use slots::{Live, Outcome, Unwatched};
-
-/// The directory [`Live::start`] takes patches through.
-static DIR: OnceLock<PathBuf> = OnceLock::new();
+pub use slots::{Live, Outcome};
 
 /// The counters that code the daemon compiled to count its branches adds to. That code finds
 /// them by calling this, by name (`hir_ty_codegen::tier::COUNTERS`).
@@ -65,14 +63,31 @@ pub extern "C" fn blaze_live_counters() -> *mut u64 {
 static COUNTERS: [std::sync::atomic::AtomicU64; format::COUNTERS] =
     [const { std::sync::atomic::AtomicU64::new(0) }; format::COUNTERS];
 
-/// What the daemon last said of the tiers of this program: the functions it spends its time
-/// in, the level each is compiled at, and what the daemon did of late. Nothing before
-/// [`Live::start`], or while the daemon is not tiering the program. It is read from a file
-/// the daemon writes a few times a second, so a program that shows it reads it about as often,
-/// not every frame.
-pub fn tiers() -> Option<format::Tiers> {
-    let path = DIR.get()?.join(format::TIERS);
-    format::Tiers::decode(&std::fs::read_to_string(path).ok()?)
+/// What the daemon says of the tiers of this program: the functions it spends its time in, the
+/// level each is compiled at, and what the daemon did of late. `None` while the daemon tiers
+/// none of its functions; an error in a program the daemon did not start, or when the channel
+/// to it fails. Each call asks the daemon over blaze-inproc's channel, so a program that shows
+/// it asks a few times a second, not every frame.
+pub fn tiers() -> Result<Option<format::Tiers>, String> {
+    use patch::ask::{NO_TIERS, TIERS, TIERS_ASK};
+    let attached = blaze_inproc::runtime::attach()
+        // alloc: error path
+        .map_err(|it| {
+            format!("the tiers come only to a program blaze started on its code memory: {it}")
+        })?;
+    // alloc: the text, a few times a second
+    let mut text = Vec::new();
+    let kinds = ask::Kinds { ask: TIERS_ASK, piece: TIERS, none: NO_TIERS };
+    if ask::fetch(attached, &kinds, "the tiers", u64::to_le_bytes, &mut text)?.is_none() {
+        return Ok(None);
+    }
+    // alloc: error path
+    let text =
+        std::str::from_utf8(&text).map_err(|_| "the daemon's tiers are not UTF-8".to_owned())?;
+    // alloc: error path
+    format::Tiers::decode(text)
+        .map(Some)
+        .ok_or_else(|| "the daemon's tiers do not read as tiers".to_owned())
 }
 
 /// Hands the daemon the text of the source file at `path`, as an editor has it, without

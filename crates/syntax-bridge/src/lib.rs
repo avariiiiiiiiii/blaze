@@ -1532,21 +1532,33 @@ impl TtTreeSink<'_> {
             ))) => (lit.text(), *span),
             tt => unreachable!("{tt:?}"),
         };
-        // FIXME: Span splitting
+        // rustc's `break_up_float`: each piece takes its own part of the span when the span is
+        // the literal's text (rustc compares the span's source text; a span here has none, so
+        // its length), otherwise the whole span.
+        let apart = span.range.len() == TextSize::of(text);
+        let piece = |from: TextSize, to: TextSize| match apart {
+            true => {
+                let start = span.range.start();
+                Span { range: TextRange::new(start + from, start + to), ..span }
+            }
+            false => span,
+        };
         match text.split_once('.') {
             Some((left, right)) => {
                 assert!(!left.is_empty());
+                let dot = TextSize::of(left);
 
                 self.inner.start_node(SyntaxKind::NAME_REF);
                 self.inner.token(SyntaxKind::INT_NUMBER, left);
                 self.inner.finish_node();
-                self.token_map.push(self.text_pos + TextSize::of(left), span);
+                self.token_map.push(self.text_pos + dot, piece(0.into(), dot));
 
                 // here we move the exit up, the original exit has been deleted in process
                 self.inner.finish_node();
 
                 self.inner.token(SyntaxKind::DOT, ".");
-                self.token_map.push(self.text_pos + TextSize::of(left) + TextSize::of("."), span);
+                let after_dot = dot + TextSize::of(".");
+                self.token_map.push(self.text_pos + after_dot, piece(dot, after_dot));
 
                 if has_pseudo_dot {
                     assert!(right.is_empty(), "{left}.{right}");
@@ -1554,7 +1566,8 @@ impl TtTreeSink<'_> {
                     assert!(!right.is_empty(), "{left}.{right}");
                     self.inner.start_node(SyntaxKind::NAME_REF);
                     self.inner.token(SyntaxKind::INT_NUMBER, right);
-                    self.token_map.push(self.text_pos + TextSize::of(text), span);
+                    let end = TextSize::of(text);
+                    self.token_map.push(self.text_pos + end, piece(after_dot, end));
                     self.inner.finish_node();
 
                     // the parser creates an unbalanced start node, we are required to close it here

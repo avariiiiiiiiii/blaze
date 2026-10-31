@@ -669,7 +669,8 @@ fn instruction_stores_are_aarch64s_alone() {
 
 #[test]
 fn the_arena_hands_out_aligned_ranges_after_the_image() {
-    let Some(mut memory) = memory(1, 4) else { return };
+    // Room for a 4096-aligned range past the three smaller ones whatever the page size.
+    let Some(mut memory) = memory(1, 3 * 4096) else { return };
     let image = memory.image_len();
     assert!(memory.reserve(0, 16).is_err());
     assert!(memory.reserve(16, 24).is_err());

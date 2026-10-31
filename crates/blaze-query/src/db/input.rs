@@ -29,6 +29,8 @@ pub trait Input: 'static {
     const NAME: &'static str;
     const FILE: &'static str;
     const FIELDS: u32;
+    /// Each field's name, in field order: `FIELDS` of them.
+    const FIELD_NAMES: &'static [&'static str];
     /// Made once, by `&mut` ([`input_new_singleton`]); a second panics naming `NAME`.
     const SINGLETON: bool;
     fn ingredient() -> &'static Ingredient;
@@ -83,6 +85,7 @@ impl Vtable {
             name: I::NAME,
             file: I::FILE,
             kind: Kind::Input,
+            fields: I::FIELD_NAMES,
             row_size: size_of::<RowOf<I>>(),
             ids_of: None,
             memory: memory::<I>,

@@ -237,28 +237,31 @@ pub fn roots() -> u128 {
 fn instances_with_one_share_key_are_one() {
     use blaze_codegen::backend::Frontend as _;
     let (db, frontend) = frontend(SHARED);
-    let policy = policy(OptLevel::O0);
-    let root = frontend.root(function(db, "roots"));
-    let origin = frontend.with(|hir, _| frontend.origin(hir, fixture::test_crate(&db)));
-    let key = |instance: &HirInstance| {
-        let described = (frontend.describe(instance, &origin))
-            .unwrap_or_else(|e| panic!("{instance:?}: {}", e.what));
-        let choice = policy.choose(&described.origin, described.overflow_checks).expect("the plan");
-        let settings = choice.first.settings();
-        UnitInstance { code: described.code, args: described.args, settings }.key()
-    };
-    let of = |name| {
-        let func = function(db, name);
-        frontend.with(|hir, homes| called(hir, homes, &root, func))
-    };
-    let ids = of("id");
-    let [a, b] = &ids[..] else { panic!("{ids:?}") };
-    assert_ne!(a, b);
-    assert_eq!(key(a), key(b));
-    assert_eq!(shape(&frontend, a), shape(&frontend, b));
-    let tids = of("tid");
-    let [one, two] = &tids[..] else { panic!("{tids:?}") };
-    assert_ne!(key(one), key(two));
+    // A failure's message formats instances, whose types are the database's.
+    hir_ty::attach_db(db, || {
+        let policy = policy(OptLevel::O0);
+        let root = frontend.root(function(db, "roots"));
+        let origin = frontend.with(|hir, _| frontend.origin(hir, fixture::test_crate(&db)));
+        let key = |instance: &HirInstance| {
+            let described = (frontend.describe(instance, &origin))
+                .unwrap_or_else(|e| panic!("{instance:?}: {}", e.what));
+            let choice = policy.choose(&described.origin, described.overflow_checks).expect("the plan");
+            let settings = choice.first.settings();
+            UnitInstance { code: described.code, args: described.args, settings }.key()
+        };
+        let of = |name| {
+            let func = function(db, name);
+            frontend.with(|hir, homes| called(hir, homes, &root, func))
+        };
+        let ids = of("id");
+        let [a, b] = &ids[..] else { panic!("{ids:?}") };
+        assert_ne!(a, b);
+        assert_eq!(key(a), key(b));
+        assert_eq!(shape(&frontend, a), shape(&frontend, b));
+        let tids = of("tid");
+        let [one, two] = &tids[..] else { panic!("{tids:?}") };
+        assert_ne!(key(one), key(two));
+    });
 }
 
 /// A generic is shared under every options a unit of its origin builds a body with: the

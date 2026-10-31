@@ -29,6 +29,10 @@ pub struct Vtable {
     /// `file!()` where it is defined.
     pub file: &'static str,
     pub kind: Kind,
+    /// The name of each field a read of it names by number ([`super::ReadKind::InputField`],
+    /// [`super::ReadKind::TrackedField`]), in that order: an input's fields, a tracked
+    /// struct's `#[tracked]` ones; none for a function or an interned struct.
+    pub fields: &'static [&'static str],
     /// A function's row size, so the verify walk reads its headers untyped.
     pub(crate) row_size: usize,
     /// An interned row's fields' IDs ([`Storage::ids_of`]).

@@ -453,6 +453,33 @@ impl Storage {
         ingredient::name(ingredient)
     }
 
+    /// The name of field `field` of ingredient `ingredient`, by the number a read of it
+    /// carries ([`super::ReadKind::InputField`], [`super::ReadKind::TrackedField`]).
+    pub fn field_name(&self, ingredient: u32, field: u32) -> &'static str {
+        let vtable = ingredient::vtable(ingredient)
+            .unwrap_or_else(|| panic!("no ingredient {ingredient} is registered"));
+        vtable.fields.get(field as usize).copied().unwrap_or_else(|| {
+            panic!(
+                "`{}` has {} named fields, not a field {field}",
+                vtable.name,
+                vtable.fields.len()
+            )
+        })
+    }
+
+    /// What a read is named by: a field of an input or tracked struct by the field's name,
+    /// anything else by its ingredient's.
+    pub fn read_name(&self, key: super::DatabaseKeyIndex, kind: super::ReadKind) -> &'static str {
+        match kind {
+            super::ReadKind::InputField(field) | super::ReadKind::TrackedField(field) => {
+                self.field_name(key.ingredient_index(), field)
+            }
+            super::ReadKind::Function | super::ReadKind::Interned => {
+                self.ingredient_name(key.ingredient_index())
+            }
+        }
+    }
+
     /// A fresh ID page owned by `ingredient`.
     pub(crate) fn new_page(&self, ingredient: u32) -> usize {
         let page = self.next_page.fetch_add(1, Ordering::Relaxed) as usize;

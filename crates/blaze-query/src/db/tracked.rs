@@ -29,6 +29,8 @@ pub trait Tracked: 'static {
     const NAME: &'static str;
     const FILE: &'static str;
     const TRACKED_FIELDS: u32;
+    /// Each `#[tracked]` field's name, in their numbers' order: `TRACKED_FIELDS` of them.
+    const TRACKED_FIELD_NAMES: &'static [&'static str];
     fn ingredient() -> &'static Ingredient;
     /// `false` for a `#[no_eq]` field.
     fn equal_field(field: u32, old: &Self::Fields, new: &Self::Fields) -> bool;
@@ -53,6 +55,7 @@ impl Vtable {
             name: T::NAME,
             file: T::FILE,
             kind: Kind::Tracked,
+            fields: T::TRACKED_FIELD_NAMES,
             row_size: 0,
             ids_of: None,
             memory: memory::<T>,

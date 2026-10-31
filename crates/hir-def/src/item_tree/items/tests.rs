@@ -147,6 +147,7 @@ mod m { pub fn inner() {} }
 /// How many top-level items making the file's tree lowers once it holds `text`, whole or
 /// alone. Before it, an edit that changes no item (a newline at the end) has the file lowered
 /// whole and keyed, as a file's first edit is, so what is counted is an edit of a keyed file.
+/// Counted from before the write: the write's name resolution maintainer asks for the tree.
 fn items_lowered_by(db: &mut TestDB, file: EditionedFileId, text: &str) -> usize {
     let krate = fixture::test_crate(db);
     let file_id = file.file_id(&*db);
@@ -154,8 +155,8 @@ fn items_lowered_by(db: &mut TestDB, file: EditionedFileId, text: &str) -> usize
     let before = file.parse(&*db).root().text().to_string();
     db.set_file_text(file_id, &format!("{before}\n"));
     crate::file_item_tree(&*db, file.into(), krate);
-    db.set_file_text(file_id, text);
     super::LOWERED.set(0);
+    db.set_file_text(file_id, text);
     crate::file_item_tree(&*db, file.into(), krate);
     let lowered = super::LOWERED.get();
     assert_assembled_is_whole(db, file, text);
@@ -230,7 +231,7 @@ fn a_big_item_keeps_its_tree_across_an_edit_elsewhere() {
 
 /// How many top-level items' syntax making the file's tree hashes once it holds `text`, and how
 /// many items' ast ids and anchors it reads from the maps, the file keyed at the text it holds
-/// before.
+/// before. Counted from before the write, as [`items_lowered_by`] is.
 fn items_keyed_by(db: &mut TestDB, file: EditionedFileId, text: &str) -> (usize, usize) {
     let krate = fixture::test_crate(db);
     let file_id = file.file_id(&*db);
@@ -239,9 +240,9 @@ fn items_keyed_by(db: &mut TestDB, file: EditionedFileId, text: &str) -> (usize,
         db.set_file_text(file_id, &warm);
         crate::file_item_tree(&*db, file.into(), krate);
     }
-    db.set_file_text(file_id, text);
     super::HASHED.set(0);
     super::READ.set(0);
+    db.set_file_text(file_id, text);
     crate::file_item_tree(&*db, file.into(), krate);
     let counts = (super::HASHED.get(), super::READ.get());
     assert_assembled_is_whole(db, file, text);

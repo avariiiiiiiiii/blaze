@@ -451,14 +451,10 @@ impl<'a> Stage<'a> {
         Ok(())
     }
 
-    /// The live descriptor and the path it names, filled once the image is placed.
+    /// The live descriptor, filled once the image is placed.
     pub fn descriptor(&mut self) {
-        let Some(live) = &self.output.live else { return };
-        let path: &'a [u8] = live.path.as_bytes();
-        let dir = self.sym(SymKey::LiveDir);
-        if self.new.home(dir).is_none() {
-            let piece = self.piece(dir, &Class::Rodata, 1, path.len() as u64, &[], What::Fixed);
-            self.make(&piece, Content::Bytes(path));
+        if self.output.live.is_none() {
+            return;
         }
         let descriptor = self.sym(SymKey::Descriptor);
         if self.new.home(descriptor).is_none() {

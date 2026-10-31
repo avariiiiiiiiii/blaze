@@ -1,16 +1,15 @@
 //! A unit's check beside its codegen (docs/v2/plan/lanes/frontend/fast-bodies-tasks.md).
 //!
-//! The check's bodies are a [`Plan`] that codegen's walk tells what it reaches
-//! ([`BodyChecks::reached`]), so the bodies the build compiles are checked before the others.
-//! Which bodies are checked does not change: the check is of every body of the crate, and the
-//! unit's outcome waits for all of them, as rustc's does. Once the check fails, codegen stops at
-//! its next step ([`BodyChecks::stopped`]) and what it made is dropped: the unit's outcome is
-//! the check's errors.
+//! The check is the unit's [`Phase::Bodies`](crate::serve::work::Phase), its codegen
+//! [`Phase::Codegen`](crate::serve::work::Phase), two nodes of the plane that run side by side
+//! once the unit's names are done, sharing one [`Checking`]. The check's bodies are a [`Plan`]
+//! that codegen's walk tells what it reaches ([`BodyChecks::reached`]), so the bodies the build
+//! compiles are checked before the others. Which bodies are checked does not change: the check
+//! is of every body of the crate, and the unit's outcome waits for all of them, as rustc's does.
+//! Once the check fails, codegen stops at its next step ([`BodyChecks::stopped`]) and what it
+//! made is dropped: the unit's outcome is the check's errors.
 
-use std::{
-    panic::resume_unwind,
-    sync::atomic::{AtomicBool, Ordering},
-};
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use base_db::Db;
 use blaze_diagnostics::{Diag, Files, Options};
@@ -40,25 +39,9 @@ impl Checking {
         Checking { krate, plan: Plan::new(db, &[krate], &EVERY), failed: AtomicBool::new(false) }
     }
 
-    /// The check with nothing beside it: of a unit that compiles no code.
-    pub(crate) fn alone(&self, db: &Db, files: Files<'_>, options: &Options) -> Vec<Diag> {
-        self.check(db, files, options)
-    }
-
-    /// The check, and `codegen` beside it on this thread: the check's diagnostics and what
-    /// codegen gave, once both are done. What codegen gave is the caller's to drop when the
-    /// check failed.
-    pub(crate) fn alongside<T>(
-        &self,
-        db: &Db,
-        files: Files<'_>,
-        options: &Options,
-        codegen: impl FnOnce() -> T,
-    ) -> (Vec<Diag>, T) {
-        beside(|| self.check(db, files, options), codegen)
-    }
-
-    fn check(&self, db: &Db, files: Files<'_>, options: &Options) -> Vec<Diag> {
+    /// The check's diagnostics, once every body is checked; a codegen beside it is told, from
+    /// then, whether it failed.
+    pub(crate) fn check(&self, db: &Db, files: Files<'_>, options: &Options) -> Vec<Diag> {
         let diags = blaze_diagnostics::check_planned(db, self.krate, &self.plan, files, options);
         if failed(&diags) {
             self.failed.store(true, Ordering::Release);
@@ -74,20 +57,6 @@ impl BodyChecks for Checking {
 
     fn stopped(&self) -> bool {
         self.failed.load(Ordering::Acquire)
-    }
-}
-
-/// `check` as a job of the process's pool (its bodies its tasks), and `codegen` on this thread
-/// meanwhile; both results once both are done. A panic of either is raised here, after both.
-fn beside<T>(check: impl FnOnce() -> Vec<Diag> + Send, codegen: impl FnOnce() -> T) -> (Vec<Diag>, T) {
-    let mut checked = None;
-    let made = blaze_graph::exec::shared().scope(|scope| {
-        scope.submit(None, check, |ran| checked = Some(ran));
-        codegen()
-    });
-    match checked.expect("a scope returns once each of its jobs is done") {
-        Ok(diags) => (diags, made),
-        Err(panic) => resume_unwind(panic),
     }
 }
 

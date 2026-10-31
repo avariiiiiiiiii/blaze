@@ -8,8 +8,9 @@ use blaze_codegen::{Arch, CompiledFunction, Covered, Data, Init, InstanceKey, Li
 use blaze_core::{Completion, Done, Effect, FileName, IoError};
 use blaze_format::SpanRef;
 use blaze_ids::ContentId;
+use blaze_inproc::{CodeMemory, CodeRange};
 use blaze_items::ItemKey;
-use blaze_live::patch::{Descriptor, Message, message_file};
+use blaze_live::patch::{Descriptor, Message, MessageView, Patch, hash};
 use object::read::elf::ElfFile64;
 use object::write::{Object as Builder, Relocation, StandardSection, Symbol as Def, SymbolSection};
 use object::{
@@ -56,7 +57,55 @@ fn output(incremental: bool) -> Output {
 }
 
 fn live() -> Output {
-    Output { live: Some(Live { dir: name("live"), path: "/tmp/blaze-link-test/live".into() }), ..output(true) }
+    Output { live: Some(Live), ..output(true) }
+}
+
+const SUPPORTED: bool = cfg!(any(
+    all(target_os = "linux", any(target_arch = "x86_64", target_arch = "aarch64")),
+    all(target_os = "macos", target_arch = "aarch64"),
+    all(windows, target_arch = "x86_64"),
+));
+
+/// A code memory whose image part has room for `len` bytes, or none where blaze-inproc does
+/// not run (and then making one says so).
+fn code_memory(name: &str, len: u64) -> Option<CodeMemory> {
+    match CodeMemory::new(name, len, 0) {
+        Ok(memory) => Some(memory),
+        Err(error) => {
+            assert!(!SUPPORTED, "{error}");
+            assert!(error.what.contains("blaze-inproc runs on"), "{error}");
+            None
+        }
+    }
+}
+
+/// A code memory holding `file` at the start of its image part, with room for it to double:
+/// what a live image linked on the disk is committed into next ([`Image::commit_into`]).
+fn memory_of(name: &str, file: &Sparse) -> Option<CodeMemory> {
+    let mut memory = code_memory(name, 2 * file.len)?;
+    memory.write(0, &contents(file)).unwrap();
+    memory.publish(CodeRange { offset: 0, len: file.len }).unwrap();
+    Some(memory)
+}
+
+fn contents(file: &Sparse) -> Vec<u8> {
+    (0..file.len).map(|at| file.page(at / PAGE)[(at % PAGE) as usize]).collect()
+}
+
+/// The patch in `message`, read in place and decoded alike, each of its code entries checked
+/// as the running program checks it: its hash is the hash of the bytes `memory` holds there
+/// (an address is its file offset).
+fn patch_in(message: &[u8], memory: &CodeMemory) -> Patch {
+    let Ok(MessageView::Patch(view)) = Message::view(message) else {
+        panic!("not a patch: {:?}", Message::decode(message))
+    };
+    let patch = view.to_patch();
+    assert_eq!(Message::decode(message), Ok(Message::Patch(view.to_patch())));
+    for code in &patch.code {
+        let held = memory.bytes(CodeRange { offset: code.at, len: code.len }).unwrap();
+        assert_eq!(code.hash, hash(held), "{} at {:#x}: the code memory holds other bytes", code.name, code.at);
+    }
+    patch
 }
 
 fn function(n: u8, code: &[u8], relocs: Vec<blaze_codegen::Relocation>) -> CompiledFunction {
@@ -281,6 +330,13 @@ struct Linked {
 impl Linked {
     fn of(file: &Sparse) -> Linked {
         Linked { words: file.words(), len: file.len as usize }
+    }
+
+    /// The first `len` bytes of `memory`'s image part: the file a commit into it wrote.
+    fn in_memory(memory: &CodeMemory, len: u64) -> Linked {
+        let mut file = Sparse::default();
+        file.write(0, memory.bytes(CodeRange { offset: 0, len }).unwrap());
+        Linked::of(&file)
     }
 
     fn bytes(&self) -> &[u8] {
@@ -549,7 +605,7 @@ fn bytes_refuses_a_live_link_that_tells_running_programs() {
     assert!(image.bytes(staged).is_ok(), "the first link tells no program");
     let staged = image.stage(edit(&g2)).unwrap();
     let error = image.bytes(staged).unwrap_err();
-    assert!(error.what.contains("tells running programs"), "{error}");
+    assert!(error.what.contains("only through the code memory") && error.what.contains("`commit_into`"), "{error}");
     assert_eq!(image.generation(), 1, "a refused link leaves the image as it was");
 }
 
@@ -641,7 +697,8 @@ fn a_live_image_names_its_table_and_patches_say_what_changed() {
     let mut image = Image::new(name(TO), live()).unwrap();
     let mut disk = Disk::default();
     disk.link(&mut image, first(&start, &g)).unwrap();
-    assert!(!disk.files.keys().any(|it| it.as_str().starts_with("live/")), "nothing runs the first link");
+    let files: Vec<&str> = disk.files.keys().map(FileName::as_str).collect();
+    assert_eq!(files, [TO], "the image alone: a file commit writes no message");
 
     let a = Linked::of(disk.file(TO));
     let at = a.dynamic_symbol(blaze_live::patch::DESCRIPTOR);
@@ -653,30 +710,69 @@ fn a_live_image_names_its_table_and_patches_say_what_changed() {
     assert!(descriptor.slots >= 2);
     let [code, end] = descriptor.patch_code;
     assert!(code < end);
-    let [dir, len] = descriptor.dir;
-    assert_eq!(a.at(dir, len as usize), b"/tmp/blaze-link-test/live");
 
-    disk.link(&mut image, edit(&g2)).unwrap();
-    let b = Linked::of(disk.file(TO));
+    let before = disk.file(TO).clone();
+    let error = disk.link(&mut image, edit(&g2)).unwrap_err();
+    assert!(error.what.contains("only through the code memory") && error.what.contains("`commit_into`"), "{error}");
+    assert_eq!(image.generation(), 1, "a refused commit leaves the image as it was");
+    assert!(disk.file(TO).same(&before), "and its file");
+
+    let Some(mut memory) = memory_of("blaze-link-live-table", disk.file(TO)) else { return };
+    let staged = image.stage(edit(&g2)).unwrap();
+    let message = image.commit_into(staged, &mut memory).unwrap().expect("a message for programs running 1");
+    let b = Linked::in_memory(&memory, image.state.file_len);
     let new = b.symbol("g2");
     assert!((code..end).contains(&new));
-    let message = disk.file(&format!("live/{}", message_file(1)));
-    let words = message.words();
-    let bytes = &Linked { words, len: message.len as usize };
-    let Message::Patch(patch) = Message::decode(bytes.bytes()).unwrap() else { panic!("not a patch") };
+    let patch = patch_in(&message, &memory);
     assert_eq!((patch.id, patch.base, patch.generation), (descriptor.id, 1, 2));
-    assert_eq!(patch.code, vec![(new, returns(2).to_vec())]);
+    let [g2_code] = &patch.code[..] else { panic!("g2's code alone: {:?}", patch.code) };
+    assert_eq!((g2_code.at, g2_code.len, g2_code.hash), (new, 6, hash(&returns(2))));
+    assert!(g2_code.name.contains("function"), "named as the function: {}", g2_code.name);
     let slot = image.slot(&key(2)).unwrap();
     assert!(patch.cells.contains(&(slot.0, new)), "{:?}", patch.cells);
     assert!(patch.frames.is_empty() && patch.windows.is_empty());
     let after = Descriptor::decode(b.at(at, Descriptor::SIZE)).unwrap();
     assert_eq!((after.id, after.generation), (descriptor.id, 2), "a program started now starts at 2");
 
-    disk.roll_back(&mut image).unwrap();
-    assert!(!disk.files.contains_key(&name(&format!("live/{}", message_file(1)))));
-    let message = disk.file(&format!("live/{}", message_file(2)));
-    let bytes = &Linked { words: message.words(), len: message.len as usize };
-    assert_eq!(Message::decode(bytes.bytes()).unwrap(), Message::RollBack { id: descriptor.id, to: 1 });
+    let mut effects = Vec::new();
+    let error = image.roll_back(&mut effects).unwrap_err();
+    assert!(error.what.contains("only through the code memory") && error.what.contains("`roll_back_into`"), "{error}");
+    assert!(effects.is_empty(), "a refused rollback asks for no effect");
+    assert_eq!(image.generation(), 2, "a refused rollback leaves the image as it was");
+    let message = image.roll_back_into(&mut memory).unwrap().expect("a live image's rollback tells its programs");
+    assert_eq!(Message::decode(&message), Ok(Message::RollBack { id: descriptor.id, to: 1 }));
+    assert!(matches!(Message::view(&message), Ok(MessageView::RollBack { to: 1, .. })));
+    assert_eq!(image.generation(), 1);
+    assert_eq!(Linked::in_memory(&memory, image.state.file_len).bytes(), a.bytes(), "the first link's file again");
+}
+
+/// The runtime never slides code, since every run of the program maps one copy of it from the
+/// code memory: a patch whose code holds an address the loader slides (a PE base relocation
+/// into code, which only a dev run refuses) is a restart naming the function.
+#[test]
+fn a_patch_whose_code_the_loader_slides_is_a_restart() {
+    let (start, g) = program(Target::Function);
+    let pe = Output {
+        format: Format::Pe,
+        kind: OutputKind::Executable { entry: "mainCRTStartup".into() },
+        interpreter: None,
+        triple: "x86_64-pc-windows-msvc".into(),
+        ..live()
+    };
+    let mut image = Image::new(name(TO), pe).unwrap();
+    let change = Change { added: vec![&start, &g], names: vec![("mainCRTStartup".into(), Target::Direct(key(1)))], ..Change::default() };
+    let staged = image.stage(change).unwrap();
+    assert!(image.bytes(staged).is_ok(), "the first link tells no program");
+    // `mov rax, imm64; ret`, the immediate the address of `_start`'s body.
+    let absolute =
+        blaze_codegen::Relocation { at: 2, kind: RelocKind::Abs64, target: Target::Direct(key(1)), addend: 0 };
+    let g2 = function(3, &[0x48, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0xc3], vec![absolute]);
+    let staged = image.stage(edit(&g2)).unwrap();
+    let message = staged.writes.message.as_deref().expect("a message for programs running 1");
+    let Ok(MessageView::Restart { generation: 2, why, .. }) = Message::view(message) else {
+        panic!("not a restart: {:?}", Message::decode(message))
+    };
+    assert!(why.contains("holds an address the loader slides, in code") && why.contains("function"), "{why}");
 }
 
 /// `lea rax, [rip + literal]; ret`, the literal its own data, and a call frame entry.
@@ -722,25 +818,34 @@ fn a_patch_puts_its_frames_and_literals_in_the_patch_regions_and_ends_its_frames
     let descriptor = Descriptor::decode(a.at(a.dynamic_symbol(blaze_live::patch::DESCRIPTOR), Descriptor::SIZE)).unwrap();
     let ([code, code_end], [data, data_end]) = (descriptor.patch_code, descriptor.patch_data);
 
-    disk.link(&mut image, edit(&g2)).unwrap();
-    let b = Linked::of(disk.file(TO));
+    let Some(mut memory) = memory_of("blaze-link-live-frames", disk.file(TO)) else { return };
+    let staged = image.stage(edit(&g2)).unwrap();
+    let message = image.commit_into(staged, &mut memory).unwrap().expect("a message for programs running 1");
+    let b = Linked::in_memory(&memory, image.state.file_len);
     let new = b.symbol("g2");
     let literal = b.rel32(new + 3);
     assert!((data..data_end).contains(&literal), "the literal at {literal:#x}, in the patch data region");
     assert_eq!(b.at(literal, 7), b"literal");
-    let message = disk.file(&format!("live/{}", message_file(1)));
-    let bytes = &Linked { words: message.words(), len: message.len as usize };
-    let Message::Patch(patch) = Message::decode(bytes.bytes()).unwrap() else { panic!("not a patch") };
+    let patch = patch_in(&message, &memory);
     let [(fde, len)] = patch.frames[..] else { panic!("one FDE: {:?}", patch.frames) };
-    assert!(patch.code.len() >= 3 && patch.code.windows(2).all(|it| it[0].0 < it[1].0), "code writes by address: {:?}", patch.code);
+    assert!(
+        patch.code.len() >= 3 && patch.code.windows(2).all(|it| it[0].at < it[1].at),
+        "code by address: {:?}",
+        patch.code
+    );
     assert!(patch.data.windows(2).all(|it| it[0].0 < it[1].0), "data writes by address");
     assert!(code <= new && new < fde && fde + len + 4 <= code_end, "the FDE after the code, in the patch code region");
     assert_eq!(fde_starts(fde, b.at(fde, len as usize)), vec![new], "the FDE covers g2");
     let cie = fde + 4 - u64::from(b.u32_at(fde + 4));
     assert!(new < cie && cie < fde, "the new CIE in the patch code region, before the FDE");
-    let written = |at: u64| patch.code.iter().find(|it| it.0 == at).map(|it| &it.1[..]);
-    assert!(written(cie).is_some() && written(fde).is_some(), "the CIE and the FDE are code writes");
-    assert_eq!(written(fde + len), Some(&[0u8; 4][..]), "the patch's frames end in their own zero length");
+    let written = |at: u64| patch.code.iter().find(|it| it.at == at).map(|it| (it.len, it.hash, &it.name[..]));
+    assert!(written(cie).is_some() && written(fde).is_some(), "the CIE and the FDE are code the patch names");
+    assert_eq!(
+        written(fde + len),
+        Some((4, hash(&[0; 4]), "the call frame entries' end")),
+        "the patch's frames end in their own zero length"
+    );
+    assert_eq!(b.at(fde + len, 4), [0; 4], "written into the code memory");
     let file = b.elf();
     for (at, bytes) in &patch.data {
         let section = file.sections().find(|it| (it.address()..it.address() + it.size()).contains(at)).unwrap();

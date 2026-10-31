@@ -189,7 +189,7 @@ pub fn body(b: &mut B<'_>, shape: Shape, args: &[String]) -> Vec<String> {
         Op::Fcopysign => one(intrinsic2(b, "llvm.copysign", ty, x(), y())),
         Op::Fmin => one(intrinsic2(b, "llvm.minimum", ty, x(), y())),
         Op::Fmax => one(intrinsic2(b, "llvm.maximum", ty, x(), y())),
-        Op::Fma => one(fma(b, ty, &x(), &y(), &z())),
+        Op::Fma => one(fma(b, ty, shape.aux == 1, x(), y(), z())),
 
         Op::Bitcast => one(b.cast("bitcast", shape.arg(0), x(), ty)),
         Op::Ireduce => one(b.cast("trunc", shape.arg(0), x(), ty)),
@@ -695,15 +695,22 @@ fn confined(b: &mut B<'_>, shape: Shape, args: &[String]) -> Vec<String> {
 /// `x * y + z` fused, with `x` and `y` in the registers Cranelift's AArch64 lowering puts them
 /// in, by asm: `fmadd d, x, y, z` and `fmla z, x, y`. Which NaN a fused multiply-add returns
 /// when both multiplicands are NaN is the first's, and LLVM takes `llvm.fma`'s multiplicands
-/// as commutative, so the intrinsic may swap them.
-fn fma(b: &mut B<'_>, ty: Ty, x: &str, y: &str, z: &str) -> String {
+/// as commutative, so the intrinsic may swap them. `negated` is `fmsub d, x, y, z` and
+/// `fmls z, x, y`, `z - x * y`, which flip `x`'s sign before the multiply, NaN or not: what
+/// Cranelift writes for `fma x (fneg y) z`.
+fn fma(b: &mut B<'_>, ty: Ty, negated: bool, x: &str, y: &str, z: &str) -> String {
     let t = ir(ty);
-    let asm = match ty {
-        Ty::F32 => "fmadd ${0:s}, ${1:s}, ${2:s}, ${3:s}\", \"=w,w,w,w",
-        Ty::F64 => "fmadd ${0:d}, ${1:d}, ${2:d}, ${3:d}\", \"=w,w,w,w",
-        Ty::F32x4 => "fmla $0.4s, $2.4s, $3.4s\", \"=w,0,w,w",
-        Ty::F64x2 => "fmla $0.2d, $2.2d, $3.2d\", \"=w,0,w,w",
-        _ => {
+    let asm = match (ty, negated) {
+        (Ty::F32, false) => "fmadd ${0:s}, ${1:s}, ${2:s}, ${3:s}\", \"=w,w,w,w",
+        (Ty::F64, false) => "fmadd ${0:d}, ${1:d}, ${2:d}, ${3:d}\", \"=w,w,w,w",
+        (Ty::F32x4, false) => "fmla $0.4s, $2.4s, $3.4s\", \"=w,0,w,w",
+        (Ty::F64x2, false) => "fmla $0.2d, $2.2d, $3.2d\", \"=w,0,w,w",
+        (Ty::F32, true) => "fmsub ${0:s}, ${1:s}, ${2:s}, ${3:s}\", \"=w,w,w,w",
+        (Ty::F64, true) => "fmsub ${0:d}, ${1:d}, ${2:d}, ${3:d}\", \"=w,w,w,w",
+        (Ty::F32x4, true) => "fmls $0.4s, $2.4s, $3.4s\", \"=w,0,w,w",
+        (Ty::F64x2, true) => "fmls $0.2d, $2.2d, $3.2d\", \"=w,0,w,w",
+        (_, true) => unreachable!("an `fma` of {} with an operand negated, which no shape is", ty.name()),
+        (_, false) => {
             let name = format!("llvm.fma.{}", mangle(ty));
             return b.call(t, &name, &[(t, x), (t, y), (t, z)]);
         }

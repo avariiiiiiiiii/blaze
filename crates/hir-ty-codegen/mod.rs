@@ -8965,7 +8965,12 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
             // The body takes the closure by value. Only when that means "through a pointer to
             // memory the body owns" is it what the `call_once` slot is called with.
             if !once {
-                unsupported!("vtable shim for a closure taken by value");
+                let kind = generic_args.as_closure().kind();
+                unsupported!(
+                    "vtable shim for a closure taken by value, in the `call` or `call_mut` slot \
+                     of a closure of kind {kind:?} (a body takes its closure by value only for \
+                     `FnOnce`)"
+                );
             }
             let layout = self.layout(receiver_ty)?;
             let mode = self.pass_mode(&layout, false)?;

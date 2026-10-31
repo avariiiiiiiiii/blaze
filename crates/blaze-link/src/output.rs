@@ -1,7 +1,6 @@
 //! What an image is linked as: its format, target and kind, and its native inputs.
 
 use blaze_codegen::Arch;
-use blaze_core::FileName;
 use blaze_ids::ContentId;
 
 /// The object format of an image.
@@ -33,8 +32,7 @@ pub struct Output {
     /// release link keeps none.
     pub incremental: bool,
     pub debug: Debug,
-    /// Where running programs take patches: under the driver's root for the linker, and the
-    /// absolute path the program reads it at.
+    /// The image takes live patches ([`Live`]).
     pub live: Option<Live>,
     /// The high bits of the tags of the image's effects: each is `tags | n` for `n` below
     /// 2^32, so the caller's other effects need other high bits.
@@ -111,11 +109,11 @@ pub enum Debug {
     Lines,
 }
 
-#[derive(Clone, PartialEq, Eq, Debug)] // clone: setup, as `Output`'s
-pub struct Live {
-    pub dir: FileName,
-    pub path: String,
-}
+/// A live image: it has a descriptor ([`blaze_live::patch::Descriptor`]) and patch regions,
+/// and its patches reach running programs only through the code memory they run
+/// ([`crate::Image::commit_into`], [`crate::Image::roll_back_into`]).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct Live;
 
 /// A native input of the link line: a C object, an archive or a shared library.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]

@@ -120,6 +120,42 @@ a scope that rayon jobs enter, at blaze-codegen's `until_stopped` and blaze-link
 sites; that is lane core's allocator. Until then a program's record changes only when it
 runs alone again (after the record is evicted) or holds more than predicted on its own thread.
 
+## A unit's compile as five nodes (queue 01325, 2026-10-31)
+
+`Worked.steps_us` (01250) sums each node's run time by node kind. A unit's compile was one
+`Codegen` node, so in a build, bodies, codegen, link and store time all showed as `codegen`.
+Now each unit is a node per [`Phase`](../../../../../crates/blaze-cargo/src/serve/work.rs) in
+`serve/job.rs` `build()`, each doing its own part of what `unit/compile.rs` `make()` used to do
+in one call:
+
+| phase | node kind | task kind | what it does |
+|---|---|---|---|
+| names | `names` | `UNIT_NAMES` | the record lookup (a hit replays the unit, and the phases after do nothing), the lint flags, the crate's def map, what the unit does, and its check: served, none for a reached-only crate, or a `Checking` of every body |
+| bodies | `bodies` | `UNIT_BODIES` | `Checking::check`, and the dependency crate's outcome kept for the store |
+| codegen | `codegen` | `COMPILE`, or `PROGRAM` keyed by the program | `codegen::generate`, told by the check beside it what fails |
+| link | `link` | `UNIT_LINK`, or `PROGRAM_LINK` keyed by the program | the diagnostics as cargo shows them, the images linked (relinking the kept ones), a proc macro's expanders loaded |
+| store | `store` | `UNIT_STORE` | each output hashed into one put, dep-info, the artifact, the record encoded |
+
+Edges: names waits for the last node of each unit it depends on (the same order between
+units as before). Bodies and codegen both wait for names and run side by side, as the check
+ran beside codegen before (it was a job of the pool, `checks::beside`, now gone). Link waits
+for both, and store for link. A unit that is only checked (`checks_only`) has names, bodies
+and store, and its store does the link's diagnostics part itself. A build script's run stays
+one node.
+
+What one phase makes waits for the next in the unit's `compile::Phases`, behind a lock only
+bodies and codegen ever contend on. A phase changes it only once it can no longer give way, so
+a phase posted again (`Failed::Again`) finds the unit as it was. Codegen keeps
+`codegen::Parts` (`Built`, `Roots`, `Policy`), which own nothing of the front end. The link
+reads them through its own task's reader (`Parts::over`), which is sound because every input
+of the unit's crate comes from units it depends on, all done before its names began. Images
+go only to the link task, and back to the loop as it ends (`Value::Phase`).
+
+Not timed by any node, as before: the loop's `Store::put` of each put. That runs on the loop
+after the unit's last node, and its time is the store's (compression and segment writes). The
+store phase times hashing and encoding, not the write. Making the write a task needs a store
+writer usable off the loop, which is the store lane's.
+
 ## Left open
 
 - **Release summaries.** A release build still prepares and summarizes every function the store

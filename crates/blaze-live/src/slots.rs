@@ -1,48 +1,41 @@
 //! The runtime of a program blaze-link linked: it takes patches while it runs.
 //!
 //! Every function a patch can replace is called through a slot of a jump table: a call loads
-//! the table cell, then the slot. A patch writes its code and data where the linker placed
-//! them, then publishes a table with its slots changed in one atomic store to the cell, so
-//! every thread's next call through any slot sees all of the patch or none of it. Going back
-//! to a kept generation (the last [`KEPT`](switch::KEPT)) is one store again: when the linker
-//! says so ([`crate::patch::Message::RollBack`]), or when code of a generation panics under
+//! the table cell, then the slot. A patch's code is already where the linker placed it: the
+//! program runs from the daemon's code memory (blaze-inproc), and the commit wrote the code
+//! there. The switch checks that code against the message's hashes, writes the patch's data,
+//! then publishes a table with its slots changed in one atomic store to the cell, so every
+//! thread's next call through any slot sees all of the patch or none of it. Going back to a
+//! kept generation (the last [`KEPT`](switch::KEPT)) is one store again: when the linker says
+//! so ([`crate::patch::Message::RollBack`]), or when code of a generation panics under
 //! [`Live::guard`].
 //!
-//! The descriptor ([`crate::patch::Descriptor`]) says where everything is. A program at
-//! generation `g` takes the message in the file
-//! [`message_file`](crate::patch::message_file)`(g)` of the directory it
-//! names, read into a buffer kept from message to message, and answers each there
-//! ([`crate::patch::Answer`]). A thread blocks on the platform's notification of changes to
-//! the directory (inotify, kqueue, change notifications) and counts them, so [`Live::poll`]
-//! is one atomic load while nothing came.
+//! The descriptor ([`crate::patch::Descriptor`]) says where everything is. Each commit
+//! announces its generation in a word of the shared control page, so [`Live::poll`] is one
+//! load while nothing came. When something did, the program asks the daemon for the message
+//! that takes it on over blaze-inproc's channel ([`crate::patch::ask`]), a piece at a time
+//! into a buffer kept from message to message, and tells it what became of it.
 //!
 //! An image linked with an execution log ([`exec`]) keeps its cell on the log's table, and a
 //! switch stores only the header's current table; [`publish`] writes one slot into every
 //! generation's table, for lazy compilation's code placed after the link.
 //!
-//! Linux on x86-64 and AArch64, macOS on AArch64 and Windows on x86-64; elsewhere
-//! [`Live::start`] says so.
+//! Linux on x86-64 and AArch64, macOS on AArch64 and Windows on x86-64, in a program the
+//! daemon started; elsewhere, or in a program started by hand, [`Live::start`] says so.
 
 use std::{
-    collections::VecDeque,
     fmt,
-    fs::{File, Metadata},
-    io::Read,
-    path::{Path, PathBuf},
-    sync::{
-        Arc, OnceLock,
-        atomic::{AtomicBool, AtomicU64, Ordering},
-    },
-    thread::Thread,
-    time::SystemTime,
+    sync::atomic::{AtomicBool, Ordering},
+    time::Duration,
 };
 
-use crate::patch::{
-    ANSWER, Answer, DESCRIPTOR, DESCRIPTOR_MAGIC, Descriptor, Message, message_file_into,
-};
+use blaze_inproc::runtime::{self, Attached};
+
+use crate::ask::{self, Kinds};
+use crate::patch::{self, Answer, DESCRIPTOR, DESCRIPTOR_MAGIC, Descriptor, Message};
 pub use exec::publish;
 use os::backtrace;
-use switch::{KEPT, Layout, Memory as _, Switch};
+use switch::{Layout, Switch};
 
 mod column;
 pub mod exec;
@@ -81,12 +74,9 @@ use windows as os;
     all(windows, target_arch = "x86_64"),
 )))]
 mod os {
-    use std::{ops::Range, path::Path, sync::Arc};
+    use std::ops::Range;
 
-    use super::{
-        Events,
-        switch::{Dwarf, Layout, Memory, Writes},
-    };
+    use super::switch::{Dwarf, Layout, Memory, Writes};
 
     const PLATFORMS: &str =
         "live patches run on Linux x86-64 and AArch64, macOS AArch64 and Windows x86-64";
@@ -120,10 +110,6 @@ mod os {
             match *self {}
         }
 
-        fn code(&mut self, _: &Writes<'_>) -> Result<(), String> {
-            match *self {}
-        }
-
         fn data(&mut self, _: &Writes<'_>) -> Result<(), String> {
             match *self {}
         }
@@ -147,11 +133,6 @@ mod os {
     }
 
     pub(super) fn in_image_of(_: &Range<u64>, _: u64) -> Result<(), String> {
-        // alloc: error path, on a platform it doesn't run on
-        Err(PLATFORMS.to_owned())
-    }
-
-    pub(super) fn watch(_: &Path, _: Arc<Events>) -> Result<(), String> {
         // alloc: error path, on a platform it doesn't run on
         Err(PLATFORMS.to_owned())
     }
@@ -200,38 +181,11 @@ pub enum Outcome {
     Restart { generation: u64, why: String },
     /// The message could not be taken, for this reason; the program runs on as it was.
     Declined { generation: u64, why: String },
-    /// What became of a message or a panic, which the linker was not told: writing the answer
-    /// at `path` failed with `error`.
-    Unanswered { outcome: Box<Outcome>, path: PathBuf, error: std::io::ErrorKind },
-    /// The thread watching the directory stopped, for this reason: no message comes after it.
-    Unwatched { generation: u64, why: Unwatched },
-}
-
-/// Why the thread watching the directory for messages stopped.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum Unwatched {
-    /// The directory was removed or moved away.
-    Gone,
-    /// The platform's `call` failed with the OS error `code`.
-    Failed { call: &'static str, code: i32 },
-}
-
-impl Unwatched {
-    /// `call`, which just failed, with the OS error it left.
-    pub(crate) fn failed(call: &'static str) -> Unwatched {
-        Unwatched::Failed { call, code: std::io::Error::last_os_error().raw_os_error().unwrap_or(0) }
-    }
-}
-
-impl fmt::Display for Unwatched {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Unwatched::Gone => write!(f, "the directory patches come through was removed"),
-            Unwatched::Failed { call, code } => {
-                write!(f, "{call}: {}", std::io::Error::from_raw_os_error(*code))
-            }
-        }
-    }
+    /// What became of a message or a panic, which the daemon was not told, for this reason.
+    Unanswered { outcome: Box<Outcome>, why: String },
+    /// The channel to the daemon failed, for this reason: no patch after `generation` is
+    /// taken.
+    Disconnected { generation: u64, why: String },
 }
 
 impl fmt::Display for Outcome {
@@ -253,10 +207,10 @@ impl fmt::Display for Outcome {
             Outcome::Declined { generation, why } => {
                 write!(f, "generation {generation} not applied: {why}")
             }
-            Outcome::Unanswered { outcome, path, error } => {
-                write!(f, "{outcome}; answering in {}: {error}", path.display())
+            Outcome::Unanswered { outcome, why } => {
+                write!(f, "{outcome}; the daemon was not told: {why}")
             }
-            Outcome::Unwatched { generation, why } => {
+            Outcome::Disconnected { generation, why } => {
                 write!(f, "no patch after generation {generation} is taken: {why}")
             }
         }
@@ -266,117 +220,39 @@ impl fmt::Display for Outcome {
 /// Whether a [`Live`] was started in this process: the image has one table cell.
 static STARTED: AtomicBool = AtomicBool::new(false);
 
-/// What the thread watching the directory tells [`Live::poll`]: how many times a message
-/// file may have come, and when to stop.
-#[derive(Default)]
-pub(crate) struct Events {
-    count: AtomicU64,
-    stop: AtomicBool,
-    /// The thread of [`Live::apply_as_they_come`], woken at each event.
-    waiter: OnceLock<Thread>,
-    /// Why the watching thread stopped, once it has.
-    lost: OnceLock<Unwatched>,
-}
+/// How long [`Live::apply_as_they_come`]'s thread sleeps for an announcement before it looks
+/// again: where the daemon's announce wakes it (Linux, macOS) only a lost wake waits this
+/// long; on Windows, where it can't, this is how late a patch is taken at most.
+const LOOK_EVERY: Duration = Duration::from_millis(16);
 
-impl Events {
-    pub(crate) fn tell(&self) {
-        self.count.fetch_add(1, Ordering::Release);
-        if let Some(waiter) = self.waiter.get() {
-            waiter.unpark();
-        }
-    }
-
-    /// The watching thread stops for `why`, which [`Live::poll`] says next.
-    pub(crate) fn lose(&self, why: Unwatched) {
-        _ = self.lost.set(why);
-        self.tell();
-    }
-
-    pub(crate) fn stopped(&self) -> bool {
-        self.stop.load(Ordering::Relaxed)
-    }
-}
-
-/// Which file a message was read from: a file renamed over it is another.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-struct Identity {
-    len: u64,
-    modified: SystemTime,
-    /// The inode on Unix, the creation time on Windows.
-    node: u64,
-}
-
-impl Identity {
-    fn of(meta: &Metadata) -> std::io::Result<Identity> {
-        #[cfg(unix)]
-        let node = std::os::unix::fs::MetadataExt::ino(meta);
-        #[cfg(windows)]
-        let node = std::os::windows::fs::MetadataExt::creation_time(meta);
-        #[cfg(not(any(unix, windows)))]
-        let node = 0;
-        Ok(Identity { len: meta.len(), modified: meta.modified()?, node })
-    }
-}
-
-/// The answer file of the directory, and the bytes of the last answer, reused.
-struct Answers {
-    path: PathBuf,
-    partial: PathBuf,
-    bytes: Vec<u8>,
-}
-
-impl Answers {
-    fn new(dir: &Path) -> Answers {
-        Answers {
-            path: dir.join(ANSWER),
-            // alloc: setup, once at start
-            partial: dir.join(format!("{ANSWER}.{}", std::process::id())),
-            // alloc: grown to the largest answer once, then reused for every answer
-            bytes: Vec::new(),
-        }
-    }
-
-    /// Writes `answer` in one write, then renames it over the last.
-    fn write(&mut self, answer: &Answer) -> Result<(), std::io::ErrorKind> {
-        self.bytes.clear();
-        answer.encode_into(&mut self.bytes);
-        std::fs::write(&self.partial, &self.bytes)
-            .and_then(|()| std::fs::rename(&self.partial, &self.path))
-            .map_err(|it| it.kind())
-    }
-
-    /// `outcome`, whose answer could not be written for `error`.
-    fn unanswered(&self, outcome: Outcome, error: std::io::ErrorKind) -> Outcome {
-        // alloc: error path
-        Outcome::Unanswered { outcome: Box::new(outcome), path: self.path.clone(), error }
-    }
-}
+/// The asks of a message.
+const PATCHES: Kinds =
+    Kinds { ask: patch::ask::PATCH_ASK, piece: patch::ask::PATCH, none: patch::ask::NO_PATCH };
 
 /// A program taking patches.
 pub struct Live {
     switch: Switch<os::Os>,
-    dir: PathBuf,
-    answers: Answers,
-    events: Arc<Events>,
-    /// The count of events and the generation when the program last looked for its message.
+    attached: &'static Attached,
+    /// What the daemon had announced and the generation the program was at when it last
+    /// asked.
     looked: Option<(u64, u64)>,
-    /// Whether [`Outcome::Unwatched`] was said.
-    told_unwatched: bool,
-    /// The files of the last messages taken, by generation: none is taken twice.
-    taken: VecDeque<(u64, Identity)>,
+    /// Why the channel failed, while [`Outcome::Disconnected`] is still to be said.
+    lost: Option<String>,
+    /// Whether the channel failed: nothing is asked any more.
+    cut: bool,
     /// The bytes of the last message, its buffer kept for the next.
     message: Vec<u8>,
-    /// The path of the last message file looked for, and its name, kept for the next.
-    path: PathBuf,
-    name: String,
+    /// The bytes of the last answer, its buffer kept for the next.
+    answer: Vec<u8>,
 }
 
 impl Live {
-    /// Finds this image's descriptor, readies its patch code region for writes, installs the
-    /// panic hook [`Live::guard`] needs and starts watching for messages. It reserves about
-    /// 435 MiB of address space for the log of generations, which costs memory only as
-    /// patches fill it; under a `ulimit -v` that leaves less, it fails naming the call and
-    /// the size.
+    /// Finds this image's descriptor and the daemon's channel, and installs the panic hook
+    /// [`Live::guard`] needs. It reserves about 435 MiB of address space for the log of
+    /// generations, which costs memory only as patches fill it; under a `ulimit -v` that leaves
+    /// less, it fails naming the call and the size. A program the daemon did not start (no
+    /// start hook ran, or none attached) fails saying why: its code is the file's, which no
+    /// patch reaches.
     pub fn start() -> Result<Live, String> {
         if STARTED.swap(true, Ordering::AcqRel) {
             // alloc: error path
@@ -390,6 +266,11 @@ impl Live {
     }
 
     fn open() -> Result<Live, String> {
+        let attached = runtime::attach()
+            // alloc: error path
+            .map_err(|it| {
+                format!("patches come only to a program blaze started on its code memory: {it}")
+            })?;
         let (at, bytes) = os::descriptor()?;
         let descriptor = Descriptor::decode(bytes).ok_or_else(|| {
             // alloc: error path
@@ -401,38 +282,18 @@ impl Live {
         })?;
         let layout = Layout::new(&descriptor, at)?;
         let memory = os::Os::new(&layout)?;
-        let dir = directory(&layout, &memory)?;
         let switch = Switch::new(memory, layout)?;
-        let mut create = std::fs::DirBuilder::new();
-        create.recursive(true);
-        #[cfg(unix)]
-        std::os::unix::fs::DirBuilderExt::mode(&mut create, 0o700);
-        // alloc: error path
-        create.create(&dir).map_err(|it| format!("{}: {it}", dir.display()))?;
-        // clone: setup, the directory handed once to `DIR`
-        _ = crate::DIR.set(dir.clone());
         hook::install();
-        // alloc: setup, the one `Events` the watcher's thread shares
-        let events = Arc::new(Events::default());
-        // clone: setup, the watcher thread's handle, once
-        os::watch(&dir, events.clone())?;
-        let answers = Answers::new(&dir);
-        // alloc: grown to a message file's name once, then reused
-        let mut name = String::new();
-        message_file_into(switch.current(), &mut name);
-        let path = dir.join(&name);
         Ok(Live {
             switch,
-            dir,
-            answers,
-            events,
+            attached,
             looked: None,
-            told_unwatched: false,
-            taken: VecDeque::with_capacity(KEPT),
+            lost: None,
+            cut: false,
             // alloc: grown to the largest message once, then reused for every message
             message: Vec::new(),
-            path,
-            name,
+            // alloc: grown to the largest answer once, then reused for every answer
+            answer: Vec::new(),
         })
     }
 
@@ -441,41 +302,67 @@ impl Live {
         self.switch.current()
     }
 
-    /// Takes every message that came since the last call, in order, answers each, and says
-    /// what became of the last. Call it where nothing of the program's is half done, such as
-    /// between two frames. Code is only written here, never over code a thread can be in, so
-    /// a function running on any thread when its patch lands finishes as it was. Data a patch
-    /// changes in place (a static's new value) is written with plain stores, so no other
-    /// thread may use it while this runs. While nothing came it is one atomic load. Once the
-    /// thread watching for messages stops, the next call says why ([`Outcome::Unwatched`]).
+    /// Takes every patch the daemon announced since the last call, in order, answers each, and
+    /// says what became of the last. Call it where nothing of the program's is half done, such
+    /// as between two frames: it is the calling thread's quiescent point for the code memory's
+    /// fences, and no code a thread can be in is replaced, so a function running on any thread
+    /// when its patch lands finishes as it was. Data a patch changes in place (a static's new
+    /// value) is written with plain stores, so no other thread may use it while this runs.
+    /// While nothing came it is a few loads. Once the channel to the daemon fails, the next call
+    /// says why ([`Outcome::Disconnected`]) and later ones take nothing.
     pub fn poll(&mut self) -> Option<Outcome> {
+        if self.cut {
+            return self
+                .lost
+                .take()
+                .map(|why| Outcome::Disconnected { generation: self.switch.current(), why });
+        }
+        self.attached.quiesce();
         let mut last = None;
         loop {
-            let events = self.events.count.load(Ordering::Acquire);
+            let announced = self.attached.announced();
             let generation = self.switch.current();
-            if self.looked == Some((events, generation)) {
-                return last.or_else(|| self.unwatched(generation));
+            if self.looked == Some((announced, generation)) {
+                return last;
             }
-            self.looked = Some((events, generation));
-            if let Some(outcome) = self.next(generation) {
-                last = Some(outcome);
+            self.looked = Some((announced, generation));
+            match self.next(generation) {
+                Ok(Some(outcome)) => last = Some(outcome),
+                Ok(None) => {}
+                Err(why) => {
+                    self.cut = true;
+                    return match last {
+                        Some(outcome) => {
+                            self.lost = Some(why);
+                            Some(outcome)
+                        }
+                        None => Some(Outcome::Disconnected { generation, why }),
+                    };
+                }
             }
         }
     }
 
-    /// Takes each message as soon as it comes, on a thread of its own woken by the watcher,
-    /// instead of at [`Live::poll`], and tells `told` what became of it. For a program whose
-    /// functions can change between any two calls: one of many functions that work together
-    /// can be in the middle of a frame when some of them do, and data a patch changes in place
-    /// is stored while other threads may use it, as [`Live::poll`] says.
+    /// Takes each patch as soon as the daemon announces it, on a thread of its own, instead of
+    /// at [`Live::poll`], and tells `told` what became of it. For a program whose functions can
+    /// change between any two calls: one of many functions that work together can be in the
+    /// middle of a frame when some of them do, and data a patch changes in place is stored
+    /// while other threads may use it, as [`Live::poll`] says. The thread ends once the channel
+    /// fails, after telling why.
     pub fn apply_as_they_come(mut self, mut told: impl FnMut(Outcome) + Send + 'static) {
         let applying = move || {
-            _ = self.events.waiter.set(std::thread::current());
             loop {
                 if let Some(outcome) = self.poll() {
                     told(outcome);
                 }
-                std::thread::park();
+                if self.cut {
+                    if let Some(outcome) = self.poll() {
+                        told(outcome);
+                    }
+                    return;
+                }
+                let seen = self.looked.map_or(0, |(announced, _)| announced);
+                self.attached.wait_announced(seen, LOOK_EVERY);
             }
         };
         std::thread::Builder::new()
@@ -485,93 +372,32 @@ impl Live {
             .expect("spawning the thread that applies patches");
     }
 
-    /// Why the watching thread stopped, the first time it is asked after it did.
-    fn unwatched(&mut self, generation: u64) -> Option<Outcome> {
-        if self.told_unwatched {
-            return None;
+    /// Takes the daemon's message for a program at `generation`, if it has one: what became of
+    /// it. An error is the channel's.
+    fn next(&mut self, generation: u64) -> Result<Option<Outcome>, String> {
+        let body = |offset| patch::ask::patch_ask(generation, offset);
+        if ask::fetch(self.attached, &PATCHES, "the next patch", body, &mut self.message)?.is_none()
+        {
+            return Ok(None);
         }
-        let why = *self.events.lost.get()?;
-        self.told_unwatched = true;
-        Some(Outcome::Unwatched { generation, why })
-    }
-
-    /// Takes the message for `generation`, if one came that wasn't taken.
-    fn next(&mut self, generation: u64) -> Option<Outcome> {
-        message_file_into(generation, &mut self.name);
-        self.path.set_file_name(&self.name);
-        let path = std::mem::take(&mut self.path);
-        let outcome = self.read_message(generation, &path);
-        self.path = path;
-        outcome
-    }
-
-    /// Takes the message file at `path`, for `generation`, unless it was taken already.
-    fn read_message(&mut self, generation: u64, path: &Path) -> Option<Outcome> {
-        let file = match File::open(path) {
-            Ok(file) => file,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return None,
-            // alloc: error path
-            Err(error) => return Some(self.unread(generation, path, &error.to_string())),
-        };
-        let meta = match file.metadata() {
-            Ok(meta) => meta,
-            // alloc: error path
-            Err(error) => return Some(self.unread(generation, path, &error.to_string())),
-        };
-        let identity = match Identity::of(&meta) {
-            Ok(identity) => identity,
-            // alloc: error path
-            Err(error) => return Some(self.unread(generation, path, &error.to_string())),
-        };
-        if self.taken.contains(&(generation, identity)) {
-            return None;
-        }
-        if self.taken.len() == KEPT {
-            self.taken.pop_front();
-        }
-        self.taken.push_back((generation, identity));
-        // Read, not mapped: the bytes checked are the bytes written, whatever happens to the
-        // file meanwhile.
-        // One `read` of the length the file has: `take` ends the read there, with no second
-        // `read` to find the end.
-        self.message.clear();
-        self.message.reserve(usize::try_from(meta.len()).unwrap_or(0));
-        if let Err(error) = (&file).take(meta.len()).read_to_end(&mut self.message) {
-            // alloc: error path
-            return Some(self.unread(generation, path, &error.to_string()));
-        }
-        drop(file);
         let (outcome, said) = match Message::view(&self.message) {
             Ok(message) => self.switch.take(&message),
             Err(why) => {
                 // alloc: error path
-                let why = format!("{}: {why}", path.display());
+                let why = format!("the daemon's message for generation {generation}: {why}");
                 (
-                    // alloc: error path
+                    // clone: a declined message's reason, one for the program and one for the daemon
                     Outcome::Declined { generation, why: why.clone() },
                     Some(Answer::Declined { generation, why }),
                 )
             }
         };
-        if let Some(said) = &said
-            && let Err(error) = self.answers.write(said)
-        {
-            return Some(self.answers.unanswered(outcome, error));
-        }
-        Some(outcome)
-    }
-
-    /// Declines the message file at `path`, which could not be read.
-    fn unread(&mut self, generation: u64, path: &Path, why: &str) -> Outcome {
-        // alloc: error path
-        let why = format!("{}: {why}", path.display());
-        // alloc: error path
-        let answered = self.answers.write(&Answer::Declined { generation, why: why.clone() });
-        let outcome = Outcome::Declined { generation, why };
-        match answered {
+        let Some(said) = said else { return Ok(Some(outcome)) };
+        Ok(Some(match ask::tell(self.attached, &said, &mut self.answer) {
             Ok(()) => outcome,
-            Err(error) => self.answers.unanswered(outcome, error),
-        }
+            // alloc: error path
+            Err(why) => Outcome::Unanswered { outcome: Box::new(outcome), why },
+        }))
     }
 
     /// Runs `f`, such as one frame of the program, under `catch_unwind`. A panic with a frame
@@ -579,44 +405,21 @@ impl Live {
     /// the one it was applied on, is answered, and comes back as
     /// [`Outcome::RolledBack`]; any other panic is resumed as it was. What `f` changed before
     /// it panicked stays changed: the guard is where the program says that is fine. A
-    /// rollback whose answer could not be written comes back as [`Outcome::Unanswered`].
+    /// rollback the daemon could not be told of comes back as [`Outcome::Unanswered`].
     pub fn guard<R>(&mut self, f: impl FnOnce() -> R) -> Result<R, Outcome> {
-        let answers = &mut self.answers;
+        let (attached, buffer) = (self.attached, &mut self.answer);
         let mut unanswered = None;
         let guarded = self.switch.guard(f, &mut |said| {
-            if let Err(error) = answers.write(said) {
-                unanswered = Some(error);
+            if let Err(why) = ask::tell(attached, said, buffer) {
+                unanswered = Some(why);
             }
         });
         match (guarded, unanswered) {
-            (Err(outcome), Some(error)) => Err(self.answers.unanswered(outcome, error)),
+            // alloc: error path
+            (Err(outcome), Some(why)) => {
+                Err(Outcome::Unanswered { outcome: Box::new(outcome), why })
+            }
             (guarded, _) => guarded,
         }
     }
-}
-
-impl Drop for Live {
-    fn drop(&mut self) {
-        self.events.stop.store(true, Ordering::Relaxed);
-    }
-}
-
-/// The directory the descriptor names: `len` bytes (at most `MOST_DIR`, `Layout::new`
-/// checked) of the image's read-only data.
-fn directory(layout: &Layout, memory: &os::Os) -> Result<PathBuf, String> {
-    let [at, len] = layout.dir;
-    if len == 0 {
-        // alloc: error path
-        return Err(format!("{DESCRIPTOR} names no directory to take patches through"));
-    }
-    let at = layout.slid(at);
-    let end = at
-        .checked_add(len)
-        // alloc: error path
-        .ok_or_else(|| format!("{DESCRIPTOR} names a directory past the end of memory"))?;
-    let bytes = memory.bytes(&(at..end))?;
-    let path = std::str::from_utf8(bytes)
-        // alloc: error path
-        .map_err(|_| format!("{DESCRIPTOR} names a directory that is not UTF-8"))?;
-    Ok(PathBuf::from(path))
 }

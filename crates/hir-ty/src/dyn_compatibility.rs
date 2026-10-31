@@ -4,8 +4,8 @@ use std::ops::ControlFlow;
 
 use base_db::Db;
 use hir_def::{
-    AssocItemId, ConstId, FunctionId, GenericDefId, HasModule, TraitId, TypeAliasId,
-    TypeOrConstParamId, TypeParamId,
+    AssocItemId, ConstId, FunctionId, GenericDefId, HasModule, ItemContainerId, Lookup, TraitId,
+    TypeAliasId, TypeOrConstParamId, TypeParamId,
     hir::generics::{GenericParams, LocalTypeOrConstParamId},
     signatures::{FunctionSignature, TraitFlags, TraitSignature},
     unstable_features::UnstableFeatures,
@@ -419,6 +419,15 @@ fn contains_illegal_self_type_reference<'db, T: rustc_type_ir::TypeVisitable<DbI
                     }
                     AllowSelfProjections::No => ty.super_visit_with(self),
                 },
+                // rustc's `is_impl_trait_in_trait` skip: a trait's own `impl Trait` is
+                // `ReferencesImplTraitInTrait`, denied in its own pass.
+                rustc_type_ir::TyKind::Alias(
+                    _,
+                    AliasTy { kind: AliasTyKind::Opaque { def_id }, .. },
+                ) if is_impl_trait_in_trait(self.db, def_id.0.loc(self.db)) =>
+                {
+                    ControlFlow::Continue(())
+                }
                 _ => ty.super_visit_with(self),
             }
         }
@@ -426,6 +435,15 @@ fn contains_illegal_self_type_reference<'db, T: rustc_type_ir::TypeVisitable<DbI
 
     let mut visitor = IllegalSelfTypeVisitor { db, trait_, allow_self_projection };
     t.visit_with(&mut visitor).is_break()
+}
+
+fn is_impl_trait_in_trait(db: &Db, id: ImplTraitId) -> bool {
+    match id {
+        ImplTraitId::ReturnTypeImplTrait(function, _) => {
+            matches!(function.lookup(db).container, ItemContainerId::TraitId(_))
+        }
+        ImplTraitId::TypeAliasImplTrait(..) => false,
+    }
 }
 
 fn dyn_compatibility_violation_for_assoc_item<'db, F>(

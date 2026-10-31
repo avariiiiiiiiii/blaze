@@ -99,6 +99,7 @@ extern "C" {
 }
         "#,
         expect![[r#"
+            #![feature(no_core)]
             #![no_core]
 
             #[on_extern_block]
@@ -151,6 +152,7 @@ enum E {
 }
         "#,
         expect![[r#"
+            #![feature(no_core)]
             #![no_core]
 
             // AstId: Struct[ED35, 0]
@@ -191,6 +193,7 @@ trait Tr: SuperTrait + 'lifetime {
 }
         "#,
         expect![[r#"
+            #![feature(no_core)]
             #![no_core]
 
             // AstId: Static[F7C1, 0]
@@ -226,6 +229,7 @@ mod inline {
 mod outline;
         "#,
         expect![[r##"
+            #![feature(no_core)]
             #![no_core]
 
             // AstId: Module[03AE, 0]
@@ -256,6 +260,7 @@ pub macro m2() {}
 m!();
         "#,
         expect![[r#"
+            #![feature(no_core)]
             #![no_core]
 
             // AstId: MacroRules[7E68, 0]
@@ -277,6 +282,7 @@ fn pub_self() {
 pub(self) struct S;
         "#,
         expect![[r#"
+            #![feature(no_core)]
             #![no_core]
 
             // AstId: Struct[5024, 0]

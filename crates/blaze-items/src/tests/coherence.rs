@@ -172,8 +172,12 @@ fn a_specializing_impl_asks_only_the_impls_its_header_unifies_with() {
     assert!(runs(&executed, "specializes_query") <= 2, "{executed:#?}");
 }
 
+/// `define_opaque` is core's built-in attribute macro, declared here as core declares it: the
+/// fixture has no core, and an unresolved `#[define_opaque]` names no defining function.
 const TAITS: &str = r#"
-#![feature(type_alias_impl_trait)]
+#![feature(type_alias_impl_trait, rustc_attrs, decl_macro)]
+#[rustc_builtin_macro]
+pub macro define_opaque($($tt:tt)*) {}
 pub trait Tr {}
 impl Tr for u32 {}
 pub type Plain = u32;

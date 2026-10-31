@@ -790,7 +790,8 @@ fn libcall_op(cx: &mut Cx<'_, '_, X64>, inst: ir::Inst) -> Result<(), Error> {
 fn bytes_op(cx: &mut Cx<'_, '_, X64>, inst: ir::Inst) -> Result<(), Error> {
     let func = cx.func;
     let data = func.dfg.insts[inst];
-    let ty = func.dfg.ctrl_typevar(inst);
+    // Neither op is polymorphic, so its controlling type is INVALID: the result's is the lanes'.
+    let ty = func.dfg.value_type(func.dfg.first_result(inst));
     if ty != types::I8X16 {
         // alloc: the error's message.
         return Err(Error::at(inst, format!("`{}` of {ty} on x86-64", data.opcode())));

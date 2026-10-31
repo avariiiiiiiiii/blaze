@@ -54,9 +54,6 @@ pub fn unescape(line: &str) -> String {
     text
 }
 
-/// The file of [`Tiers`] in the directory the program takes patches through.
-pub const TIERS: &str = "tiers";
-
 /// How many counters [`counters`](crate::blaze_live_counters) has room for.
 pub const COUNTERS: usize = 1 << 16;
 
@@ -135,8 +132,8 @@ impl Tiers {
         out
     }
 
-    /// What [`Tiers::encode`] wrote, owned: the program's copy, read from the daemon's file a
-    /// few times a second ([`crate::tiers`]), not per frame.
+    /// What [`Tiers::encode`] wrote, owned: the program's copy, asked of the daemon a few
+    /// times a second ([`crate::tiers`]), not per frame.
     pub fn decode(text: &str) -> Option<Tiers> {
         let mut tiers = Tiers::default();
         for line in text.lines() {

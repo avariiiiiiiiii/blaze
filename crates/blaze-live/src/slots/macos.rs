@@ -1,57 +1,33 @@
-//! Writing a running Mach-O image on macOS AArch64.
+//! Writing a running Mach-O image's data on macOS AArch64.
 //!
-//! A page that is not writable is never made writable, since
-//! a page of code that is writable is not runnable and a thread running on it would fault.
-//! A copy of its pages is written, given their protection, and mapped over them in one
-//! `mach_vm_remap`, then the instruction cache is invalidated (`sys_icache_invalidate`).
-//! `pthread_jit_write_protect_np` only switches pages mapped `MAP_JIT`, which can't be mapped
-//! at a fixed address (XNU refuses `MAP_JIT | MAP_FIXED`) such as the image's patch code
-//! region, where the linker resolved the patch's references, so it has no part here.
+//! The patch code region is the daemon's code memory (blaze-inproc), mapped by the start hook
+//! before `main`: the commit writes the code there, and nothing here maps over the region or
+//! writes it.
 //!
-//! The protections of the image's regions are read once, at start ([`Regions`]): a swap
-//! gives pages the protection they had, so they stay true, and checking a patch's writes
-//! takes no system call. A patch's code
-//! is one remap per run of pages it writes (runs closer than [`MERGE`] are one, the pages
-//! between copied as they are), its bytes copied straight from the message into the copy.
-//! Data in writable pages is written in place with atomic stores ([`Writes::store`]), since
-//! other threads may read it meanwhile.
+//! A page that is not writable is never made writable, since a reader of it may be another
+//! thread. A copy of its pages is written, given their protection, and mapped over them in
+//! one `mach_vm_remap`, then the instruction cache is invalidated (`sys_icache_invalidate`)
+//! when they run. The protections of the image's regions are read once, at start
+//! ([`Regions`]): a swap gives pages the protection they had, so they stay true, and checking
+//! a patch's writes takes no system call. Data in writable pages is written in place with
+//! atomic stores ([`Writes::store`]), since other threads may read it meanwhile.
 
-#![allow(unsafe_code, reason = "the jump table's executable memory, protections and unwind registration")]
+#![allow(
+    unsafe_code,
+    reason = "the image's protections, its read-only pages' copies and unwind registration"
+)]
 
 use std::{
-    ffi::{CString, c_char, c_int, c_void},
+    ffi::c_void,
     ops::Range,
-    os::unix::ffi::OsStrExt,
-    path::Path,
-    sync::{
-        Arc,
-        atomic::{AtomicU64, Ordering},
-    },
+    sync::atomic::{AtomicU64, Ordering},
 };
 
 pub(super) use super::unix::{GRAIN, Reserved, backtrace, descriptor, in_image_of};
 use super::{
-    Events, Unwatched,
     switch::{Dwarf, Layout, Memory, Writes},
     unix::{__register_frame, Segments, load_cell, loaders},
 };
-
-#[repr(C)]
-#[allow(dead_code)]
-struct Kevent {
-    ident: usize,
-    filter: i16,
-    flags: u16,
-    fflags: u32,
-    data: isize,
-    udata: *mut c_void,
-}
-
-#[repr(C)]
-struct Timespec {
-    sec: i64,
-    nsec: i64,
-}
 
 unsafe extern "C" {
     fn mach_task_self() -> u32;
@@ -81,46 +57,19 @@ unsafe extern "C" {
         object: *mut u32,
     ) -> i32;
     fn sys_icache_invalidate(start: *mut c_void, len: usize);
-    fn open(path: *const c_char, flags: c_int, ...) -> c_int;
-    fn close(fd: c_int) -> c_int;
-    fn kqueue() -> c_int;
-    fn kevent(
-        kq: c_int,
-        changes: *const Kevent,
-        change_count: c_int,
-        events: *mut Kevent,
-        event_count: c_int,
-        timeout: *const Timespec,
-    ) -> c_int;
 }
 
 const READ: i32 = 1;
 const WRITE: i32 = 2;
 const EXECUTE: i32 = 4;
 const PAGE: u64 = 0x4000;
-/// Runs of pages written this close together are remapped as one.
-const MERGE: u64 = 4 * PAGE;
 const ANYWHERE: i32 = 1;
 const FIXED: i32 = 0;
 const OVERWRITE: i32 = 0x4000;
 const INHERIT_NONE: u32 = 2;
 const BASIC_INFO_64: i32 = 9;
-const O_EVTONLY: c_int = 0x8000;
-const O_CLOEXEC: c_int = 0x0100_0000;
-const EVFILT_VNODE: i16 = -4;
-const EV_ADD: u16 = 0x1;
-const EV_CLEAR: u16 = 0x20;
-const NOTE_DELETE: u32 = 0x1;
-const NOTE_WRITE: u32 = 0x2;
-const NOTE_RENAME: u32 = 0x20;
-const EINTR: i32 = 4;
-/// How long the watching thread blocks before it looks whether to stop.
-const WAKE_EVERY: Timespec = Timespec { sec: 1, nsec: 0 };
 
 pub(super) struct Os {
-    /// The patch code region in memory, and its protection.
-    code: Range<u64>,
-    protection: i32,
     /// The protection of the table cell's region.
     cell: i32,
     /// Where the image is mapped, which every data write is checked to be in.
@@ -130,35 +79,10 @@ pub(super) struct Os {
 
 impl Os {
     pub(super) fn new(layout: &Layout) -> Result<Os, String> {
-        let code = layout.code_in_memory();
-        if !code.start.is_multiple_of(PAGE) || !code.end.is_multiple_of(PAGE) {
-            // alloc: error path
-            return Err(format!(
-                "the patch code region {:#x}..{:#x} is not whole pages of {PAGE:#x}",
-                code.start, code.end
-            ));
-        }
-        let mut protection = None;
-        let mut at = code.start;
-        while at < code.end {
-            let (region, this) = region_at(at)?;
-            match protection {
-                Some(other) if other != this => {
-                    // alloc: error path
-                    return Err(format!(
-                        "the patch code region has pages of protection {other:#x} and, at \
-                         {at:#x}, {this:#x}"
-                    ));
-                }
-                _ => protection = Some(this),
-            }
-            at = region.end;
-        }
         let (_, cell) = region_at(layout.cell())?;
         let segments = Segments::of(layout.cell())?;
         let regions = Regions::read(&segments.hull())?;
-        let protection = protection.unwrap_or(READ | EXECUTE);
-        Ok(Os { code, protection, cell, segments, regions })
+        Ok(Os { cell, segments, regions })
     }
 }
 
@@ -191,25 +115,6 @@ impl Memory for Os {
 
     fn loaders(&self, at: u64, slots: u64) -> &[AtomicU64] {
         loaders(at, slots)
-    }
-
-    fn code(&mut self, writes: &Writes<'_>) -> Result<(), String> {
-        let mut run: Option<Range<u64>> = None;
-        for span in writes.spans {
-            let pages = pages(&span.range());
-            match &mut run {
-                Some(at) if pages.start <= at.end + MERGE => at.end = at.end.max(pages.end),
-                _ => {
-                    if let Some(done) = run.replace(pages) {
-                        self.swap_code(writes, &done)?;
-                    }
-                }
-            }
-        }
-        if let Some(done) = run {
-            self.swap_code(writes, &done)?;
-        }
-        Ok(())
     }
 
     fn data(&mut self, writes: &Writes<'_>) -> Result<(), String> {
@@ -281,18 +186,6 @@ impl Memory for Os {
         let at = (cell - pages.start) as usize;
         // SAFETY: the cell's page is read-only data of the image, which nothing else writes.
         unsafe { swap(&pages, self.cell, |copy| copy[at..at + 8].copy_from_slice(&bytes)) }
-    }
-}
-
-impl Os {
-    fn swap_code(&self, writes: &Writes<'_>, run: &Range<u64>) -> Result<(), String> {
-        debug_assert!(run.start >= self.code.start && run.end <= self.code.end);
-        // SAFETY: the pages are the patch code region's, mapped with one protection
-        // (`Os::new` checked, and every swap keeps it). The bytes written are over no code
-        // the cell ever pointed at nor any registered unwind entry (the switch's `Lasting`),
-        // and the rest of the pages is copied as it is, so a thread running there runs the
-        // same bytes before and after.
-        unsafe { swap(run, self.protection, |copy| writes.fill(run, copy)) }
     }
 }
 
@@ -436,91 +329,6 @@ unsafe fn swap(
     Ok(())
 }
 
-/// Opens `path` for events only and adds it to `kq`: its descriptor.
-fn register(kq: c_int, path: &CString) -> Option<c_int> {
-    // SAFETY: the path ends in a zero.
-    let fd = unsafe { open(path.as_ptr(), O_EVTONLY | O_CLOEXEC) };
-    if fd < 0 {
-        return None;
-    }
-    let change = Kevent {
-        ident: fd as usize,
-        filter: EVFILT_VNODE,
-        flags: EV_ADD | EV_CLEAR,
-        fflags: NOTE_WRITE | NOTE_DELETE | NOTE_RENAME,
-        data: 0,
-        udata: std::ptr::null_mut(),
-    };
-    // SAFETY: one change, no events asked for.
-    if unsafe { kevent(kq, &change, 1, std::ptr::null_mut(), 0, std::ptr::null()) } < 0 {
-        // SAFETY: this function's descriptor.
-        unsafe { close(fd) };
-        return None;
-    }
-    Some(fd)
-}
-
-/// Watches `dir` on a thread of its own: each change to its entries (a message renamed into
-/// place) is told to `events`.
-pub(super) fn watch(dir: &Path, events: Arc<Events>) -> Result<(), String> {
-    let path = CString::new(dir.as_os_str().as_bytes())
-        // alloc: error path
-        .map_err(|_| format!("{}: a directory with a zero byte", dir.display()))?;
-    // alloc: error path
-    let error = || format!("watching {}: {}", dir.display(), std::io::Error::last_os_error());
-    // SAFETY: it takes no pointer.
-    let kq = unsafe { kqueue() };
-    if kq < 0 {
-        return Err(error());
-    }
-    let Some(fd) = register(kq, &path) else {
-        let error = error();
-        // SAFETY: this function's queue.
-        unsafe { close(kq) };
-        return Err(error);
-    };
-    let watching = move || {
-        while !events.stopped() {
-            let mut event = Kevent {
-                ident: 0,
-                filter: 0,
-                flags: 0,
-                fflags: 0,
-                data: 0,
-                udata: std::ptr::null_mut(),
-            };
-            // SAFETY: room for one event; the timeout is a whole `timespec`.
-            let got = unsafe { kevent(kq, std::ptr::null(), 0, &mut event, 1, &WAKE_EVERY) };
-            if got < 0 {
-                if std::io::Error::last_os_error().raw_os_error() == Some(EINTR) {
-                    continue;
-                }
-                events.lose(Unwatched::failed("kevent on the directory"));
-                break;
-            }
-            if got > 0 {
-                if event.fflags & (NOTE_DELETE | NOTE_RENAME) != 0 {
-                    events.lose(Unwatched::Gone);
-                    break;
-                }
-                events.tell();
-            }
-        }
-        // SAFETY: the thread's own descriptor and queue, each closed once.
-        unsafe {
-            close(fd);
-            close(kq);
-        }
-    };
-    std::thread::Builder::new()
-        // alloc: setup, the thread's name, once
-        .name("blaze-live-slots".to_owned())
-        .spawn(watching)
-        .map(drop)
-        // alloc: error path
-        .map_err(|it| format!("starting the thread that watches for patches: {it}"))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -529,12 +337,13 @@ mod tests {
     /// The regions read once give, for every address, what `mach_vm_region` gives for it.
     #[test]
     fn regions_read_at_start_say_what_the_kernel_says() {
-        const MAP_PRIVATE: c_int = 2;
-        const MAP_ANONYMOUS: c_int = 0x1000;
+        const MAP_PRIVATE: std::ffi::c_int = 2;
+        const MAP_ANONYMOUS: std::ffi::c_int = 0x1000;
         let len = 3 * PAGE as usize;
         // SAFETY: a new private mapping anywhere, which only this test uses.
-        let at =
-            unsafe { mmap(std::ptr::null_mut(), len, READ | WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0) };
+        let at = unsafe {
+            mmap(std::ptr::null_mut(), len, READ | WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0)
+        };
         assert_ne!(at, !0usize as *mut c_void);
         let base = at as u64;
         // SAFETY: the middle page of the mapping above.

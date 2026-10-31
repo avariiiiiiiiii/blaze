@@ -599,11 +599,11 @@ pub struct Worked {
     pub served: Vec<ServedCrate>,
     /// Functions whose code was generated.
     pub compiled: u64,
-    /// The plane's critical path of the request.
-    pub critical_path_us: u64,
     /// The measured run time of the request's nodes, summed by kind: each kind that ran at
     /// all, in [`NodeKind::ALL`]'s order.
     pub steps_us: Vec<(NodeKind, u64)>,
+    /// The plane's critical path of the request.
+    pub critical_path_us: u64,
 }
 
 /// A dependency crate of [`Worked::served`].

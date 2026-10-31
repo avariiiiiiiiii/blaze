@@ -490,8 +490,8 @@ mod tests {
     /// `check`'s searches do.
     #[test]
     fn a_forward_check_of_the_segments_is_a_search_for_each() {
-        let segments =
-            Segments::new(0x1000, vec![0x5000..0x6000, 0x1000..0x3000, 0x3000..0x4000]).expect("some");
+        let segments = Segments::new(0x1000, vec![0x5000..0x6000, 0x1000..0x3000, 0x3000..0x4000])
+            .expect("some");
         let ranges = [
             0x800..0x1008,
             0x1000..0x1008,

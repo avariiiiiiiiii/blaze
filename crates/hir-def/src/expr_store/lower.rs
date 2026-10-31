@@ -119,6 +119,9 @@ pub(super) fn lower_body(
     let mut collector =
         ExprCollector::with_maps(db, module, current_file_id, LoweringMode::Analysis, maps);
     collector.set_lowering(lowering);
+    // A block's item tree is lowered from the body's syntax only when its id is of that
+    // syntax's map: lowered from the whole file, the body's blocks have the file's ids.
+    collector.block_owner = maps.is_some().then_some(owner);
 
     let skip_body = AttrFlags::query(
         db,
@@ -631,6 +634,9 @@ pub struct ExprCollector<'db> {
     stacks: Stacks,
     /// The blocks of the body's first lowering not yet taken ([`BodyLowering::SourceMap`]).
     given_blocks: Option<std::slice::Iter<'db, BlockId>>,
+    /// The body being lowered, the owner of each block made ([`BlockIdLt::owner`]); `None`
+    /// for a signature's store.
+    block_owner: Option<DefWithBodyId>,
 }
 
 #[derive(Clone, Debug)]
@@ -937,6 +943,7 @@ impl<'db> ExprCollector<'db> {
             for_type_binder: None,
             stacks: Stacks::take(),
             given_blocks: None,
+            block_owner: None,
         };
         result.store.inference_roots = Some(SmallVec::new());
         result
@@ -2109,7 +2116,10 @@ impl<'db> ExprCollector<'db> {
             }
 
             ast::Expr::Literal(e) => {
-                let literal = self.module_path_literal(e).unwrap_or_else(|| e.kind().into());
+                let literal = match self.module_path_literal(e) {
+                    Some(it) => it,
+                    None => self.lower_literal(e),
+                };
                 let id = self.store.alloc_literal_expr(literal);
                 self.map_expr(id, syntax_ptr)
             }
@@ -3216,7 +3226,7 @@ impl<'db> ExprCollector<'db> {
             }
             // The id goes only into this lowering query's result (`block_scopes`, the block's
             // `Expr::Block`) and the source map of the same body, invalidated with it.
-            Some(BlockIdLt::new(self.db, ast_id, self.module, token).to_static())
+            Some(BlockIdLt::new(self.db, ast_id, self.module, self.block_owner, token).to_static())
         })();
 
         let (module, def_map) =
@@ -3516,7 +3526,7 @@ impl<'db> ExprCollector<'db> {
                 });
             }
             ast::Pat::LiteralPat(lit) => 'b: {
-                let Some((hir_lit, ast_lit)) = pat_literal_to_hir(lit) else {
+                let Some((hir_lit, ast_lit)) = self.pat_literal_to_hir(lit) else {
                     break 'b Pat::Missing;
                 };
                 let expr_ptr = ExprPtr::of(ast::Expr::Literal(ast_lit));
@@ -3550,7 +3560,7 @@ impl<'db> ExprCollector<'db> {
                         let ptr = PatPtr::of(it);
                         match it {
                             ast::Pat::LiteralPat(it) => {
-                                let (literal, _) = pat_literal_to_hir(it)?;
+                                let (literal, _) = self.pat_literal_to_hir(it)?;
                                 let id = self.store.alloc_literal_expr(literal);
                                 Some(self.map_expr_from_pat(id, ptr))
                             }
@@ -3751,7 +3761,9 @@ impl<'db> ExprCollector<'db> {
         let ptr = PatPtr::of(pat);
         match pat {
             ast::Pat::LiteralPat(it) => {
-                let Some((literal, _)) = pat_literal_to_hir(it) else { return self.missing_expr() };
+                let Some((literal, _)) = self.pat_literal_to_hir(it) else {
+                    return self.missing_expr();
+                };
                 let id = self.store.alloc_literal_expr(literal);
                 self.map_expr_from_pat(id, ptr)
             }
@@ -3993,13 +4005,33 @@ impl<'db> ExprCollector<'db> {
     }
 }
 
-fn pat_literal_to_hir(lit: ast::LiteralPat<'_>) -> Option<(Literal, ast::Literal<'_>)> {
-    let ast_lit = lit.literal()?;
-    let mut hir_lit: Literal = ast_lit.kind().into();
-    if lit.minus_token().is_some() {
-        hir_lit = hir_lit.negate()?;
+impl<'db> ExprCollector<'db> {
+    fn pat_literal_to_hir<'t>(
+        &mut self,
+        lit: ast::LiteralPat<'t>,
+    ) -> Option<(Literal, ast::Literal<'t>)> {
+        let ast_lit = lit.literal()?;
+        let mut hir_lit = self.lower_literal(ast_lit);
+        if lit.minus_token().is_some() {
+            hir_lit = hir_lit.negate()?;
+        }
+        Some((hir_lit, ast_lit))
     }
-    Some((hir_lit, ast_lit))
+
+    /// `lit` as a value, reporting an integer whose digits do not fit `u128` (rustc's
+    /// `LitError::IntTooLarge` from `lower_lit`; [`Literal::from`] gives it `0`).
+    fn lower_literal(&mut self, lit: ast::Literal<'_>) -> Literal {
+        let kind = lit.kind();
+        if let ast::LiteralKind::IntNumber(int) = kind
+            && int.suffix().and_then(crate::builtin_type::BuiltinFloat::from_suffix).is_none()
+            && int.value().is_err_and(|it| *it.kind() == std::num::IntErrorKind::PosOverflow)
+        {
+            self.store.diagnostics.push(ExpressionStoreDiagnostics::IntLiteralTooLarge {
+                node: self.expander.in_file(AstPtr::<tag::Literal>::of(lit)),
+            });
+        }
+        kind.into()
+    }
 }
 
 impl<'db> ExprCollector<'db> {

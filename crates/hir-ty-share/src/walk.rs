@@ -30,6 +30,8 @@
 //! A call of a generic instance of the body itself is recorded as such: direct recursion
 //! shares. Any other cycle of instances gives [`Unshared::Recursive`] to all in it.
 
+use std::hash::Hash as _;
+
 use base_db::Db;
 use blaze_ids::{ContentId, Hasher};
 use blaze_items::{ItemId, closure_code, code_hash, coroutine_code, interface_hash, item_key};
@@ -137,24 +139,58 @@ pub(crate) fn value<'db>(cx: &Cx<'db>, konst: Const<'db>) -> Result<ContentId, U
         }
     }
     .map_err(|error| Unshared::ConstEval(format!("`{konst:?}`: {error:?}")))?; // alloc: error path
-    allocation_value(&allocation)
+    allocation_value(db, &allocation)
 }
 
-/// An evaluated constant's bytes and the one allocation it may point to.
-fn allocation_value(allocation: &AllocationData<'_>) -> Result<ContentId, Unshared> {
+/// An evaluated constant's bytes and the memory it points to. Its `TypeId`s are numbers of the
+/// evaluation, which the code generator replaces by their types' identities: so are they here.
+fn allocation_value(db: &Db, allocation: &AllocationData<'_>) -> Result<ContentId, Unshared> {
     let mut h = Hasher::new(VALUE_DOMAIN);
     h.part(&allocation.memory);
     match &allocation.memory_map {
-        MemoryMap::Empty => h.update(&[0]),
-        MemoryMap::Simple(pointee) => h.update(&[1]).part(pointee),
-        MemoryMap::Complex(_) => {
+        MemoryMap::Empty => {
+            h.update(&[0]);
+        }
+        MemoryMap::Simple(pointee) => {
+            h.update(&[1]).part(pointee);
+        }
+        // A static and a vtable's type are named by the database's own ids, which are no
+        // content; the rest of the map is bytes and addresses.
+        MemoryMap::Complex(map) if !map.statics.is_empty() || !map.vtable.is_empty() => {
             return Err(Unshared::NoContent(format!( // alloc: error path
-                "a constant of `{:?}` that points to more than one allocation",
+                "a constant of `{:?}` that points to a static or a vtable",
                 allocation.ty
             )));
         }
+        MemoryMap::Complex(map) => {
+            // The map's own `Hash` reads every field; its `TypeId`s' types are taken out first.
+            // clone: once per constant with a `TypeId` or more pieces, on the query's miss
+            let mut bare = (**map).clone();
+            let types = std::mem::take(&mut bare.type_ids);
+            bare.hash(&mut Fed(h.update(&[2])));
+            h.update(&(types.len() as u64).to_le_bytes());
+            for ty in types {
+                match ty {
+                    Some(ty) => h.update(&[1]).id(&identity::ty(db, ty)?),
+                    None => h.update(&[0]),
+                };
+            }
+        }
     };
     Ok(h.finish())
+}
+
+/// A [`std::hash::Hasher`] into a content hash: every byte it is given is hashed.
+struct Fed<'a>(&'a mut Hasher);
+
+impl std::hash::Hasher for Fed<'_> {
+    fn finish(&self) -> u64 {
+        unreachable!("a content hash is finished by its owner")
+    }
+
+    fn write(&mut self, bytes: &[u8]) {
+        self.0.update(bytes);
+    }
 }
 
 #[blaze_query::tracked(returns(ref), cycle_result = share_cycle)]
@@ -771,7 +807,7 @@ impl<'a, 'db> Walk<'a, 'db> {
         .and_then(|body| db.interpret_mir(body, Some(self.cx.env)).ok());
         match evaluated {
             Some(allocation) => {
-                let value = allocation_value(&allocation)?;
+                let value = allocation_value(db, &allocation)?;
                 self.record(tag::PROMOTED, value);
             }
             // The code generator does not promote a constant it can't evaluate.

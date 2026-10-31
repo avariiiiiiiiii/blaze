@@ -51,6 +51,7 @@ pub mod kinds {
     pub const LIBRARY: TaskKind = TaskKind(0x1_0002);
     /// A crate's bodies lowered to MIR.
     pub const LOWER: TaskKind = TaskKind(0x1_0003);
+    /// A unit's codegen: its functions compiled from its roots.
     pub const COMPILE: TaskKind = TaskKind(0x1_0004);
     /// What a binary reaches, for its compiles.
     pub const REACH: TaskKind = TaskKind(0x1_0005);
@@ -59,10 +60,20 @@ pub mod kinds {
     /// `blaze test --ub`: the tests selected, and one test evaluated.
     pub const UB_TESTS: TaskKind = TaskKind(0x1_0007);
     pub const EVALUATE: TaskKind = TaskKind(0x1_0008);
-    /// A program's build: the codegen and link of a binary, test, bench, example or `cdylib`.
-    /// One its predictor has not measured is predicted the whole budget and runs alone
-    /// ([`super::Predict::measured`]).
+    /// A program's codegen: of a binary, test, bench, example or `cdylib`. One its predictor
+    /// has not measured is predicted the whole budget and runs alone
+    /// ([`super::Predict::measured`]), as [`PROGRAM_LINK`] is.
     pub const PROGRAM: TaskKind = TaskKind(0x1_0009);
+    /// A unit's names: whether its record is kept, its crate's def map, its check's bodies.
+    pub const UNIT_NAMES: TaskKind = TaskKind(0x1_000a);
+    /// A unit's check: the diagnostics of every body of its crate.
+    pub const UNIT_BODIES: TaskKind = TaskKind(0x1_000b);
+    /// A unit's link: its images linked from its codegen, a proc macro's expanders loaded.
+    pub const UNIT_LINK: TaskKind = TaskKind(0x1_000c);
+    /// A unit's outputs hashed, and its record encoded, for the store.
+    pub const UNIT_STORE: TaskKind = TaskKind(0x1_000d);
+    /// A program's link, admitted as [`PROGRAM`] is.
+    pub const PROGRAM_LINK: TaskKind = TaskKind(0x1_000e);
 }
 
 /// The subsystem whose memory a task of `kind` holds: whose budget holds it back.
@@ -74,8 +85,11 @@ pub mod kinds {
 /// none of them names is [`Tag::Other`]'s.
 pub const fn tag_of(kind: TaskKind) -> Tag {
     match kind {
-        kinds::FETCH => Tag::Store,
+        kinds::FETCH | kinds::UNIT_STORE => Tag::Store,
         kinds::LIBRARY | kinds::COMPILE | kinds::REACH | kinds::PROGRAM => Tag::Codegen,
+        kinds::UNIT_NAMES => Tag::Nameres,
+        kinds::UNIT_BODIES => Tag::Infer,
+        kinds::UNIT_LINK | kinds::PROGRAM_LINK => Tag::Link,
         kinds::LOWER | kinds::UB_TESTS | kinds::EVALUATE => Tag::Mir,
         kinds::WALK | TaskKind(4) => Tag::Query,
         TaskKind(1..=3) | TaskKind(5..=6) => Tag::Vfs,
@@ -672,6 +686,11 @@ mod tests {
             (0x1_0004, Tag::Codegen),
             (0x1_0008, Tag::Mir),
             (0x1_0009, Tag::Codegen),
+            (0x1_000a, Tag::Nameres),
+            (0x1_000b, Tag::Infer),
+            (0x1_000c, Tag::Link),
+            (0x1_000d, Tag::Store),
+            (0x1_000e, Tag::Link),
             (0, Tag::Other),
             (0x7000, Tag::Other),
             (u32::MAX, Tag::Other),

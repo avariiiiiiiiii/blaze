@@ -15,14 +15,15 @@ use std::{
 use blaze_ids::rng::SplitMix64;
 
 use super::{
-    Answers, Events, Identity, Outcome, Unwatched,
+    Outcome,
     exec::{self, Header, Tables},
     hook, image,
     switch::{Dwarf, HOST_ARCH, KEPT, Layout, Limits, Memory, POOL, Span, Switch, Writes},
 };
 use crate::patch::{
-    Answer, DESCRIPTOR_MAGIC, DESCRIPTOR_VERSION, Descriptor, FIRST_GENERATION, Message, Patch,
-    exec::{self as words, CELL, CURRENT, LOADER, MAP, MAGIC, REGION_HEADER, SLOTS, STUBS},
+    Answer, Code, DESCRIPTOR_MAGIC, DESCRIPTOR_VERSION, Descriptor, FIRST_GENERATION, Message,
+    Patch,
+    exec::{self as words, CELL, CURRENT, LOADER, MAGIC, MAP, REGION_HEADER, SLOTS, STUBS},
 };
 
 /// The slide of the fake image: every address it says is this much below where it is.
@@ -52,8 +53,6 @@ fn unslid(address: u64) -> u64 {
 
 #[derive(Default)]
 struct Fake {
-    /// Whether code writes are written: not when the region is a function's own code.
-    write_code: bool,
     frames: Vec<u64>,
     functions: Vec<(u64, u64, u64)>,
     published: usize,
@@ -82,23 +81,17 @@ impl Memory for Fake {
     }
 
     fn bytes(&self, range: &Range<u64>) -> Result<&'static [u8], String> {
-        Err(format!("{:#x}: the fake image has no read-only data", range.start))
+        self.in_image(range)?;
+        // SAFETY: what the switch reads is a patch's code, in the patch code region: the
+        // `Program`'s code buffer or a function's own code, readable and outliving the switch,
+        // and written only by the test between patches, as the daemon's commit writes it.
+        Ok(unsafe { image::view(range.start, (range.end - range.start) as usize) })
     }
 
     fn loaders(&self, at: u64, slots: u64) -> &[AtomicU64] {
         // SAFETY: the table is the `Program`'s `AtomicU64`s, `slots` long (`Switch::new`
         // checked the header names it), and outlives the switch.
         unsafe { image::words(at, slots as usize) }
-    }
-
-    fn code(&mut self, writes: &Writes<'_>) -> Result<(), String> {
-        if self.write_code {
-            // SAFETY: every write the tests make is to a buffer of their `Program`, which
-            // outlives the switch, and the switch checked it is in the region the descriptor
-            // names.
-            unsafe { writes.put_in_place() };
-        }
-        Ok(())
     }
 
     fn data(&mut self, writes: &Writes<'_>) -> Result<(), String> {
@@ -245,24 +238,47 @@ impl Program {
         self.region.start + offset
     }
 
+    /// Writes `bytes` at `offset` of the code buffer, as the daemon's commit writes a patch's
+    /// code into the code memory: the patch's entry for it, named `name`.
+    fn commit(&mut self, offset: u64, bytes: &[u8], name: &str) -> Code {
+        let buffer = self.code.as_mut_ptr() as u64;
+        assert_eq!(self.region.start, buffer, "the patch code region is the code buffer");
+        assert!(offset as usize + bytes.len() <= self.code.len() * 8, "within the code buffer");
+        // SAFETY: `offset..offset + len` is within `code`'s buffer (asserted), borrowed mutably
+        // here; the switch reads it only while it takes a patch.
+        unsafe {
+            std::ptr::copy_nonoverlapping(bytes.as_ptr(), (buffer + offset) as *mut u8, bytes.len())
+        };
+        Code::of(unslid(buffer + offset), bytes, name)
+    }
+
+    /// The entry of `len` bytes of the patch code region at `offset`, as they are now: code
+    /// the region has already, such as a function's own.
+    fn present(&self, offset: u64, len: u64, name: &str) -> Code {
+        let at = self.code_at(offset);
+        // SAFETY: `at..at + len` is in the patch code region, the code buffer or a function's
+        // own code, readable for the test.
+        let bytes = unsafe { image::view(at, len as usize) };
+        Code::of(unslid(at), bytes, name)
+    }
+
     fn data_at(&self, offset: u64) -> u64 {
         self.data.as_ptr() as u64 + offset
     }
 
-    fn switch(&self, write_code: bool) -> Switch<Fake> {
-        self.switch_at(write_code, FIRST_GENERATION)
+    fn switch(&self) -> Switch<Fake> {
+        self.switch_at(FIRST_GENERATION)
     }
 
     /// A switch of the program, from its descriptor as the linker writes it for an image
     /// linked at `generation`.
-    fn switch_at(&self, write_code: bool, generation: u64) -> Switch<Fake> {
-        self.switch_with(Fake { write_code, ..Fake::default() }, generation).expect("a switch")
+    fn switch_at(&self, generation: u64) -> Switch<Fake> {
+        self.switch_with(Fake::default(), generation).expect("a switch")
     }
 
     /// A switch of the program whose log and lasting ranges hold at most `limits`.
-    fn switch_limited(&self, write_code: bool, limits: &Limits) -> Switch<Fake> {
-        let fake = Fake { write_code, ..Fake::default() };
-        self.switch_with_limits(fake, FIRST_GENERATION, limits).expect("a switch")
+    fn switch_limited(&self, limits: &Limits) -> Switch<Fake> {
+        self.switch_with_limits(Fake::default(), FIRST_GENERATION, limits).expect("a switch")
     }
 
     fn switch_with(&self, fake: Fake, generation: u64) -> Result<Switch<Fake>, String> {
@@ -288,7 +304,6 @@ impl Program {
             slots: self.table.len() as u64,
             patch_code: [unslid(self.region.start), unslid(self.region.end)],
             patch_data: [unslid(self.data_at(0)), unslid(self.data_at(64 * 8))],
-            dir: [0, 0],
         };
         bytes.copy_from_slice(&descriptor.encode());
         let decoded = Descriptor::decode(&bytes).expect("a descriptor");
@@ -367,22 +382,21 @@ fn a_table_outside_the_image_is_refused() {
 
 #[test]
 fn patches_switch_the_table_and_roll_back() {
-    let program = Program::new();
-    let mut switch = program.switch(true);
+    let mut program = Program::new();
+    let mut switch = program.switch();
     let image_table = program.cell().load(Ordering::Relaxed);
     assert_eq!(program.calls(), (1, 2));
 
-    // An address to rebase, then an FDE and the zero length after it, in the code; a static
-    // holding an address in the data.
+    // An FDE and the zero length after it, in the code the commit wrote; a static holding an
+    // address to rebase in the data.
     let mut code = vec![0u8; 32];
-    code[..8].copy_from_slice(&unslid(address(one)).to_le_bytes());
     code[8..12].copy_from_slice(&12u32.to_le_bytes());
     code[12..16].copy_from_slice(&1u32.to_le_bytes());
     let mut first = patch(1, 0, vec![(0, unslid(address(two))), (1, unslid(address(one)))]);
-    first.code = vec![(unslid(program.code_at(0)), code)];
+    first.code = vec![program.commit(0, &code, "first")];
     first.data =
         vec![(unslid(program.data_at(0)), unslid(program.data_at(8)).to_le_bytes().into())];
-    first.rebase = vec![unslid(program.code_at(0)), unslid(program.data_at(0))];
+    first.rebase = vec![unslid(program.data_at(0))];
     first.frames = vec![(unslid(program.code_at(8)), 16)];
     first.windows =
         vec![(unslid(program.code_at(0)), unslid(program.code_at(8)), unslid(program.code_at(24)))];
@@ -391,7 +405,6 @@ fn patches_switch_the_table_and_roll_back() {
     assert_eq!(outcome, Outcome::Applied { generation: 1, functions: 2, statics: 1 });
     assert_eq!(answer, Some(Answer::Applied { generation: 1 }));
     assert_eq!(program.calls(), (2, 1));
-    assert_eq!(program.code[0], address(one));
     assert_eq!(program.data[0], program.data_at(8));
     assert_eq!(switch.memory.frames, vec![program.code_at(8)]);
     assert_eq!(
@@ -408,13 +421,12 @@ fn patches_switch_the_table_and_roll_back() {
     assert_eq!(program.calls(), (2, 1));
 
     let mut second = patch(2, 1, vec![(1, unslid(address(two)))]);
-    second.code = vec![(unslid(program.code_at(64)), vec![0xcc; 16])];
+    second.code = vec![program.commit(64, &[0xcc; 16], "second")];
     applied(&mut switch, second);
     assert_eq!(program.calls(), (2, 2));
-    assert_eq!(program.code[8], u64::from_le_bytes([0xcc; 8]));
 
     let mut over = patch(3, 2, vec![]);
-    over.code = vec![(unslid(program.code_at(16)), vec![0; 8])];
+    over.code = vec![program.present(16, 8, "over")];
     let (outcome, _) = switch.handle(Message::Patch(over));
     assert!(
         matches!(&outcome, Outcome::Declined { why, .. } if why.contains("can be running")),
@@ -432,16 +444,15 @@ fn patches_switch_the_table_and_roll_back() {
 
     // Code rolled back stays: a thread can be in it still.
     let mut over = patch(3, 0, vec![(1, unslid(address(one)))]);
-    over.code = vec![(unslid(program.code_at(0)), vec![0x90; 8])];
+    over.code = vec![program.present(0, 8, "over")];
     let (outcome, _) = switch.handle(Message::Patch(over));
     assert!(
         matches!(&outcome, Outcome::Declined { why, .. }
             if why.contains("generation 1's code") && why.contains("can be running")),
         "{outcome}"
     );
-    assert_eq!(program.code[0], address(one));
     let mut third = patch(3, 0, vec![(1, unslid(address(one)))]);
-    third.code = vec![(unslid(program.code_at(128)), vec![0x90; 8])];
+    third.code = vec![program.commit(128, &[0x90; 8], "third")];
     applied(&mut switch, third);
     assert_eq!(switch.kept(), vec![0, 1, 2, 3]);
     assert_eq!(program.calls(), (1, 1));
@@ -464,7 +475,7 @@ fn patches_switch_the_table_and_roll_back() {
 #[test]
 fn a_program_starts_at_the_generation_it_was_linked_at() {
     let program = Program::new();
-    let mut switch = program.switch_at(false, 7);
+    let mut switch = program.switch_at(7);
     assert_eq!(switch.current(), 7);
     let (outcome, _) = switch.handle(Message::Patch(patch(1, 0, vec![])));
     assert!(
@@ -480,25 +491,32 @@ fn a_program_starts_at_the_generation_it_was_linked_at() {
 
 #[test]
 fn a_bad_patch_is_declined_before_anything_is_written() {
-    let program = Program::new();
-    let mut switch = program.switch(true);
+    let mut program = Program::new();
+    let mut unterminated = vec![0u8; 16];
+    unterminated[..4].copy_from_slice(&12u32.to_le_bytes());
+    unterminated[4..8].copy_from_slice(&1u32.to_le_bytes());
+    let unterminated = program.commit(256, &unterminated, "unterminated");
+    let unwinds = program.commit(384, &[0, 0, 0, 0, 0, 0, 4, 0], "unwinds");
+    let mut switch = program.switch();
     let table = program.cell().load(Ordering::Relaxed);
     let region = unslid(program.code_at(0));
+    let data = unslid(program.data_at(0));
     let with = |change: &dyn Fn(&mut Patch)| {
         let mut patch = patch(1, 0, vec![]);
         change(&mut patch);
         patch
     };
-    let mut unterminated = vec![0u8; 16];
-    unterminated[..4].copy_from_slice(&12u32.to_le_bytes());
-    unterminated[4..8].copy_from_slice(&1u32.to_le_bytes());
     let cases: Vec<(Patch, &str)> = vec![
         (with(&|it| it.id = [0; 16]), "for image"),
         (patch(1, 1, vec![]), "where this program is at 0"),
         (patch(0, 0, vec![]), "counts up from its base"),
         (
-            with(&|it| it.code = vec![(unslid(program.region.end), vec![1])]),
-            "outside the patch code",
+            with(&|it| it.code = vec![Code::of(unslid(program.region.end), &[1], "past")]),
+            "`past`'s code at",
+        ),
+        (
+            with(&|it| it.code = vec![Code { hash: [0; 32], ..program.present(0, 8, "edited") }]),
+            "is not what the daemon committed",
         ),
         (with(&|it| it.data = vec![(region, vec![1])]), "in the patch code region"),
         (
@@ -510,31 +528,41 @@ fn a_bad_patch_is_declined_before_anything_is_written() {
         (with(&|it| it.rebase = vec![region]), "in none of the patch's writes"),
         (
             with(&|it| {
-                it.code = vec![(region, vec![1; 8])];
-                it.rebase = vec![region, region];
+                it.data = vec![(data, vec![1; 8])];
+                it.rebase = vec![data, data];
             }),
             "rebased twice",
         ),
-        (with(&|it| it.code = vec![(region, vec![0; 16]), (region + 8, vec![0; 8])]), "two writes"),
         (
             with(&|it| {
-                it.code = vec![(region, vec![0; 16])];
+                it.code = vec![program.present(0, 8, "f")];
+                it.rebase = vec![region];
+            }),
+            "an address to rebase at",
+        ),
+        (
+            with(&|it| it.code = vec![program.present(0, 16, "f"), program.present(8, 8, "g")]),
+            "two functions' code",
+        ),
+        (
+            with(&|it| {
+                it.code = vec![program.present(0, 16, "f")];
                 it.frames = vec![(region, 16)];
             }),
             "its length says 4",
         ),
         (
             with(&|it| {
-                it.code = vec![(region, unterminated.clone())];
-                it.frames = vec![(region, 16)];
+                it.code = vec![unterminated.clone()];
+                it.frames = vec![(unterminated.at, 16)];
             }),
             "unwind entries reach",
         ),
         (with(&|it| it.windows = vec![(region, region, region)]), "a RUNTIME_FUNCTION"),
         (
             with(&|it| {
-                it.code = vec![(region, vec![0, 0, 0, 0, 0, 0, 4, 0])];
-                it.windows = vec![(region, region + 4, region + 4)];
+                it.code = vec![unwinds.clone()];
+                it.windows = vec![(unwinds.at, unwinds.at + 4, unwinds.at + 4)];
             }),
             "runs past the patch's writes (12 bytes)",
         ),
@@ -556,7 +584,7 @@ fn a_bad_patch_is_declined_before_anything_is_written() {
         assert_eq!(switch.memory.published, 0);
         assert_eq!(switch.current(), 0);
     }
-    assert!(program.code.iter().chain(program.data.iter()).all(|it| *it == 0));
+    assert!(program.code[..32].iter().chain(program.data.iter()).all(|it| *it == 0));
     assert!(switch.memory.frames.is_empty() && switch.memory.functions.is_empty());
 }
 
@@ -566,11 +594,12 @@ fn a_bad_patch_is_declined_before_anything_is_written() {
 fn data_outside_the_image_is_refused_before_any_write() {
     let program = Program::new();
     let outside = program.data_at(8)..program.data_at(16);
-    let fake = Fake { write_code: true, outside: Some(outside), ..Fake::default() };
+    let fake = Fake { outside: Some(outside), ..Fake::default() };
     let mut switch = program.switch_with(fake, FIRST_GENERATION).expect("a switch");
     let mut bad = patch(1, 0, vec![(0, unslid(address(two)))]);
-    bad.code = vec![(unslid(program.code_at(0)), vec![1; 8])];
-    bad.data = vec![(unslid(program.data_at(0)), vec![1; 8]), (unslid(program.data_at(8)), vec![1; 8])];
+    bad.code = vec![program.present(0, 8, "f")];
+    bad.data =
+        vec![(unslid(program.data_at(0)), vec![1; 8]), (unslid(program.data_at(8)), vec![1; 8])];
     let (outcome, _) = switch.handle(Message::Patch(bad));
     assert!(
         matches!(&outcome, Outcome::Declined { why, .. } if why.contains("outside the image")),
@@ -584,7 +613,7 @@ fn data_outside_the_image_is_refused_before_any_write() {
 #[test]
 fn the_last_generations_are_kept() {
     let program = Program::new();
-    let mut switch = program.switch(false);
+    let mut switch = program.switch();
     for generation in 1..=100u64 {
         let target = if generation % 2 == 0 { address(one) } else { address(two) };
         applied(&mut switch, patch(generation, generation - 1, vec![(0, unslid(target))]));
@@ -602,12 +631,12 @@ fn the_last_generations_are_kept() {
 #[test]
 fn a_panic_is_tied_to_the_newest_generation_of_its_code() {
     let program = Program::new();
-    let mut switch = program.switch(false);
+    let mut switch = program.switch();
     let mut first = patch(1, 0, vec![(0, unslid(address(two)))]);
-    first.code = vec![(unslid(program.code_at(0)), vec![0; 64])];
+    first.code = vec![program.present(0, 64, "first")];
     applied(&mut switch, first);
     let mut second = patch(2, 1, vec![]);
-    second.code = vec![(unslid(program.code_at(64)), vec![0; 64])];
+    second.code = vec![program.present(64, 64, "second")];
     applied(&mut switch, second);
 
     assert_eq!(switch.tie(&[program.code_at(10)]), Some((1, 0)));
@@ -630,9 +659,9 @@ fn a_panic_in_a_generations_code_rolls_it_back() {
     hook::install();
     let mut program = Program::new();
     program.region = address(boom)..address(boom) + 256;
-    let mut switch = program.switch(false);
+    let mut switch = program.switch();
     let mut first = patch(1, 0, vec![(0, unslid(address(boom)))]);
-    first.code = vec![(unslid(address(boom)), vec![0; 256])];
+    first.code = vec![program.present(0, 256, "boom")];
     applied(&mut switch, first);
 
     let mut answers = Vec::new();
@@ -653,9 +682,9 @@ fn a_panic_in_a_generations_code_rolls_it_back() {
 fn a_panic_elsewhere_is_resumed() {
     hook::install();
     let program = Program::new();
-    let mut switch = program.switch(false);
+    let mut switch = program.switch();
     let mut first = patch(1, 0, vec![]);
-    first.code = vec![(unslid(program.code_at(0)), vec![0; 64])];
+    first.code = vec![program.present(0, 64, "first")];
     applied(&mut switch, first);
 
     let mut answers = Vec::new();
@@ -672,7 +701,7 @@ fn a_panic_elsewhere_is_resumed() {
 #[test]
 fn registered_unwind_entries_are_never_written_again() {
     let program = Program::new();
-    let mut switch = program.switch(false);
+    let mut switch = program.switch();
     // An FDE of 16 bytes, then the zero length ending its run, in the data.
     let mut entries = vec![0u8; 20];
     entries[..4].copy_from_slice(&12u32.to_le_bytes());
@@ -711,7 +740,7 @@ fn registered_unwind_entries_are_never_written_again() {
 fn the_pool_holds_what_a_whole_table_per_generation_would() {
     const SLOTS: usize = 16;
     let program = Program::with_slots(SLOTS);
-    let mut switch = program.switch(false);
+    let mut switch = program.switch();
     let mut model = HashMap::from([(FIRST_GENERATION, program.loaders())]);
     let mut rng = SplitMix64::new(0x9e37_79b9_7f4a_7c15);
     let mut next = FIRST_GENERATION + 1;
@@ -745,7 +774,7 @@ fn the_pool_holds_what_a_whole_table_per_generation_would() {
 fn a_rollback_to_a_generation_a_table_holds_writes_no_table() {
     let program = Program::new();
     let image = program.cell().load(Ordering::Relaxed);
-    let mut switch = program.switch(false);
+    let mut switch = program.switch();
     applied(&mut switch, patch(1, 0, vec![(0, unslid(address(two)))]));
     let first = switch.table_of(1).expect("a table holds generation 1");
     applied(&mut switch, patch(2, 1, vec![(1, unslid(address(one)))]));
@@ -773,7 +802,7 @@ fn a_rollback_to_a_generation_a_table_holds_writes_no_table() {
 fn a_patch_stores_only_its_own_cells_before_the_switch() {
     const SLOTS: usize = 64;
     let program = Program::with_slots(SLOTS);
-    let mut switch = program.switch(false);
+    let mut switch = program.switch();
     let mut table = program.loaders();
     for generation in 1..=4 * POOL as u64 {
         let cells: Vec<(u32, u64)> = (0..generation as u32 % 7 + 1)
@@ -841,6 +870,13 @@ fn outcomes_say_what_became_of_a_patch() {
     assert_eq!(restart.to_string(), "restart needed at generation 3: a layout changed");
     let declined = Outcome::Declined { generation: 4, why: "no".into() };
     assert_eq!(declined.to_string(), "generation 4 not applied: no");
+    let unanswered = Outcome::Unanswered { outcome: Box::new(declined), why: "gone".into() };
+    assert_eq!(
+        unanswered.to_string(),
+        "generation 4 not applied: no; the daemon was not told: gone"
+    );
+    let disconnected = Outcome::Disconnected { generation: 4, why: "gone".into() };
+    assert_eq!(disconnected.to_string(), "no patch after generation 4 is taken: gone");
 }
 
 /// A warm patch's table work allocates nothing, however many patches came before it: the
@@ -856,7 +892,7 @@ fn a_warm_patch_allocates_nothing() {
     const CELLS: u64 = 4;
     const PATCHES: u64 = 9_000;
     let program = Program::with_slots(SLOTS as usize);
-    let mut switch = program.switch(false);
+    let mut switch = program.switch();
     let message = |generation: u64, base: u64| {
         let cells = (0..CELLS)
             .map(|it| {
@@ -898,13 +934,15 @@ fn a_warm_patch_allocates_nothing() {
 #[test]
 fn a_full_column_refuses_the_patch() {
     let refused = |outcome: &Outcome, says: &str| match outcome {
-        Outcome::Declined { why, .. } => assert!(why.contains(says), "{why:?} doesn't say {says:?}"),
+        Outcome::Declined { why, .. } => {
+            assert!(why.contains(says), "{why:?} doesn't say {says:?}")
+        }
         other => panic!("{other}, where it should say {says:?}"),
     };
     let roomy = Limits { generations: 64, cells: 64, code: 64, lasting: 64 };
 
     let program = Program::new();
-    let mut switch = program.switch_limited(false, &Limits { generations: 3, ..roomy });
+    let mut switch = program.switch_limited(&Limits { generations: 3, ..roomy });
     applied(&mut switch, patch(1, 0, vec![(0, unslid(address(two)))]));
     applied(&mut switch, patch(2, 1, vec![(1, unslid(address(one)))]));
     let table = program.cell().load(Ordering::Relaxed);
@@ -918,7 +956,7 @@ fn a_full_column_refuses_the_patch() {
     assert_eq!(program.calls(), (2, 2));
 
     let program = Program::new();
-    let mut switch = program.switch_limited(false, &Limits { cells: 3, ..roomy });
+    let mut switch = program.switch_limited(&Limits { cells: 3, ..roomy });
     let both = |to: u64| vec![(0, unslid(to)), (1, unslid(to))];
     applied(&mut switch, patch(1, 0, both(address(two))));
     let (outcome, _) = switch.handle(Message::Patch(patch(2, 1, both(address(one)))));
@@ -928,20 +966,20 @@ fn a_full_column_refuses_the_patch() {
     assert_eq!(program.calls(), (1, 2));
 
     let program = Program::new();
-    let mut switch = program.switch_limited(false, &Limits { code: 2, ..roomy });
+    let mut switch = program.switch_limited(&Limits { code: 2, ..roomy });
     let mut three = patch(1, 0, vec![(0, unslid(address(two)))]);
-    three.code = [0, 64, 128].map(|at| (unslid(program.code_at(at)), vec![0x90; 8])).to_vec();
+    three.code = [0, 64, 128].map(|at| program.present(at, 8, "f")).to_vec();
     let (outcome, _) = switch.handle(Message::Patch(three));
     refused(&outcome, "the log's code starts is full: it holds 2 rows at most");
     assert_eq!((switch.current(), program.calls()), (0, (1, 2)));
 
     let program = Program::new();
-    let mut switch = program.switch_limited(false, &Limits { lasting: 2, ..roomy });
+    let mut switch = program.switch_limited(&Limits { lasting: 2, ..roomy });
     let mut two_spans = patch(1, 0, vec![(0, unslid(address(two)))]);
-    two_spans.code = [0, 64].map(|at| (unslid(program.code_at(at)), vec![0x90; 8])).to_vec();
+    two_spans.code = [0, 64].map(|at| program.present(at, 8, "f")).to_vec();
     applied(&mut switch, two_spans);
     let mut more = patch(2, 1, vec![(1, unslid(address(one)))]);
-    more.code = vec![(unslid(program.code_at(128)), vec![0x90; 8])];
+    more.code = vec![program.present(128, 8, "f")];
     let (outcome, _) = switch.handle(Message::Patch(more));
     refused(&outcome, "the lasting ranges' starts is full: it holds 2 rows at most");
     assert_eq!((switch.current(), program.calls()), (1, (2, 2)));
@@ -954,7 +992,7 @@ fn a_full_column_refuses_the_patch() {
 #[test]
 fn a_warm_roll_back_allocates_nothing() {
     let program = Program::with_slots(4);
-    let mut switch = program.switch(false);
+    let mut switch = program.switch();
     for _ in 0..POOL + 2 {
         let base = switch.current();
         let cell = ((base % 4) as u32, unslid(address(two)));
@@ -1017,7 +1055,7 @@ fn arm(program: &Program, region: &[AtomicU64], len: usize) -> i32 {
 fn arming_carries_the_prelude_and_logs_the_first_calls() {
     const SLOTS: usize = 12;
     let program = Program::linked(SLOTS, true);
-    let _switch = program.switch(false);
+    let _switch = program.switch();
     let header = program.header.as_ptr() as u64;
     assert_eq!(program.cell().load(Ordering::Relaxed), header + words::log_word(0));
     assert_eq!(program.call(1), 2);
@@ -1027,9 +1065,8 @@ fn arming_carries_the_prelude_and_logs_the_first_calls() {
     let map = program.private_map();
     // SAFETY: the private map is the header's last `16 + SLOTS` bytes, rounded to words.
     let byte = |at: u64| unsafe { image::byte(map + at) }.load(Ordering::Relaxed);
-    let prelude = || -> Vec<u64> {
-        (0..SLOTS as u64).filter(|it| byte(REGION_HEADER + it) != 0).collect()
-    };
+    let prelude =
+        || -> Vec<u64> { (0..SLOTS as u64).filter(|it| byte(REGION_HEADER + it) != 0).collect() };
     assert_eq!(prelude(), [1, 9]);
 
     let len = REGION_HEADER as usize + SLOTS;
@@ -1061,7 +1098,7 @@ fn arming_carries_the_prelude_and_logs_the_first_calls() {
 fn arming_refuses_a_region_it_cannot_use() {
     const SLOTS: usize = 3;
     let program = Program::linked(SLOTS, true);
-    let _switch = program.switch(false);
+    let _switch = program.switch();
     let map = program.word(MAP).load(Ordering::Relaxed);
     let len = REGION_HEADER as usize + SLOTS;
     let record = region(SLOTS as u32, len);
@@ -1080,7 +1117,7 @@ fn arming_refuses_a_region_it_cannot_use() {
     assert_eq!(program.word(MAP).load(Ordering::Relaxed), map);
 
     let plain = Program::linked(SLOTS, false);
-    let _plain_switch = plain.switch(false);
+    let _plain_switch = plain.switch();
     assert!(!plain.exec_header().logged());
     assert_eq!(arm(&plain, &record, len), exec::NO_LOG);
     assert_eq!(armed(&record), 0);
@@ -1093,7 +1130,7 @@ fn arming_refuses_a_region_it_cannot_use() {
 fn publish_while_armed_leaves_the_log_table_alone() {
     const SLOTS: usize = 4;
     let program = Program::linked(SLOTS, true);
-    let mut switch = program.switch(false);
+    let mut switch = program.switch();
     let len = REGION_HEADER as usize + SLOTS;
     let record = region(SLOTS as u32, len);
     assert_eq!(arm(&program, &record, len), exec::ARMED);
@@ -1130,7 +1167,7 @@ fn publish_while_armed_leaves_the_log_table_alone() {
 fn a_switch_while_armed_keeps_the_cell_on_the_log_table() {
     const SLOTS: usize = 2;
     let program = Program::linked(SLOTS, true);
-    let mut switch = program.switch(false);
+    let mut switch = program.switch();
     let log_table = program.header.as_ptr() as u64 + words::log_word(0);
     let len = REGION_HEADER as usize + SLOTS;
     let record = region(SLOTS as u32, len);
@@ -1151,86 +1188,29 @@ fn a_switch_while_armed_keeps_the_cell_on_the_log_table() {
     assert_eq!(armed(&record), SLOTS as u32);
 
     let plain = Program::linked(SLOTS, false);
-    let mut switch = plain.switch(false);
+    let mut switch = plain.switch();
     applied(&mut switch, patch(FIRST_GENERATION + 1, FIRST_GENERATION, swapped));
     let current = plain.word(CURRENT).load(Ordering::Relaxed);
     assert_eq!(plain.cell().load(Ordering::Relaxed), current);
     assert_eq!(plain.calls(), (2, 1));
 }
 
-/// A directory of its own under the system's temporary one, empty.
-fn scratch_dir(name: &str) -> std::path::PathBuf {
-    let dir = std::env::temp_dir().join(format!("blaze-live-{name}-{}", std::process::id()));
-    _ = std::fs::remove_dir_all(&dir);
-    dir
-}
-
-/// An answer the directory can't take comes back as what became of the message with why it
-/// was not answered, never a line on stderr.
+/// Code in the code memory that is not what the daemon committed, a byte of it changed
+/// after the commit, refuses the patch naming the function, and nothing is switched.
 #[test]
-fn an_answer_that_cant_be_written_is_unanswered() {
-    let dir = scratch_dir("unanswered");
-    let mut answers = Answers::new(&dir);
-    let error = answers.write(&Answer::Applied { generation: 2 }).expect_err("no directory");
-    assert_eq!(error, std::io::ErrorKind::NotFound);
-    let applied = || Outcome::Applied { generation: 2, functions: 1, statics: 0 };
-    assert_eq!(
-        answers.unanswered(applied(), error),
-        Outcome::Unanswered {
-            outcome: Box::new(applied()),
-            path: dir.join(crate::patch::ANSWER),
-            error: std::io::ErrorKind::NotFound,
-        }
-    );
-
-    std::fs::create_dir_all(&dir).unwrap();
-    answers.write(&Answer::Applied { generation: 2 }).expect("answered");
-    let written = std::fs::read(dir.join(crate::patch::ANSWER)).unwrap();
-    assert_eq!(Answer::decode(&written), Ok(Answer::Applied { generation: 2 }));
-    std::fs::remove_dir_all(&dir).unwrap();
-}
-
-/// The watcher's first reason to stop is kept, and each wakes the program to say it.
-#[test]
-fn a_lost_watch_keeps_its_first_reason() {
-    let events = Events::default();
-    events.lose(Unwatched::Gone);
-    events.lose(Unwatched::Failed { call: "poll", code: 4 });
-    assert_eq!(events.count.load(Ordering::Acquire), 2);
-    assert_eq!(events.lost.get(), Some(&Unwatched::Gone));
-}
-
-/// Removing the directory the program watches stops the watcher with [`Unwatched::Gone`]
-/// rather than waiting for it to come back.
-#[cfg(any(
-    all(target_os = "linux", any(target_arch = "x86_64", target_arch = "aarch64")),
-    all(target_os = "macos", target_arch = "aarch64"),
-))]
-#[test]
-fn a_removed_directory_stops_the_watch() {
-    let dir = scratch_dir("removed");
-    std::fs::create_dir_all(&dir).unwrap();
-    let events = std::sync::Arc::new(Events::default());
-    super::os::watch(&dir, events.clone()).expect("watching");
-    std::fs::remove_dir_all(&dir).unwrap();
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-    while events.lost.get().is_none() && std::time::Instant::now() < deadline {
-        std::thread::sleep(std::time::Duration::from_millis(5));
-    }
-    assert_eq!(events.lost.get(), Some(&Unwatched::Gone));
-    events.stop.store(true, Ordering::Relaxed);
-}
-
-/// A message file is known by its length, node and time written, all three read.
-#[test]
-fn a_message_file_identity_reads_its_time() {
-    let dir = scratch_dir("identity");
-    std::fs::create_dir_all(&dir).unwrap();
-    let path = dir.join("message");
-    std::fs::write(&path, [1, 2, 3]).unwrap();
-    let meta = std::fs::metadata(&path).unwrap();
-    let identity = Identity::of(&meta).expect("every platform the runtime runs on has the time");
-    assert_eq!(identity.len, 3);
-    assert_eq!(identity.modified, meta.modified().unwrap());
-    std::fs::remove_dir_all(&dir).unwrap();
+fn code_that_differs_from_the_commit_is_refused_naming_its_function() {
+    let mut program = Program::new();
+    let mut switch = program.switch();
+    let table = program.cell().load(Ordering::Relaxed);
+    let committed = program.commit(0, &[0x90; 16], "life::step");
+    program.commit(15, &[0xcc], "a later write");
+    let mut patch = patch(1, 0, vec![(0, unslid(address(two)))]);
+    patch.code = vec![committed];
+    let (outcome, answer) = switch.handle(Message::Patch(patch));
+    let Outcome::Declined { generation: 1, why } = &outcome else { panic!("{outcome}") };
+    assert!(why.starts_with("`life::step`'s code at "), "{why}");
+    assert!(why.contains("is not what the daemon committed"), "{why}");
+    assert!(matches!(answer, Some(Answer::Declined { generation: 1, .. })), "{answer:?}");
+    assert_eq!(program.cell().load(Ordering::Relaxed), table);
+    assert_eq!((switch.current(), program.calls()), (0, (1, 2)));
 }

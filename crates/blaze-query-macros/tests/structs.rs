@@ -230,6 +230,25 @@ fn a_tracked_struct_keeps_its_id_and_each_field_changes_alone() {
     );
 }
 
+#[test]
+fn a_field_is_named_by_its_ident_and_a_tracked_struct_names_its_tracked_fields() {
+    let mut db = TestDb::new();
+    let settings = Settings::builder(3).new(&mut db);
+    let file = File::new(&db, "a b".to_owned());
+    let parsed = parse(&db, file);
+    let storage = db.storage();
+    let names = |id: Id, count| {
+        let ingredient = storage.owner(id).expect("a made row");
+        (0..count).map(|field| storage.field_name(ingredient, field)).collect::<Vec<_>>()
+    };
+    assert_eq!(names(settings.as_id(), 3), ["depth", "label", "note"], "not the getter `level`");
+    assert_eq!(
+        names(parsed.as_id(), 3),
+        ["words", "count", "stamp"],
+        "not the identity's `origin`"
+    );
+}
+
 #[blaze_query_macros::tracked]
 impl<'db> Parsed<'db> {
     /// The word at `index`.

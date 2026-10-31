@@ -35,8 +35,8 @@ use super::{
     Daemon, Options,
     plane::{Inline, Runner},
     work::{
-        Compiled, Failed, Front, FrontEnd, Goal, Image, JobInput, Kept, Library, Output, Put, Runs, Selection, Source,
-        SourceFile, Steps, Writer,
+        Compiled, Failed, Front, FrontEnd, Goal, Image, JobInput, Kept, Library, Output, Phase, Put, Runs, Selection,
+        Source, SourceFile, Steps, Writer,
     },
 };
 
@@ -64,6 +64,8 @@ thread_local! {
     static APPLIES: Cell<usize> = const { Cell::new(0) };
     /// Each compile's unit, and the runs applied in the front end it read.
     static SEEN: RefCell<Vec<(usize, Vec<usize>)>> = const { RefCell::new(Vec::new()) };
+    /// Each phase of a unit's compile as it ran, in order.
+    static PHASES: RefCell<Vec<(usize, Phase)>> = const { RefCell::new(Vec::new()) };
     /// Whether the first unit's compile keeps its reader in [`HOLD`]: a reader still alive,
     /// as one of a task that is still running.
     static KEEP: Cell<bool> = const { Cell::new(false) };
@@ -548,11 +550,17 @@ impl Front<Fake> for FakeFront {
         false
     }
 
-    fn compile(&self, reader: FakeReader, unit: usize, _: &mut Vec<Image<Fake>>) -> Result<Compiled, Failed> {
+    fn compile(&self, reader: FakeReader, unit: usize, phase: Phase, _: &mut Vec<Image<Fake>>) -> Result<Option<Compiled>, Failed> {
         assert_ne!(self.goal, Goal::Reach, "a reach compiles nothing");
-        SEEN.with(|it| it.borrow_mut().push((unit, reader.0.runs.clone())));
-        if unit == 0 && KEEP.get() {
-            HOLD.with(|it| it.borrow_mut().push(reader));
+        PHASES.with(|it| it.borrow_mut().push((unit, phase)));
+        if phase == Phase::Names {
+            SEEN.with(|it| it.borrow_mut().push((unit, reader.0.runs.clone())));
+            if unit == 0 && KEEP.get() {
+                HOLD.with(|it| it.borrow_mut().push(reader));
+            }
+        }
+        if phase != Phase::Store {
+            return Ok(None);
         }
         let (mut puts, mut outputs) = (Vec::new(), Vec::new());
         if unit == 3 && OUTPUT.get() {
@@ -564,7 +572,7 @@ impl Front<Fake> for FakeFront {
             true => vec![warning_of_app("unused variable: `x`"), warning_of_app("unused import: `y`")],
             false => Vec::new(),
         };
-        Ok(Compiled { diagnostics, ok: true, puts, outputs, artifact: None, macros: None, links: Vec::new() })
+        Ok(Some(Compiled { diagnostics, ok: true, puts, outputs, artifact: None, macros: None, links: Vec::new() }))
     }
 
     fn script(&self, unit: usize, _: u64) -> Result<FakeRuns, ApiError> {
@@ -822,6 +830,37 @@ fn a_build_of_a_checkout_goes_from_the_server_to_built() {
     assert!(built.is_some() && built < worked, "`Built`, then `Work`: {got:#?}");
     assert_eq!(daemon.driver().contents(&name("w/Cargo.lock")), b"# a lock\n");
     assert!(daemon.mounts().has(DEP) && daemon.mounts().has(INDEX) && daemon.mounts().has(LIBRARY));
+}
+
+/// Each unit's compile is a node a phase: its names first, its check and its codegen once those
+/// are, its link once both are, and its store last, each once.
+#[test]
+fn a_units_compile_runs_each_of_its_phases_once_in_order() {
+    PHASES.with(|it| it.borrow_mut().clear());
+    let mut sim = Sim::new(17, Faults::default());
+    checkout(&mut sim, "[package]\n");
+    let steps = Arc::new(Fake::default());
+    let mut daemon = start(sim, &steps, 17);
+    let mut client = dial(&mut daemon);
+    let id = client.send(&mut daemon, Request::Build { view: ViewRef::Head("/w".into()), targets: agent() });
+    let got = client.wait(&mut daemon, id);
+    assert_eq!(got.last(), Some(&Response::Done { ok: true }), "{got:#?}");
+
+    let ran = PHASES.with(|it| it.take());
+    let mut units: Vec<usize> = ran.iter().map(|it| it.0).collect();
+    units.sort_unstable();
+    units.dedup();
+    assert!(!units.is_empty(), "the build compiled no unit");
+    for unit in units {
+        let phases: Vec<Phase> = ran.iter().filter(|it| it.0 == unit).map(|it| it.1).collect();
+        let mut each = phases.clone();
+        each.sort_unstable_by_key(|it| *it as u8);
+        assert!(each == Phase::BUILD || each == Phase::CHECK, "unit {unit} ran {phases:?}");
+        assert_eq!((phases[0], phases[phases.len() - 1]), (Phase::Names, Phase::Store), "unit {unit}: {phases:?}");
+        if let Some(link) = phases.iter().position(|it| *it == Phase::Link) {
+            assert!(phases[..link].contains(&Phase::Bodies) && phases[..link].contains(&Phase::Codegen), "unit {unit}: {phases:?}");
+        }
+    }
 }
 
 #[test]
@@ -1189,8 +1228,15 @@ fn each_kind_of_batch_runs_its_own_step_of_the_front_end() {
         _ => panic!("the evaluation gave no result"),
     }
 
-    match run(Does::Compile { front: Arc::new(FakeFront { goal: Goal::Build }), back: Default::default() }, reading()) {
-        Value::Compiled(0, Ok(compiled), images) => assert!(compiled.ok && images.is_empty()),
+    let compile = || Step::of(&cancelled, Does::Compile { front: Arc::new(FakeFront { goal: Goal::Build }), back: Default::default() });
+    match compile().run(Phase::Names.arg(0), reading()) {
+        Some(Did { outcome: blaze_graph::Outcome::Built, value: Value::Phase(0, images) }) => assert!(images.is_empty()),
+        _ => panic!("a phase before the last gives no compile"),
+    }
+    match compile().run(Phase::Store.arg(0), reading()) {
+        Some(Did { outcome: blaze_graph::Outcome::Built, value: Value::Compiled(0, Ok(compiled), images) }) => {
+            assert!(compiled.ok && images.is_empty());
+        }
         _ => panic!("the compile gave no unit"),
     }
 }

@@ -34,7 +34,7 @@ after a diagnostic that stops the build was recorded, as rustc recovers. Lines a
 | file:line | kind | what it does | rustc | what it becomes |
 |---|---|---|---|---|
 | `hir-def/src/signatures.rs:1316`, `:1972`, `expr_store/lower.rs:1103` | recovery, not reported yet | an `extern "x"` whose string is no ABI is `ExternAbi::FALLBACK` (`extern "C"`); nothing reports it | `rustc_ast_lowering` `lower_abi`: E0703, then `ExternAbi::FALLBACK` | stays as rustc's recovery once blaze-diagnostics reports E0703 (queue 01175, no-fallback-tools) |
-| `hir-def/src/hir.rs:275`, `:278` | recovery, not reported yet | an integer literal past `u128` lowers as `0`; nothing reports it outside attributes | `rustc_session::errors::report_lit_error` `IntTooLarge` | stays once `syntax/src/validation.rs` reports "integer literal is too large" (queue 01176, format) |
+| `hir-def/src/hir.rs:275`, `:278` | recovery, reported in hir-def | an integer literal past `u128` lowers as `0` | `rustc_ast_lowering` `lower_lit` -> `report_lit_error` `IntTooLarge`, after cfg stripping (so not in syntax validation) | `ExprCollector::lower_literal` records `ExpressionStoreDiagnostics::IntLiteralTooLarge` for exprs and patterns (queue 01176). Waiting on the hir arm (01315, no-fallback-front-ty) and the blaze-diagnostics lowering (01316, no-fallback-tools) |
 ## Rules and recovery that stay
 
 | file:line | kind | what it does | rustc function it matches |

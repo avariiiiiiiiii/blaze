@@ -194,9 +194,12 @@ impl<W: Words> Fences<W> {
         }
     }
 
-    /// Stores `value` where every run process reads it with one load ([`Thread::announced`]).
+    /// Stores `value` where every run process reads it with one load ([`Thread::announced`]),
+    /// and wakes the threads sleeping for it ([`Thread::wait_announced`]).
     pub fn announce(&self, value: u64) {
-        self.words.word(W_ANNOUNCED).store(value, Ordering::Release);
+        let word = self.words.word(W_ANNOUNCED);
+        word.store(value, Ordering::Release);
+        crate::sys::wake(word);
     }
 
     /// The count of slot claims so far: read before listing the processes' threads for
@@ -279,6 +282,19 @@ impl Thread {
     /// What the daemon last announced ([`Fences::announce`]).
     pub fn announced(words: &impl Words) -> u64 {
         words.word(W_ANNOUNCED).load(Ordering::Acquire)
+    }
+
+    /// Sleeps while what the daemon announced is `seen`, until [`Fences::announce`] wakes it or
+    /// `timeout` passes: what is announced then, which may still be `seen` (a timeout, or a
+    /// wake for another word on the same futex). The wait compares the word's low 32 bits.
+    pub fn wait_announced(words: &impl Words, seen: u64, timeout: std::time::Duration) -> u64 {
+        let word = words.word(W_ANNOUNCED);
+        let now = word.load(Ordering::Acquire);
+        if now != seen {
+            return now;
+        }
+        crate::sys::wait(word, seen as u32, timeout);
+        word.load(Ordering::Acquire)
     }
 
     /// The epoch now.

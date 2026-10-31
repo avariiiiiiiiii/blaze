@@ -5,7 +5,10 @@
 //! Also the typed rows of the address space the switch's columns reserve ([`rows`]), whose
 //! safety rests on the platform's [`Reserved`].
 
-#![allow(unsafe_code, reason = "atomic views of the image's words at the addresses the linker placed them")]
+#![allow(
+    unsafe_code,
+    reason = "atomic views of the image's words at the addresses the linker placed them"
+)]
 
 use std::{
     ops::Range,
@@ -98,18 +101,6 @@ impl Writes<'_> {
         assert_eq!(to.len() as u64, range.end - range.start, "a buffer the length of {range:x?}");
         // SAFETY: `to` is `range`'s length (asserted) and borrowed mutably for this call.
         unsafe { self.put(range, to.as_mut_ptr()) }
-    }
-
-    /// Writes every span where it goes, by [`Writes::put`].
-    ///
-    /// # Safety
-    ///
-    /// Every span's memory is writable, and nothing else reads or writes it while this runs.
-    pub(crate) unsafe fn put_in_place(&self) {
-        for span in self.spans {
-            // SAFETY: the caller's.
-            unsafe { self.put(&span.range(), span.at as *mut u8) };
-        }
     }
 
     /// [`Writes::put`] for memory other threads may read while it is written: the bytes,

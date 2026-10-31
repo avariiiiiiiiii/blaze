@@ -105,9 +105,8 @@ pub(crate) enum SymKey {
     Cells,
     /// The jump table's stubs.
     Stubs,
-    /// The live descriptor, and the path of the directory it names.
+    /// The live descriptor.
     Descriptor,
-    LiveDir,
     /// A function's own SanitizerCoverage array, by the function's instance key and the
     /// array's index ([`blaze_codegen::Target::Coverage`]), and its PC table's entries.
     Coverage(IdNo, u32),
@@ -155,7 +154,6 @@ impl SymKey {
             Cells => [19, 0, 0, 0, 0],
             Stubs => [20, 0, 0, 0, 0],
             Descriptor => [21, 0, 0, 0, 0],
-            LiveDir => [22, 0, 0, 0, 0],
             Coverage(a, b) => [23, a.0, b, 0, 0],
             CoveragePcs(a) => [24, a.0, 0, 0, 0],
             StartHook => [25, 0, 0, 0, 0],
@@ -570,7 +568,6 @@ impl Symbols {
             SymKey::Cells => write!(out, "Cells"),
             SymKey::Stubs => write!(out, "Stubs"),
             SymKey::Descriptor => write!(out, "Descriptor"),
-            SymKey::LiveDir => write!(out, "LiveDir"),
             SymKey::Coverage(it, array) => write!(out, "Coverage({:?}, {array})", self.instance(it)),
             SymKey::CoveragePcs(it) => write!(out, "CoveragePcs({:?})", self.instance(it)),
             SymKey::StartHook => write!(out, "StartHook"),
@@ -627,7 +624,6 @@ impl Symbols {
             | SymKey::Cells
             | SymKey::Stubs
             | SymKey::Descriptor
-            | SymKey::LiveDir
             | SymKey::StartHook
             | SymKey::Counters
             | SymKey::LazyStubs => {}

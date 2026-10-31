@@ -101,6 +101,7 @@ impl Vtable {
             name: I::NAME,
             file: I::FILE,
             kind: Kind::Interned,
+            fields: &[],
             row_size: size_of::<InternRow<I::Fields>>(),
             ids_of: Some(ids_of::<I> as fn(&Storage, u32, Id, &mut Vec<Id>)),
             memory: memory::<I>,

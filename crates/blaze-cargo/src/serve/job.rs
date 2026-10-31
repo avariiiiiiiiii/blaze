@@ -79,8 +79,8 @@ use super::{
     mounts::Mounts,
     plane::{self, Did, Fresh, Happened, Plane, Posting, Task, kinds, loops},
     work::{
-        Compiled, Failed, Front, FrontEnd, Goal, Image, JobInput, Kept, Library, Linking, Readers, Runs, Selection,
-        Source, Steps, Writer,
+        Compiled, Failed, Front, FrontEnd, Goal, Image, JobInput, Kept, Library, Linking, Phase, Readers, Runs,
+        Selection, Source, Steps, Writer,
     },
 };
 use crate::cli::print::Format;
@@ -106,8 +106,12 @@ pub enum Value<S: Steps> {
     Fetched(Arc<[Fetch]>, u32, Result<Source, ApiError>),
     Planned(Result<Planned, ApiError>),
     Lowered(Result<FrontEnd<S>, ApiError>),
-    /// A unit's compile, and the images it relinked, given back to the loop.
+    /// A unit's compile, and the images it relinked, given back to the loop: by its last
+    /// phase, or by the one that failed.
     Compiled(usize, Result<Compiled, ApiError>, Vec<Image<S>>),
+    /// A phase of a unit's compile before its last, done, and the images it relinked: its
+    /// link's, which the loop keeps at once.
+    Phase(usize, Vec<Image<S>>),
     Answer(Result<Response, ApiError>),
     /// Answered with these, in order: a [`Work::Doc`]'s pages, warnings and documentation.
     Answers(Result<Vec<Response>, ApiError>),
@@ -255,14 +259,21 @@ impl<S: Steps> plane::Work for Step<S> {
                 self.settle(steps.lower(input, kept), Value::Lowered)
             }
             Does::Compile { front, back } => {
+                let (unit, phase) = Phase::of(arg);
                 let Readers { this, mut images, .. } = readers;
-                let compiled = front.compile(this.expect("a task that reads is posted with its reader"), at, &mut images);
+                let reader = this.expect("a task that reads is posted with its reader");
+                let compiled = front.compile(reader, unit, phase, &mut images);
                 if matches!(compiled, Err(Failed::Again)) && !self.cancelled.load(Ordering::Acquire) {
                     back.lock().unwrap_or_else(|it| it.into_inner()).append(&mut images);
                     return None;
                 }
+                let compiled = match compiled {
+                    Ok(None) => return Some(Did { outcome: Outcome::Built, value: Value::Phase(unit, images) }),
+                    Ok(Some(compiled)) => Ok(compiled),
+                    Err(failed) => Err(failed),
+                };
                 let ok = matches!(&compiled, Ok(it) if it.ok);
-                let mut did = self.settle(compiled, |it| Value::Compiled(at, it, images))?;
+                let mut did = self.settle(compiled, |it| Value::Compiled(unit, it, images))?;
                 if !ok && matches!(did.outcome, Outcome::Built) {
                     did.outcome = Outcome::Failed { why: "it did not compile".to_owned() }; // alloc: a unit that failed, once
                 }
@@ -716,10 +727,10 @@ struct Build<S: Steps> {
     writer: S::Writer,
     /// Reading tasks the plane asked to post while a write waited, posted once it is applied.
     held: Vec<(Posting, bool)>,
-    /// The unit at node `first + at` is `picked[at]`, or `at` when all are built.
+    /// Node `first + at` is of unit `units[at]`: one node a phase of its compile, a unit's
+    /// nodes one after another ([`Phase`]), and one for a build script's run.
     first: NodeId,
-    count: u32,
-    picked: Option<Vec<u32>>,
+    units: Vec<u32>,
     /// Each unit's package, by its place in the plan's packages; `u32::MAX` for none.
     package_of: Vec<u32>,
     /// The packages reported started, a bit each.
@@ -743,11 +754,13 @@ struct Evaluation {
 
 impl<S: Steps> Build<S> {
     fn unit(&self, node: NodeId) -> Option<usize> {
-        let at = node.0.wrapping_sub(self.first.0);
-        if at >= self.count {
-            return None;
-        }
-        Some(self.picked.as_ref().map_or(at, |it| it[at as usize]) as usize)
+        self.units.get(node.0.wrapping_sub(self.first.0) as usize).map(|it| *it as usize)
+    }
+
+    /// Whether `node` is its unit's first: the one whose start is the unit's.
+    fn begins(&self, node: NodeId) -> bool {
+        let at = node.0.wrapping_sub(self.first.0) as usize;
+        at < self.units.len() && (at == 0 || self.units[at - 1] != self.units[at])
     }
 }
 
@@ -1205,8 +1218,8 @@ impl<S: Steps> Jobs<S> {
                     build.held.push((task, again));
                     return;
                 };
-                let images = match task.kind == kinds::COMPILE || task.kind == kinds::PROGRAM {
-                    true => self.paths.take_images(build.outputs.of(task.arg as usize)),
+                let images = match task.kind == kinds::UNIT_LINK || task.kind == kinds::PROGRAM_LINK {
+                    true => self.paths.take_images(build.outputs.of(Phase::of(task.arg).0)),
                     false => Vec::new(), // alloc: none
                 };
                 Some(Readers { this: Some(this), images, ..Readers::default() })
@@ -1317,6 +1330,18 @@ impl<S: Steps> Jobs<S> {
         }
     }
 
+    /// The images unit `unit`'s link relinked, kept at its outputs for its next link.
+    fn keep_images(&mut self, node: NodeId, unit: usize, images: Vec<Image<S>>) {
+        if images.is_empty() {
+            return;
+        }
+        let build = self.batches.job_of(node).and_then(|id| match &self.jobs.get(key_of(id))?.stage {
+            Stage::Units(build) => Some(build),
+            _ => None,
+        });
+        self.paths.keep(build.map_or(&[][..], |it| it.outputs.of(unit)), images);
+    }
+
     fn did(&mut self, w: &mut World<'_, S>, node: NodeId, value: Value<S>) {
         match value {
             Value::Library(Ok(Library { at, fingerprint, source })) => {
@@ -1348,15 +1373,10 @@ impl<S: Steps> Jobs<S> {
                 self.fetch_failed.insert(fetches[at as usize].at.clone(), error);
             }
             Value::Compiled(unit, result, images) => {
-                if !images.is_empty() {
-                    let build = self.batches.job_of(node).and_then(|id| match &self.jobs.get(key_of(id))?.stage {
-                        Stage::Units(build) => Some(build),
-                        _ => None,
-                    });
-                    self.paths.keep(build.map_or(&[][..], |it| it.outputs.of(unit)), images);
-                }
+                self.keep_images(node, unit, images);
                 self.compiled(w, node, unit, result);
             }
+            Value::Phase(unit, images) => self.keep_images(node, unit, images),
             Value::Evaluated(result) => {
                 let Some(id) = self.batches.job_of(node) else { return };
                 let Some(job) = self.jobs.get_mut(key_of(id)) else { return };
@@ -1712,47 +1732,88 @@ impl<S: Steps> Jobs<S> {
                 Some((0u32..).zip(&wanted).filter_map(|(at, it)| it.then_some(at)).collect::<Vec<u32>>())
             }
         };
-        let count = u32::try_from(picked.as_ref().map_or(all.len(), Vec::len)).expect("under 2^32 units");
-        // The node of each unit, by its place after the batch's first; `u32::MAX` for one not built.
-        let node_of: Option<Vec<u32>> = picked.as_ref().map(|picked| {
-            let mut node_of = vec![u32::MAX; all.len()]; // alloc: once per build ahead
-            for (offset, &unit) in (0u32..).zip(picked) {
-                node_of[unit as usize] = offset;
-            }
-            node_of
-        });
+        let built = u32::try_from(picked.as_ref().map_or(all.len(), Vec::len)).expect("under 2^32 units");
         let unit_at = |offset: u32| picked.as_ref().map_or(offset, |it| it[offset as usize]) as usize;
-        let check = input.goal == Goal::Check;
-        let kind = if check { NodeKind::Bodies } else { NodeKind::Codegen };
-        let (names, all_deps) = (0..count).map(|offset| &all[unit_at(offset)]).fold((0, 0), |(names, deps), unit| {
-            (names + unit.pkg_id.len() + 1 + unit.target.name.len(), deps + unit.dependencies.len())
-        });
+        let goal = input.goal;
+        // A unit's phases, a node each; none for a build script's run, which is one node.
+        let phases_of = |unit: &blaze_units::schema::Unit| match unit.mode {
+            UnitMode::RunCustomBuild => &[][..],
+            _ => super::unit::phases(goal, unit),
+        };
+        // Each built unit's last node, by its place after the batch's first; `u32::MAX` for one
+        // not built. A unit's first node waits for the last of each unit it depends on.
+        let mut last = vec![u32::MAX; all.len()]; // alloc: once per build
+        let mut units_of = Vec::new(); // alloc: once per build, a unit a node
+        let (mut names, mut all_deps) = (0, 0);
+        for offset in 0..built {
+            let at = unit_at(offset);
+            let unit = &all[at];
+            let count = phases_of(unit).len().max(1);
+            units_of.extend(std::iter::repeat_n(at as u32, count));
+            last[at] = u32::try_from(units_of.len() - 1).expect("under 2^32 nodes");
+            names += count * (unit.pkg_id.len() + 1 + unit.target.name.len());
+            // A phase waits for at most two of its unit's before it.
+            all_deps += unit.dependencies.len() + 2 * count;
+        }
+        let count = u32::try_from(units_of.len()).expect("under 2^32 nodes");
         let mut nodes = w.plane.fresh(count, names, all_deps);
         let first = nodes.first();
         // alloc: a name and a deps buffer, once per build, reused by every unit
         let (mut name, mut deps) = (String::new(), Vec::new());
-        for offset in 0..count {
+        let mut next = first.0;
+        for offset in 0..built {
             let at = unit_at(offset);
             let unit = &all[at];
-            deps.clear();
-            deps.extend(unit.dependencies.iter().map(|dep| {
-                let index = dep.index as usize;
-                NodeId(first.0 + node_of.as_ref().map_or(index as u32, |it| it[index]))
-            }));
             name.clear();
             name.push_str(&unit.pkg_id);
             name.push(' ');
             name.push_str(&unit.target.name);
-            // A program's build is admitted by what that program held, one never measured alone.
-            if !check && let Some(program) = super::unit::program_key(unit) {
-                w.plane.push_program(&mut nodes, node(kind, &name, &deps, Pool::Work, None), at as u32, program);
+            deps.clear();
+            deps.extend(unit.dependencies.iter().map(|dep| NodeId(first.0 + last[dep.index as usize])));
+            let phases = phases_of(unit);
+            if phases.is_empty() {
+                let task = Task::Loop { kind: loops::SCRIPT_RUN };
+                w.plane.push(&mut nodes, node(NodeKind::ScriptRun, &name, &deps, Pool::Work, None), task);
+                next += 1;
                 continue;
             }
-            let (kind, task) = match unit.mode {
-                UnitMode::RunCustomBuild => (NodeKind::ScriptRun, Task::Loop { kind: loops::SCRIPT_RUN }),
-                _ => (kind, Task::Thread { kind: kinds::COMPILE, arg: at as u32 }),
+            let base = next;
+            let of = |phase: Phase| {
+                let index = phases.iter().position(|it| *it == phase).expect("a phase a unit's phases have");
+                NodeId(base + index as u32)
             };
-            w.plane.push(&mut nodes, node(kind, &name, &deps, Pool::Work, None), task);
+            for (index, &phase) in phases.iter().enumerate() {
+                if index > 0 {
+                    deps.clear();
+                    match phase {
+                        Phase::Names => {}
+                        Phase::Bodies | Phase::Codegen => deps.push(of(Phase::Names)),
+                        Phase::Link => deps.extend([of(Phase::Bodies), of(Phase::Codegen)]),
+                        Phase::Store => deps.push(NodeId(base + index as u32 - 1)),
+                    }
+                }
+                let arg = phase.arg(at as u32);
+                let spec = node(phase.kind(), &name, &deps, Pool::Work, None);
+                let task = match phase {
+                    Phase::Names => kinds::UNIT_NAMES,
+                    Phase::Bodies => kinds::UNIT_BODIES,
+                    Phase::Codegen => kinds::COMPILE,
+                    Phase::Link => kinds::UNIT_LINK,
+                    Phase::Store => kinds::UNIT_STORE,
+                };
+                let program = match phase {
+                    Phase::Codegen => Some(kinds::PROGRAM),
+                    Phase::Link => Some(kinds::PROGRAM_LINK),
+                    _ => None,
+                };
+                // A program's codegen and link are each admitted by what that program's held,
+                // one never measured alone.
+                match program.zip(super::unit::program_key(unit, phase)) {
+                    Some((kind, key)) => _ = w.plane.push_program(&mut nodes, spec, kind, arg, key),
+                    None => _ = w.plane.push(&mut nodes, spec, Task::Thread { kind: task, arg }),
+                }
+                next += 1;
+            }
         }
         // clone: refcounts, once per build
         let work = Step::of(&cancelled, Does::Compile { front: front.clone(), back: self.paths.back.clone() });
@@ -1800,8 +1861,7 @@ impl<S: Steps> Jobs<S> {
             writer,
             held: Vec::new(), // alloc: none until a write holds a task
             first,
-            count,
-            picked,
+            units: units_of,
             package_of,
             reported,
             outputs,
@@ -1857,6 +1917,9 @@ impl<S: Steps> Jobs<S> {
         let Some(job) = self.jobs.get_mut(key_of(id)) else { return };
         let Stage::Units(build) = &mut job.stage else { return };
         let Some(at) = build.unit(node) else { return };
+        if !build.begins(node) {
+            return;
+        }
         let fresh = build.front.fresh(at);
         match fresh {
             true => job.fresh += 1,

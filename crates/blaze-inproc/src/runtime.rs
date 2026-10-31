@@ -297,6 +297,14 @@ impl Attached {
         Thread::announced(&self.control)
     }
 
+    /// Sleeps until the daemon announces other than `seen`, or `timeout` passes: what is
+    /// announced then. On Linux and macOS the daemon's announce wakes it (a futex on the
+    /// shared word); on Windows a wait on an address stays within its process, so it wakes at
+    /// `timeout` and the caller looks again.
+    pub fn wait_announced(&self, seen: u64, timeout: std::time::Duration) -> u64 {
+        Thread::wait_announced(&self.control, seen, timeout)
+    }
+
     /// The calling thread's return addresses as linked addresses, the fence's.
     fn walk<'a>(&self, frames: &'a mut [u64; MOST_FRAMES]) -> Option<&'a [u64]> {
         let len = sys::backtrace(frames)?;

@@ -41,8 +41,9 @@ use crate::{
 /// (`to_input`, `intersperse_trivia`) keeps a running offset instead.
 ///
 /// Both columns are the worker's `u32` scratch ([`scratch::lend_u32s`]), back on the shelf of
-/// the thread that drops the `LexedStr`, so a warm lex allocates nothing. A shelf holds 4
-/// buffers: more than two `LexedStr`s alive at once on a thread allocate the extra columns.
+/// the thread that drops the `LexedStr`, so a warm lex allocates nothing. A shelf holds
+/// [`scratch::DEPTH`] buffers: more than four `LexedStr`s alive at once on a thread allocate
+/// the extra columns.
 pub struct LexedStr<'a> {
     text: &'a str,
     // Fields drop in declaration order: `checkpoints`, lent after `tokens`, goes back first,

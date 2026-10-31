@@ -93,9 +93,9 @@ mod tests {
     }
 
     /// A tree made in a task counts its block's bytes against the task's tag (no other test of
-    /// this crate makes a tree of [`Tag::Diagnostics`]) until it is freed and the thread's frees
-    /// are folded, at the latest when the thread ends; one walked into lazily counts its part
-    /// against its tree's tag, made outside any task.
+    /// this crate makes a tree of [`Tag::Diagnostics`]: the tests run at once and a tag's count
+    /// is the process's) until it is freed and the thread's frees are folded, at the latest when
+    /// the thread ends.
     #[test]
     fn a_tree_counts_against_its_tasks_tag_until_freed() {
         let tag = Tag::Diagnostics;
@@ -122,7 +122,8 @@ mod tests {
         assert_eq!(live(tag), before, "the thread's frees, folded as it ended");
     }
 
-    /// A lazy node's part, parsed outside any task, counts against its tree's tag.
+    /// A lazy node's part, parsed outside any task, counts against its tree's tag: [`Tag::Mir`],
+    /// which no other test of this crate makes a tree of.
     #[test]
     fn a_part_counts_against_its_trees_tag() {
         fn expand(
@@ -137,7 +138,7 @@ mod tests {
             builder.finish_node();
             (builder.finish(), Vec::new())
         }
-        let tag = Tag::Diagnostics;
+        let tag = Tag::Mir;
         std::thread::spawn(move || {
             let tree = frame::task(tag, |_| {
                 let mut builder = FlatTreeBuilder::sourced("{body}".into());

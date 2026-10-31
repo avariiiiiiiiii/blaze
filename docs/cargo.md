@@ -135,9 +135,11 @@ end with `cfg(doc)` set (`crates/blaze-doc`, `crates/blaze-cargo/src/serve/unit/
 agent API's `Request::Doc`). The client writes the pages to `target/doc`, or
 `target/<triple>/doc` with `--target`, keeps the crates earlier runs documented there in the
 search's list, and says `Documenting`, `Finished` and `Generated` (or `Opening`, and opens the
-page with `$BROWSER` or the system's opener, for `--open`) as cargo does. Not yet: cargo's
-`doc.browser` setting, `--message-format=json`'s messages for the pages, and doctests (v2
-refuses `test --doc`). What the pages hold is in [doc.md](doc.md), a record of v1's
+page with `$BROWSER` or the system's opener, for `--open`) as cargo does. What `cargo doc`
+reads and blaze can't honor yet stops it with an error naming it: rustdoc's flags
+(`RUSTDOCFLAGS`, `build.rustdocflags`, `target.<triple>.rustdocflags`), `doc.browser` under
+`--open`, a JSON `--message-format`, `--unit-graph` and `--timings`; doctests are refused as
+`test --doc` is. What the pages hold is in [doc.md](doc.md), a record of v1's
 `blaze doc`, which wrote them from the same crate.
 
 While a build waits, the client prints each unit's lines as the daemon sends them; there is no

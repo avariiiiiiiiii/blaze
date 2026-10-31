@@ -663,8 +663,7 @@ fn a_placed_function_counts_in_its_own_pair_and_a_linked_one_in_the_stage_s() {
 fn the_placer_never_stores_a_slot_of_an_armed_execution_log() {
     for case in CASES {
         // The runtime finds the log through the live descriptor.
-        let live = Live { dir: name("live"), path: "/tmp/blaze-link-test/live".into() };
-        let Some(mut placed) = placed(case, Output { exec_log: true, live: Some(live), ..case.lazy() }, "log") else { continue };
+        let Some(mut placed) = placed(case, Output { exec_log: true, live: Some(Live), ..case.lazy() }, "log") else { continue };
         let snapshot = |placed: &Placed| {
             let memory = placed.memory.lock().unwrap();
             memory.bytes(CodeRange { offset: 0, len: memory.image_len() }).unwrap().to_vec()
@@ -684,8 +683,7 @@ fn the_placer_never_stores_a_slot_of_an_armed_execution_log() {
 fn a_commit_and_a_rollback_never_name_a_lazy_slot() {
     for case in CASES {
         let arch = case.arch();
-        let live = Live { dir: name("live"), path: "/tmp/blaze-link-test/live".into() };
-        let Some(mut placed) = placed(case, Output { live: Some(live), ..case.lazy() }, "history") else { continue };
+        let Some(mut placed) = placed(case, Output { live: Some(Live), ..case.lazy() }, "history") else { continue };
         let l0 = calls(L0, arch, &[Target::Function(key(L1))]);
         let target = placed.placer.place(&l0).unwrap();
         let lazy: Vec<Slot> = LAZY.iter().map(|n| placed.slot(*n)).collect();

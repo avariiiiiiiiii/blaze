@@ -11,11 +11,16 @@ readme = "README.md"
 keywords = ["hot-reload", "live-reload", "jit", "compiler"]
 categories = ["development-tools"]
 
+# blaze-inproc's run side (no `host` feature): the start hook a dev run needs, the channel
+# patches come through and the fences. blaze-live is a path dependency of programs outside this
+# workspace too (demo/life, user programs, `tools/nix/life_launch.py`); cargo inherits its
+# `workspace = true` lines from this workspace's root `Cargo.toml`, which a copy of it must
+# carry with every crate below (flake.nix's `lifeSource` lists them). Its lints are written out, equal to
+# the root's `[workspace.lints]`, so a program's own lints don't apply to it.
 [dependencies]
+blaze-inproc.workspace = true
+blaze-sha256.workspace = true
 
-# By path and with its lints written out, never `workspace = true`: blaze-live is built outside
-# this workspace too (demo/life, user programs, `tools/nix/life_launch.py`, `harness/tiers.py`),
-# where no root `Cargo.toml` is found. Keep the lints equal to the root's `[workspace.lints]`.
 [dev-dependencies]
 blaze-alloc-count.workspace = true
 blaze-ids.workspace = true

@@ -43,7 +43,7 @@
 //! so a wave of build scripts is one stop.
 //!
 //! Images kept linked between jobs are the loop's too ([`Image`]): each is moved into the
-//! one compile that relinks it and back with what it made, so no worker shares them. So is a
+//! one link ([`Phase::Link`]) that relinks it and back with what it made, so no worker shares them. So is a
 //! checkout's last front end ([`Writer::keep`]), once no reader of it is left: it is moved
 //! into the one lowering of the checkout's next build, which moves it to the new view.
 
@@ -55,6 +55,7 @@ use blaze_api::{ApiError, Artifact, Diagnostic, Edit, Edited, Reach, Response, T
 use blaze_cas::Store;
 use blaze_core::{Completion, Effect, Tag};
 use blaze_ids::ContentId;
+use blaze_protocol::events::NodeKind;
 use blaze_query::{Database, DbError, Query, QueryKey};
 use blaze_units::query::{BuildConfig, Fetch, Plan, Planned, Units};
 use blaze_vfs::{Change, Mode, ViewId};
@@ -201,6 +202,62 @@ pub struct Compiled {
     /// Each image the compile linked, by its path, and how the link reached it: what the job's
     /// [`blaze_api::Worked`] says, and the bench fails an edit by.
     pub links: Vec<(String, Linking)>,
+}
+
+/// A part of a unit's compile ([`Front::compile`]), each one node of the plane, so each is
+/// timed by the work it does ([`blaze_api::Worked::steps_us`]). A unit's phases run in this
+/// order, but [`Phase::Bodies`] and [`Phase::Codegen`], which both wait for
+/// [`Phase::Names`] and run side by side: the check tells codegen what fails, and codegen
+/// tells the check what it reaches first.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Phase {
+    /// Whether the unit's record is kept, its crate's def map, and what its check is of.
+    Names,
+    /// Its check: the diagnostics of every body of its crate, or the check served for it.
+    Bodies,
+    /// Its functions compiled from its roots.
+    Codegen,
+    /// Its images linked from what codegen made, a proc macro's expanders loaded.
+    Link,
+    /// Its outputs hashed and its record encoded for the store: the compile's outcome.
+    Store,
+}
+
+impl Phase {
+    /// A unit's phases when it compiles code.
+    pub const BUILD: [Phase; 5] = [Phase::Names, Phase::Bodies, Phase::Codegen, Phase::Link, Phase::Store];
+    /// A unit's phases when it is only checked.
+    pub const CHECK: [Phase; 3] = [Phase::Names, Phase::Bodies, Phase::Store];
+
+    /// The phase's node kind, as the steps are timed by.
+    pub const fn kind(self) -> NodeKind {
+        match self {
+            Phase::Names => NodeKind::Names,
+            Phase::Bodies => NodeKind::Bodies,
+            Phase::Codegen => NodeKind::Codegen,
+            Phase::Link => NodeKind::Link,
+            Phase::Store => NodeKind::Store,
+        }
+    }
+
+    /// Unit `unit`'s task of this phase, as one `u32` argument of the batch's work.
+    pub const fn arg(self, unit: u32) -> u32 {
+        assert!(unit < 1 << 29, "under 2^29 units");
+        unit << 3 | self as u32
+    }
+
+    /// The unit and phase of a task's argument, which only [`Phase::arg`] makes.
+    pub const fn of(arg: u32) -> (usize, Phase) {
+        let phase = match arg & 7 {
+            0 => Phase::Names,
+            1 => Phase::Bodies,
+            2 => Phase::Codegen,
+            3 => Phase::Link,
+            4 => Phase::Store,
+            _ => panic!("a task's argument names no phase"),
+        };
+        ((arg >> 3) as usize, phase)
+    }
 }
 
 /// How a link reached its image: what the link line (`link: <path> (<how>)`) says, and what
@@ -501,12 +558,14 @@ pub trait Front<S: Steps>: Send + Sync + 'static {
     /// On the loop, as unit `unit` (an index into `Units::graph.units`) is about to start:
     /// whether nothing of it will be made again (cargo's `Fresh`).
     fn fresh(&self, unit: usize) -> bool;
-    /// On a worker: unit `unit` (any mode but `RunCustomBuild`) checked and, unless the goal
-    /// is [`Goal::Check`] or the unit is a check, compiled and linked. Every unit it depends on
-    /// is done, the runs of build scripts it depends on applied. `images` are the kept images
-    /// at the unit's outputs (`UnitPlan::outputs`): it takes each it relinks and puts back
-    /// what it linked.
-    fn compile(&self, reader: S::Reader, unit: usize, images: &mut Vec<Image<S>>) -> Result<Compiled, Failed>;
+    /// On a worker: phase `phase` of unit `unit` (any mode but `RunCustomBuild`), which is
+    /// checked and, unless the goal is [`Goal::Check`] or the unit is a check, compiled and
+    /// linked. Every unit it depends on is done, the runs of build scripts it depends on
+    /// applied, and the phases before `phase` ([`Phase`]) are done; what each made waits for
+    /// the next with the front. [`Phase::Store`] gives the compile; every other phase none.
+    /// `images` are the kept images at the unit's outputs (`UnitPlan::outputs`), given to
+    /// [`Phase::Link`] alone: it takes each it relinks and puts back what it linked.
+    fn compile(&self, reader: S::Reader, unit: usize, phase: Phase, images: &mut Vec<Image<S>>) -> Result<Option<Compiled>, Failed>;
     /// On the loop: the run of build script unit `unit` (mode `RunCustomBuild`). Its run
     /// reports [`Response::BuildScript`] (and cargo's warnings as diagnostics), and before it
     /// ends applies its directives as cargo does to the units they reach (`rustc-cfg`,

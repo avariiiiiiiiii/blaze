@@ -320,7 +320,7 @@ fn lower_in_file(
 /// Whether [`Body::with_source_map`] checks the source map of each body lowered alone, moved,
 /// against that of the same body lowered in its file, and [`BodySyntax::tree`] parses every
 /// anchor again and prints the ones that parse differently alone (`RA_CHECK_RELATIVE_BODIES`).
-fn check_relative() -> bool {
+pub(crate) fn check_relative() -> bool {
     static CHECK: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *CHECK.get_or_init(|| std::env::var_os("RA_CHECK_RELATIVE_BODIES").is_some())
 }

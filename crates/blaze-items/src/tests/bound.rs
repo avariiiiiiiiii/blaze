@@ -88,8 +88,10 @@ fn a_trait_method_binds_to_the_impl_it_resolves_to() {
 fn a_new_impl_of_an_object_s_trait_changes_the_bound_hash() {
     let text = "trait Tr { fn m(&self); }\nstruct S;\nimpl Tr for S { fn m(&self) {} }\n\
                 fn f(s: &S) -> &dyn Tr { s }\n";
-    // The unsizing coercion to `&dyn Tr` is `core`'s `Unsize` and `CoerceUnsized`.
-    let (mut db, file) = single(&format!("//- minicore: sized, coerce_unsized\n{text}"));
+    // The unsizing coercion to `&dyn Tr` is `core`'s `Unsize` and `CoerceUnsized`; `m`'s
+    // `&self` is dispatchable, and so `Tr` dyn-compatible, through `DispatchFromDyn`.
+    let (mut db, file) =
+        single(&format!("//- minicore: sized, coerce_unsized, dispatch_from_dyn\n{text}"));
     let before = bound(&db, "f");
     edit(&mut db, file, &format!("{text}struct U;\nimpl Tr for U {{ fn m(&self) {{}} }}\n"));
     assert_ne!(bound(&db, "f"), before);

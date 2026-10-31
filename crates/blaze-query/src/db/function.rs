@@ -121,6 +121,7 @@ impl Vtable {
             name: F::NAME,
             file: F::FILE,
             kind: Kind::Function,
+            fields: &[],
             row_size: size_of::<RowOf<F>>(),
             ids_of: None,
             memory: memory::<F>,

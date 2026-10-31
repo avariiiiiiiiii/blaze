@@ -3,7 +3,7 @@
 
 use proc_macro2::TokenStream;
 use quote::{format_ident, quote};
-use syn::{ItemStruct, Lifetime};
+use syn::{ItemStruct, Lifetime, ext::IdentExt as _};
 
 use crate::fields::{self, Field, Kind};
 use crate::hygiene::Hygiene;
@@ -44,6 +44,8 @@ fn expand_in(args: TokenStream, item: &ItemStruct) -> syn::Result<TokenStream> {
     })?;
     // alloc: expansion time, once per annotated item; no query runs this
     let tys: Vec<&syn::Type> = fields.iter().map(|it| &it.ty).collect();
+    // alloc: expansion time, once per annotated item; no query runs this
+    let field_names = fields.iter().map(|it| it.ident.unraw().to_string());
     let singleton = options.singleton.is_some();
 
     // alloc: expansion time, once per annotated item; no query runs this
@@ -209,6 +211,7 @@ fn expand_in(args: TokenStream, item: &ItemStruct) -> syn::Result<TokenStream> {
                 const NAME: &'static str = ::core::stringify!(#ident);
                 const FILE: &'static str = ::core::file!();
                 const FIELDS: u32 = #count_u32;
+                const FIELD_NAMES: &'static [&'static str] = &[#(#field_names),*];
                 const SINGLETON: bool = #singleton;
                 #[inline]
                 fn ingredient() -> &'static #plumbing::Ingredient {

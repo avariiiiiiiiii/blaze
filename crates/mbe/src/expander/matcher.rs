@@ -85,7 +85,7 @@ pub(super) use self::failure::match_failure;
 use self::failure::Tracker;
 use super::{Binding, Bindings, Fragment, NONE, TokensOrigin};
 use crate::{
-    ExpandError, ExpandErrorKind, ExpandResult, MetaTemplate, ValueResult, expect_fragment,
+    ExpandError, ExpandErrorKind, MetaTemplate, ValueResult, expect_fragment,
     parser::{Binder, ExprKind, MetaVarKind, NO_BINDER, Op, RepeatKind, Separator},
 };
 
@@ -300,7 +300,7 @@ fn collect_vars(pattern: &MetaTemplate, vars: &mut Vec<Binder>) {
 pub(super) struct Match<'t> {
     pub(super) bindings: Bindings<'t>,
     /// We currently just keep the first error.
-    pub(super) err: Option<ExpandError>,
+    pub(super) err: Option<MatchError>,
     /// How many top-level token trees were left to match.
     pub(super) unmatched_tts: usize,
     /// The number of bound variables
@@ -319,17 +319,42 @@ impl<'t> Match<'t> {
         self.bound_count = 0;
     }
 
-    fn add_err(&mut self, err: ExpandError) {
+    fn add_err(&mut self, err: impl Into<MatchError>) {
         if self.err.is_none() {
-            self.err = Some(err);
+            self.err = Some(err.into());
         }
     }
 
     /// As [`Match::add_err`], building the error only when it is the first.
     fn add_err_with(&mut self, err: impl FnOnce() -> ExpandError) {
         if self.err.is_none() {
-            self.err = Some(err());
+            self.err = Some(MatchError::Built(err()));
         }
+    }
+}
+
+/// A match's first error, as what makes it: one a fragment's token makes is built into an
+/// [`ExpandError`] only for the match the expander reports, not for each match a later token or
+/// rule makes moot (`$($t:tt)*` fails one more `tt` at the end of every input it matches).
+#[derive(Debug)]
+pub(super) enum MatchError {
+    Built(ExpandError),
+    /// A fragment's binding error, `what` the fragment it expected.
+    Expected { span: span::Span, what: &'static str },
+}
+
+impl MatchError {
+    pub(super) fn build(self) -> ExpandError {
+        match self {
+            MatchError::Built(it) => it,
+            MatchError::Expected { span, what } => ExpandError::binding_error(span, what),
+        }
+    }
+}
+
+impl From<ExpandError> for MatchError {
+    fn from(it: ExpandError) -> Self {
+        MatchError::Built(it)
     }
 }
 
@@ -1108,15 +1133,17 @@ fn match_meta_var<'t>(
     kind: MetaVarKind,
     input: &mut TtIter<'t>,
     delim_span: DelimSpan,
-) -> ExpandResult<Fragment<'t>> {
+) -> ValueResult<Fragment<'t>, MatchError> {
     let fragment = match kind {
         MetaVarKind::Path => {
             return expect_fragment(db, input, parser::PrefixEntryPoint::Path, delim_span)
-                .map(Fragment::Path);
+                .map(Fragment::Path)
+                .map_err(MatchError::Built);
         }
         MetaVarKind::Ty => {
             return expect_fragment(db, input, parser::PrefixEntryPoint::Ty, delim_span)
-                .map(Fragment::Ty);
+                .map(Fragment::Ty)
+                .map_err(MatchError::Built);
         }
         MetaVarKind::Expr(expr) => {
             // `expr_2021` should not match underscores, let expressions, or inline const.
@@ -1135,49 +1162,35 @@ fn match_meta_var<'t>(
                         it.sym == sym::let_
                     };
                     if is_err {
-                        return ExpandResult::only_err(ExpandError::new(
+                        return ValueResult::only_err(MatchError::Built(ExpandError::new(
                             it.span,
                             ExpandErrorKind::NoMatchingRule,
-                        ));
+                        )));
                     }
                 }
                 _ => {}
             };
             return expect_fragment(db, input, parser::PrefixEntryPoint::Expr, delim_span)
-                .map(Fragment::Expr);
+                .map(Fragment::Expr)
+                .map_err(MatchError::Built);
         }
         MetaVarKind::Ident | MetaVarKind::Tt | MetaVarKind::Lifetime | MetaVarKind::Literal => {
             let span = input.next_span();
             let savepoint = input.savepoint();
             let mut negative = false;
-            let err = match kind {
-                MetaVarKind::Ident => input.expect_ident().map(drop).map_err(|()| {
-                    ExpandError::binding_error(span.unwrap_or(delim_span.close), "expected ident")
-                }),
-                MetaVarKind::Tt => expect_tt(input).map_err(|()| {
-                    ExpandError::binding_error(
-                        span.unwrap_or(delim_span.close),
-                        "expected token tree",
-                    )
-                }),
-                MetaVarKind::Lifetime => expect_lifetime(input).map(drop).map_err(|()| {
-                    ExpandError::binding_error(
-                        span.unwrap_or(delim_span.close),
-                        "expected lifetime",
-                    )
-                }),
+            let (found, what) = match kind {
+                MetaVarKind::Ident => (input.expect_ident().map(drop), "expected ident"),
+                MetaVarKind::Tt => (expect_tt(input), "expected token tree"),
+                MetaVarKind::Lifetime => (expect_lifetime(input).map(drop), "expected lifetime"),
                 MetaVarKind::Literal => {
                     negative = eat_char(input, '-');
-                    expect_literal(input).map_err(|()| {
-                        ExpandError::binding_error(
-                            span.unwrap_or(delim_span.close),
-                            "expected literal",
-                        )
-                    })
+                    (expect_literal(input), "expected literal")
                 }
                 _ => unreachable!(),
-            }
-            .err();
+            };
+            let err = found
+                .err()
+                .map(|()| MatchError::Expected { span: span.unwrap_or(delim_span.close), what });
             let value = match err {
                 Some(_) => Fragment::Empty,
                 // A sign and a number are one operand where they go, as an expression is.
@@ -1205,6 +1218,7 @@ fn match_meta_var<'t>(
     let (entry_point, origin) = fragment;
     expect_fragment(db, input, entry_point, delim_span)
         .map(|tree| Fragment::Tokens { tree, origin })
+        .map_err(MatchError::Built)
 }
 
 /// Whether `tree` is what an earlier expansion put in for one of its metavariables.

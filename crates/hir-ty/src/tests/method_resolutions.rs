@@ -16,7 +16,7 @@ use rustc_type_ir::inherent::IntoKind as _;
 use crate::{InferBodyId, InferenceResult, next_solver::TyKind};
 
 const FIXTURE: &str = r#"
-//- minicore: sized, fn
+//- minicore: sized, fn, dispatch_from_dyn
 trait Shape {
     fn area(&self) -> u32;
 }

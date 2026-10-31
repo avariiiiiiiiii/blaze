@@ -124,14 +124,15 @@ fn ret_impl_trait() -> impl Trait {}
     );
 }
 
+/// Kept as written: the type lowering refuses it there (E0562, `ImplTraitNotAllowed`).
 #[test]
-fn an_impl_trait_where_none_is_allowed_is_an_error() {
+fn an_impl_trait_where_none_is_allowed_is_kept_for_the_type_lowering() {
     lower_and_print(
         r"
 fn f<T = impl Trait>() {}
 ",
         expect![[r#"
-            fn f<T = {error}>() {...}
+            fn f<T = impl Trait>() {...}
         "#]],
     );
 }

@@ -5,8 +5,9 @@
 //! Each entry of a table is its kind and the portable form of its id: a crate by its index in
 //! the closure, a file by its path from a crate's root, a macro call and a syntax context as
 //! the location they intern (each once, then by index), an item as its location. A block is
-//! its ast id and its module: a module of the crate's `DefMap`, or the root of the `DefMap` of a
-//! block the table names before it. Reading interns each again in this database.
+//! its ast id, the body that made it (none for a signature's), and its module: a module of the
+//! crate's `DefMap`, or the root of the `DefMap` of a block the table names before it. Reading
+//! interns each again in this database.
 //!
 //! A store's buffer holds five kinds of word outside its words: each block of `block_scopes`
 //! (its bits), each macro call of `macro_calls` (its bits), the block of each `Expr::Block`
@@ -94,6 +95,13 @@ pub(super) fn encode(db: &Db, krate: Crate, table: &Relocation) -> R<Vec<u8>> {
 /// Writes `block`, entry `index` of `table`.
 fn block(enc: &mut Enc<'_>, db: &Db, table: &Relocation, index: usize, block: BlockId) -> R {
     enc.ast_id(block.ast_id(db))?;
+    match block.owner(db) {
+        None => enc.u8(0),
+        Some(owner) => {
+            enc.u8(1);
+            enc.body_owner(owner)?;
+        }
+    }
     let module = block.module(db);
     let Some(outer) = module.block(db) else {
         enc.u8(0);
@@ -178,6 +186,12 @@ fn def_bits(kind: Kind, def: ModuleDefId) -> R<u64> {
 /// A block [`block`] wrote, made again; `entries` are those read before it.
 fn read_block(dec: &mut Dec<'_>, db: &Db, entries: &[(Kind, u64)]) -> R<u64> {
     let ast_id: AstId<ast::BlockExpr> = dec.ast_id()?;
+    let owner = match dec.u8()? {
+        0 => None,
+        1 => Some(dec.body_owner()?),
+        // alloc: the reason of a corrupt image's panic, or of a part that fails.
+        tag => return Err(format!("block owner tag {tag}")),
+    };
     let module = match dec.u8()? {
         0 => dec.module()?,
         1 => {
@@ -193,7 +207,7 @@ fn read_block(dec: &mut Dec<'_>, db: &Db, entries: &[(Kind, u64)]) -> R<u64> {
         tag => return Err(format!("block module tag {tag}")),
     };
     let token = LoweringMode::Analysis.allow_tracked_structs().expect("analysis makes blocks");
-    Ok(bits(BlockIdLt::new(db, ast_id, module, token)))
+    Ok(bits(BlockIdLt::new(db, ast_id, module, owner, token)))
 }
 
 /// Where a store's buffer holds an id outside its words.

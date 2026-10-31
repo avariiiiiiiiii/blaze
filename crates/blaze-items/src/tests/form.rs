@@ -192,6 +192,7 @@ fn a_capture_edit_reaches_the_owner_and_the_closure_s_captures() {
     // #906
     let (mut db, file) = single(
         r#"
+//- minicore: sized, copy, clone, add, fn
 fn f() -> u8 {
     let a = 1u8;
     let b = 2u8;
@@ -202,6 +203,7 @@ fn f() -> u8 {
     );
     let f = item(&db, "f");
     let owner = body(&db, "f");
+    assert_eq!(owner.2, None);
     let captures: Vec<_> =
         closures(&db, f).into_iter().map(|it| Cx::new(&db).captures(it).digest).collect();
     edit(
@@ -220,7 +222,9 @@ fn f() -> u8 {
     let after: Vec<_> =
         closures(&db, f).into_iter().map(|it| Cx::new(&db).captures(it).digest).collect();
     assert_eq!(captures.len(), 1);
-    assert_ne!(body(&db, "f").0, owner.0);
+    let after_owner = body(&db, "f");
+    assert_eq!(after_owner.2, None);
+    assert_ne!(after_owner.0, owner.0);
     assert_ne!(after, captures);
 }
 

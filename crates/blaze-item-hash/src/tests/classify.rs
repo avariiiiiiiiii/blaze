@@ -452,7 +452,7 @@ const REFUSALS: &[(&str, &str)] = &[
     ("TraitImpls::for_block", "a block's impls: no fact yet"),
     ("InherentImpls::for_block", "a block's impls: no fact yet"),
     ("table", "a walk of every module of a crate (hir-ty lower/path.rs inherent_associated_type)"),
-    ("modules", "a published crate's whole module table, read for one module and a walk alike"),
+    ("modules", "a walk of every module of a published crate (DefMap::table)"),
     // Positions: the identity has no spans.
     ("Body::with_source_map", "a source map: positions"),
     ("Body::relative", "a source map: positions"),

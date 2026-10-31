@@ -80,7 +80,7 @@ use syntax::{
     view::{self, AstNode as _},
 };
 
-use crate::BlockId;
+use crate::{BlockId, expr_store::body::body_syntax};
 
 pub(crate) use crate::item_tree::{
     attrs::*,
@@ -273,10 +273,33 @@ pub(crate) fn block_item_tree_query(
 ) -> ItemTree {
     let _p = tracing::info_span!("block_item_tree_query", ?block).entered();
     let ast_id = block.ast_id(db);
-    let block = ast_id.to_view(db);
-
-    let ctx = lower::Ctx::new(db, ast_id.file_id, krate);
-    ctx.lower_block(block)
+    // A block of a body written in a file is lowered from that body's syntax alone, which an
+    // edit elsewhere in the file leaves as it is; any other (a signature's, a macro's body's,
+    // one a macro call in the body expands to, whose id is of the expansion) from its file.
+    let syntax = block
+        .owner(db)
+        .and_then(|owner| body_syntax(db, owner).as_ref())
+        .filter(|syntax| syntax.file_id == ast_id.file_id);
+    let Some(syntax) = syntax else {
+        return lower::Ctx::new(db, ast_id.file_id, krate).lower_block(ast_id.to_view(db));
+    };
+    let tree = syntax.tree(db);
+    let ptr = syntax.ast_id_map.try_get_erased(ast_id.value.erase()).unwrap_or_else(|| {
+        panic!(
+            "{block:?}: block {:?} of {:?} is not in its body's syntax, which made it",
+            ast_id.value,
+            block.owner(db),
+        )
+    });
+    let node = view::to_node(ptr, view::Node::root(&tree));
+    let view = view::BlockExpr::cast(node).expect("a block's ast id names a block");
+    let ctx = lower::Ctx::with_maps(db, ast_id.file_id, krate, &syntax.ast_id_map, &syntax.span_map);
+    let lowered = ctx.lower_block(view);
+    if crate::expr_store::body::check_relative() {
+        let whole = lower::Ctx::new(db, ast_id.file_id, krate).lower_block(ast_id.to_view(db));
+        assert!(lowered == whole, "{block:?}: the block's item tree lowered from its body alone");
+    }
+    lowered
 }
 
 block::columns! {

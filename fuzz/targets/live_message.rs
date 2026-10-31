@@ -7,7 +7,7 @@
 //! - No reader panics, on any bytes, nor does walking every list of a view.
 //! - `view` allocates nothing for a message it accepts, and asks for at most
 //!   `blaze_fuzz::allowed(len)` bytes at once for one it refuses (its error).
-//! - Every write's bytes a view gives are bytes of the message.
+//! - Every write's bytes and every function's name a view gives are bytes of the message.
 //! - `decode` is `view` then `to_message`, and a message either reads encodes back to
 //!   exactly the bytes read; so does an answer, and a descriptor its first `SIZE` bytes.
 
@@ -17,8 +17,8 @@ use std::time::Duration;
 
 use blaze_fuzzer::Target;
 use blaze_live::patch::{
-    ARCH_X86_64, Answer, DESCRIPTOR_MAGIC, DESCRIPTOR_VERSION, Descriptor, Message, MessageView,
-    Patch,
+    ARCH_X86_64, Answer, Code, DESCRIPTOR_MAGIC, DESCRIPTOR_VERSION, Descriptor, Message,
+    MessageView, Patch,
 };
 
 const TARGET: Target = Target {
@@ -42,17 +42,21 @@ const TARGET: Target = Target {
 fn walk(message: &[u8], view: &MessageView<'_>) -> usize {
     let MessageView::Patch(patch) = *view else { return 0 };
     let inside = message.as_ptr_range();
-    let writes = patch.code.len() + patch.data.len();
-    let mut seen = 0;
-    for (_, bytes) in patch.code.chain(patch.data) {
+    let within = |bytes: &[u8]| {
         let range = bytes.as_ptr_range();
-        assert!(
-            inside.start <= range.start && range.end <= inside.end,
-            "a write's bytes are the message's"
-        );
+        inside.start <= range.start && range.end <= inside.end
+    };
+    let entries = patch.code.len() + patch.data.len();
+    let mut seen = 0;
+    for code in patch.code {
+        assert!(within(code.name.as_bytes()), "a function's name is the message's");
         seen += 1;
     }
-    assert_eq!(seen, writes, "a write list gives as many writes as it says");
+    for (_, bytes) in patch.data {
+        assert!(within(bytes), "a write's bytes are the message's");
+        seen += 1;
+    }
+    assert_eq!(seen, entries, "the code and write lists give as many entries as they say");
     let lists =
         [patch.rebase().len(), patch.cells().len(), patch.frames().len(), patch.windows().len()];
     let walked = [
@@ -111,7 +115,7 @@ fn seeds() -> Vec<Vec<u8>> {
         id: [7; 16],
         generation: 2,
         base: 1,
-        code: vec![(0x4000, vec![0x90; 16]), (0x4010, Vec::new())],
+        code: vec![Code::of(0x4000, &[0x90; 16], "life::step"), Code::of(0x4010, &[], "ünï")],
         data: vec![(0x8000, 0x4000u64.to_le_bytes().to_vec())],
         rebase: vec![0x8000],
         cells: vec![(0, 0x4000), (3, 0x4008)],
@@ -142,7 +146,6 @@ fn seeds() -> Vec<Vec<u8>> {
         slots: 4,
         patch_code: [0x4000, 0x8000],
         patch_data: [0x8000, 0xc000],
-        dir: [0x3000, 12],
     };
     let mut seeds: Vec<Vec<u8>> = messages.iter().map(Message::encode).collect();
     seeds.extend(answers.iter().map(Answer::encode));

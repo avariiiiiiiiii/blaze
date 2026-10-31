@@ -48,7 +48,7 @@ src/header.rs 12 b274e986b0d4d9e1
 src/ignore_path.rs 7 c65c4b06d1156f89
 src/imports.rs 50 1d8c150f35525450
 src/items.rs 100 552270321705706c
-src/lib.rs 87 8f066642e7897373
+src/lib.rs 86 bef9db2dbc6f0f53
 src/lists.rs 36 97d284c7f43dec93
 src/macros.rs 67 3c7d36d4332fb442
 src/matches.rs 30 a6a36889a21a9067

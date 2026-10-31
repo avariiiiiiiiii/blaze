@@ -5,7 +5,8 @@
 //! A full link writes the file as runs of at most [`RUN`] bytes, built in parallel, which the
 //! commit submits together. An incremental link writes what changed: each piece it wrote whose
 //! bytes differ from before, each jump-table cell it set (8 bytes, not the cells array), the
-//! synthetic regions' changed blocks and the changed headers, with ranges closer than [`GAP`]
+//! zero length after the call frame entries a patch adds in its code region, the synthetic
+//! regions' changed blocks and the changed headers, with ranges closer than [`GAP`]
 //! merged into one write. Every range's bytes are copied once, from the regions' pages
 //! straight into the write. The undo is only ranges: the state the history keeps holds the
 //! old bytes, read when a rollback needs them ([`restore`]).
@@ -35,7 +36,8 @@ pub(crate) struct Finished {
     /// full link, whose undo is the whole old file.
     pub undo: Vec<(u64, u64)>,
     pub old_len: u64,
-    /// The encoded message for running programs.
+    /// The encoded message for running programs, which only a commit into the code memory
+    /// gives them ([`crate::Image::commit_into`]).
     pub message: Option<Vec<u8>>,
 }
 
@@ -458,6 +460,14 @@ impl<'a> Stage<'a> {
             let Some(space) = self.new.spaces.get(region as usize) else { continue };
             let Some(offset) = space.offset else { continue };
             ranges.push((offset + addr - space.region.addr, len));
+        }
+        // The zero length after the call frame entries is no piece's, and a running program
+        // checks it in the code memory (`Stage::message`), so it is written as code is.
+        if let Some(end) = self.frames_end
+            && let Some(space) = self.new.space_of(&Class::Patch).map(|it| &self.new.spaces[it])
+            && let Some(offset) = space.offset
+        {
+            ranges.push((offset + end - space.region.addr, 4));
         }
         for (at, space) in self.new.spaces.iter().enumerate() {
             let Some(offset) = space.offset else { continue };

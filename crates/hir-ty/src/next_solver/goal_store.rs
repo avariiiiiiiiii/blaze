@@ -351,7 +351,7 @@ impl Store {
             if kind == blaze_query::db::ReadKind::Interned {
                 return ControlFlow::Continue(());
             }
-            let name = storage.ingredient_name(read.ingredient_index());
+            let name = storage.read_name(read, kind);
             match self.facts.fact_of(db, read, name) {
                 Some(fact) => {
                     facts.push(fact);

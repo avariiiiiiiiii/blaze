@@ -12,9 +12,10 @@ use blaze_codegen::{
     template::Refs,
 };
 use cranelift_codegen::ir;
+use hir_def::attrs::AttrFlags;
 
 use super::{Built, HirFrontend, HirInstance, Kind, backend, convert, failed, places::resolve};
-use crate::fragment::FuncTarget;
+use crate::{Instance, InstanceDef, fragment::FuncTarget};
 
 /// What an instance is for a caller that compiles its IR itself.
 pub enum Lowering {
@@ -57,16 +58,23 @@ pub fn lowered(
         Kind::Code(..) | Kind::Start(_) => {}
     }
     frontend.with(|db, homes| {
+        let refused = |what: &str| {
+            let name = super::linked::debug_name(db, &instance.0);
+            // alloc: an error
+            failed(unit, format!("{name}: {what}, which the compiled tier of proc macros does not run"))
+        };
+        // Refused before it is built: building a naked function assembles it, and the refusal
+        // is the tier's whether or not anything here assembles.
+        if let Kind::Code(Instance { def: InstanceDef::Fn(func), .. }, _) = &instance.0
+            && AttrFlags::query(db, (*func).into()).contains(AttrFlags::NAKED)
+        {
+            return Err(refused("a naked function (`naked_asm!`)"));
+        }
         let inlined = frontend.inlines(db, instance).map_err(|e| failed(unit, e))?;
         blaze_mem::frame::task(blaze_mem::Tag::Codegen, |frame| {
             let walked = (instance, inlined);
             let function =
                 backend::built_function(db, homes, &frontend.hashes, unit, spec, walked, refs, frame)?;
-            let refused = |what: &str| {
-                let name = super::linked::debug_name(db, &instance.0);
-                // alloc: an error
-                failed(unit, format!("{name}: {what}, which the compiled tier of proc macros does not run"))
-            };
             let Built::Ir(pending) = function.code else {
                 return Err(refused("a naked function (`naked_asm!`)"));
             };

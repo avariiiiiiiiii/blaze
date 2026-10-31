@@ -668,6 +668,56 @@ fn select_of_icmp_is_one_stencil_either_way_round() {
 }
 
 #[test]
+fn an_fma_by_an_fneg_is_the_negated_fma_of_its_operand_wherever_the_fneg_is() {
+    use crate::arch::aarch64::{Aarch64, tests::{LINUX, library_of}};
+    static BYTES: OnceLock<Vec<u8>> = OnceLock::new();
+    let library = Reader::new(BYTES.get_or_init(|| library_of(&[Op::Fma, Op::Fneg, Op::Fadd, Op::Copy, Op::Jump]))).unwrap();
+    let negated = |srcs| Shape { aux: 1, ..shape(Op::Fma, Ty::F64, srcs, Dst::Slot) };
+    let plan = |func: &ir::Function| {
+        compile_in::<Aarch64, _>(func, &LINUX, &library, |_, plan| Seen::of(plan)).unwrap_or_else(|e| panic!("{e}"))
+    };
+    let sel = |plan: &Seen, func: &ir::Function, value| plan.sels[inst_of(func, value).as_u32() as usize];
+    let mut values = Vec::new();
+
+    // Its one use: the `fneg` is dropped and its operand handed on in the accumulator.
+    let func = function(&[types::F64; 3], &[types::F64], |b, p| {
+        let y = b.ins().fadd(p[1], p[1]);
+        let n = b.ins().fneg(y);
+        let r = b.ins().fma(p[0], n, p[2]);
+        b.ins().return_(&[r]);
+        values = vec![y, n, r];
+    });
+    let seen = plan(&func);
+    assert_eq!(sel(&seen, &func, values[0]).shape, shape(Op::Fadd, Ty::F64, [S, S, N], Dst::Acc));
+    assert_eq!(sel(&seen, &func, values[1]).kind, Kind::Fused);
+    let fma = sel(&seen, &func, values[2]);
+    assert_eq!((fma.kind, fma.shape), (Kind::Stencil, negated([S, A, S])));
+    assert_eq!(fma.args[1], values[0]);
+
+    // In another block and read there too: the `fneg` stays, and its operand, now read in
+    // that block as well, keeps a slot of its own besides the accumulator.
+    let func = function(&[types::F64; 3], &[types::F64, types::F64], |b, p| {
+        let next = b.create_block();
+        let y = b.ins().fadd(p[1], p[1]);
+        let n = b.ins().fneg(y);
+        b.ins().jump(next, &[]);
+        b.switch_to_block(next);
+        let r = b.ins().fma(p[0], n, p[2]);
+        b.ins().return_(&[r, n]);
+        values = vec![y, n, r];
+    });
+    let seen = plan(&func);
+    assert_eq!(sel(&seen, &func, values[0]).shape, shape(Op::Fadd, Ty::F64, [S, S, N], Dst::Both));
+    assert_eq!(sel(&seen, &func, values[1]).shape, shape(Op::Fneg, Ty::F64, [A, N, N], Dst::Slot));
+    let fma = sel(&seen, &func, values[2]);
+    assert_eq!(fma.shape, negated([S, S, S]));
+    assert_eq!(fma.args[1], values[0]);
+    let y = values[0].as_u32() as usize;
+    assert_eq!(seen.last[y], GLOBAL);
+    assert_ne!(seen.slot[y], NONE);
+}
+
+#[test]
 fn block_arguments_move_in_parallel_and_a_swap_goes_through_the_scratch_slot() {
     let mut values = Vec::new();
     let func = function(&[types::I64, types::I64], &[types::I64], |b, p| {

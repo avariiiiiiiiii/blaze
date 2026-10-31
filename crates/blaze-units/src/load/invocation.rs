@@ -54,6 +54,8 @@ pub(crate) struct Asked {
     pub unstable: Vec<String>,
     pub jobs: Option<u32>,
     pub ignore_rust_version: bool,
+    /// `cargo doc --open`.
+    pub open: bool,
 }
 
 impl Asked {
@@ -306,8 +308,10 @@ fn argument(command: Command, name: &str) -> Option<Takes> {
     match (command, name) {
         (Command::Test, "doc") => Some(Takes::Flag(|a| a.doc = true)),
         (Command::Test | Command::Bench, "no-run" | "no-fail-fast") => Some(Takes::Flag(|_| {})),
+        // Whether the plan reads `doc.browser`; the pages are opened by the CLI.
+        (Command::Doc, "open") => Some(Takes::Flag(|a| a.open = true)),
         // What the documentation is made of, not which units: the request's (`Request::Doc`).
-        (Command::Doc, "open" | "no-deps" | "document-private-items") => Some(Takes::Flag(|_| {})),
+        (Command::Doc, "no-deps" | "document-private-items") => Some(Takes::Flag(|_| {})),
         _ => None,
     }
 }
@@ -444,6 +448,8 @@ mod tests {
         assert_eq!(it.packages, ["a"]);
         assert!(it.lib);
         assert_eq!(it.bins, ["x"]);
+        assert!(it.open);
+        assert!(!asked(Command::Doc, &["--no-deps"]).unwrap().open);
         assert!(asked(Command::Doc, &["--examples", "--example", "e", "--release"]).is_ok());
         for refused in ["--tests", "--benches", "--all-targets", "--doc"] {
             assert_eq!(asked(Command::Doc, &[refused]).unwrap_err(), format!("unexpected argument '{refused}' found"));

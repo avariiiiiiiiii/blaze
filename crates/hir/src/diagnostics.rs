@@ -150,6 +150,7 @@ diagnostics![AnyDiagnostic<'db> ->
     AmbiguousAssociatedItem<'db>,
     ArrayPatternWithoutFixedLength,
     AwaitOutsideOfAsync,
+    IntLiteralTooLarge,
     BorrowckError,
     BorrowckSkipped,
     BreakOutsideOfLoop,
@@ -353,6 +354,12 @@ pub struct UnreachableLabel {
 pub struct AwaitOutsideOfAsync {
     pub node: InFile<AstPtr<ast::AwaitExpr>>,
     pub location: String,
+}
+
+/// An integer literal whose digits do not fit `u128`: rustc's `LitError::IntTooLarge`.
+#[derive(Debug)]
+pub struct IntLiteralTooLarge {
+    pub node: InFile<AstPtr<ast::Literal>>,
 }
 
 #[derive(Debug, Clone, Eq, PartialEq)]
@@ -3207,6 +3214,9 @@ impl<'a, 'db, F: Fn(crate::DefWithBody) -> bool + ?Sized> DiagnosticsCollector<'
                 }
                 ExpressionStoreDiagnostics::MissingBody { node, kind } => {
                     MissingBody { node: *node, kind: *kind }.into()
+                }
+                ExpressionStoreDiagnostics::IntLiteralTooLarge { node } => {
+                    IntLiteralTooLarge { node: *node }.into()
                 }
             });
         }

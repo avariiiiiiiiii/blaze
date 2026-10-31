@@ -26,6 +26,17 @@ fn doc_reads_cargo_docs_flags_and_refuses_what_it_does_not_take() {
     assert!(refused(&["doc", "--tests"]).starts_with("error: unexpected argument '--tests' found"));
     assert!(refused(&["doc", "stray"]).starts_with("error: unexpected argument 'stray' found"));
     assert!(refused(&["check", "--open"]).starts_with("error: unexpected argument '--open' found"));
+    // What cargo doc takes and blaze doc can't honor yet stops it, naming the flag.
+    let unhonored = |words: &[&str]| super::refused(&cargo(words));
+    assert_eq!(unhonored(&["doc"]), None);
+    assert_eq!(unhonored(&["doc", "--message-format", "short"]), None);
+    assert_eq!(unhonored(&["doc", "--unit-graph"]).unwrap(), "`blaze doc` does not write what `--unit-graph` asks for yet");
+    assert_eq!(unhonored(&["doc", "--timings"]).unwrap(), "`blaze doc` does not write what `--timings` asks for yet");
+    assert_eq!(
+        unhonored(&["doc", "--message-format=json-render-diagnostics,json-diagnostic-short"]).unwrap(),
+        "`blaze doc` writes no JSON messages for the pages yet (`--message-format json-render-diagnostics`)"
+    );
+    assert_eq!(super::refused(&cargo(&["check", "--timings"])), None, "not doc's");
 }
 
 #[test]

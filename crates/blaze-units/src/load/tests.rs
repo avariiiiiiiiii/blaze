@@ -303,6 +303,17 @@ fn doc_checks_the_targets_cargo_doc_documents() {
     let examples = Ask { command: Command::Doc, args: &["--examples"], ..ask(&files) };
     let units = ready(fixture.plan(fixture.open(&examples)));
     assert_eq!(roots_named(&units), ["e example"]);
+
+    // What cargo doc would read and blaze doc does not honor yet stops the load, named.
+    let flagged = Ask { command: Command::Doc, args: &[], env: &[("RUSTDOCFLAGS", "--html-in-header x.html")], ..ask(&files) };
+    let what = failed(fixture.plan(fixture.open(&flagged)));
+    assert!(what.contains("rustdoc's flags") && what.contains("`--html-in-header x.html`"), "{what}");
+    let browser = [("CARGO_DOC_BROWSER", "firefox")];
+    let opened = Ask { command: Command::Doc, args: &["--open"], env: &browser, ..ask(&files) };
+    let what = failed(fixture.plan(fixture.open(&opened)));
+    assert!(what.contains("`doc.browser` (`CARGO_DOC_BROWSER`)"), "{what}");
+    let unopened = Ask { command: Command::Doc, args: &[], env: &browser, ..ask(&files) };
+    ready(fixture.plan(fixture.open(&unopened)));
 }
 
 // library/Cargo.toml's `[profile.*.package.panic_abort] rustflags = ["-Cpanic=abort"]` is

@@ -48,7 +48,6 @@ impl FileChange {
     pub fn set_crate_graph(&mut self, graph: CrateGraphBuilder) {
         self.crate_graph = Some(graph);
     }
-
     pub fn apply(self, db: &mut Db) -> Option<CratesIdMap> {
         let _p = tracing::info_span!("FileChange::apply").entered();
         if let Some(roots) = self.roots {

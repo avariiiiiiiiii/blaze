@@ -453,10 +453,10 @@ fn main() {
     diag.span_note(defined, "`Option<i32>` defined here");
     diag.note("the matched value is of type `Option<i32>`");
     diag.suggestion_verbose(
-        main.span("None => {},").shrink_to_hi(),
+        main.span("None => {}").shrink_to_hi(),
         "ensure that all possible cases are being handled by adding a match arm with a wildcard pattern or an \
          explicit pattern as shown",
-        "\n        Some(_) => todo!(),",
+        ",\n        Some(_) => todo!()",
         Applicability::HasPlaceholders,
     );
     let mut sources = File::sources(&[&main]);

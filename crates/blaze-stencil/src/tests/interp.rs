@@ -66,13 +66,61 @@ pub fn run(funcs: &[&ir::Function], entry: usize, args: &[DataValue]) -> Result<
 ///   adds its operands as one scalar, which panics on a vector and wraps before it halves on
 ///   a scalar;
 /// - each `srem` by -1 as one by 1, both 0: the interpreter's traps on the minimum by -1,
-///   which only a zero divisor does.
+///   which only a zero divisor does;
+/// - each `bitcast` from or to `i128` or `f128` as a store to a 16-byte stack slot and a load
+///   of the other type, the same bytes little-endian (a bitcast's only order the interpreter
+///   takes): the interpreter's splits the value into lanes, which panics on a 128-bit lane, and
+///   makes an `i128` one `i8` lane of a vector;
+/// - each extending vector load (`sload8x8` to `uload32x2`), which the interpreter does not
+///   have, as the `i64` load it is, its bytes made the narrow lanes and those widened.
 fn interpretable(func: &ir::Function) -> ir::Function {
     let mut func = func.clone();
     let mut cursor = FuncCursor::new(&mut func);
     while cursor.next_block().is_some() {
         while let Some(inst) = cursor.next_inst() {
             match cursor.func.dfg.insts[inst].opcode() {
+                ir::Opcode::Bitcast => {
+                    let &[x] = cursor.func.dfg.inst_args(inst) else { unreachable!("bitcast takes one operand") };
+                    let from = cursor.func.dfg.value_type(x);
+                    let to = cursor.func.dfg.value_type(cursor.func.dfg.first_result(inst));
+                    if from.lane_bits() <= 64 && to.lane_bits() <= 64 {
+                        continue;
+                    }
+                    let slot = cursor.func.create_sized_stack_slot(ir::StackSlotData::new(
+                        ir::StackSlotKind::ExplicitSlot,
+                        16,
+                        4,
+                    ));
+                    cursor.ins().stack_store(types::I64, x, slot, 0);
+                    cursor.func.replace(inst).stack_load(types::I64, to, slot, 0);
+                }
+                opcode @ (ir::Opcode::Sload8x8
+                | ir::Opcode::Uload8x8
+                | ir::Opcode::Sload16x4
+                | ir::Opcode::Uload16x4
+                | ir::Opcode::Sload32x2
+                | ir::Opcode::Uload32x2) => {
+                    let ir::InstructionData::Load { arg, offset, .. } = cursor.func.dfg.insts[inst] else {
+                        unreachable!("an extending load is a load")
+                    };
+                    let flags = cursor.func.dfg.insts[inst]
+                        .memflags_data(&cursor.func.dfg)
+                        .expect("a load has memory flags");
+                    let narrow = match opcode {
+                        ir::Opcode::Sload8x8 | ir::Opcode::Uload8x8 => types::I8X16,
+                        ir::Opcode::Sload16x4 | ir::Opcode::Uload16x4 => types::I16X8,
+                        _ => types::I32X4,
+                    };
+                    let word = cursor.ins().load(types::I64, flags, arg, offset);
+                    let wide = cursor.ins().scalar_to_vector(types::I64X2, word);
+                    let little = ir::MemFlagsData::new().with_endianness(ir::Endianness::Little);
+                    let lanes = cursor.ins().bitcast(narrow, little, wide);
+                    if matches!(opcode, ir::Opcode::Sload8x8 | ir::Opcode::Sload16x4 | ir::Opcode::Sload32x2) {
+                        cursor.func.replace(inst).swiden_low(lanes);
+                    } else {
+                        cursor.func.replace(inst).uwiden_low(lanes);
+                    }
+                }
                 ir::Opcode::AvgRound => {
                     let &[x, y] = cursor.func.dfg.inst_args(inst) else {
                         unreachable!("avg_round takes two operands")
@@ -243,6 +291,42 @@ fn the_interpreter_runs_an_add() {
         run(&[&func], 0, &[DataValue::I32(i32::MAX)]),
         Ok(Run::Returned(vec![DataValue::I32(i32::MIN)]))
     );
+}
+
+/// A bitcast between a 128-bit scalar and a vector keeps the bytes, little-endian.
+#[test]
+fn the_interpreter_runs_a_bitcast_of_a_128_bit_lane() {
+    use cranelift_frontend::{FunctionBuilder, FunctionBuilderContext};
+    let bitcast = |from: ir::Type, to: ir::Type, arg: DataValue| {
+        let mut sig = ir::Signature::new(cranelift_codegen::isa::CallConv::SystemV);
+        sig.params.push(ir::AbiParam::new(from));
+        sig.returns.push(ir::AbiParam::new(to));
+        let mut func = ir::Function::with_name_signature(ir::UserFuncName::user(0, 0), sig);
+        let mut cx = FunctionBuilderContext::new();
+        let mut b = FunctionBuilder::new(&mut func, &mut cx);
+        let entry = b.create_block();
+        b.append_block_params_for_function_params(entry);
+        b.switch_to_block(entry);
+        let x = b.block_params(entry)[0];
+        let y = b.ins().bitcast(to, ir::MemFlagsData::new().with_endianness(ir::Endianness::Little), x);
+        b.ins().return_(&[y]);
+        b.seal_all_blocks();
+        let config = super::host::isa(&super::host::TARGETS[0]).frontend_config();
+        b.finalize(config);
+        run(&[&func], 0, &[arg])
+    };
+    let bytes: [u8; 16] = std::array::from_fn(|i| i as u8 * 16 + 1);
+    let wide = u128::from_le_bytes(bytes);
+    assert_eq!(
+        bitcast(types::I128, types::I8X16, DataValue::I128(wide as i128)),
+        Ok(Run::Returned(vec![DataValue::V128(bytes)]))
+    );
+    assert_eq!(
+        bitcast(types::I8X16, types::I128, DataValue::V128(bytes)),
+        Ok(Run::Returned(vec![DataValue::I128(wide as i128)]))
+    );
+    let f128 = DataValue::F128(cranelift_codegen::ir::immediates::Ieee128::with_bits(wide));
+    assert_eq!(bitcast(types::F128, types::I32X4, f128), Ok(Run::Returned(vec![DataValue::V128(bytes)])));
 }
 
 /// `avg_round` is `(x + y + 1) >> 1` of each lane, computed wide.

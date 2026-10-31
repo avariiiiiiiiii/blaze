@@ -203,7 +203,6 @@ fn prefix(symbols: &Symbols, sym: Sym) -> u64 {
         Cells => 19,
         Stubs => 20,
         Descriptor => 21,
-        LiveDir => 22,
         Coverage(..) => 23,
         CoveragePcs(_) => 24,
         Counters => 25,
@@ -222,7 +221,7 @@ fn prefix(symbols: &Symbols, sym: Sym) -> u64 {
         Local(obj, _) | Section(obj, _) | Frame(obj, ..) => seven(&symbols.content(obj.native).0),
         Name(name) | FileName(name) | IatEnd(name) | Common(name) => seven(symbols.str(name).as_bytes()),
         Got(kind, _) => (kind as u64) << 48,
-        Plt(_) | Generation | Cells | Stubs | Descriptor | LiveDir | Counters | StartHook | LazyStubs => 0,
+        Plt(_) | Generation | Cells | Stubs | Descriptor | Counters | StartHook | LazyStubs => 0,
     };
     tag << 56 | rest
 }

@@ -1326,3 +1326,31 @@ fn body_maps_reference(db: &TestDB, def: DefWithBodyId) -> (&Body, &BodySourceMa
     };
     (&**body, source_map)
 }
+
+#[test]
+fn an_integer_literal_past_u128_is_reported_unless_cfg_removes_it() {
+    let (db, def) = lower(
+        r#"
+fn f() {
+    let _ = 340282366920938463463374607431768211456;
+    let _ = 340282366920938463463374607431768211455u128;
+    let _ = 340282366920938463463374607431768211456f64;
+    match 0 { 0x1_0000_0000_0000_0000_0000_0000_0000_0000 => {} _ => {} }
+    #[cfg(any())]
+    let _ = 999999999999999999999999999999999999999999;
+}
+"#,
+    );
+    let (_, source_map) = Body::with_source_map(&db, def);
+    let too_large: Vec<_> = source_map
+        .diagnostics()
+        .iter()
+        .filter_map(|it| match it {
+            ExpressionStoreDiagnostics::IntLiteralTooLarge { node } => {
+                Some(node.value.text_range())
+            }
+            _ => None,
+        })
+        .collect();
+    assert_eq!(too_large.len(), 2, "the literal past u128 and the pattern: {too_large:?}");
+}

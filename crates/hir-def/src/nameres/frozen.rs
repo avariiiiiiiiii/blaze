@@ -78,7 +78,7 @@ type R<T = ()> = Result<T, String>;
 /// The version of what this module writes, for the key frozen bytes are stored under: it
 /// changes with every change to the bytes [`Enc`] writes, the list of lang items included, so
 /// bytes of another version are never read.
-pub const ENCODING: &str = "blaze frozen def map 13";
+pub const ENCODING: &str = "blaze frozen def map 14";
 
 /// What name resolution does with the frozen bytes of a crate.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -484,8 +484,8 @@ pub struct Enc<'a> {
     crates: FxHashMap<Crate, u32>,
     closure: Vec<Crate>,
     dirs: FxHashMap<u32, String>,
-    /// The first crate of the closure whose root is in each source root.
-    owners: FxHashMap<base_db::SourceRootId, u32>,
+    /// The crates of the closure whose root is in each source root, in the closure's order.
+    owners: FxHashMap<base_db::SourceRootId, Vec<u32>>,
     /// Each file: the crate it is named from and its path from that crate's root.
     file_names: FxHashMap<FileId, (u32, String)>,
     files: FxHashMap<FileId, u32>,
@@ -709,15 +709,38 @@ impl Enc<'_> {
         if self.owners.is_empty() {
             for (index, &krate) in self.closure.iter().enumerate() {
                 let (dir, _, root) = root_dir(db, krate)?;
-                self.owners.entry(root).or_insert(index as u32);
+                // alloc: encoding, once per crate per image write (not on a build's path)
+                self.owners.entry(root).or_default().push(index as u32);
                 self.dirs.insert(index as u32, dir);
             }
         }
-        let owner = *self
+        let candidates = self
             .owners
             .get(&source_root)
             // alloc: error path
             .ok_or_else(|| format!("a file of no crate of the closure: {path}"))?;
+        // Crates share a source root (a package's lib and its build script, every crate of a
+        // test fixture), so the file is named from the one nearest it: whose root's directory
+        // is the deepest above it, among those the one whose root it is, then the closure's
+        // first. Named from another crate's directory, it would change when that crate moves.
+        let dirs = &self.dirs;
+        let closure = &self.closure;
+        let depth = |index: u32| {
+            let dir = &dirs[&index];
+            let above = path.strip_prefix(dir.as_str()).is_some_and(|rest| rest.starts_with('/'));
+            above.then(|| dir.split('/').filter(|it| !it.is_empty()).count())
+        };
+        let nearest = candidates.iter().filter_map(|&it| Some((it, depth(it)?))).max_by_key(
+            |&(index, depth)| {
+                let is_root = closure[index as usize].data(db).root_file_id == file;
+                (depth, is_root, std::cmp::Reverse(index))
+            },
+        );
+        let owner = match nearest {
+            Some((owner, _)) => owner,
+            // Above every crate's directory (`#[path = "../x.rs"]`): from the closure's first.
+            None => candidates[0],
+        };
         // Named from the crate whose build script wrote it, whichever crate's root is beside it.
         let below_out = self.out_dirs.iter().find_map(|(index, out)| {
             let rest = path.strip_prefix(out.as_str())?;
@@ -3566,6 +3589,23 @@ pub mod prelude { pub mod rust_2018 { pub use crate::{Clone, Debug, derive}; } }
     #[test]
     fn the_same_bytes_in_every_database() {
         assert_eq!(frozen(), frozen());
+    }
+
+    /// The names `script`'s encoder gives its own root and its dependency's, two crates of one
+    /// source root, with `script` at `at`.
+    fn names_with_script_at(at: &str) -> [(u32, String); 2] {
+        let text = format!("//- {at} crate:script deps:dep\n//- /dep.rs crate:dep\npub fn f() {{}}\n");
+        let db = fixture::db(&text).into_db();
+        let (script, dep) = (crate_named(&db, "script"), crate_named(&db, "dep"));
+        let mut enc = Enc::new(&db, script);
+        [script, dep].map(|it| enc.file_name(it.data(&db).root_file_id).unwrap())
+    }
+
+    #[test]
+    fn a_file_is_named_from_the_nearest_crate_of_its_source_root() {
+        let names = names_with_script_at("/build.rs");
+        assert_eq!(names, [(0, "build.rs".to_owned()), (1, "dep.rs".to_owned())]);
+        assert_eq!(names_with_script_at("/tools/gen/build.rs"), names, "moving one crate renames none");
     }
 
     #[test]

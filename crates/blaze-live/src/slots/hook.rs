@@ -51,7 +51,7 @@ pub(crate) fn install() {
 #[allow(clippy::type_complexity)]
 pub(crate) fn catch<R>(
     f: impl FnOnce() -> R,
-// dyn: std's panic payload, as `catch_unwind` hands it
+    // dyn: std's panic payload, as `catch_unwind` hands it
 ) -> Result<R, (Box<dyn Any + Send + 'static>, Option<Panic>)> {
     GUARDED.with(|it| it.set(it.get() + 1));
     // The guard is where the program says what `f` touched may be dropped half done.

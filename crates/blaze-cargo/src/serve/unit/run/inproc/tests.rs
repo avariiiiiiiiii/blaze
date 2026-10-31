@@ -1,15 +1,27 @@
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use blaze_inproc::frame::{Frame, Kind, kinds};
+use blaze_live::patch::Answer;
+use blaze_live::patch::ask::{self, ANSWER, ANSWERED, NO_PATCH, NO_TIERS, PATCH, PATCH_ASK, TIERS_ASK};
 
-use super::{ARENA, CELLS_PER_FUNCTION, NO_PATCH, PATCH, PATCH_ASK, Patch, answer, dev_run};
+use super::{ARENA, CELLS_PER_FUNCTION, Patch, answer, dev_run};
+
+const PID: u32 = 41;
 
 fn ask(kind: Kind, body: &[u8]) -> Frame<'_> {
     Frame { kind, seq: 7, body }
 }
 
-fn at(generation: u64) -> [u8; 8] {
-    generation.to_le_bytes()
+/// The answer to `frame` of process [`PID`], and what it kept as failures.
+fn answered(frame: &Frame<'_>, patch: &Patch) -> (Result<(Kind, Vec<u8>), String>, Vec<String>) {
+    let failures = Mutex::new(Vec::new());
+    let mut body = Vec::new();
+    let kind = answer(frame, patch, PID, &failures, &mut body);
+    (kind.map(|it| (it, body)), failures.into_inner().unwrap())
+}
+
+fn patch_of(generation: u64, message: &[u8]) -> Patch {
+    Patch { generation, message: Some(Arc::from(message)) }
 }
 
 #[test]
@@ -22,49 +34,78 @@ fn a_dev_executable_reserves_the_arena_and_only_a_tiered_run_cells() {
 }
 
 #[test]
-fn the_patch_kinds_are_blaze_lives() {
-    for kind in [PATCH_ASK, PATCH, NO_PATCH] {
-        assert!(kinds::LIVE.contains(&kind.0), "{kind:?}");
-    }
-    assert_eq!((PATCH_ASK.0, PATCH.0, NO_PATCH.0), (0x0300, 0x0301, 0x0302));
-}
-
-#[test]
 fn a_run_behind_the_newest_patch_gets_it_and_one_at_it_gets_none() {
-    let message: Arc<[u8]> = Arc::from(&b"patch 3"[..]);
-    let patch = Patch { generation: 3, message: Some(message.clone()) };
-    let (kind, body) = answer(&ask(PATCH_ASK, &at(2)), &patch).unwrap();
-    assert_eq!((kind, &*body), (PATCH, &*message));
-    let (kind, body) = answer(&ask(PATCH_ASK, &at(0)), &patch).unwrap();
-    assert_eq!((kind, &*body), (PATCH, &*message), "several behind: the newest, which holds them all");
+    let patch = patch_of(3, b"patch 3");
+    for behind in [2, 0] {
+        let (kind, body) = answered(&ask(PATCH_ASK, &ask::patch_ask(behind, 0)), &patch).0.unwrap();
+        assert_eq!(kind, PATCH, "at {behind}: the newest, which holds them all");
+        assert_eq!(ask::read_piece(&body), Ok((3, 7, &b"patch 3"[..])));
+    }
     for at_or_past in [3, 4] {
-        let (kind, body) = answer(&ask(PATCH_ASK, &at(at_or_past)), &patch).unwrap();
+        let (kind, body) = answered(&ask(PATCH_ASK, &ask::patch_ask(at_or_past, 0)), &patch).0.unwrap();
         assert_eq!((kind, body.len()), (NO_PATCH, 0), "at {at_or_past}");
     }
-    let (kind, _) = answer(&ask(PATCH_ASK, &at(0)), &Patch::default()).unwrap();
+    let (kind, _) = answered(&ask(PATCH_ASK, &ask::patch_ask(0, 0)), &Patch::default()).0.unwrap();
     assert_eq!(kind, NO_PATCH, "no patch since the first link");
 }
 
+/// A message longer than an answer comes a piece at a time, each fitting one answer and
+/// naming the generation, from the offset the run asks from; an offset past it is refused.
 #[test]
-fn a_patch_longer_than_an_answer_is_refused_by_size() {
-    let long: Arc<[u8]> = vec![0u8; blaze_inproc::ask::MOST_BODY + 1].into();
-    let patch = Patch { generation: 1, message: Some(long) };
-    let why = answer(&ask(PATCH_ASK, &at(0)), &patch).unwrap_err();
-    assert!(why.contains("more than an answer holds"), "{why}");
-    let fits: Arc<[u8]> = vec![1u8; blaze_inproc::ask::MOST_BODY].into();
-    let patch = Patch { generation: 1, message: Some(fits) };
-    assert_eq!(answer(&ask(PATCH_ASK, &at(0)), &patch).unwrap().0, PATCH);
+fn a_patch_longer_than_an_answer_comes_in_pieces() {
+    let message: Vec<u8> = (0..blaze_inproc::ask::MOST_BODY * 2).map(|it| it as u8).collect();
+    let patch = patch_of(5, &message);
+    let mut joined = Vec::new();
+    while joined.len() < message.len() {
+        let from = ask::patch_ask(4, joined.len() as u64);
+        let (kind, body) = answered(&ask(PATCH_ASK, &from), &patch).0.unwrap();
+        assert_eq!(kind, PATCH);
+        assert!(body.len() <= blaze_inproc::ask::MOST_BODY);
+        let (name, total, bytes) = ask::read_piece(&body).unwrap();
+        assert_eq!((name, total), (5, message.len() as u64));
+        joined.extend_from_slice(bytes);
+    }
+    assert_eq!(joined, message);
+    let past = ask::patch_ask(4, message.len() as u64 + 1);
+    let why = answered(&ask(PATCH_ASK, &past), &patch).0.unwrap_err();
+    assert!(why.contains("generation 5") && why.contains("from byte"), "{why}");
 }
 
 #[test]
-fn a_bad_patch_ask_and_other_kinds_are_refused_naming_them() {
+fn an_answer_is_taken_and_what_was_not_applied_kept_as_a_failure() {
     let patch = Patch::default();
-    assert!(answer(&ask(PATCH_ASK, &[1, 2, 3]), &patch).is_err(), "short");
-    assert!(answer(&ask(PATCH_ASK, &[0; 9]), &patch).is_err(), "trailing");
-    let lazy = answer(&ask(Kind(kinds::LAZY.start), &[]), &patch).unwrap_err();
+    let applied = Answer::Applied { generation: 2 }.encode();
+    let (kind, failures) = answered(&ask(ANSWER, &applied), &patch);
+    assert_eq!(kind.unwrap(), (ANSWERED, Vec::new()));
+    assert!(failures.is_empty());
+    let declined = Answer::Declined { generation: 2, why: "a layout changed".into() }.encode();
+    let (kind, failures) = answered(&ask(ANSWER, &declined), &patch);
+    assert_eq!(kind.unwrap().0, ANSWERED);
+    assert_eq!(failures, ["process 41 did not apply generation 2: a layout changed"]);
+    let back = Answer::RolledBack { generation: 3, to: 2, why: "panicked at a.rs:1:2: x".into() }.encode();
+    let (_, failures) = answered(&ask(ANSWER, &back), &patch);
+    assert_eq!(failures, ["process 41 rolled generation 3 back to 2: panicked at a.rs:1:2: x"]);
+    let (kind, failures) = answered(&ask(ANSWER, &[1, 2, 3]), &patch);
+    assert!(kind.unwrap_err().starts_with("an answer: "));
+    assert!(failures.is_empty());
+}
+
+#[test]
+fn a_tiers_ask_gets_none() {
+    let (kind, _) = answered(&ask(TIERS_ASK, &0u64.to_le_bytes()), &Patch::default());
+    assert_eq!(kind.unwrap(), (NO_TIERS, Vec::new()));
+}
+
+#[test]
+fn a_bad_ask_and_other_kinds_are_refused_naming_them() {
+    let patch = Patch::default();
+    assert!(answered(&ask(PATCH_ASK, &[1, 2, 3]), &patch).0.is_err(), "short");
+    assert!(answered(&ask(PATCH_ASK, &[0; 17]), &patch).0.is_err(), "trailing");
+    assert!(answered(&ask(TIERS_ASK, &[0; 9]), &patch).0.is_err(), "trailing");
+    let lazy = answered(&ask(Kind(kinds::LAZY.start), &[]), &patch).0.unwrap_err();
     assert!(lazy.contains("0x0100") && lazy.contains("lazy"), "{lazy}");
-    let premap = answer(&ask(Kind(kinds::PREMAP.start), &[]), &patch).unwrap_err();
+    let premap = answered(&ask(Kind(kinds::PREMAP.start), &[]), &patch).0.unwrap_err();
     assert!(premap.contains("0x0200"), "{premap}");
-    let other = answer(&ask(Kind(0x0303), &[]), &patch).unwrap_err();
-    assert!(other.contains("0x0303"), "{other}");
+    let other = answered(&ask(Kind(0x03ff), &[]), &patch).0.unwrap_err();
+    assert!(other.contains("0x03ff"), "{other}");
 }

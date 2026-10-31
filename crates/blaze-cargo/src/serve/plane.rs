@@ -299,6 +299,12 @@ static RAISED: Mutex<VecDeque<(Option<String>, String)>> = Mutex::new(VecDeque::
 /// once this many are newer.
 const RAISED_KEPT: usize = 64;
 
+/// Whether a task of `kind` is a part of a program's build: admitted by that program's own
+/// measure, and alone until it has one ([`Plane::push_program`]).
+const fn of_program(kind: TaskKind) -> bool {
+    matches!(kind, kinds::PROGRAM | kinds::PROGRAM_LINK)
+}
+
 /// Has every panic of the process recorded where it was raised, for the task that catches it
 /// ([`Panic::at`]), then printed as before. Once, as the daemon starts.
 pub fn record_panics() {
@@ -537,20 +543,21 @@ impl<W: Work, P: Predict> Plane<W, P> {
         fresh.nodes.push(node)
     }
 
-    /// The next node of `fresh`, the build of a program ([`kinds::PROGRAM`]: its codegen and
-    /// link), task `arg` of the batch's work. It is predicted and taught by `program`, the
-    /// program's key, which the plane never sees: the node has no key, so nothing single-flights
-    /// or memoizes it by that. With a budget, a program the predictor has not measured, or one
-    /// measured to hold all of it, is predicted the whole budget and runs alone, its peak then
-    /// what the whole process held beyond its start (docs/memory-budget.md).
+    /// The next node of `fresh`, a part of a program's build of `kind` ([`kinds::PROGRAM`], its
+    /// codegen, or [`kinds::PROGRAM_LINK`], its link), task `arg` of the batch's work. It is
+    /// predicted and taught by `program`, the key of that part of the program, which the plane
+    /// never sees: the node has no key, so nothing single-flights or memoizes it by that. With
+    /// a budget, a part the predictor has not measured, or one measured to hold all of it, is
+    /// predicted the whole budget and runs alone, its peak then what the whole process held
+    /// beyond its start (docs/memory-budget.md).
     ///
     /// # Panics
     ///
-    /// As [`Plane::push`], and when `node` has a key.
-    pub fn push_program(&self, fresh: &mut Fresh, mut node: NodeRef<'_>, arg: u32, program: Key) -> NodeId {
+    /// As [`Plane::push`], when `node` has a key, and when `kind` is no program's.
+    pub fn push_program(&self, fresh: &mut Fresh, mut node: NodeRef<'_>, kind: TaskKind, arg: u32, program: Key) -> NodeId {
         assert!((fresh.tasks.len() as u32) < fresh.count, "a batch of {} nodes given another", fresh.count);
         assert!(node.key.is_none(), "program build {} is given a key of the plane's", node.name);
-        let kind = kinds::PROGRAM;
+        assert!(of_program(kind), "{kind:?} is no part of a program's build");
         let Prediction { cost, peak } = self.predict.predict(kind, Some(program));
         node.memory = node.memory.max(peak);
         if let Some(cost) = cost {
@@ -569,7 +576,7 @@ impl<W: Work, P: Predict> Plane<W, P> {
     /// Whether the build of program `key` that starts now runs alone, never measured: its
     /// peak is then the whole process's ([`Plane::push_program`]).
     fn watched(&self, kind: TaskKind, key: Option<Key>) -> bool {
-        kind == kinds::PROGRAM && self.budget().is_some() && !self.predict.measured(kind, key)
+        of_program(kind) && self.budget().is_some() && !self.predict.measured(kind, key)
     }
 
     /// What a thread task of `kind` that ended teaches its key, from `peak`, what its thread
@@ -579,7 +586,7 @@ impl<W: Work, P: Predict> Plane<W, P> {
     fn learned(&mut self, id: NodeId, kind: TaskKind, key: Option<Key>, peak: u64) -> u64 {
         match self.alone.remove(&id) {
             Some(start) => peak.max(arena::high_water().saturating_sub(start)),
-            None if kind == kinds::PROGRAM => peak.max(self.predict.predict(kind, key).peak),
+            None if of_program(kind) => peak.max(self.predict.predict(kind, key).peak),
             None => peak,
         }
     }
@@ -928,7 +935,7 @@ mod tests {
         let work = Arc::new(Each(|_| -> Option<Did<u32>> {
             let raised = std::thread::Builder::new()
                 .name("plane-test-raiser".to_owned())
-                .spawn(|| -> Option<Did<u32>> { panic!("plane-test: the task's panic") })
+                .spawn(|| -> u32 { panic!("plane-test: the task's panic") })
                 .expect("a thread")
                 .join()
                 .expect_err("the thread panics");
@@ -1074,8 +1081,9 @@ mod tests {
 
         let request = plane.open(Duration::ZERO, true, false);
         let mut fresh = plane.fresh(2, 16, 0);
-        let first = plane.push_program(&mut fresh, node("app"), 0, program);
-        let again = plane.push_program(&mut fresh, node("app again"), 1, program);
+        assert!(plane.watched(kinds::PROGRAM_LINK, Some(program)), "a program's link runs alone as its codegen does");
+        let first = plane.push_program(&mut fresh, node("app"), kinds::PROGRAM, 0, program);
+        let again = plane.push_program(&mut fresh, node("app again"), kinds::PROGRAM, 1, program);
         plane.add(Duration::ZERO, request, fresh, Some(Each(built)), false).unwrap();
         assert_eq!(settle(&mut plane, &[first, again]), [(first, true), (again, true)]);
         assert!(plane.alone.is_empty(), "every watch ends with its task");

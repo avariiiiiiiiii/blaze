@@ -517,10 +517,10 @@ impl Gen {
                     package: g.text(),
                 }),
                 compiled: self.wide(),
-                critical_path_us: self.wide(),
                 steps_us: self.many(depth, |g| {
                     (NodeKind::ALL[(g.next() % NodeKind::ALL.len() as u64) as usize], g.wide())
                 }),
+                critical_path_us: self.wide(),
             }),
             8 => Response::TestResult(TestResult {
                 name: self.text(),

@@ -641,7 +641,7 @@ mod run {
         inputs
             .iter()
             .zip(set)
-            .map(|(input, bytes)| DataValue::read_from_slice_le(&input.xform.apply(input.ty, *bytes), ir_ty(input.ty)))
+            .map(|(input, bytes)| DataValue::read_from_slice_le(&input.xform.apply(input.ty, *bytes), ir_ty(input.xform.param(input.ty))))
             .collect()
     }
 

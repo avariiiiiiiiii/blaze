@@ -232,6 +232,9 @@ fn plan_units<F: Files>(input: &PlanInput<'_, F>) -> Result<PlanOutput, LoadErro
         kind_hashes.push(hash::kind_fingerprint_hash(Some(target))?);
         layouts.push(Layout::new(input.target_dir, input.build_dir, Some(target), input.profile_dir));
     }
+    if let Intent::Doc { open } = input.intent {
+        flags::doc_unhonored(config, input.host, input.target, &kinds, open)?;
+    }
     let mut linkers = Vec::with_capacity(kinds.len());
     let mut runners = Vec::with_capacity(kinds.len());
     for (at, info) in kinds.iter().enumerate() {
@@ -372,7 +375,7 @@ fn plan_units<F: Files>(input: &PlanInput<'_, F>) -> Result<PlanOutput, LoadErro
     let primary: FxHashSet<&str> = input.roots.iter().map(|&at| units[at].pkg_id.as_str()).collect();
     let mut per_package: FxHashMap<&str, PackageFlags> =
         FxHashMap::with_capacity_and_hasher(input.packages.len(), Default::default());
-    let artifact_dir = !matches!(input.intent, Intent::Check { .. } | Intent::Doc);
+    let artifact_dir = !matches!(input.intent, Intent::Check { .. } | Intent::Doc { .. });
 
     let mut plans = Vec::with_capacity(units.len());
     for (at, it) in facts.iter().enumerate() {

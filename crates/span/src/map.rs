@@ -326,6 +326,39 @@ impl<A: Allocator + Clone> SpanMap<A> {
         }
     }
 
+    /// The outermost fragments inside `range`, in text order, each with its span (of fragments
+    /// with one range, the innermost's, as [`Self::fragment_span`]). A fragment that starts in
+    /// `range` and ends past it is not one, nor is any fragment inside another of them. A
+    /// binary search a fragment taken, then a scan of the fragments starting where it does.
+    pub fn outermost_fragments_in(
+        &self,
+        range: TextRange,
+    ) -> impl Iterator<Item = (TextRange, Span)> + '_ {
+        let mut from = range.start();
+        std::iter::from_fn(move || {
+            let mut at = self.fragment_spans.partition_point(|&(it, _)| it.start() < from);
+            while let Some(&(first, _)) = self.fragment_spans.get(at) {
+                if first.start() >= range.end() {
+                    return None;
+                }
+                let mut best: Option<(TextRange, Span)> = None;
+                while let Some(&(it, span)) = self.fragment_spans.get(at)
+                    && it.start() == first.start()
+                {
+                    if it.end() <= range.end() && best.is_none_or(|(b, _)| it.end() > b.end()) {
+                        best = Some((it, span));
+                    }
+                    at += 1;
+                }
+                if let Some((it, span)) = best {
+                    from = it.end().max(it.start() + TextSize::new(1));
+                    return Some((it, span));
+                }
+            }
+            None
+        })
+    }
+
     /// How many macro fragments start at `offset`.
     pub fn fragments_starting_at(&self, offset: TextSize) -> usize {
         count_of(&self.fragment_starts, offset)
@@ -1272,6 +1305,32 @@ mod tests {
         other.finish();
         assert!(map != other, "the spans are part of the map");
         assert_eq!(SpanMap::empty().fragment_span(range(0, 0)), None);
+    }
+
+    /// The outermost fragments inside a range, in order: one inside another is not, nor is one
+    /// running past the range's end; of two with one range, the innermost's span.
+    #[cfg(feature = "query")]
+    #[test]
+    fn the_outermost_fragments_in_a_range() {
+        let (mut map, _) = spans(&mut SplitMix64::new(9), 30);
+        map.push_fragment(range(4, 6), group(1));
+        map.push_fragment(range(3, 8), group(2));
+        map.push_fragment(range(3, 8), group(3));
+        map.push_fragment(range(10, 14), group(4));
+        map.push_fragment(range(16, 18), group(6));
+        map.push_fragment(range(15, 20), group(5));
+        map.finish();
+        let outermost = |r| map.outermost_fragments_in(r).collect::<Vec<_>>();
+        assert_eq!(outermost(range(0, 30)), [
+            (range(3, 8), group(2)),
+            (range(10, 14), group(4)),
+            (range(15, 20), group(5)),
+        ]);
+        assert_eq!(outermost(range(0, 15)), [(range(3, 8), group(2)), (range(10, 14), group(4))]);
+        assert_eq!(outermost(range(4, 13)), [(range(4, 6), group(1))]);
+        assert_eq!(outermost(range(16, 30)), [(range(16, 18), group(6))]);
+        assert!(outermost(range(21, 30)).is_empty());
+        assert_eq!(SpanMap::empty().outermost_fragments_in(range(0, 10)).count(), 0);
     }
 
     /// What a merge keeps of the fragments' spans, by the rules of its fragment starts and ends

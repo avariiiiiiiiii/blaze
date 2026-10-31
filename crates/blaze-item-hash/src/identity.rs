@@ -8,7 +8,8 @@
 //! - its owner (3.2): the item it is the body of as "self", by signature and attributes, and
 //!   the impl or trait that item is in by key and signature;
 //! - its HIR (3.3) as [`hir_def::item_hash::portable_body`] writes it, anonymous, with no
-//!   span, and what a location macro expanded to as a slot (`slots`);
+//!   span, and what a location macro expanded to as a slot (`slots`), and whether lowering it
+//!   found an error;
 //! - what each id the HIR names is (3.4, `entries`);
 //! - what each path resolves to where it is written, and the traits in scope (3.5, `names`);
 //! - the chain of modules it is in, by key (3.6): privacy and `super` paths.
@@ -35,7 +36,7 @@ use smallvec::SmallVec;
 
 pub use inputs::{FrontEnd, crate_inputs, set_build};
 
-pub const IDENTITY_DOMAIN: &str = "blaze v2 item identity 3";
+pub const IDENTITY_DOMAIN: &str = "blaze v2 item identity 4";
 
 /// A body that has no identity, and why: its inference, MIR and borrow check are computed
 /// and not filed.
@@ -80,7 +81,10 @@ pub fn identity_parts(db: &Db, def: DefWithBodyId) -> Result<[(&'static str, Con
     let names = names::names_of(db, def).as_ref().map_err(|it| *it)?;
     let portable =
         portable_body(Body::of(db, def), &names.blank, &slots::of(db, def), &lifetimes(db, def));
-    let hir = part("hir").part(portable.bytes()).finish();
+    // A lowering error can leave the HIR as it would be without it (an undeclared label, a
+    // literal too large), and the borrow check skips a body with one.
+    let lowering_errors = Body::has_lowering_errors(db, def);
+    let hir = part("hir").part(portable.bytes()).part(&[u8::from(lowering_errors)]).finish();
     let entries = scratch::with_bytes(|buffer| -> Result<ContentId, &'static str> {
         entries::write(db, home, item::own_item(def), &portable, buffer)?;
         Ok(part("entries").part(buffer).finish())
@@ -205,6 +209,8 @@ pub fn covered_queries() -> &'static [(&'static str, Key)] {
     &[
         // 3.3: the HIR is hashed as written; its source map is not (a read of it is refused).
         ("Body::of", OwnBody),
+        // 3.3: whether lowering found an error, which the HIR part hashes beside the HIR.
+        ("Body::has_lowering_errors", OwnBody),
         // 3.3: the scopes are a function of the HIR.
         ("ExprScopes::body_expr_scopes", OwnBody),
         // 3.3: the closures and what they capture are of the HIR's expressions and bindings.
@@ -254,6 +260,7 @@ pub fn covered_queries() -> &'static [(&'static str, Key)] {
         ("Modules", Any),
         ("Modules::module", Any),
         ("Modules::name", Any),
+        ("CrateResolution::module", Any),
         ("ModuleIdLt", Any),
         ("BlockIdLt", Any),
     ]

@@ -89,7 +89,7 @@ fn e0597() {
 
 /// `check`'s tests' bodies with no error.
 const CHECK_CLEAN: &str = r#"
-//- minicore: sized, copy, clone, fn, index, slice
+//- minicore: sized, copy, clone, fn, index, slice, add
 struct Point { x: u32, y: u32 }
 struct Stack { items: [u32; 4], len: usize }
 enum Shape { Circle(Point), Square(u32), Empty }

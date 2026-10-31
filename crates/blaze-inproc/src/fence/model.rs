@@ -54,6 +54,8 @@ struct Config {
     /// Quiescent points each thread reaches.
     quiesces: u8,
     mutation: Mutation,
+    /// Explore one state per class of [`canonical`]; off, every state as it steps.
+    reduce: bool,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
@@ -565,6 +567,9 @@ fn daemon_steps(state: &State, config: &Config, out: &mut Vec<State>) -> Result<
 ///   exactly when it does in the other, and the range is freed from one exactly when from the
 ///   other. Sorted by everything of a thread but its ID; ties only cost reduction.
 fn canonical(mut state: State, config: &Config) -> State {
+    if !config.reduce {
+        return state;
+    }
     for thread in &mut state.threads {
         if thread.pc == Pc::Dead {
             debug_assert!(!thread.old && !thread.in_range, "a thread died in the range");
@@ -635,8 +640,9 @@ impl Fx {
 }
 
 impl std::hash::Hasher for Fx {
+    /// Rotated so the table's low bits come from every word, not from the words' low bits.
     fn finish(&self) -> u64 {
-        self.0
+        self.0.rotate_left(26)
     }
 
     fn write(&mut self, bytes: &[u8]) {
@@ -666,15 +672,272 @@ impl std::hash::Hasher for Fx {
     }
 }
 
+/// A [`State`] in 160 bits, for the explorer's table, which holds every state twice: a
+/// `State` spends a byte or more on each field.
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct Packed([u32; 5]);
+
+impl std::hash::Hash for Packed {
+    fn hash<H: std::hash::Hasher>(&self, hasher: &mut H) {
+        let [a, b, c, d, e] = self.0;
+        hasher.write_u64(u64::from(a) | u64::from(b) << 32);
+        hasher.write_u64(u64::from(c) | u64::from(d) << 32);
+        hasher.write_u32(e);
+    }
+}
+
+/// The fields of a [`Packed`], each in the bits it is given.
+#[derive(Default)]
+struct Bits {
+    words: [u64; 3],
+    at: u32,
+}
+
+impl Bits {
+    fn put(&mut self, value: u8, bits: u32) {
+        let value = u64::from(value);
+        assert!(value >> bits == 0, "a model field outgrew its {bits} bits: {value}");
+        let (word, offset) = ((self.at / 64) as usize, self.at % 64);
+        self.words[word] |= value << offset;
+        if offset + bits > 64 {
+            self.words[word + 1] |= value >> (64 - offset);
+        }
+        self.at += bits;
+    }
+
+    fn take(&mut self, bits: u32) -> u8 {
+        let (word, offset) = ((self.at / 64) as usize, self.at % 64);
+        let mut value = self.words[word] >> offset;
+        if offset + bits > 64 {
+            value |= self.words[word + 1] << (64 - offset);
+        }
+        self.at += bits;
+        (value & ((1 << bits) - 1)) as u8
+    }
+
+    /// A slot index or `NONE` in two bits.
+    fn put_index(&mut self, value: u8) {
+        assert!(value == NONE || value < 3, "index {value} past the model's slots");
+        self.put(if value == NONE { 3 } else { value }, 2);
+    }
+
+    fn take_index(&mut self) -> u8 {
+        match self.take(2) {
+            3 => NONE,
+            it => it,
+        }
+    }
+}
+
+const _: () = assert!(MOST_SLOTS == 3 && MOST_THREADS == 3, "the codes below list three slots and threads");
+
+/// Every [`Pc`], at its code.
+const PCS: [Pc; 36] = [
+    Pc::Unborn,
+    Pc::Top,
+    Pc::Called,
+    Pc::Inside,
+    Pc::QEpoch,
+    Pc::QHolds,
+    Pc::QScan,
+    Pc::QCheck,
+    Pc::QReport,
+    Pc::QBegin,
+    Pc::XRelease,
+    Pc::XGone,
+    Pc::Dead,
+    Pc::QAdopt(0),
+    Pc::QAdopt(1),
+    Pc::QAdopt(2),
+    Pc::QAdopt(3),
+    Pc::QFree(0),
+    Pc::QFree(1),
+    Pc::QFree(2),
+    Pc::QFree(3),
+    Pc::QAdoptSeen(0),
+    Pc::QAdoptSeen(1),
+    Pc::QAdoptSeen(2),
+    Pc::QAdoptOnline(0),
+    Pc::QAdoptOnline(1),
+    Pc::QAdoptOnline(2),
+    Pc::QTid(0),
+    Pc::QTid(1),
+    Pc::QTid(2),
+    Pc::QSeen(0),
+    Pc::QSeen(1),
+    Pc::QSeen(2),
+    Pc::QOnline(0),
+    Pc::QOnline(1),
+    Pc::QOnline(2),
+];
+
+fn pc_code(pc: Pc) -> u8 {
+    match pc {
+        Pc::Unborn => 0,
+        Pc::Top => 1,
+        Pc::Called => 2,
+        Pc::Inside => 3,
+        Pc::QEpoch => 4,
+        Pc::QHolds => 5,
+        Pc::QScan => 6,
+        Pc::QCheck => 7,
+        Pc::QReport => 8,
+        Pc::QBegin => 9,
+        Pc::XRelease => 10,
+        Pc::XGone => 11,
+        Pc::Dead => 12,
+        Pc::QAdopt(k) if k <= 3 => 13 + k,
+        Pc::QFree(k) if k <= 3 => 17 + k,
+        Pc::QAdoptSeen(k) if k < 3 => 21 + k,
+        Pc::QAdoptOnline(k) if k < 3 => 24 + k,
+        Pc::QTid(k) if k < 3 => 27 + k,
+        Pc::QSeen(k) if k < 3 => 30 + k,
+        Pc::QOnline(k) if k < 3 => 33 + k,
+        _ => panic!("{pc:?} is past the model's slots"),
+    }
+}
+
+/// Every [`Dpc`], at its code.
+const DPCS: [Dpc; 26] = [
+    Dpc::Unlink,
+    Dpc::Post,
+    Dpc::Start,
+    Dpc::Births,
+    Dpc::ListBegin,
+    Dpc::ListEnd,
+    Dpc::Check,
+    Dpc::Count,
+    Dpc::Decide,
+    Dpc::Done,
+    Dpc::Slot(0, Part::State),
+    Dpc::Slot(0, Part::Tid),
+    Dpc::Slot(0, Part::Seen),
+    Dpc::Slot(1, Part::State),
+    Dpc::Slot(1, Part::Tid),
+    Dpc::Slot(1, Part::Seen),
+    Dpc::Slot(2, Part::State),
+    Dpc::Slot(2, Part::Tid),
+    Dpc::Slot(2, Part::Seen),
+    Dpc::Slot(3, Part::State),
+    Dpc::Slot(3, Part::Tid),
+    Dpc::Slot(3, Part::Seen),
+    Dpc::Reap(0),
+    Dpc::Reap(1),
+    Dpc::Reap(2),
+    Dpc::Reap(3),
+];
+
+fn dpc_code(pc: Dpc) -> u8 {
+    match pc {
+        Dpc::Unlink => 0,
+        Dpc::Post => 1,
+        Dpc::Start => 2,
+        Dpc::Births => 3,
+        Dpc::ListBegin => 4,
+        Dpc::ListEnd => 5,
+        Dpc::Check => 6,
+        Dpc::Count => 7,
+        Dpc::Decide => 8,
+        Dpc::Done => 9,
+        Dpc::Slot(k, part) if k <= 3 => 10 + 3 * k + part as u8,
+        Dpc::Reap(k) if k <= 3 => 22 + k,
+        _ => panic!("{pc:?} is past the model's slots"),
+    }
+}
+
+const SLOT_STATES: [SlotState; 3] = [SlotState::Free, SlotState::Claiming, SlotState::Online];
+
+fn pack(state: &State) -> Packed {
+    let mut bits = Bits::default();
+    bits.put(u8::from(state.new), 1);
+    bits.put(state.epoch, 2);
+    bits.put(state.grace, 2);
+    bits.put(state.births, 4);
+    for slot in &state.slots {
+        bits.put(slot.state as u8, 2);
+        bits.put(slot.tid, 2);
+        bits.put(slot.seen, 2);
+    }
+    bits.put(state.alive, 4);
+    bits.put(u8::from(state.listing), 1);
+    bits.put(state.during, 4);
+    bits.put(state.throughout, 4);
+    for thread in &state.threads {
+        bits.put(pc_code(thread.pc), 6);
+        bits.put(thread.tid, 2);
+        bits.put(u8::from(thread.inside), 1);
+        bits.put(u8::from(thread.old), 1);
+        bits.put(u8::from(thread.in_range), 1);
+        bits.put(thread.epoch, 2);
+        bits.put(thread.seen, 2);
+        bits.put_index(thread.slot);
+        bits.put(thread.reported, 2);
+        bits.put(thread.calls, 2);
+        bits.put(thread.quiesces, 2);
+    }
+    let daemon = &state.daemon;
+    bits.put(dpc_code(daemon.pc), 5);
+    bits.put(daemon.births, 4);
+    bits.put(daemon.list, 4);
+    bits.put(daemon.counted, 2);
+    bits.put_index(daemon.oldest);
+    bits.put(daemon.dead, 3);
+    bits.put(u8::from(daemon.unlinked), 1);
+    assert!(bits.at <= 160, "a state is {} bits", bits.at);
+    let [a, b, c] = bits.words;
+    Packed([a as u32, (a >> 32) as u32, b as u32, (b >> 32) as u32, c as u32])
+}
+
+fn unpack(packed: Packed) -> State {
+    let [a, b, c, d, e] = packed.0.map(u64::from);
+    let mut bits = Bits { words: [a | b << 32, c | d << 32, e], at: 0 };
+    let new = bits.take(1) != 0;
+    let epoch = bits.take(2);
+    let grace = bits.take(2);
+    let births = bits.take(4);
+    let slots = [(); MOST_SLOTS].map(|()| Slot {
+        state: SLOT_STATES[bits.take(2) as usize],
+        tid: bits.take(2),
+        seen: bits.take(2),
+    });
+    let alive = bits.take(4);
+    let listing = bits.take(1) != 0;
+    let during = bits.take(4);
+    let throughout = bits.take(4);
+    let threads = [(); MOST_THREADS].map(|()| Thread {
+        pc: PCS[bits.take(6) as usize],
+        tid: bits.take(2),
+        inside: bits.take(1) != 0,
+        old: bits.take(1) != 0,
+        in_range: bits.take(1) != 0,
+        epoch: bits.take(2),
+        seen: bits.take(2),
+        slot: bits.take_index(),
+        reported: bits.take(2),
+        calls: bits.take(2),
+        quiesces: bits.take(2),
+    });
+    let daemon = Daemon {
+        pc: DPCS[bits.take(5) as usize],
+        births: bits.take(4),
+        list: bits.take(4),
+        counted: bits.take(2),
+        oldest: bits.take_index(),
+        dead: bits.take(3),
+        unlinked: bits.take(1) != 0,
+    };
+    State { new, epoch, grace, births, slots, alive, listing, during, throughout, threads, daemon }
+}
+
 struct Explored {
     states: usize,
     /// Done states with a thread still alive.
     freed_while_running: usize,
 }
 
-/// The most states one exploration holds (a few GiB with its edges): past it the config is too
-/// big for a test, an error rather than a run of hours.
-const MOST_STATES: usize = 1 << 24;
+/// The most states one exploration holds (about 120 bytes each with the table and the edges):
+/// past it the config is too big for a test, an error rather than a run of hours.
+const MOST_STATES: usize = 1 << 25;
 
 /// Explores every reachable state; `Err` is the trace to a violation.
 fn explore(config: Config) -> Result<Explored, String> {
@@ -682,25 +945,27 @@ fn explore(config: Config) -> Result<Explored, String> {
 }
 
 fn explore_within(config: Config, most: usize) -> Result<Explored, String> {
-    let initial = canonical(State::initial(&config), &config);
-    let mut index: HashMap<State, u32, BuildHasherDefault<Fx>> = HashMap::default();
-    let mut states: Vec<State> = vec![initial];
+    let initial = pack(&canonical(State::initial(&config), &config));
+    let mut index: HashMap<Packed, u32, BuildHasherDefault<Fx>> = HashMap::default();
+    let mut states: Vec<Packed> = vec![initial];
     let mut parent: Vec<u32> = vec![u32::MAX];
-    let mut edges: Vec<(u32, u32)> = Vec::new();
+    // The edges: each stepped state, with the end of its successors in `targets`.
+    let mut stepped: Vec<(u32, u32)> = Vec::new();
+    let mut targets: Vec<u32> = Vec::new();
     index.insert(initial, 0);
     let mut stack = vec![0u32];
     let mut next = Vec::new();
-    let trace = |states: &[State], parent: &[u32], mut at: u32| {
+    let trace = |states: &[Packed], parent: &[u32], mut at: u32| {
         let mut steps = Vec::new();
         while at != u32::MAX {
-            steps.push(format!("{:?}", states[at as usize]));
+            steps.push(format!("{:?}", unpack(states[at as usize])));
             at = parent[at as usize];
         }
         steps.reverse();
         steps.join("\n")
     };
     while let Some(at) = stack.pop() {
-        let state = states[at as usize];
+        let state = unpack(states[at as usize]);
         // Past the free nothing is checked: the daemon steps no more, and liveness asks only
         // that a freed state be reached.
         if state.daemon.pc == Dpc::Done {
@@ -718,15 +983,21 @@ fn explore_within(config: Config, most: usize) -> Result<Explored, String> {
         }
         for successor in next.drain(..) {
             let successor = canonical(successor, &config);
-            assert!(successor.threads.iter().all(|it| it.pc != Pc::Called), "a state kept a thread at Called");
-            let to = *index.entry(successor).or_insert_with(|| {
-                states.push(successor);
+            assert!(
+                !config.reduce || successor.threads.iter().all(|it| it.pc != Pc::Called),
+                "a state kept a thread at Called"
+            );
+            let packed = pack(&successor);
+            let to = *index.entry(packed).or_insert_with(|| {
+                assert_eq!(unpack(packed), successor, "a state did not survive packing");
+                states.push(packed);
                 parent.push(at);
                 stack.push((states.len() - 1) as u32);
                 (states.len() - 1) as u32
             });
-            edges.push((at, to));
+            targets.push(to);
         }
+        stepped.push((at, u32::try_from(targets.len()).expect("more edges than a u32 counts")));
         if states.len() > most {
             return Err(format!(
                 "{config:?}: past {most} states ({} not yet stepped), too many to explore in a test",
@@ -737,11 +1008,17 @@ fn explore_within(config: Config, most: usize) -> Result<Explored, String> {
 
     // Liveness: every state reaches one where the range is freed (backwards from those).
     let count = states.len();
-    let sources = blaze_radix::Csr::build(count, edges.iter().map(|&(source, to)| (to, source)));
+    let edges = (0..stepped.len()).flat_map(|row| {
+        let start = if row == 0 { 0 } else { stepped[row - 1].1 as usize };
+        let (source, end) = stepped[row];
+        targets[start..end as usize].iter().map(move |&to| (to, source))
+    });
+    let sources = blaze_radix::Csr::build(count, edges);
+    drop((stepped, targets));
     let mut reaches = vec![false; count];
     let mut work: Vec<u32> = Vec::new();
-    for (at, state) in states.iter().enumerate() {
-        if state.daemon.pc == Dpc::Done {
+    for (at, &state) in states.iter().enumerate() {
+        if unpack(state).daemon.pc == Dpc::Done {
             reaches[at] = true;
             work.push(at as u32);
         }
@@ -762,6 +1039,7 @@ fn explore_within(config: Config, most: usize) -> Result<Explored, String> {
     }
     let freed_while_running = states
         .iter()
+        .map(|&it| unpack(it))
         .filter(|it| it.daemon.pc == Dpc::Done && it.threads.iter().any(|t| !matches!(t.pc, Pc::Unborn | Pc::Dead)))
         .count();
     Ok(Explored { states: count, freed_while_running })
@@ -776,6 +1054,7 @@ const BASE: Config = Config {
     calls: 2,
     quiesces: 2,
     mutation: Mutation::None,
+    reduce: true,
 };
 
 fn check(config: Config) {
@@ -792,6 +1071,29 @@ fn two_threads() {
 #[test]
 fn a_thread_starts_while_the_daemon_looks() {
     check(Config { threads: 1, spawn: true, slots: 3, calls: 1, quiesces: 1, ..BASE });
+}
+
+#[test]
+fn every_code_is_its_place_in_the_table() {
+    for (code, &pc) in PCS.iter().enumerate() {
+        assert_eq!(usize::from(pc_code(pc)), code, "{pc:?}");
+    }
+    for (code, &pc) in DPCS.iter().enumerate() {
+        assert_eq!(usize::from(dpc_code(pc)), code, "{pc:?}");
+    }
+    for (code, &state) in SLOT_STATES.iter().enumerate() {
+        assert_eq!(state as usize, code, "{state:?}");
+    }
+}
+
+/// Each reduction fires: the reduced graph is smaller, and it gives the same verdicts.
+#[test]
+fn the_reductions_shrink_two_threads() {
+    let whole = explore(Config { reduce: false, ..BASE }).unwrap_or_else(|it| panic!("{it}"));
+    let reduced = explore(BASE).unwrap_or_else(|it| panic!("{it}"));
+    println!("two_threads: {} states whole, {} reduced", whole.states, reduced.states);
+    assert!(reduced.states < whole.states, "{} reduced, {} whole", reduced.states, whole.states);
+    assert!(reduced.freed_while_running > 0);
 }
 
 #[test]

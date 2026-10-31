@@ -16,7 +16,7 @@ use hir_expand::{
     span_map::SpanMap,
 };
 use la_arena::Arena;
-use span::{AstIdMap, FileAstId, SyntaxContext};
+use span::{AstIdMap, FileAstId, RealSpanMap, SyntaxContext};
 use syntax::{
     ast as tag,
     view::{self as ast, AstNode, HasModuleItem, HasName, HasVisibility, StructKind},
@@ -399,6 +399,27 @@ impl<'db> Ctx<'db> {
             file,
             cfg_options: OnceCell::new(),
             span_map: OnceCell::new(),
+            krate,
+        }
+    }
+
+    /// [`Ctx::new`] with the maps of a part of `file` parsed alone (a body's
+    /// [`crate::expr_store::BodySyntax`]), whose ids and spans are the file's: what is lowered
+    /// reads that part and not the whole file.
+    pub(super) fn with_maps(
+        db: &'db Db,
+        file: HirFileId,
+        krate: Crate,
+        ids: &'db AstIdMap,
+        span_map: &'db RealSpanMap,
+    ) -> Self {
+        Self {
+            db,
+            tree: SCRATCH.take(),
+            ids,
+            file,
+            cfg_options: OnceCell::new(),
+            span_map: OnceCell::from(SpanMap::RealSpanMap(span_map)),
             krate,
         }
     }

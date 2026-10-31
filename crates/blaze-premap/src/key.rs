@@ -340,7 +340,7 @@ fn output_into(hasher: &mut Hasher, output: &Output) {
     // Where running programs take live patches: an image is never patched, so a live output
     // is refused before it is keyed ([`crate::prelink`]); hashed all the same.
     match live {
-        Some(live) => hasher.update(&[1]).part(live.dir.as_str().as_bytes()).part(live.path.as_bytes()),
+        Some(_) => hasher.update(&[1]),
         None => hasher.update(&[0]),
     };
     hasher.update(&tags.to_le_bytes());

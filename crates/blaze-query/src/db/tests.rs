@@ -17,8 +17,8 @@ use std::{
 use hegel::{TestCase, generators as gs};
 
 use super::{
-    AsId, Cancelled, Cycle, Database, Durability, Event, FromIdIn, Hook, Id, ReadKind, Reads,
-    Setter, Storage, attach, capture_reads,
+    AsId, Cancelled, Cycle, Database, DatabaseKeyIndex, Durability, Event, FromIdIn, Hook, Id,
+    ReadKind, Reads, Setter, Storage, attach, capture_reads,
     input::field_node,
     owner_is,
     plumbing::{
@@ -186,6 +186,7 @@ impl Input for Cells {
     const NAME: &'static str = "Cell";
     const FILE: &'static str = file!();
     const FIELDS: u32 = 2;
+    const FIELD_NAMES: &'static [&'static str] = &["a", "b"];
     const SINGLETON: bool = false;
 
     fn ingredient() -> &'static Ingredient {
@@ -738,6 +739,7 @@ impl Input for Config {
     const NAME: &'static str = "Config";
     const FILE: &'static str = file!();
     const FIELDS: u32 = 1;
+    const FIELD_NAMES: &'static [&'static str] = &["value"];
     const SINGLETON: bool = true;
 
     fn ingredient() -> &'static Ingredient {
@@ -869,6 +871,19 @@ fn owners_ids_and_argument_names_are_read_from_the_pages() {
         "probe::interned_arguments"
     );
     assert!(db.storage().ingredient_file(Cells::ingredient().index()).ends_with("tests.rs"));
+    let cells = Cells::ingredient().index();
+    assert_eq!(db.storage().field_name(cells, 1), "b");
+    let at = DatabaseKeyIndex::new(cells, cell.0);
+    assert_eq!(db.storage().read_name(at, ReadKind::InputField(0)), "a");
+    assert_eq!(db.storage().read_name(at, ReadKind::Function), "Cell");
+    let items = Items::ingredient().index();
+    assert_eq!(
+        db.storage().read_name(DatabaseKeyIndex::new(items, cell.0), ReadKind::TrackedField(0)),
+        "count"
+    );
+    let payload = catch_unwind(AssertUnwindSafe(|| db.storage().field_name(cells, 2)))
+        .expect_err("`Cell` has two fields");
+    assert!(message(&*payload).contains("not a field 2"));
     let payload = catch_unwind(AssertUnwindSafe(|| input_fields::<Cells>(db.storage(), pair).0))
         .expect_err("a pair read as a cell");
     assert!(message(&*payload).contains("read as Cell"));
@@ -884,6 +899,7 @@ impl Tracked for Items {
     const NAME: &'static str = "Item";
     const FILE: &'static str = file!();
     const TRACKED_FIELDS: u32 = 1;
+    const TRACKED_FIELD_NAMES: &'static [&'static str] = &["count"];
 
     fn ingredient() -> &'static Ingredient {
         ingredient!(tracked::<Items>)

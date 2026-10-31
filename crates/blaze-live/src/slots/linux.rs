@@ -1,57 +1,40 @@
-//! Writing a running ELF image on Linux (x86-64 and AArch64).
+//! Writing a running ELF image's data on Linux (x86-64 and AArch64).
 //!
-//! At `start` the patch code region is moved onto a memory file mapped twice: read and run
-//! where the image has it, and read and write at an address of its own. A patch's code is
-//! written through the second, straight from its message, with no system call and no change
-//! of protection, so no TLB shootdown and no moment a page of the region can't run: what JITs
-//! that keep code W^X by mapping it twice do. The image's other mappings and their
-//! protections are read from /proc/self/maps once, at start. Read-only pages are written the
-//! same way: the first write into one moves a window of its mapping ([`WINDOW`], within the
-//! mapping) onto a memory file mapped twice, with the protection it had ([`Aliases`]), so
-//! that write and every later one into the window are stores through the second mapping,
-//! with no system call and no TLB shootdown. The table cell's page, when read-only, gets its
-//! window at start. Data is written with atomic stores ([`Writes::store`]), since other
-//! threads may read it meanwhile.
+//! The patch code region is the daemon's code memory (blaze-inproc), mapped by the start hook
+//! before `main`: the commit writes the code there, and nothing here maps over the region or
+//! writes it. The image's mappings and their protections are read from /proc/self/maps once,
+//! at start. Read-only pages are written through a second mapping: the first write into one
+//! moves a window of its mapping ([`WINDOW`], within the mapping) onto a memory file mapped
+//! twice, with the protection it had ([`Aliases`]), so that write and every later one into the
+//! window are stores through the second mapping, with no system call and no TLB shootdown:
+//! what JITs that keep code W^X by mapping it twice do. The table cell's page, when read-only,
+//! gets its window at start. Data is written with atomic stores ([`Writes::store`]), since
+//! other threads may read it meanwhile.
 
-#![allow(unsafe_code, reason = "the jump table's executable memory, protections and unwind registration")]
+#![allow(
+    unsafe_code,
+    reason = "the image's protections, its read-only pages' windows and unwind registration"
+)]
 
 use std::{
-    ffi::{CString, c_char, c_void},
+    ffi::{c_char, c_void},
     ops::Range,
-    os::unix::ffi::OsStrExt,
-    path::Path,
-    sync::{
-        Arc,
-        atomic::{AtomicU64, Ordering},
-    },
+    sync::atomic::{AtomicU64, Ordering},
 };
 
 pub(super) use super::unix::{GRAIN, Reserved, backtrace, descriptor, in_image_of};
 use super::{
-    Events, Unwatched,
     switch::{Dwarf, Layout, Memory, Span, Writes},
     unix::{__register_frame, Segments, load_cell, loaders, mmap, munmap},
 };
-use crate::patch::MESSAGE_PREFIX;
-
-#[repr(C)]
-#[allow(dead_code)]
-struct PollFd {
-    fd: i32,
-    events: i16,
-    revents: i16,
-}
 
 unsafe extern "C" {
     fn mremap(old: *mut c_void, old_len: usize, new_len: usize, flags: i32, ...) -> *mut c_void;
+    #[cfg(test)]
     fn sysconf(name: i32) -> i64;
     fn memfd_create(name: *const c_char, flags: u32) -> i32;
     fn ftruncate(fd: i32, len: i64) -> i32;
     fn close(fd: i32) -> i32;
-    fn inotify_init1(flags: i32) -> i32;
-    fn inotify_add_watch(fd: i32, path: *const c_char, mask: u32) -> i32;
-    fn poll(fds: *mut PollFd, count: u64, timeout: i32) -> i32;
-    fn read(fd: i32, buffer: *mut c_void, len: usize) -> isize;
 }
 
 const PROT_READ: i32 = 1;
@@ -61,20 +44,9 @@ const MAP_SHARED: i32 = 1;
 const MAP_FAILED: *mut c_void = !0usize as *mut c_void;
 const MREMAP_MAYMOVE: i32 = 1;
 const MREMAP_FIXED: i32 = 2;
+#[cfg(test)]
 const SC_PAGESIZE: i32 = 30;
 const MFD_CLOEXEC: u32 = 1;
-const IN_NONBLOCK: i32 = 0o4000;
-const IN_CLOEXEC: i32 = 0o2000000;
-const IN_CLOSE_WRITE: u32 = 0x8;
-const IN_MOVED_TO: u32 = 0x80;
-const IN_Q_OVERFLOW: u32 = 0x4000;
-const IN_IGNORED: u32 = 0x8000;
-const WATCHED: u32 = IN_CLOSE_WRITE | IN_MOVED_TO;
-const POLLIN: i16 = 1;
-const EINTR: i32 = 4;
-const EAGAIN: i32 = 11;
-/// How long the watching thread blocks before it looks whether to stop.
-const WAKE_EVERY_MS: i32 = 1000;
 /// What a window of read-only pages written through a second mapping is aligned to and at
 /// most as long as: the first write into it copies at most this much (about 0.2 ms at
 /// 10 GB/s, once), and a file-backed page in it costs a page of memory from then on.
@@ -83,9 +55,6 @@ const WINDOW: u64 = 2 << 20;
 pub(super) struct Os {
     /// The protection of the table cell's page.
     cell: i32,
-    /// The patch code region in memory, and where it is mapped writable.
-    code: Range<u64>,
-    alias: u64,
     maps: Maps,
     /// Where the image is mapped, which every data write is checked to be in.
     segments: Segments,
@@ -94,39 +63,20 @@ pub(super) struct Os {
 
 impl Os {
     pub(super) fn new(layout: &Layout) -> Result<Os, String> {
-        // SAFETY: it takes no pointer.
-        let page = unsafe { sysconf(SC_PAGESIZE) };
-        let page =
-            u64::try_from(page).ok().filter(|it| it.is_power_of_two()).ok_or("no page size")?;
-        let code = layout.code_in_memory();
-        if !code.start.is_multiple_of(page) || !code.end.is_multiple_of(page) {
-            // alloc: error path
-            return Err(format!(
-                "the patch code region {:#x}..{:#x} is not whole pages of {page:#x}",
-                code.start, code.end
-            ));
-        }
         let maps = Maps::read()?;
-        let alias = if code.is_empty() {
-            0
-        } else {
-            maps.each(&code, |piece, protection| {
-                if protection & PROT_READ == 0 {
-                    // alloc: error path
-                    return Err(format!("the patch code at {:#x} can't be read", piece.start));
-                }
-                Ok(())
-            })?;
-            map_twice(&code, PROT_READ | PROT_EXEC)?
-        };
+        let code = layout.code_in_memory();
+        if !code.is_empty() {
+            maps.each(&code, readable)?;
+        }
         let at = layout.cell();
         let segments = Segments::of(at)?;
         let (mapping, cell) = maps.mapping(at)?;
         let mut aliases = Aliases::new();
         if !code.is_empty() {
-            // The code region is mapped twice already: as a window, no window of read-only
-            // pages in the same mapping is cut over it.
-            aliases.windows.push((code.start, code.end, alias));
+            // No window of read-only pages is cut over the code memory's mapping: data is
+            // never written into it (the switch refuses that), and the window's address, 0,
+            // is never written through.
+            aliases.windows.push((code.start, code.end, 0));
         }
         if cell & PROT_WRITE == 0 {
             if cell & PROT_READ == 0 {
@@ -136,7 +86,7 @@ impl Os {
             segments.check(&(at..at + 8))?;
             aliases.make(at, &mapping, cell)?;
         }
-        Ok(Os { cell, code, alias, maps, segments, aliases })
+        Ok(Os { cell, maps, segments, aliases })
     }
 }
 
@@ -144,9 +94,8 @@ impl Os {
 /// file mapped twice ([`map_twice`]): where the image has it, with the protection it had, and
 /// read and write at an address of its own. Sorted by address, none overlapping, each within
 /// one mapping of the image. A window is made once, at the first write into it, and kept for
-/// the life of the program. The patch code region is the first, put there at start: data is
-/// never written into it (the switch refuses that), but a window of the mapping around it
-/// must not be cut over it.
+/// the life of the program. The patch code region is the first, put there at start, with no
+/// second mapping: no window is cut over the code memory.
 struct Aliases {
     /// Start and end in memory, and where the window is mapped writable.
     windows: Vec<(u64, u64, u64)>,
@@ -230,8 +179,8 @@ fn window(at: u64, mapping: &Range<u64>, free: Range<u64>) -> Range<u64> {
     start..end
 }
 
-// Not blaze-inproc's `View`: this crate links into the program with no dependencies, and
-// the region it maps over is live code that threads may be running.
+// Not blaze-inproc's `View`: the pages it maps over are the image's, which threads may be
+// reading.
 /// Puts a memory file under `range` (whole pages, mapped readable), with the bytes it has,
 /// mapped there with `protection`; the address it is mapped read and write at.
 fn map_twice(range: &Range<u64>, protection: i32) -> Result<u64, String> {
@@ -239,7 +188,12 @@ fn map_twice(range: &Range<u64>, protection: i32) -> Result<u64, String> {
     let len = (code.end - code.start) as usize;
     let error = |what: &str| {
         // alloc: error path
-        format!("{what} for {:#x}..{:#x}: {}", code.start, code.end, std::io::Error::last_os_error())
+        format!(
+            "{what} for {:#x}..{:#x}: {}",
+            code.start,
+            code.end,
+            std::io::Error::last_os_error()
+        )
     };
     // SAFETY: the name ends in a zero.
     let fd = unsafe { memfd_create(c"blaze-live-code".as_ptr(), MFD_CLOEXEC) };
@@ -272,7 +226,7 @@ fn map_twice(range: &Range<u64>, protection: i32) -> Result<u64, String> {
         // SAFETY: `view` is this function's mapping of the bytes the region has, with its
         // protection; moving it over the region replaces it in one step, so a thread reading
         // or running it sees the same bytes before and after. Nothing writes the region
-        // meanwhile: it is the patch code region before any patch, or read-only pages.
+        // meanwhile: it is read-only pages of the image.
         let moved = unsafe { mremap(view, len, len, MREMAP_MAYMOVE | MREMAP_FIXED, to) };
         if moved != to {
             let error = error("moving a memory file over the region");
@@ -319,21 +273,6 @@ impl Memory for Os {
 
     fn loaders(&self, at: u64, slots: u64) -> &[AtomicU64] {
         loaders(at, slots)
-    }
-
-    fn code(&mut self, writes: &Writes<'_>) -> Result<(), String> {
-        let (Some(first), Some(last)) = (writes.spans.first(), writes.spans.last()) else {
-            return Ok(());
-        };
-        let hull = first.at..last.end();
-        let to = self.alias + (hull.start - self.code.start);
-        // SAFETY: the spans are in the patch code region (the switch checked), which `alias`
-        // maps writable at the same offsets for as long as the program runs. The bytes
-        // written are over no code the cell ever pointed at nor any registered unwind entry
-        // (the switch's `Lasting`), so no thread runs them and no unwinder reads them.
-        unsafe { writes.put(&hull, to as *mut u8) };
-        flush(writes.spans.iter().map(|it| it.range()), self.alias.wrapping_sub(self.code.start));
-        Ok(())
     }
 
     fn data(&mut self, writes: &Writes<'_>) -> Result<(), String> {
@@ -491,101 +430,6 @@ impl Maps {
     }
 }
 
-/// Watches `dir` for message files on a thread of its own, telling `events` of each.
-pub(super) fn watch(dir: &Path, events: Arc<Events>) -> Result<(), String> {
-    let path = CString::new(dir.as_os_str().as_bytes())
-        // alloc: error path
-        .map_err(|_| format!("{}: a directory with a zero byte", dir.display()))?;
-    let error =
-        // alloc: error path
-        |what: &str| format!("{what} {}: {}", dir.display(), std::io::Error::last_os_error());
-    // SAFETY: it takes no pointer.
-    let fd = unsafe { inotify_init1(IN_NONBLOCK | IN_CLOEXEC) };
-    if fd < 0 {
-        return Err(error("watching"));
-    }
-    // SAFETY: the path ends in a zero.
-    if unsafe { inotify_add_watch(fd, path.as_ptr(), WATCHED) } < 0 {
-        let error = error("watching");
-        // SAFETY: this function's descriptor.
-        unsafe { close(fd) };
-        return Err(error);
-    }
-    let errno = || std::io::Error::last_os_error().raw_os_error();
-    let watching = move || {
-        let mut buffer = [0u8; 4096];
-        'watching: while !events.stopped() {
-            let mut ready = PollFd { fd, events: POLLIN, revents: 0 };
-            // SAFETY: one `pollfd`.
-            let polled = unsafe { poll(&mut ready, 1, WAKE_EVERY_MS) };
-            if polled == 0 || (polled < 0 && errno() == Some(EINTR)) {
-                continue;
-            }
-            if polled < 0 {
-                events.lose(Unwatched::failed("poll of the directory's inotify"));
-                break;
-            }
-            loop {
-                // SAFETY: `buffer` is writable for its length.
-                let read = unsafe { read(fd, buffer.as_mut_ptr() as *mut c_void, buffer.len()) };
-                let Ok(read) = usize::try_from(read) else {
-                    match errno() {
-                        Some(EAGAIN) => break,
-                        Some(EINTR) => continue,
-                        _ => {
-                            events.lose(Unwatched::failed("read of the directory's inotify"));
-                            break 'watching;
-                        }
-                    }
-                };
-                if read == 0 {
-                    break;
-                }
-                let (message, ended) = names(&buffer[..read]);
-                if ended {
-                    events.lose(Unwatched::Gone);
-                    break 'watching;
-                }
-                if message {
-                    events.tell();
-                }
-            }
-        }
-        // SAFETY: the thread's own descriptor.
-        unsafe { close(fd) };
-    };
-    std::thread::Builder::new()
-        // alloc: setup, the thread's name, once
-        .name("blaze-live-slots".to_owned())
-        .spawn(watching)
-        .map(drop)
-        // alloc: error path
-        .map_err(|it| format!("starting the thread that watches for patches: {it}"))
-}
-
-/// Whether the inotify events in `bytes` may have brought a message file, and whether the
-/// watch ended (the directory went).
-fn names(bytes: &[u8]) -> (bool, bool) {
-    let (mut message, mut ended) = (false, false);
-    let mut at = 0;
-    while at + 16 <= bytes.len() {
-        let field = |offset: usize| {
-            let mut value = [0; 4];
-            value.copy_from_slice(&bytes[at + offset..at + offset + 4]);
-            u32::from_ne_bytes(value)
-        };
-        let (mask, len) = (field(4), field(12) as usize);
-        let name = bytes.get(at + 16..at + 16 + len).unwrap_or(&[]);
-        message |= mask & IN_Q_OVERFLOW != 0 || name.starts_with(MESSAGE_PREFIX.as_bytes());
-        if mask & IN_IGNORED != 0 {
-            message = true;
-            ended = true;
-        }
-        at += 16 + len;
-    }
-    (message, ended)
-}
-
 /// Makes what was written at each of `ranges`, through the addresses `delta` from them, what
 /// runs there: every data cache line cleaned, one barrier, every instruction cache line
 /// invalidated, one barrier. Where `CTR_EL0` says the hardware keeps either side coherent
@@ -729,14 +573,16 @@ mod tests {
 
         let message: Vec<u8> = (0..64u8).map(|it| it ^ 0xa5).collect();
         let (first, second) = (page + 4, 3 * page - 8);
-        let spans = [Span::new(base + first as u64, 0, 24), Span::new(base + second as u64, 24, 16)];
+        let spans =
+            [Span::new(base + first as u64, 0, 24), Span::new(base + second as u64, 24, 16)];
         let writes = Writes::new(&message, &spans, &[], 0);
         let mut aliases = Aliases::new();
         for span in &spans {
             aliases.store(&writes, &span.range(), &mapping, PROT_READ).expect("written");
         }
         let blocks = |at: u64, len: u64| [at / WINDOW, (at + len - 1) / WINDOW];
-        let mut touched: Vec<u64> = spans.iter().flat_map(|it| blocks(it.at, it.len as u64)).collect();
+        let mut touched: Vec<u64> =
+            spans.iter().flat_map(|it| blocks(it.at, it.len as u64)).collect();
         touched.sort_unstable();
         touched.dedup();
         assert_eq!(aliases.windows.len(), touched.len(), "a window per block written, once");
@@ -754,7 +600,10 @@ mod tests {
         // SAFETY: 8-aligned (the window keeps the page offset), mapped writable for the test.
         unsafe { AtomicU64::from_ptr(to as *mut u64) }.store(0x1234, Ordering::Release);
         // SAFETY: the mapping is readable and 8-aligned at `base + 8`.
-        assert_eq!(unsafe { AtomicU64::from_ptr((base + 8) as *mut u64) }.load(Ordering::Acquire), 0x1234);
+        assert_eq!(
+            unsafe { AtomicU64::from_ptr((base + 8) as *mut u64) }.load(Ordering::Acquire),
+            0x1234
+        );
 
         Maps::read()
             .expect("this process's maps")
@@ -769,28 +618,6 @@ mod tests {
         }
         // SAFETY: as above, the mapping the windows were moved over.
         unsafe { munmap(at, len) };
-    }
-
-    fn event(mask: u32, name: &[u8]) -> Vec<u8> {
-        let len = name.len().next_multiple_of(4) + 4;
-        let mut bytes = Vec::new();
-        for field in [1u32, mask, 0, len as u32] {
-            bytes.extend_from_slice(&field.to_ne_bytes());
-        }
-        bytes.extend_from_slice(name);
-        bytes.resize(16 + len, 0);
-        bytes
-    }
-
-    #[test]
-    fn only_message_files_and_lost_events_wake_the_program() {
-        let answer = [event(IN_CLOSE_WRITE, b"answer.7"), event(IN_MOVED_TO, b"answer")].concat();
-        assert_eq!(names(&answer), (false, false));
-        let message = [event(IN_MOVED_TO, b"answer"), event(IN_MOVED_TO, b"message-00000001")];
-        assert_eq!(names(&message.concat()), (true, false));
-        assert_eq!(names(&event(IN_Q_OVERFLOW, b"")), (true, false));
-        assert_eq!(names(&event(IN_IGNORED, b"")), (true, true));
-        assert_eq!(names(&[0; 7]), (false, false));
     }
 
     #[test]

@@ -243,7 +243,8 @@ absent run again, in the view right after it is made. `&` can't make a singleton
   a capture is a frame whose edges are copied out as a span of the edge array, with their
   lowest durability, highest stamp and summary (`Reads`, 32 bytes, valid in its view only; replaying
   one of another view panics). `None` when the capture read a provisional row.
-- `Reads::for_each_read` and `Storage::ingredient_of(node)`, `ingredient_name`, `owner(id)`:
+- `Reads::for_each_read` and `Storage::ingredient_of(node)`, `ingredient_name`, `read_name`
+  (a field read by its field's name, as salsa named it), `owner(id)`:
   what `blaze-item-hash`, `blaze-items` and `hir-firewall` classify reads with, in place of
   `DatabaseKeyIndex`, `zalsa().lookup_ingredient`, `lookup_page_type_id` and `ids_of`. A
   function of several arguments gives its key back as its tuple (`Query::key_of(db, id)`).
@@ -363,6 +364,9 @@ impl Storage {
     pub fn owner(&self, id: Id) -> Option<u32>;  // the ingredient that owns id's page
     pub fn ingredient_name(&self, ingredient: u32) -> &'static str;
     pub fn ingredient_file(&self, ingredient: u32) -> &'static str;   // `file!()` of its definition (01125)
+    pub fn field_name(&self, ingredient: u32, field: u32) -> &'static str;   // by a field read's number (01295)
+    pub fn read_name(&self, key: DatabaseKeyIndex, kind: ReadKind) -> &'static str;  // a field read by its
+                                                 // field's name, as salsa's, any other by its ingredient's
     pub fn ids_of(&self, id: Id, out: &mut Vec<Id>);  // an interned row's fields' ids (01127)
     pub fn keep_every_value(&mut self, keep: bool);   // no lru eviction while set (01128)
     pub fn memory_usage(&self, out: &mut Vec<MemoryUsage>);   // one per ingredient (01129)
@@ -504,6 +508,7 @@ pub trait Input: 'static {
     const NAME: &'static str;
     const FILE: &'static str;
     const FIELDS: u32;
+    const FIELD_NAMES: &'static [&'static str];   // in field order; `Storage::field_name`
     const SINGLETON: bool;                        // a second `input_new` panics naming NAME
     fn ingredient() -> &'static Ingredient;
 }
@@ -558,6 +563,7 @@ pub trait Tracked: 'static {
     const NAME: &'static str;
     const FILE: &'static str;
     const TRACKED_FIELDS: u32;
+    const TRACKED_FIELD_NAMES: &'static [&'static str];   // the `#[tracked]` ones, by number
     fn ingredient() -> &'static Ingredient;
     /// `field` here and in `tracked_fields` is the field's number among the `#[tracked]` ones
     /// (0..TRACKED_FIELDS); `false` for a `#[no_eq]` field.
@@ -631,7 +637,8 @@ or `#[value(unsafe(prove_safe_to_retain_manually))]` (salsa's `#[salsa_value(..)
    file changes).
 2. `tools/v2/salsa_to_query.py` rewrites a crate's sources (the paths above, `salsa::Id` to
    `blaze_query::db::Id`, `as_bits`/`from_bits` to `as_u32`/`from_u32`), then prints what is left:
-   every use of `salsa::plumbing`, `capture_reads`, events, `zalsa`.
+   every use of `salsa::plumbing`, `capture_reads`, events, `zalsa`. (2026-10-31: it and its
+   replay records, `tools/v2/salsa_port/`, were deleted once the port merged, 04cca11739.)
 3. The crates are switched in one window the coordinator holds for them, in this order, each
    checked (`cargo check -p <crate> --all-targets`) before the next: span, intern, base-db,
    hir-expand, hir-def, hir-ty, hir-ty-* , blaze-items, blaze-item-hash, hir-firewall, hir,

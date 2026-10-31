@@ -166,7 +166,9 @@ pub(super) fn check(asked: &Asked<'_>, shown: &str, source: &str, library: &Libr
     let mut paths: HashMap<FileId, String> = (**lowered.paths()).clone();
     paths.insert(root_file, shown.to_owned());
     let lints = CommandLine::parse(asked.args).map_err(anyhow::Error::msg)?;
-    let options = Options { lints, keep_duplicates: false };
+    // rustc gives the future-incompatibility report only for `--json=future-incompat`, which
+    // the probe refuses.
+    let options = Options { lints, keep_duplicates: false, future_breakage_report: false };
     let diags = blaze_diagnostics::check_crate(db, hir::Crate::from(krate), Files::new(&paths, ""), &options);
     if let Some(diag) = diags.iter().find(|it| it.code.as_ref().and_then(Code::error) == Some("E0583")) {
         bail!("blaze reads a probe's one file, and it declares a module in another: {}", diag.message);

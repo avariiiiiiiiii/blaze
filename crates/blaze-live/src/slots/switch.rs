@@ -11,8 +11,14 @@
 //! table holds that generation still, or when it is the one the program started at (the
 //! loader's table).
 //!
-//! What a patch may write over:
-//! - Code goes only into the patch code region, and never over code of a generation whose
+//! A patch's code is not in its message: the commit wrote it into the code memory the
+//! program runs (blaze-inproc), and the switch only reads it there, hashing each function's
+//! bytes against the message's ([`crate::patch::Code`]). One that differs refuses the patch,
+//! naming the function. Code holds no address to rebase: every run of the program maps the
+//! same copy, whatever its slide.
+//!
+//! What a patch may write over, or switch to:
+//! - Code is only in the patch code region, and never over code of a generation whose
 //!   unwind entries were registered or that the cell may have pointed at ([`Lasting`]): a
 //!   thread can still be in that code however long ago the program left it, rolled back or
 //!   not.
@@ -62,7 +68,6 @@ pub(crate) const KEPT: usize = 64;
 /// next patch stores only its own cells before its switch.
 pub(crate) const POOL: usize = 4;
 const MOST_SLOTS: u64 = 1 << 26;
-const MOST_DIR: u64 = 4096;
 
 /// [`Descriptor::arch`] of what this program runs on; none matches elsewhere.
 pub(crate) const HOST_ARCH: u32 = if cfg!(target_arch = "x86_64") {
@@ -74,7 +79,7 @@ pub(crate) const HOST_ARCH: u32 = if cfg!(target_arch = "x86_64") {
 };
 
 /// What an image's descriptor says, with its slide. Addresses are as linked unless a method
-/// slides them. 96 bytes, made once at start.
+/// slides them. 80 bytes, made once at start.
 #[derive(Debug)]
 pub(crate) struct Layout {
     pub(crate) id: [u8; 16],
@@ -86,7 +91,6 @@ pub(crate) struct Layout {
     pub(crate) slots: u64,
     pub(crate) code: Range<u64>,
     pub(crate) data: Range<u64>,
-    pub(crate) dir: [u64; 2],
 }
 
 impl Layout {
@@ -120,10 +124,6 @@ impl Layout {
             // alloc: error path
             return Err(format!("{DESCRIPTOR} has {} slots", descriptor.slots));
         }
-        if descriptor.dir[1] > MOST_DIR {
-            // alloc: error path
-            return Err(format!("{DESCRIPTOR} names a directory {} bytes long", descriptor.dir[1]));
-        }
         let slide = at.wrapping_sub(descriptor.this);
         if !descriptor.table.wrapping_add(slide).is_multiple_of(8) {
             // alloc: error path
@@ -140,7 +140,6 @@ impl Layout {
             slots: descriptor.slots,
             code: code_start..code_end,
             data: data_start..data_end,
-            dir: descriptor.dir,
         })
     }
 
@@ -171,7 +170,8 @@ pub(crate) enum Dwarf {
     Not,
 }
 
-/// One write of a patch: `len` bytes of its message from `from`, to `at` in memory. 24 bytes.
+/// One data write of a patch: `len` bytes of its message from `from`, to `at` in memory. 24
+/// bytes.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(crate) struct Span {
     pub(crate) at: u64,
@@ -223,10 +223,12 @@ impl<'a> Writes<'a> {
 }
 
 /// What a platform does to the memory of a running image. Every address is in memory
-/// (slid). The switch has checked that code is in the patch code region, that data is
-/// outside it, the table's header and the loader's table, and that neither is over lasting
-/// memory (the module's rules). Whether data is in the image is the platform's to check. The
-/// platform is also where the switch reads the image: the header and the loader's table.
+/// (slid). The switch has checked that data is outside the patch code region, the table's
+/// header and the loader's table, and that it is over no lasting memory (the module's rules).
+/// Whether data is in the image is the platform's to check. The platform is also where the
+/// switch reads the image: the header, the loader's table and the code the commit wrote. No
+/// platform writes code: the daemon wrote it into the code memory the image's patch code
+/// region is mapped from, and made it runnable there (blaze-inproc's `CodeMemory`).
 pub(crate) trait Memory {
     const DWARF: Dwarf;
     /// Whether the unwinder takes Windows `RUNTIME_FUNCTION`s.
@@ -242,14 +244,12 @@ pub(crate) trait Memory {
         spans.iter().try_for_each(|it| self.in_image(&it.range()))
     }
     /// The image's bytes at `range`, which the platform checks are in the image and
-    /// readable: read-only data the linker wrote, such as the directory's name.
+    /// readable: a patch's code, which the switch hashes and reads unwind entries from.
     fn bytes(&self, range: &Range<u64>) -> Result<&'static [u8], String>;
     /// The loader's table, `slots` addresses at `at`, which [`Switch::new`] checked is
     /// 8-aligned and in the image. Only [`super::exec::publish`] writes it, atomically: the
     /// switch stores only to the header and its own tables, and refuses data over it.
     fn loaders(&self, at: u64, slots: u64) -> &[AtomicU64];
-    /// Writes into the patch code region and makes it runnable again.
-    fn code(&mut self, writes: &Writes<'_>) -> Result<(), String>;
     /// Writes data anywhere in the image with [`Writes::store`], making read-only pages
     /// writable for the write and back.
     fn data(&mut self, writes: &Writes<'_>) -> Result<(), String>;
@@ -518,7 +518,8 @@ struct Pooled {
 /// Buffers a patch is checked and written with, kept from one to the next.
 #[derive(Default)]
 struct Scratch {
-    code: Vec<Span>,
+    /// The patch's code, in memory.
+    code: Vec<Range<u64>>,
     data: Vec<Span>,
     rebase: Vec<u64>,
     slots: Vec<u32>,
@@ -732,29 +733,42 @@ impl<M: Memory> Switch<M> {
         let slide = layout.slide;
         let message = patch.message;
         s.code.clear();
-        for (at, bytes) in patch.code {
-            let range = span(at, bytes.len())?;
+        for code in patch.code {
+            let range = span(code.at, code.len)?;
             if !inside(&range, &layout.code) {
                 // alloc: error path
                 return Err(format!(
-                    "code at {:#x}..{:#x}, outside the patch code region {:#x}..{:#x}",
-                    range.start, range.end, layout.code.start, layout.code.end
+                    "`{}`'s code at {:#x}..{:#x}, outside the patch code region {:#x}..{:#x}",
+                    code.name, range.start, range.end, layout.code.start, layout.code.end
                 ));
             }
-            if !bytes.is_empty() {
-                let placed = place(message, at, bytes, slide)?;
-                if let Some(hit) = self.lasting.hit(&placed.range()) {
-                    return Err(over("code", hit, slide));
-                }
-                s.code.push(placed);
+            if range.is_empty() {
+                continue;
             }
+            let slid = span(range.start.wrapping_add(slide), code.len)?;
+            if let Some(hit) = self.lasting.hit(&slid) {
+                return Err(over("code", hit, slide));
+            }
+            let bytes = self.memory.bytes(&slid).map_err(|why| {
+                // alloc: error path
+                format!("`{}`'s code at {:#x}..{:#x}: {why}", code.name, range.start, range.end)
+            })?;
+            if crate::patch::hash(bytes) != code.hash {
+                // alloc: error path
+                return Err(format!(
+                    "`{}`'s code at {:#x}..{:#x} is not what the daemon committed: the code memory \
+                     this program runs holds other bytes there",
+                    code.name, range.start, range.end
+                ));
+            }
+            s.code.push(slid);
         }
         let header = exec::len(layout.slots, self.header.logged());
         let cell = layout.table..layout.table.saturating_add(header);
         let loaders = self.image..self.image.saturating_add(layout.slots.saturating_mul(8));
         s.data.clear();
         for (at, bytes) in patch.data {
-            let range = span(at, bytes.len())?;
+            let range = span(at, bytes.len() as u64)?;
             if overlap(&range, &layout.code) {
                 // alloc: error path
                 return Err(format!(
@@ -781,14 +795,17 @@ impl<M: Memory> Switch<M> {
                 s.data.push(placed);
             }
         }
-        // Code is inside the code region and data outside it, so only writes of one kind can
-        // overlap.
-        for spans in [&mut s.code, &mut s.data] {
-            spans.sort_unstable_by_key(|it| it.at);
-            if let Some(pair) = spans.windows(2).find(|it| it[1].at < it[0].end()) {
-                // alloc: error path
-                return Err(format!("two writes at {:#x}", pair[1].at.wrapping_sub(slide)));
-            }
+        // Code is inside the code region and data outside it, so only code can overlap code
+        // and data data.
+        s.code.sort_unstable_by_key(|it| it.start);
+        if let Some(pair) = s.code.windows(2).find(|it| it[1].start < it[0].end) {
+            // alloc: error path
+            return Err(format!("two functions' code at {:#x}", pair[1].start.wrapping_sub(slide)));
+        }
+        s.data.sort_unstable_by_key(|it| it.at);
+        if let Some(pair) = s.data.windows(2).find(|it| it[1].at < it[0].end()) {
+            // alloc: error path
+            return Err(format!("two writes at {:#x}", pair[1].at.wrapping_sub(slide)));
         }
         // The platform's `data` refuses the same while it writes, a span at a time: checked
         // here, a bad span refuses the patch before any is written.
@@ -814,7 +831,15 @@ impl<M: Memory> Switch<M> {
             return Err(format!("the address at {:#x} rebased twice", pair[0].wrapping_sub(slide)));
         }
         for &at in &s.rebase {
-            if find(message, &s.code, at, 8).is_none() && find(message, &s.data, at, 8).is_none() {
+            if in_code(&s.code, at, 8).is_some() {
+                // alloc: error path
+                return Err(format!(
+                    "an address to rebase at {:#x}, in code: every run of the program maps one \
+                     copy of its code, whatever its slide",
+                    at.wrapping_sub(slide)
+                ));
+            }
+            if find(message, &s.data, at, 8).is_none() {
                 // alloc: error path
                 return Err(format!(
                     "an address to rebase at {:#x}, in none of the patch's writes",
@@ -822,8 +847,11 @@ impl<M: Memory> Switch<M> {
                 ));
             }
         }
+        let memory = &self.memory;
+        let (code, data) = (&s.code, &s.data);
+        let written = |at: u64, len: u64| written_at(memory, message, code, data, at, len);
         let (fdes, starts, ends) = (&mut s.fdes, &mut s.starts, &mut s.ends);
-        frames::<M>(patch, message, &s.code, &s.data, slide, fdes, starts, ends)?;
+        frames::<M>(patch, &written, slide, fdes, starts, ends)?;
         if patch.windows().len() != 0 && !M::SEH {
             // alloc: error path
             return Err("RUNTIME_FUNCTIONs, which this platform's unwinder doesn't take".to_owned());
@@ -832,14 +860,11 @@ impl<M: Memory> Switch<M> {
         s.unwinds.clear();
         for (begin, end, unwind) in patch.windows() {
             let (slid_begin, slid_unwind) = (begin.wrapping_add(slide), unwind.wrapping_add(slide));
-            if begin >= end || find(message, &s.code, slid_begin, end - begin).is_none() {
+            if begin >= end || in_code(code, slid_begin, end - begin).is_none() {
                 // alloc: error path
                 return Err(format!("a RUNTIME_FUNCTION of {begin:#x}..{end:#x}, not in the code"));
             }
-            let written = |len: u64| {
-                find(message, &s.code, slid_unwind, len)
-                    .or_else(|| find(message, &s.data, slid_unwind, len))
-            };
+            let written = |len: u64| written(slid_unwind, len);
             let Some(header) = written(4) else {
                 // alloc: error path
                 return Err(format!("unwind information at {unwind:#x}, in none of the writes"));
@@ -863,14 +888,13 @@ impl<M: Memory> Switch<M> {
         self.log.room(set, s.code.len())?;
         self.lasting.room(lasting)?;
 
-        let rebase = &s.rebase;
-        self.memory.code(&Writes { message, spans: &s.code, rebase, slide })?;
-        self.memory.data(&Writes { message, spans: &s.data, rebase, slide })?;
+        self.memory.data(&Writes { message, spans: &s.data, rebase: &s.rebase, slide })?;
         // From here the unwinder or a thread may read what this generation wrote, whatever
         // becomes of the rest.
         let number = patch.generation;
-        for span in &s.code {
-            self.lasting.add(span.range(), number, Holds::Code)?;
+        for range in &s.code {
+            // clone: a Range<u64> of two words; Range isn't Copy
+            self.lasting.add(range.clone(), number, Holds::Code)?;
         }
         for &(at, len) in &s.fdes {
             self.lasting.add(at..at + len, number, Holds::Unwind)?;
@@ -890,9 +914,9 @@ impl<M: Memory> Switch<M> {
             self.log.new.push(target.wrapping_add(slide))?;
             self.log.old.push(old)?;
         }
-        for span in &s.code {
-            self.log.code_start.push(span.at)?;
-            self.log.code_end.push(span.end())?;
+        for range in &s.code {
+            self.log.code_start.push(range.start)?;
+            self.log.code_end.push(range.end)?;
         }
         let generation = self.log.finish(patch.generation, self.current)?;
         let at = self.standby(generation, &mut s.path);
@@ -1182,15 +1206,13 @@ fn place(message: &[u8], at: u64, bytes: &[u8], slide: u64) -> Result<Span, Stri
     Ok(Span { at: slid, from, len: bytes.len() })
 }
 
-/// Checks the FDEs of `patch` against the bytes it writes (`code` and `data`) and puts in
-/// `starts` what to register at, in memory: each FDE, or the start of each run of entries
-/// that ends in a zero length, and in `ends` where each such zero length is.
-#[allow(clippy::too_many_arguments)]
-fn frames<M: Memory>(
+/// Checks the FDEs of `patch` against the bytes it has (`written`: its code in memory and its
+/// data writes) and puts in `starts` what to register at, in memory: each FDE, or the start
+/// of each run of entries that ends in a zero length, and in `ends` where each such zero
+/// length is.
+fn frames<'m, M: Memory>(
     patch: PatchView<'_>,
-    message: &[u8],
-    code: &[Span],
-    data: &[Span],
+    written: &impl Fn(u64, u64) -> Option<&'m [u8]>,
     slide: u64,
     fdes: &mut Vec<(u64, u64)>,
     starts: &mut Vec<u64>,
@@ -1207,8 +1229,7 @@ fn frames<M: Memory>(
         return Err("DWARF unwind entries, which this platform's unwinder doesn't take".to_owned());
     }
     let linked = |at: u64| at.wrapping_sub(slide);
-    let bytes =
-        |at: u64, len: u64| find(message, code, at, len).or_else(|| find(message, data, at, len));
+    let bytes = written;
     let length = |at: u64| -> Result<u32, String> {
         let field = bytes(at, 4).ok_or_else(|| {
             // alloc: error path
@@ -1287,6 +1308,29 @@ fn find<'m>(message: &'m [u8], spans: &[Span], at: u64, len: u64) -> Option<&'m 
         .then(|| &message[span.from + offset as usize..span.from + end as usize])
 }
 
+/// `at..at + len`, when one of `code` (sorted, in memory) has all of it: a binary search.
+fn in_code(code: &[Range<u64>], at: u64, len: u64) -> Option<Range<u64>> {
+    let range = code.get(code.partition_point(|it| it.end <= at))?;
+    let end = at.checked_add(len)?;
+    (range.start <= at && end <= range.end).then_some(at..end)
+}
+
+/// The `len` bytes at `at` of the patch: of its code, read from `memory`, which
+/// [`Switch::apply`] checked is readable and hashed whole, or of its data writes.
+fn written_at<'m, M: Memory>(
+    memory: &M,
+    message: &'m [u8],
+    code: &[Range<u64>],
+    data: &[Span],
+    at: u64,
+    len: u64,
+) -> Option<&'m [u8]> {
+    match in_code(code, at, len) {
+        Some(range) => memory.bytes(&range).ok(),
+        None => find(message, data, at, len),
+    }
+}
+
 /// The length of the UNWIND_INFO whose first 4 bytes are `header`: the fixed part, the unwind
 /// codes (2 bytes each, an even count), then the handler's address or the chained
 /// RUNTIME_FUNCTION. Not counted: a handler's data after its address, whose length only the
@@ -1307,8 +1351,8 @@ fn unwind_len(header: &[u8]) -> u64 {
     4 + 2 * codes + after
 }
 
-fn span(at: u64, len: usize) -> Result<Range<u64>, String> {
-    at.checked_add(len as u64)
+fn span(at: u64, len: u64) -> Result<Range<u64>, String> {
+    at.checked_add(len)
         .map(|end| at..end)
         // alloc: error path
         .ok_or_else(|| format!("a write at {at:#x} of {len} bytes, past the end of memory"))

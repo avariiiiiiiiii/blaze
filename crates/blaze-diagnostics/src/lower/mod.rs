@@ -111,6 +111,7 @@ pub(crate) mod unsafe_binder_cast_of_non_binder;
 
 pub(crate) mod async_coroutines_not_supported;
 pub(crate) mod await_outside_of_async;
+pub(crate) mod int_literal_too_large;
 pub(crate) mod borrowck_error;
 pub(crate) mod borrowck_skipped;
 pub(crate) mod break_outside_of_loop;
@@ -313,6 +314,7 @@ pub(crate) fn lower<'db>(cx: &Cx<'_, 'db>, d: AnyDiagnostic<'db>) -> Vec<Found> 
 
         AnyDiagnostic::AsyncCoroutinesNotSupported(d) => async_coroutines_not_supported::lower(cx, &d),
         AnyDiagnostic::AwaitOutsideOfAsync(d) => await_outside_of_async::lower(cx, &d),
+        AnyDiagnostic::IntLiteralTooLarge(d) => int_literal_too_large::lower(cx, &d),
         AnyDiagnostic::BorrowckError(d) => borrowck_error::lower(cx, &d),
         AnyDiagnostic::BorrowckSkipped(d) => borrowck_skipped::lower(cx, &d),
         AnyDiagnostic::BreakOutsideOfLoop(d) => break_outside_of_loop::lower(cx, &d),

@@ -15,6 +15,20 @@ use crate::{
     parser::{Binder, ConcatMetaVarExprElem, MetaVar, MetaVarKind, Op, RepeatKind, Separator},
 };
 
+/// Why [`Bindings::get_fragment`] gave no fragment.
+enum Miss {
+    /// The innermost repetition is past its last round, which `expand_repeat` drops with all
+    /// it made, so no error is made for it.
+    Ended,
+    Error(ExpandError),
+}
+
+impl From<ExpandError> for Miss {
+    fn from(it: ExpandError) -> Self {
+        Miss::Error(it)
+    }
+}
+
 impl<'t> Bindings<'t> {
     /// The binding of `name`, numbered `binder` when its rule was defined.
     fn get(&self, binder: Binder, name: &MetaVar, span: Span) -> Result<Binding, ExpandError> {
@@ -35,14 +49,15 @@ impl<'t> Bindings<'t> {
         mut span: Span,
         nesting: &mut [NestingState],
         marker: impl Fn(&mut Span),
-    ) -> Result<Fragment<'t>, ExpandError> {
+    ) -> Result<Fragment<'t>, Miss> {
         macro_rules! binding_err {
             // alloc: an error.
-            ($($arg:tt)*) => { ExpandError::binding_error(span, format!($($arg)*)) };
+            ($($arg:tt)*) => { Miss::Error(ExpandError::binding_error(span, format!($($arg)*))) };
         }
 
         let mut b = self.get(binder, name, span)?;
-        for nesting_state in nesting.iter_mut() {
+        let innermost = nesting.len().wrapping_sub(1);
+        for (depth, nesting_state) in nesting.iter_mut().enumerate() {
             nesting_state.hit = true;
             b = match b {
                 Binding::Fragment(_) => break,
@@ -51,14 +66,23 @@ impl<'t> Bindings<'t> {
                     break;
                 }
                 Binding::Nested { start, len } => {
-                    self.iteration(start, len, nesting_state.idx).ok_or_else(|| {
-                        nesting_state.at_end = true;
-                        binding_err!("could not find nested binding `{name}`")
-                    })?
+                    match self.iteration(start, len, nesting_state.idx) {
+                        Some(it) => it,
+                        None => {
+                            nesting_state.at_end = true;
+                            return Err(match depth == innermost {
+                                true => Miss::Ended,
+                                false => binding_err!("could not find nested binding `{name}`"),
+                            });
+                        }
+                    }
                 }
                 Binding::Empty => {
                     nesting_state.at_end = true;
-                    return Err(binding_err!("could not find empty binding `{name}`"));
+                    return Err(match depth == innermost {
+                        true => Miss::Ended,
+                        false => binding_err!("could not find empty binding `{name}`"),
+                    });
                 }
             };
         }
@@ -238,7 +262,10 @@ fn expand_subtree(
             Op::Ignore { name, id, binder } => {
                 // Expand the variable, but ignore the result. This registers the repetition count.
                 let e =
-                    ctx.bindings.get_fragment(*binder, name, *id, &mut ctx.nesting, marker).err();
+                    match ctx.bindings.get_fragment(*binder, name, *id, &mut ctx.nesting, marker) {
+                        Err(Miss::Error(e)) => Some(e),
+                        Ok(_) | Err(Miss::Ended) => None,
+                    };
                 // FIXME: The error gets dropped if there were any previous errors.
                 // This should be reworked in a way where the errors can be combined
                 // and reported rather than storing the first error encountered.
@@ -335,7 +362,8 @@ fn expand_subtree(
                                 marker,
                             ) {
                                 Ok(var) => var,
-                                Err(e) => {
+                                Err(Miss::Ended) => continue,
+                                Err(Miss::Error(e)) => {
                                     if err.is_none() {
                                         err = Some(e);
                                     };
@@ -524,7 +552,8 @@ fn expand_var(
             };
             ExpandResult::ok(())
         }
-        Err(e) if matches!(e.inner.1, ExpandErrorKind::UnresolvedBinding(_)) => {
+        Err(Miss::Ended) => ExpandResult::ok(()),
+        Err(Miss::Error(e)) if matches!(e.inner.1, ExpandErrorKind::UnresolvedBinding(_)) => {
             // Note that it is possible to have a `$var` inside a macro which is not bound.
             // For example:
             // ```
@@ -547,7 +576,7 @@ fn expand_var(
             ]);
             ExpandResult::ok(())
         }
-        Err(e) => ExpandResult::only_err(e),
+        Err(Miss::Error(e)) => ExpandResult::only_err(e),
     }
 }
 

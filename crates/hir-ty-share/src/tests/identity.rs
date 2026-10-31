@@ -678,6 +678,28 @@ fn the_identity_tells_apart_what_both_old_spellings_did() {
     });
 }
 
+/// A length named by a constant or written as an expression is the value it evaluates to, as
+/// rustc normalizes it: `[u8; N]` and `[u8; 1 + 1]` are `[u8; 2]`, one `TypeId`.
+#[test]
+fn a_named_or_computed_length_is_its_value() {
+    let db = fixture(
+        "pub const N: usize = 2;\n\
+         pub type Two = [u8; 2];\n\
+         pub type Named = [u8; N];\n\
+         pub type Computed = [u8; 1 + 1];\n\
+         pub type Three = [u8; N + 1];\n",
+    );
+    hir_ty::attach_db(&db, || {
+        let spelled = |name: &str| {
+            identity::ty(&db, db.ty(TyDefId::TypeAliasId(alias(&db, name))).skip_binder())
+                .unwrap_or_else(|why| panic!("`{name}`: {why}"))
+        };
+        assert_eq!(spelled("Named"), spelled("Two"));
+        assert_eq!(spelled("Computed"), spelled("Two"));
+        assert_ne!(spelled("Three"), spelled("Two"));
+    });
+}
+
 #[test]
 fn constants_and_argument_lists_agree_with_the_old_spellings() {
     let db = fixture(CORPUS);

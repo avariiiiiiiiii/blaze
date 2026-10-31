@@ -430,12 +430,30 @@ pub(crate) fn policy(job: &Job, unit: usize, toolchain: Toolchain) -> Result<Pol
     })
 }
 
-/// What a unit's codegen made, reading the task's front end.
-pub(crate) struct Generated<'db> {
+/// What a unit's codegen made ([`generate`]), kept for its link: nothing of the front end
+/// that made it, which the link reads through its own task's ([`Parts::over`]).
+pub(crate) struct Parts {
     pub(crate) built: Built,
     pub(crate) roots: Roots,
-    pub(crate) frontend: HirFrontend<'db>,
     pub(crate) policy: Policy,
+}
+
+impl Parts {
+    /// What codegen made, read through `reader`'s front end. The unit's crate is the same in
+    /// it as in the one codegen read: every input of the crate is of a unit it depends on,
+    /// done before its codegen began, so a write applied since changed none of it.
+    pub(crate) fn over<'a>(&'a self, job: &Job, reader: &'a UnitReader, mounted: &Arc<Mounted>) -> Generated<'a> {
+        let frontend = frontend(job, reader, mounted).with_policy(&self.policy);
+        Generated { built: &self.built, roots: &self.roots, frontend, policy: &self.policy, side: std::cell::OnceCell::new() }
+    }
+}
+
+/// What a unit's codegen made, reading the task's front end.
+pub(crate) struct Generated<'a> {
+    pub(crate) built: &'a Built,
+    pub(crate) roots: &'a Roots,
+    pub(crate) frontend: HirFrontend<'a>,
+    pub(crate) policy: &'a Policy,
     /// The span tables and debug names the build's code names: read once, by the first
     /// link or test selection that needs them, and none for a library.
     side: std::cell::OnceCell<LinkInputs>,
@@ -447,7 +465,7 @@ impl Generated<'_> {
         if let Some(side) = self.side.get() {
             return Ok(side);
         }
-        let side = self.frontend.link_inputs(&self.built).map_err(|it| it.what)?;
+        let side = self.frontend.link_inputs(self.built).map_err(|it| it.what)?;
         Ok(self.side.get_or_init(|| side))
     }
 }
@@ -512,7 +530,7 @@ pub(crate) fn generate<'db>(
     mounted: &Arc<Mounted>,
     // dyn: `HirFrontend::with_checks` takes it; called once a level of the walk
     checks: Option<&'db dyn BodyChecks>,
-) -> Result<Result<Generated<'db>, Vec<String>>, String> {
+) -> Result<Result<Parts, Vec<String>>, String> {
     let u = job.unit(unit).map_err(|it| it.what)?;
     let krate = job
         .crates
@@ -545,7 +563,7 @@ pub(crate) fn generate<'db>(
     match built {
         Ok(mut built) => {
             built.puts.extend(profile);
-            Ok(Ok(Generated { built, roots, frontend, policy, side: std::cell::OnceCell::new() }))
+            Ok(Ok(Parts { built, roots, policy }))
         }
         Err(errors) => {
             if let Some(put) = profile {
@@ -801,7 +819,7 @@ fn link_at(
     images: &mut Vec<KeptImage>,
 ) -> Result<LinkMade, LinkCause> {
     let u = job.unit(unit).map_err(|it| it.what)?;
-    let built = &generated.built;
+    let built = generated.built;
     let debug = match generated.policy.profile.debuginfo {
         DebugInfo::None => blaze_link::Debug::None,
         _ => blaze_link::Debug::Lines,
@@ -919,7 +937,7 @@ fn relink(
     side: &LinkInputs,
     linked: &mut Linked,
 ) -> Result<(Vec<u8>, Vec<Read>, Option<blaze_codegen::ExecTable>, bool), LinkCause> {
-    let built = &generated.built;
+    let built = generated.built;
     // Each native input by the hash of its contents, through the process's table of files by
     // their `stat`: one `stat` for a library the image already has, read only when it is new.
     let mut files = blaze_usercode::inputs::Disk::new(Vec::new());

@@ -69,8 +69,8 @@ use crate::serve::{
     Paths,
     fetch::Fetcher,
     work::{
-        Compiled, Failed, Front, FrontEnd, Goal, Image, JobInput, Kept, Library, Put, Runs, Selection, Source,
-        SourceFile, Steps, Writer,
+        Compiled, Failed, Front, FrontEnd, Goal, Image, JobInput, Kept, Library, Phase, Put, Runs, Selection,
+        Source, SourceFile, Steps, Writer,
     },
 };
 
@@ -550,6 +550,8 @@ pub(crate) struct Job {
     /// What each compiled unit made that later work reads: its main file, its tests. Written
     /// once per unit.
     pub(crate) made: Box<[OnceLock<compile::Made>]>,
+    /// What each unit's phases made for the phases after them, by unit.
+    pub(crate) phases: Box<[Mutex<compile::Phases>]>,
     /// Each unit's record key, worked out once: `fresh` on the loop and `compile` on a worker
     /// both read it.
     pub(crate) keys: Box<[OnceLock<Option<blaze_cas::Key>>]>,
@@ -600,6 +602,7 @@ impl Job {
             identities: (0..slots).map(|_| OnceLock::new()).collect(),
             scripts: (0..slots).map(|_| OnceLock::new()).collect(),
             made: (0..slots).map(|_| OnceLock::new()).collect(),
+            phases: (0..slots).map(|_| Mutex::default()).collect(),
             keys: (0..slots).map(|_| OnceLock::new()).collect(),
             runs: (0..slots).map(|_| OnceLock::new()).collect(),
             mounted,
@@ -732,25 +735,34 @@ pub(crate) fn checks_only(goal: Goal, unit: &Unit) -> bool {
     goal == Goal::Check || matches!(unit.mode, Mode::Check)
 }
 
-/// The key a program's build is predicted and taught by (`plane::Plane::push_program`), when
-/// `unit` builds a program its client runs: a binary, test, bench, example or `cdylib`. A
-/// build script and a proc macro are not: many and small, they are admitted as any compile.
-/// The same program of the same profile and platform has the same key in every build and
-/// daemon.
-pub(crate) fn program_key(unit: &Unit) -> Option<blaze_graph::Key> {
+/// The phases of `unit`'s compile, each a node of the plane ([`Phase`]): no codegen and no
+/// link for a unit [`checks_only`] stops after the front end.
+pub(crate) fn phases(goal: Goal, unit: &Unit) -> &'static [Phase] {
+    match checks_only(goal, unit) {
+        true => &Phase::CHECK,
+        false => &Phase::BUILD,
+    }
+}
+
+/// The key phase `phase` (its codegen or its link) of a program's build is predicted and
+/// taught by (`plane::Plane::push_program`), when `unit` builds a program its client runs: a
+/// binary, test, bench, example or `cdylib`. A build script and a proc macro are not: many
+/// and small, they are admitted as any compile. The same program of the same profile and
+/// platform has the same key in every build and daemon.
+pub(crate) fn program_key(unit: &Unit, phase: Phase) -> Option<blaze_graph::Key> {
     if unit.target.is_custom_build() || !matches!(unit.mode, Mode::Build | Mode::Test) {
         return None;
     }
     if !matches!(codegen::makes(unit), Ok(codegen::Makes::Executable | codegen::Makes::Shared { proc_macro: false })) {
         return None;
     }
-    let mut hasher = blaze_ids::Hasher::new("blaze v2 program build 1");
+    let mut hasher = blaze_ids::Hasher::new("blaze v2 program build 2");
     let platform = unit.platform.as_deref().unwrap_or("");
     let parts = [unit.pkg_id.as_str(), &unit.target.name, &unit.profile.name, platform];
     for part in parts.into_iter().chain(unit.target.kind.iter().map(String::as_str)) {
         hasher.update(&(part.len() as u64).to_le_bytes()).update(part.as_bytes());
     }
-    hasher.update(&[unit.mode as u8]);
+    hasher.update(&[unit.mode as u8, phase as u8]);
     Some(blaze_graph::Key(hasher.finish().0))
 }
 
@@ -766,11 +778,11 @@ impl Front<Real> for JobFront {
         }
     }
 
-    fn compile(&self, reader: UnitReader, unit: usize, images: &mut Vec<Image<Real>>) -> Result<Compiled, Failed> {
+    fn compile(&self, reader: UnitReader, unit: usize, phase: Phase, images: &mut Vec<Image<Real>>) -> Result<Option<Compiled>, Failed> {
         if self.0.cancelled() {
             return Err(Failed::Again);
         }
-        cancellable(|| compile::compile(&self.0, &reader, unit, images))?
+        cancellable(|| compile::compile(&self.0, &reader, unit, phase, images))?
     }
 
     fn script(&self, unit: usize, tags: u64) -> Result<UnitRuns, ApiError> {

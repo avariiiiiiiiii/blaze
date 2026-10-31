@@ -17,7 +17,7 @@ mod frame;
 mod glue;
 mod inst;
 #[cfg(test)]
-mod tests;
+pub(crate) mod tests;
 
 pub use frame::Frame;
 

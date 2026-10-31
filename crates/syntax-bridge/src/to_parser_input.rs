@@ -103,8 +103,9 @@ pub fn tree_words<F: FnMut(SyntaxContext) -> Edition + ?Sized>(
 /// `fragments` false [`to_parser_input`]'s, and nothing is converted.
 ///
 /// The kept words hold the editions their contexts were given when they were made. When
-/// `span_to_edition` gives any of those contexts another, the view's words are made afresh for
-/// this call, by the same conversion, and the kept ones are left as they are.
+/// `span_to_edition` gives any of those contexts another, the view alone is converted into
+/// `copy` for this call, by the same conversion (the tree's words made again would cost the
+/// tree, not the view), and the kept ones are left as they are.
 ///
 /// A tree that keeps no words (a task's, [`tt::Tree::keeps_words`]) has its view converted into
 /// `copy` on every call.
@@ -139,12 +140,12 @@ pub fn view_tokens<'a, F: FnMut(SyntaxContext) -> Edition + ?Sized>(
                 (tokens, words.first_fragment_counts)
             }
             false => {
-                let made = tree_words(view.tree(), span_to_edition);
-                let words = view.words(&made);
-                copy.clear();
-                copy.extend_from_words(words.words());
+                match fragments {
+                    true => to_matcher_input_into(view, span_to_edition, copy),
+                    false => to_parser_input_into(view, span_to_edition, copy),
+                }
                 let copy: &'a parser::Input = copy;
-                (copy.tokens(), words.first_fragment_counts)
+                return copy.tokens();
             }
         };
     let tokens = if fragments { tokens } else { tokens.ignoring_fragments() };

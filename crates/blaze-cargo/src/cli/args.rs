@@ -363,6 +363,16 @@ pub fn refused(asked: &Invocation) -> Option<String> {
             let mut targets = flags.bins.iter().chain(&flags.examples).flatten();
             targets.any(|it| glob(it)).then(|| "`cargo run` does not support glob patterns on target selection".to_owned())
         }
+        // What `cargo doc` would write beside the pages, which `blaze doc` does not yet.
+        Command::Doc => {
+            if let Some(flag) = flags.reports.first() {
+                return Some(format!("`blaze doc` does not write what `--{flag}` asks for yet"));
+            }
+            let mut formats = flags.message_format.iter().flat_map(|it| it.split(','));
+            formats.find(|it| it.to_ascii_lowercase().starts_with("json")).map(|it| {
+                format!("`blaze doc` writes no JSON messages for the pages yet (`--message-format {it}`)")
+            })
+        }
         _ => None,
     }
 }
@@ -403,6 +413,8 @@ pub struct Flags {
     pub ub: bool,
     pub ub_seed: Option<u64>,
     pub ub_schedules: Option<u32>,
+    /// `--unit-graph` and `--timings`, by name, as given.
+    pub reports: Vec<&'static str>,
 }
 
 impl Flags {
@@ -444,6 +456,7 @@ impl Flags {
             "no-fail-fast" => self.no_fail_fast = true,
             "reached" => self.reached = true,
             "ub" => self.ub = true,
+            name @ ("unit-graph" | "timings") => self.reports.push(name),
             // `check_value` parsed them first.
             "ub-seed" => {
                 self.ub = true;

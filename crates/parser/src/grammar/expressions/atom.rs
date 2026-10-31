@@ -247,7 +247,8 @@ fn builtin_expr(p: &mut Parser<'_>) -> Option<CompletedMarker> {
         // fn foo() {
         //     builtin#offset_of(Foo, (bar.baz.0));
         // }
-        while !p.at(EOF) && !p.at(T![')']) {
+        // A name refuses a `}` without bumping it: the `}` closes a block around the macro.
+        while !p.at(EOF) && !p.at(T![')']) && !p.at(T!['}']) {
             // `0.1` is lexed as a float; whoever reads the name splits it.
             if p.at(FLOAT_NUMBER) {
                 let m = p.start();
@@ -348,14 +349,15 @@ fn builtin_expr(p: &mut Parser<'_>) -> Option<CompletedMarker> {
 // }
 pub(crate) fn parse_asm_expr(p: &mut Parser<'_>, m: Marker) -> Option<CompletedMarker> {
     p.expect(T!['(']);
-    if expr(p).is_none() {
+    if expr(p).is_none() && !p.at(T!['}']) {
         p.err_and_bump("expected asm template");
     }
     let mut allow_templates = true;
-    while !p.at(EOF) && !p.at(T![')']) {
+    // A `}` here closes a block around the `asm!`: every `{` inside it is an operand's.
+    while !p.at(EOF) && !p.at(T![')']) && !p.at(T!['}']) {
         p.expect(T![,]);
         // accept trailing commas
-        if p.at(T![')']) {
+        if p.at(T![')']) || p.at(T!['}']) {
             break;
         }
 
@@ -447,7 +449,7 @@ pub(crate) fn parse_asm_expr(p: &mut Parser<'_>, m: Marker) -> Option<CompletedM
             // The attributes of a template are the template expression's.
             let r =
                 Restrictions { forbid_structs: false, prefer_stmt: false, macro_ends_stmt: true };
-            if expr_bp(p, Some(op_n), r, 1).is_none() {
+            if expr_bp(p, Some(op_n), r, 1).is_none() && !p.at(T!['}']) {
                 p.err_and_bump("expected asm template");
             }
             continue;
@@ -466,6 +468,8 @@ pub(crate) fn parse_asm_expr(p: &mut Parser<'_>, m: Marker) -> Option<CompletedM
                 //     );
                 // }
                 expr(p);
+            } else if p.at(T!['}']) {
+                p.error("expected asm operand");
             } else {
                 p.err_and_bump("expected asm operand");
             }
@@ -484,7 +488,7 @@ pub(crate) fn parse_asm_expr(p: &mut Parser<'_>, m: Marker) -> Option<CompletedM
 fn parse_options(p: &mut Parser<'_>) {
     p.expect(T!['(']);
 
-    while !p.eat(T![')']) && !p.at(EOF) {
+    while !p.eat(T![')']) && !p.at(EOF) && !p.at(T!['}']) {
         const OPTIONS: &[SyntaxKind] = &[
             T![pure],
             T![nomem],
@@ -515,7 +519,7 @@ fn parse_options(p: &mut Parser<'_>) {
 fn parse_clobber_abi(p: &mut Parser<'_>) {
     p.expect(T!['(']);
 
-    while !p.eat(T![')']) && !p.at(EOF) {
+    while !p.eat(T![')']) && !p.at(EOF) && !p.at(T!['}']) {
         if !p.expect(T![string]) {
             break;
         }
@@ -538,6 +542,8 @@ fn parse_reg(p: &mut Parser<'_>) {
         let m = p.start();
         p.bump_any();
         m.complete(p, ASM_REG_SPEC);
+    } else if p.at(T!['}']) {
+        p.error("expected register name");
     } else {
         p.err_and_bump("expected register name");
     }

@@ -845,6 +845,8 @@ dependencies = [
  "blaze-alloc-count",
  "blaze-check",
  "blaze-ids",
+ "blaze-inproc",
+ "blaze-sha256",
 ]
 
 [[package]]

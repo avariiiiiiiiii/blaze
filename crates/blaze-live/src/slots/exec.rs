@@ -18,7 +18,10 @@
 //! and unmarked ones still mark. So a slot first called before a switch keeps the target it
 //! copied, for the rest of the process.
 
-#![allow(unsafe_code, reason = "the execution log's header and region, at the addresses the linker placed them")]
+#![allow(
+    unsafe_code,
+    reason = "the execution log's header and region, at the addresses the linker placed them"
+)]
 
 use std::{
     ops::Range,
@@ -28,7 +31,10 @@ use std::{
     },
 };
 
-use super::{image, os, switch::{Layout, POOL}};
+use super::{
+    image, os,
+    switch::{Layout, POOL},
+};
 use crate::patch::{DESCRIPTOR, Descriptor, exec};
 
 /// What [`__blaze_exec_arm`] returns: 0 once armed, else why not.
@@ -132,11 +138,14 @@ impl Header {
         let loader = header.loader;
         if loader == 0 || !loader.is_multiple_of(8) {
             // alloc: error path
-            return Err(format!("the jump table at {at:#x} holds {loader:#x} for its loader's table"));
+            return Err(format!(
+                "the jump table at {at:#x} holds {loader:#x} for its loader's table"
+            ));
         }
         let end = slots.checked_mul(8).and_then(|len| loader.checked_add(len));
         // alloc: error path
-        let end = end.ok_or_else(|| format!("a jump table at {loader:#x} past the end of memory"))?;
+        let end =
+            end.ok_or_else(|| format!("a jump table at {loader:#x} past the end of memory"))?;
         in_image(&(loader..end))?;
         if header.logged() {
             in_image(&(at..at + exec::len(slots, true)))?;

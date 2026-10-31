@@ -20,8 +20,11 @@ use std::{
     path::PathBuf,
 };
 
-/// Buffers kept per thread and kind: the nesting depth whose buffers stay warm.
-pub const DEPTH: usize = 4;
+/// Buffers kept per thread and kind: the nesting depth whose buffers stay warm. A reparse
+/// holds four lexings at once (a node's, and the text around it lexed joined and in parts),
+/// two `u32` columns each. A shelf only holds buffers that were out at once, so a deeper one
+/// costs a thread nothing it did not already use.
+pub const DEPTH: usize = 8;
 
 /// A thread's buffers of one kind, up to `N` (the nesting depth kept warm): what a
 /// [`Shelved`] implementation keeps in its `thread_local!`, as

@@ -5,7 +5,7 @@
 use std::cmp::Reverse;
 
 use blaze_manifest::Config;
-use blaze_manifest::config::{CompileKind, Flags};
+use blaze_manifest::config::{CompileKind, Flags, PathAndArgs};
 use blaze_manifest::files::Files;
 use blaze_manifest::manifest::Manifest;
 use blaze_resolve::Cfg;
@@ -63,6 +63,51 @@ pub(super) fn kind_info<F: Files>(config: &Config<F>, host: &str, target: Option
         }
         return Ok(KindInfo { triple: triple.to_owned(), rustflags, cfg_lines, cfgs });
     }
+}
+
+/// What `cargo doc` would read that `blaze doc` does not honor yet, refused naming it: rustdoc's
+/// flags of each kind (`extra_args` with `Flags::Rustdoc`; blaze-doc makes the pages, and no
+/// rustdoc runs), and under `--open` the browser of `doc.browser` (`CARGO_DOC_BROWSER`), which
+/// cargo takes over `$BROWSER`.
+pub(super) fn doc_unhonored<F: Files>(
+    config: &Config<F>,
+    host: &str,
+    target: Option<&str>,
+    kinds: &[KindInfo],
+    open: bool,
+) -> Result<(), LoadError> {
+    let requested = [match target {
+        Some(triple) => CompileKind::Target(triple.to_owned()),
+        None => CompileKind::Host,
+    }];
+    for (at, info) in kinds.iter().enumerate() {
+        let kind = match at {
+            0 => CompileKind::Host,
+            _ => CompileKind::Target(info.triple.clone()),
+        };
+        let rustdocflags = config
+            .extra_args(&requested, host, Some(&info.cfgs), &kind, Flags::Rustdoc)
+            .map_err(|e| load_error(&e, None))?;
+        if !rustdocflags.is_empty() {
+            return Err(error(format!(
+                "blaze doc makes the pages itself and takes none of rustdoc's flags yet: `{}` \
+                 (`RUSTDOCFLAGS`, `build.rustdocflags` or `target.{}.rustdocflags`)",
+                rustdocflags.join(" "),
+                info.triple
+            )));
+        }
+    }
+    if open {
+        let browser: Option<PathAndArgs> = config.get("doc.browser").map_err(|e| load_error(&e, None))?;
+        if browser.is_some() {
+            return Err(error(
+                "blaze doc --open opens the pages with `$BROWSER` or the system's opener, and does \
+                 not read `doc.browser` (`CARGO_DOC_BROWSER`) yet"
+                    .to_owned(),
+            ));
+        }
+    }
+    Ok(())
 }
 
 /// Each `--cfg` of `flags`, as `--cfg x` or `--cfg=x`.

@@ -17,7 +17,8 @@
 //!
 //! A slot is one database's file in one crate ([`Kept`]). One another file took, or one
 //! another thread holds, is a whole lowering, never a wrong one: what decides reuse is the
-//! keys, the crate's `cfg` set and the top level's attributes, compared.
+//! keys, the crate's `cfg` set and the top level's attributes: keyed ([`top_key`]), and
+//! lowered again and compared where the key changed.
 
 use std::{
     cell::Cell,
@@ -125,6 +126,8 @@ struct Keyed {
     tree: Arc<ItemTree>,
     /// The file's text the keys were made of: what the next edit's text is compared with.
     text: Text,
+    /// What lowering the top level's attributes read ([`top_key`]).
+    top: u128,
     /// Per top-level item of the file, in order: what lowering it reads.
     keys: Keys,
     /// Per top-level item, where its rows begin in each of `tree`'s columns; then where the
@@ -205,16 +208,19 @@ fn reuse(db: &Db, file: EditionedFileId, krate: Crate, mut keyed: Keyed) -> Keye
     let after = (0..(old_items - before).min(new_items - before))
         .take_while(|&it| old.same(old_items - 1 - it, new, new_items - 1 - it))
         .count();
-    let top = top_attrs(db, file, krate);
-    if before == old_items
-        && before == new_items
-        && same_top(&keyed.tree, &keyed.marks[0], &top)
-    {
-        // The tree and its marks stand; the items' ranges moved with the edit.
-        mem::swap(&mut keyed.keys, &mut scratch.keys);
-        release(scratch);
-        return keyed;
-    }
+    let top_key = top_key(db, file, krate, source_file, &mut scratch.bytes);
+    let top_kept = mem::replace(&mut keyed.top, top_key) == top_key;
+    let unchanged = before == old_items && before == new_items;
+    let top = (!unchanged || !top_kept).then(|| top_attrs(db, file, krate));
+    let top = match top {
+        Some(top) if !unchanged || !same_top(&keyed.tree, &keyed.marks[0], &top) => top,
+        _ => {
+            // The tree and its marks stand; the items' ranges moved with the edit.
+            mem::swap(&mut keyed.keys, &mut scratch.keys);
+            release(scratch);
+            return keyed;
+        }
+    };
 
     let changed = new_items - before - after;
     count_lowered(|| changed);
@@ -278,6 +284,7 @@ fn lower_keyed(
     scratch.marks.clear();
     item_keys(db, file, source_file, &mut scratch, None);
     count_lowered(|| scratch.keys.items.len());
+    let top = top_key(db, file, krate, source_file, &mut scratch.bytes);
 
     let mut ctx = lower::Ctx::new(db, file.into(), krate);
     ctx.lower_top_attrs(source_file, crate_attrs_of(db, file, krate));
@@ -286,6 +293,7 @@ fn lower_keyed(
         cfg: cfg.clone(), // clone: once a file's first edit or a new `cfg` set
         tree: Arc::new(tree), // alloc: the tree's handle, once a lowering
         text: text_of(source_file).clone(), // clone: one count of the file's text
+        top,
         keys: mem::take(&mut scratch.keys),
         marks: mem::take(&mut scratch.marks),
         entries: mem::take(&mut scratch.entries),
@@ -301,6 +309,40 @@ pub(super) fn top_attrs(db: &Db, file: EditionedFileId, krate: Crate) -> ItemTre
     let source_file = file.parse(db).view();
     lower::Ctx::new(db, HirFileId::from(file), krate)
         .lower_top(source_file, crate_attrs_of(db, file, krate))
+}
+
+/// A fingerprint of what lowering the top level's attributes reads ([`top_attrs`]) but the
+/// crate's `cfg` set: the file's syntax outside its top-level items, at its offsets, and the
+/// crate attributes' files. Where the items' keys are as they were, the same offsets put them
+/// where they were, so the attributes' spans are too. One that changed may still lower to the
+/// same attributes ([`same_top`]).
+fn top_key(
+    db: &Db,
+    file: EditionedFileId,
+    krate: Crate,
+    source_file: ast::SourceFile<'_>,
+    bytes: &mut Vec<u8>,
+) -> u128 {
+    bytes.clear();
+    let mut feed = Feed(bytes);
+    for child in source_file.syntax().children_with_tokens() {
+        match child {
+            NodeOrToken::Node(node) if ast::Item::can_cast(node.kind()) => {}
+            NodeOrToken::Node(node) => {
+                u32::from(node.text_range().start()).hash(&mut feed);
+                hash_full(node, &mut feed);
+            }
+            NodeOrToken::Token(token) => {
+                u32::from(token.text_range().start()).hash(&mut feed);
+                hash_token(token, &mut feed);
+            }
+        }
+    }
+    for &attr_file in crate_attrs_of(db, file, krate) {
+        (END, attr_file).hash(&mut feed);
+        hash_full(attr_file.parse(db).view().syntax(), &mut feed);
+    }
+    feed.fingerprint()
 }
 
 /// The files of the crate attributes rustc appends to `file`'s inner attributes: `krate`'s

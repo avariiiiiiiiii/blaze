@@ -575,6 +575,9 @@ pub enum Op {
     Fmul,
     Fdiv,
     Sqrt,
+    /// `aux` 1 is AArch64's `fmsub`/`fmls`, `z - x * y` with `x`'s sign flipped before the
+    /// multiply, which Cranelift lowers `fma x (fneg y) z` to: operands `[x, y, z]`
+    /// ([`Aux::Negated`]).
     Fma,
     Fneg,
     Fabs,
@@ -748,6 +751,8 @@ pub enum Aux {
     Wide,
     /// A confined access and its [`Disp`] ([`Op::LoadConfined`], [`Op::StoreConfined`]).
     Confined,
+    /// 0, or 1 for the form with an operand's sign flipped ([`Op::Fma`]).
+    Negated,
 }
 
 /// What an op takes and gives, and which shapes of it exist.
@@ -941,7 +946,7 @@ const TABLE: [Info; Op::Trapnz as usize + 1] = [
     binary(Op::Fmul, "fmul", TySet::FLOAT_MATH),
     binary(Op::Fdiv, "fdiv", TySet::FLOAT_MATH),
     unary(Op::Sqrt, "sqrt", TySet::FLOAT_MATH),
-    Info::new(Op::Fma, "fma", 3, 1, TySet::FLOAT_MATH),
+    Info::new(Op::Fma, "fma", 3, 1, TySet::FLOAT_MATH).aux(Aux::Negated),
     unary(Op::Fneg, "fneg", TySet::FLOAT_MATH),
     unary(Op::Fabs, "fabs", TySet::FLOAT_MATH),
     binary(Op::Fcopysign, "fcopysign", TySet::FLOAT_MATH),
@@ -1206,6 +1211,7 @@ impl Shape {
             Aux::Lane => aux < ty.lanes(),
             Aux::Rmw => aux < RmwOp::COUNT,
             Aux::Wide => aux == 0 || (aux == 1 && ty.bytes() == 8),
+            Aux::Negated => aux < 2,
             Aux::Confined => {
                 self.confined().is_some_and(|(access, _)| access.info().tys.contains(ty))
             }
@@ -1384,7 +1390,7 @@ fn auxes(info: &Info, ty: Ty) -> impl Iterator<Item = u8> {
         Aux::Lane => (0, ty.lanes()),
         Aux::Ty(_) => (0, Ty::ALL.len() as u8),
         Aux::Rmw => (0, RmwOp::COUNT),
-        Aux::Wide => (0, 2),
+        Aux::Wide | Aux::Negated => (0, 2),
         Aux::Confined => (0, 3 << 5),
     };
     start..end

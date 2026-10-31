@@ -32,7 +32,10 @@ struct Switched {
 fn model_a_call_sees_all_of_a_patch_or_none() {
     blaze_check::model(|| {
         // alloc: the state the model's two threads share, once an execution
-        let switched = Arc::new(Switched { tables: [OLD.map(AtomicU64::new), OLD.map(AtomicU64::new)], cell: AtomicU64::new(0) });
+        let switched = Arc::new(Switched {
+            tables: [OLD.map(AtomicU64::new), OLD.map(AtomicU64::new)],
+            cell: AtomicU64::new(0),
+        });
         let patch = {
             // clone: the patching thread's handle on it
             let switched = switched.clone();

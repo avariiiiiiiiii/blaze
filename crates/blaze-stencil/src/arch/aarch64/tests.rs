@@ -42,7 +42,7 @@ fn on_frame<R>(f: impl FnOnce(&blaze_mem::Frame) -> R) -> R {
     blaze_mem::frame::task(blaze_mem::Tag::Codegen, f)
 }
 
-const LINUX: Target = Target {
+pub(crate) const LINUX: Target = Target {
     arch: blaze_codegen::Arch::Aarch64,
     os: Os::Linux,
     cpu: Cpu::Baseline,
@@ -875,8 +875,8 @@ fn a_return_call_of_more_stack_arguments_grows_the_frame_as_cranelift_does() {
     });
     let out = whole(&func, &LINUX);
     assert_eq!((out.frame.pop, out.frame.grow), (16, 16));
-    // `sub sp, sp, #16`, `ldr x29, [sp, #16]`, `stp x29, x30, [sp]`, `mov x29, sp`.
-    let grow = [0xd100_43ff, 0xf940_0bfd, 0xa900_7bfd, 0x9100_03fd];
+    // `sub sp, sp, #16`, `ldur x29, [sp, #16]`, `stp x29, x30, [sp]`, `mov x29, sp`.
+    let grow = [0xd100_43ff, 0xf841_03fd, 0xa900_7bfd, 0x9100_03fd];
     let has = |words: &[u32]| words.windows(4).any(|w| w == grow);
     assert!(has(&out.words[..out.prologue as usize / 4]), "the glue's prologue grows");
     assert!(has(&cranelift(&func, &LINUX).words), "Cranelift's prologue grows the same way");
@@ -979,17 +979,19 @@ fn stencil(shape: Shape) -> (Vec<u8>, Vec<Hole>) {
 
 fn mock() -> Reader<'static> {
     static BYTES: OnceLock<Vec<u8>> = OnceLock::new();
-    let bytes = BYTES.get_or_init(|| {
-        let mut writer = Writer::new(Variant::Aarch64);
-        shape::each_on(Isa::Aarch64, |shape| {
-            if OPS.contains(&shape.op) {
-                let (code, holes) = stencil(shape);
-                writer.push(shape, &code, 4, &holes).unwrap();
-            }
-        });
-        writer.finish(|_| [0; 32]).unwrap()
+    Reader::new(BYTES.get_or_init(|| library_of(&OPS))).unwrap()
+}
+
+/// A library of the mock stencils of every AArch64 shape of `ops`.
+pub(crate) fn library_of(ops: &[Op]) -> Vec<u8> {
+    let mut writer = Writer::new(Variant::Aarch64);
+    shape::each_on(Isa::Aarch64, |shape| {
+        if ops.contains(&shape.op) {
+            let (code, holes) = stencil(shape);
+            writer.push(shape, &code, 4, &holes).unwrap();
+        }
     });
-    Reader::new(bytes).unwrap()
+    writer.finish(|_| [0; 32]).unwrap()
 }
 
 #[test]

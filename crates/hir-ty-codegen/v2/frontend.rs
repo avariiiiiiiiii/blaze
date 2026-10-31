@@ -699,7 +699,7 @@ pub(super) fn item_of(db: &Db, kind: &Kind) -> Result<ItemId, String> {
             let loc = closure_loc(db, instance.def).expect("a closure or coroutine");
             owner_item(db, loc.owner)
         }
-        InstanceDef::DropGlue => lang(lang_items().DropInPlace, "drop_in_place"),
+        InstanceDef::DropGlue => lang(lang_items().DropGlue, "drop_glue"),
         InstanceDef::CallOnceShim | InstanceDef::FnPointerShim => {
             lang(lang_items().FnOnce_call_once, "FnOnce::call_once")
         }

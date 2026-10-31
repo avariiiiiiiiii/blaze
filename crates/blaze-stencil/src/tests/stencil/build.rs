@@ -7,6 +7,8 @@
 //! - An operand from the accumulator is the result of the instruction right before, a `bnot`
 //!   (integers, integer vectors) or `fneg` (floats, float vectors) of a parameter the test
 //!   passes inverted or negated ([`Xform`]), so the operand's bits are exactly the input's.
+//!   An `fma`'s operand 1 is a `bitcast` of the integer parameter of the same bits instead:
+//!   an `fneg` there is fused into the `fma` (`patch/select.rs`).
 //! - A result to the accumulator has the next instruction, the same `bnot`/`fneg`, as its one
 //!   use; to both, it is returned as well; to a slot, it is returned.
 //! - Memory goes through a stack slot the function first stores its input to, since the
@@ -42,14 +44,27 @@ pub enum Xform {
     Invert,
     /// Each lane's sign flipped: the function's `fneg` gives the input back.
     Negate,
+    /// The same bits as the integer type of the float's width: the function's `bitcast`
+    /// gives the input back.
+    Bits,
 }
 
 impl Xform {
+    /// The type of the parameter carrying an input of `ty`.
+    pub fn param(self, ty: Ty) -> Ty {
+        match (self, ty) {
+            (Xform::Bits, Ty::F32) => Ty::I32,
+            (Xform::Bits, Ty::F64) => Ty::I64,
+            (Xform::Bits, it) => it.int_lanes(),
+            (_, it) => it,
+        }
+    }
+
     /// The parameter's bits for an input of `ty`.
     pub fn apply(self, ty: Ty, mut bytes: [u8; 16]) -> [u8; 16] {
         let width = usize::from(ty.bytes());
         match self {
-            Xform::Plain => {}
+            Xform::Plain | Xform::Bits => {}
             Xform::Invert => bytes[..width].iter_mut().for_each(|it| *it = !*it),
             Xform::Negate => {
                 let lane = usize::from(ty.lane().bytes());
@@ -232,8 +247,9 @@ impl Cx<'_> {
     fn param(&mut self, ty: Ty, xform: Xform, amount_of: Option<Ty>) -> ir::Value {
         // The entry block's parameters are appended as inputs are found, after its first
         // instructions: no variable is ever declared, so SSA construction never reads them.
-        let value = self.b.func.dfg.append_block_param(self.entry, ir_ty(ty));
-        self.b.func.signature.params.push(ir::AbiParam::new(ir_ty(ty)));
+        let carried = ir_ty(xform.param(ty));
+        let value = self.b.func.dfg.append_block_param(self.entry, carried);
+        self.b.func.signature.params.push(ir::AbiParam::new(carried));
         self.inputs.push(Input { ty, xform, amount_of });
         value
     }
@@ -263,6 +279,10 @@ impl Cx<'_> {
         match self.shape.srcs[n] {
             Src::Slot => self.param(ty, Xform::Plain, self.amount_of(n)),
             Src::Imm => self.iconst(ty, self.baked.imms[n]),
+            Src::Acc if self.shape.op == Op::Fma && n == 1 => {
+                let param = self.param(ty, Xform::Bits, None);
+                self.b.ins().bitcast(ir_ty(ty), MemFlagsData::new(), param)
+            }
             Src::Acc => {
                 let xform = if ty.lane().is_float() { Xform::Negate } else { Xform::Invert };
                 let param = self.param(ty, xform, self.amount_of(n));
@@ -618,6 +638,10 @@ impl Cx<'_> {
             Op::Fmul => self.pure(|b, [x, y, _]| vec![b.ins().fmul(x, y)]),
             Op::Fdiv => self.pure(|b, [x, y, _]| vec![b.ins().fdiv(x, y)]),
             Op::Sqrt => self.pure(|b, [x, _, _]| vec![b.ins().sqrt(x)]),
+            Op::Fma if shape.aux == 1 => self.pure(|b, [x, y, z]| {
+                let negated = b.ins().fneg(y);
+                vec![b.ins().fma(x, negated, z)]
+            }),
             Op::Fma => self.pure(|b, [x, y, z]| vec![b.ins().fma(x, y, z)]),
             Op::Fneg => self.pure(|b, [x, _, _]| vec![b.ins().fneg(x)]),
             Op::Fabs => self.pure(|b, [x, _, _]| vec![b.ins().fabs(x)]),

@@ -1,6 +1,9 @@
-//! What a stage is to a running program: a patch it applies (new code and data, the slots
-//! that changed, the frames to register), or why it must start again.
+//! What a stage is to a running program: a patch it applies (the new code it runs, new data,
+//! the slots that changed, the frames to register), or why it must start again.
 //!
+//! The message carries no code: the commit writes it into the code memory the program runs
+//! ([`crate::Image::commit_into`]), and the message names each function's code by address,
+//! length, SHA-256 and name, which the program checks against what it maps before it switches.
 //! The patch borrows what it sends: a piece's bytes are read in place from the new state's
 //! pages (copied into the stage's arena only when they span written pages), its cells are
 //! the dirty slots alone, and the message is encoded into one buffer of its exact length.
@@ -10,7 +13,7 @@
 use blaze_codegen::Arch;
 use blaze_ids::radix;
 use blaze_live::patch::{
-    ARCH_AARCH64, ARCH_X86_64, DESCRIPTOR_MAGIC, DESCRIPTOR_VERSION, Descriptor, Message, PatchRef,
+    ARCH_AARCH64, ARCH_X86_64, CodeRef, DESCRIPTOR_MAGIC, DESCRIPTOR_VERSION, Descriptor, Message, PatchRef, hash,
 };
 
 use crate::arena::FrameVec;
@@ -26,10 +29,11 @@ use crate::symbols::SymKey;
 const EH_FRAME_END: [u8; 4] = [0; 4];
 
 impl Stage<'_> {
-    /// The live descriptor's bytes: where the table, the patch regions and the directory
-    /// are, as linked.
+    /// The live descriptor's bytes: where the table and the patch regions are, as linked.
     pub fn fill_descriptor(&mut self) -> Result<(), crate::LinkError> {
-        let Some(live) = &self.output.live else { return Ok(()) };
+        if self.output.live.is_none() {
+            return Ok(());
+        }
         let missing = || error(None, "a live image laid out without its jump table");
         let at = |this: &Self, key: SymKey| -> Option<u64> {
             let (piece, offset) = this.new.home(this.symbols.find(key)?)?;
@@ -56,7 +60,6 @@ impl Stage<'_> {
             slots: u64::from(self.new.capacity),
             patch_code: region(self, Class::Patch),
             patch_data: region(self, Class::PatchData),
-            dir: [at(self, SymKey::LiveDir).ok_or_else(missing)?, live.path.len() as u64],
         };
         let sym = self.symbols.find(SymKey::Descriptor).ok_or_else(missing)?;
         let (piece, _) = self.new.home(sym).ok_or_else(missing)?;
@@ -90,7 +93,7 @@ impl Stage<'_> {
         let mut ids = Vec::with_capacity_in(self.write.len(), arena);
         ids.extend(self.write.iter());
         ids.sort_unstable();
-        let mut code: FrameVec<'_, (u64, &[u8])> = Vec::with_capacity_in(ids.len(), arena);
+        let mut code: FrameVec<'_, CodeRef<'_>> = Vec::with_capacity_in(ids.len(), arena);
         let mut data: FrameVec<'_, (u64, &[u8])> = Vec::with_capacity_in(ids.len(), arena);
         let mut rebase: FrameVec<'_, u64> = Vec::new_in(arena);
         let mut slots: FrameVec<'_, (u32, u64)> = Vec::new_in(arena);
@@ -119,7 +122,21 @@ impl Stage<'_> {
                 continue;
             }
             match &space.region.class {
-                Class::Patch => code.push((piece.addr, piece.bytes_in(self.arena))),
+                Class::Patch => {
+                    if !piece.rebase().is_empty() {
+                        // alloc: a restart's reason, which the message carries: once per message
+                        return restart(format!(
+                            "{} holds an address the loader slides, in code: every run of the program maps one \
+                             copy of its code",
+                            self.symbols.describe(piece.sym)
+                        ));
+                    }
+                    let bytes = piece.bytes_in(arena);
+                    // alloc: the function's name, once per function the patch changes, for the
+                    // program's refusal of code that differs; the list borrows the arena's copy
+                    let name: &str = arena.alloc_str(&self.symbols.describe(piece.sym));
+                    code.push(CodeRef { at: piece.addr, len: bytes.len() as u64, hash: hash(bytes), name });
+                }
                 Class::PatchData
                 | Class::EhFrame
                 | Class::Rodata
@@ -164,7 +181,12 @@ impl Stage<'_> {
             }
         }
         if let Some(end) = self.frames_end {
-            code.push((end, &EH_FRAME_END));
+            code.push(CodeRef {
+                at: end,
+                len: EH_FRAME_END.len() as u64,
+                hash: hash(&EH_FRAME_END),
+                name: "the call frame entries' end",
+            });
         }
         if in_eh_frame && self.output.format == Format::Elf {
             let Some(space) = self.new.space_of(&Class::EhFrame) else {
@@ -181,7 +203,7 @@ impl Stage<'_> {
         radix::sort(&mut rebase);
         // By address, as the runtime checks them: a sorted list is one pass of its sort on
         // the switch's latency path, an unsorted one n log n compares. Ties keep piece order.
-        radix::sort_copy_by_key(&mut code, |it| it.0);
+        radix::sort_copy_by_key(&mut code, |it| it.at);
         radix::sort_copy_by_key(&mut data, |it| it.0);
         radix::sort_copy_by_key(&mut frames, |it| it.0);
         radix::sort_copy_by_key(&mut windows, |it| it.0);

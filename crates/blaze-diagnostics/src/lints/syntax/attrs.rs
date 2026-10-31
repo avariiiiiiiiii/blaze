@@ -231,7 +231,21 @@ pub(crate) fn owners<'db>(cx: &Cx<'_, 'db>, walk: &Walk<'db>) -> Vec<Owner<'db>>
     // A module file's inner attributes are its `mod` item's: only those are looked up.
     let mut module_items: FxHashMap<InFile<SyntaxNodePtr>, usize> = FxHashMap::default();
     for tree in &walk.trees {
-        for node in tree.of_kind(ast::AnyHasAttrs::can_cast) {
+        for node in tree.of_kind(|kind| ast::AnyHasAttrs::can_cast(kind) || kind == SyntaxKind::MACRO_EXPR) {
+            // The parser puts a macro call expression's attributes on the `MACRO_EXPR`, which has
+            // no `HasAttrs`; rustc's expansion checks them as the call's (`check_attributes` of
+            // `collect_bang`).
+            if let Some(call) = ast::MacroExpr::cast(node).and_then(|it| it.macro_call()) {
+                // alloc: empty until an attribute, then the owner's row of the table
+                let mut attrs = Vec::new();
+                let written = node.children().filter_map(ast::AnyAttr::cast).filter(|it| it.kind().is_outer());
+                written_attributes(walk, tree.file, written, &mut attrs);
+                if !attrs.is_empty() {
+                    let node = InFile::new(tree.file, call.syntax());
+                    owners.push(Owner { node, target: Target::MacroCall, attrs, buffered_at: None });
+                }
+                continue;
+            }
             // `Tree::attrs` marks no doc comment's owner, so each node that can have one is read.
             let Some(has_attrs) = ast::AnyHasAttrs::cast(node) else { continue };
             let kind = node.kind();
@@ -250,15 +264,7 @@ pub(crate) fn owners<'db>(cx: &Cx<'_, 'db>, walk: &Walk<'db>) -> Vec<Owner<'db>>
             if attrs.is_empty() && !is_module {
                 continue;
             }
-            // The parser puts a macro call expression's attributes on the `MACRO_EXPR`; rustc's
-            // expansion checks them as the call's (`check_attributes` of `collect_bang`).
-            let (node, target) = match ast::MacroExpr::cast(node).and_then(|it| it.macro_call()) {
-                Some(call) => (call.syntax(), Target::MacroCall),
-                None => match Target::of(cx, InFile::new(tree.file, node), crate_root) {
-                    Some(target) => (node, target),
-                    None => continue,
-                },
-            };
+            let Some(target) = Target::of(cx, InFile::new(tree.file, node), crate_root) else { continue };
             if is_module {
                 module_items.insert(tree.ptr(node), owners.len());
             }
@@ -294,7 +300,17 @@ pub(crate) fn owners<'db>(cx: &Cx<'_, 'db>, walk: &Walk<'db>) -> Vec<Owner<'db>>
 /// The attributes of `owner`, written in `file`, with `cfg_attr` expanded as the crate's cfg
 /// says and the `cfg`s left out (rustc keeps only a trace of them), pushed onto `attrs`.
 fn attributes<'db>(walk: &Walk<'db>, file: HirFileId, owner: ast::AnyHasAttrs<'db>, attrs: &mut Vec<Attr<'db>>) {
-    let written = ast::attrs_with_doc_including_inner(&owner).map(|it| match it {
+    written_attributes(walk, file, ast::attrs_with_doc_including_inner(&owner), attrs);
+}
+
+/// [`attributes`] of the attributes and doc comments `written`, as they are written.
+fn written_attributes<'db>(
+    walk: &Walk<'db>,
+    file: HirFileId,
+    written: impl Iterator<Item = ast::AnyAttr<'db>>,
+    attrs: &mut Vec<Attr<'db>>,
+) {
+    let written = written.map(|it| match it {
         ast::AnyAttr::Attr(it) => Either::Left(it),
         ast::AnyAttr::DocComment(it) => Either::Right(it),
     });

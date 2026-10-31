@@ -181,6 +181,27 @@ fn an_announcement_is_one_word_apart_from_the_rest() {
 }
 
 #[test]
+fn a_waiter_for_an_announcement_wakes_at_it_or_at_its_timeout() {
+    let fences = Arc::new(Fences::new(words()));
+    fences.announce(3);
+    let started = Instant::now();
+    assert_eq!(Thread::wait_announced(fences.words(), 2, Duration::from_secs(60)), 3, "not what was seen: at once");
+    assert_eq!(Thread::wait_announced(fences.words(), 3, Duration::from_millis(20)), 3, "nothing announced");
+    let announcer = fences.clone();
+    let announcing = std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_millis(50));
+        announcer.announce(4);
+    });
+    let mut now = 3;
+    while now == 3 {
+        now = Thread::wait_announced(fences.words(), 3, Duration::from_secs(60));
+    }
+    assert_eq!(now, 4);
+    announcing.join().unwrap();
+    assert!(started.elapsed() < Duration::from_secs(30), "woken by the announce, not the timeout");
+}
+
+#[test]
 fn processes_are_counted_apart() {
     let fences = Fences::new(words());
     Thread::claim(fences.words(), PID, 1, 2).unwrap();

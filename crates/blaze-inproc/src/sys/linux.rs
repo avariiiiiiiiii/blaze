@@ -82,7 +82,7 @@ fn icache_way() -> Result<u64, String> {
         let dir = format!("/sys/devices/system/cpu/cpu0/cache/index{index}");
         let read = |name: &str| std::fs::read_to_string(format!("{dir}/{name}")).map(|it| it.trim().to_owned());
         let Ok(kind) = read("type") else { break };
-        if kind != "Instruction" || read("level").as_deref() != Ok("1") {
+        if kind != "Instruction" || !read("level").is_ok_and(|it| it == "1") {
             continue;
         }
         let size = read("size").map_err(|it| it.to_string())?;

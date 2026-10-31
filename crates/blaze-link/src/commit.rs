@@ -1,7 +1,8 @@
 //! The commit: the one serial step. A stage's writes go to a copy of the image (a clone that
 //! shares its blocks, or a new file for a full link), which is synced and renamed over the
-//! image, so a reader or a crash sees the old image or the new; then running programs are
-//! told. Effects complete in any order: each step waits for all of its own.
+//! image, so a reader or a crash sees the old image or the new. Running programs are told
+//! only by a commit into their code memory ([`Image::commit_into`]), never by a file commit.
+//! Effects complete in any order: each step waits for all of its own.
 //!
 //! The effects of every step are one queue, cut by each step's count, and their tags are
 //! given out one after another, so the effects in flight are a range of tags and a bitset
@@ -14,11 +15,10 @@ use std::collections::VecDeque;
 use blaze_core::{Completion, Done, Effect, FileName, Tag};
 use blaze_ids::bits::BitSet;
 use blaze_inproc::{CodeMemory, CodeRange};
-use blaze_live::patch::message_file;
 
 use crate::file;
 use crate::state::State;
-use crate::{Image, LinkError, Output, Staged};
+use crate::{Image, LinkError, Staged};
 
 /// A state the image can go back to: the state before a commit, and the ranges of its file
 /// the commit overwrote (read from `state` when rolling back).
@@ -76,16 +76,14 @@ pub(crate) enum Revert {
 /// How many commits back a rollback can go.
 pub(crate) const HISTORY: usize = 16;
 
-/// The file writes of one commit, and the message for running programs.
+/// The file writes of one commit, and the encoded message for running programs, which only a
+/// commit into their code memory gives them.
 pub(crate) struct Writes {
     pub full: bool,
     pub len: u64,
     pub old_len: u64,
     pub writes: Vec<(u64, Vec<u8>)>,
-    /// The message file to remove first (a rollback's: the generation it undoes), and the
-    /// encoded one to write last.
-    pub remove: Option<u64>,
-    pub message: Option<(u64, Vec<u8>)>,
+    pub message: Option<Vec<u8>>,
 }
 
 /// The image's tags, given out one after another: the high half is the output's.
@@ -105,12 +103,6 @@ impl Tags<'_> {
 fn owned(name: &FileName) -> FileName {
     // clone: each effect owns its file name (`blaze_core::Effect`), a few per commit
     name.clone()
-}
-
-fn message_name(output: &Output, generation: u64) -> Option<FileName> {
-    let live = output.live.as_ref()?;
-    // alloc: the message file's name, once per commit; the effect owns it
-    FileName::new(&format!("{}/{}", live.dir.as_str(), message_file(generation)))
 }
 
 impl Image {
@@ -156,17 +148,14 @@ impl Image {
         let Some(undo) = self.history.back() else {
             return Err(LinkError { function: None, what: "no commit to roll back".into(), refusal: None });
         };
-        let from = self.state.generation;
         let to = undo.state.generation;
-        let message = self.output.live.as_ref().map(|_| {
-            (from, blaze_live::patch::Message::RollBack { id: self.state.lineage, to }.encode())
-        });
+        let message =
+            self.output.live.map(|_| blaze_live::patch::Message::RollBack { id: self.state.lineage, to }.encode());
         Ok(Writes {
             full: undo.full,
             len: undo.len,
             old_len: self.state.file_len,
             writes: file::restore(&undo.state, undo.full, &undo.writes),
-            remove: message.is_some().then_some(to),
             message,
         })
     }
@@ -225,7 +214,22 @@ impl Image {
         }
     }
 
+    /// The effects of a file commit or rollback. One with a message for running programs is
+    /// refused before anything changes: the file reaches no running program, only the code
+    /// memory does.
     pub(crate) fn steps(&mut self, writes: Writes) -> Result<Steps, LinkError> {
+        if writes.message.is_some() {
+            return Err(LinkError {
+                function: None,
+                refusal: None,
+                // alloc: error path
+                what: format!(
+                    "{}: a live image's patches reach running programs only through the code memory: commit it with \
+                     `commit_into`, roll it back with `roll_back_into`",
+                    self.to
+                ),
+            });
+        }
         let mut tags = Tags { high: self.output.tags, low: &mut self.tags };
         let (to, next) = (&self.to, &self.next);
         let mut steps = Steps {
@@ -248,14 +252,6 @@ impl Image {
         steps.step([Effect::Sync { file: owned(next), tag: tags.next() }]);
         steps.step([Effect::Mode { file: owned(next), mode: 0o755, tag: tags.next() }]);
         steps.step([Effect::Rename { from: owned(next), to: owned(to), tag: tags.next() }]);
-        if let Some(generation) = writes.remove {
-            let file = message_name(&self.output, generation).ok_or_else(live_dir_error)?;
-            steps.step([Effect::Remove { file, tag: tags.next() }]);
-        }
-        if let Some((generation, bytes)) = writes.message {
-            let file = message_name(&self.output, generation).ok_or_else(live_dir_error)?;
-            steps.step([Effect::Write { file, bytes, tag: tags.next() }]);
-        }
         Ok(steps)
     }
 
@@ -325,7 +321,7 @@ impl Image {
                     format!("writing {}: {why}", self.to)
                 } else {
                     // alloc: error path
-                    format!("{} is written, but running programs were not told: {why}", self.to)
+                    format!("{} is renamed into place, but an effect after the rename failed: {why}", self.to)
                 };
                 pending.failed.get_or_insert(LinkError { function: None, what, refusal: None });
             }
@@ -358,9 +354,4 @@ impl Image {
         self.next_step(effects);
         None
     }
-}
-
-fn live_dir_error() -> LinkError {
-    // alloc: error path
-    LinkError { function: None, what: "the live directory names no file under the driver's root".into(), refusal: None }
 }

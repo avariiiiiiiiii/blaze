@@ -392,9 +392,6 @@ fn build(fixture: &str, mut extra: Vec<(String, ProcMacro)>) -> Fixture {
     }
 
     let mut db = Db::for_tests();
-    // Setting the crate graph maintains every crate's def map, which reads the proc macros: the
-    // input is there first, as `load-cargo` makes it, and `build_in` gives it the fixture's.
-    ProcMacros::init_default(&mut db, Durability::HIGH);
     let ids = set_files(&mut db, &base, &planned, &roots);
     let sysroot_files = ids[own_files..].to_vec();
     let core_file = has_core.then(|| ids[own_files]);
@@ -527,8 +524,13 @@ fn build(fixture: &str, mut extra: Vec<(String, ProcMacro)>) -> Fixture {
         }
     }
 
-    let crates_id_map = graph.set_in_db(&mut db);
-    macros.build_in(&mut db, &crates_id_map);
+    // Setting the crate graph maintains every crate's def map, which reads the proc macros: one
+    // write sets both, so the maintainers run once and see the fixture's.
+    let crates_id_map = db.batch(|db| {
+        let crates_id_map = graph.set_in_db(db);
+        macros.build_in(db, &crates_id_map);
+        crates_id_map
+    });
 
     let files = ids[..own_files]
         .iter()

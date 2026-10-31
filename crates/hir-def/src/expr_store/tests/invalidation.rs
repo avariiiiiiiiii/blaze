@@ -190,6 +190,89 @@ fn an_edit_in_one_body_lowers_only_that_body() {
     }
 }
 
+/// (b') The item tree of a block with items is lowered from its body's own text: an edit of one
+/// body lowers again only that body's block's tree, and every block is owned by its body.
+#[test]
+fn an_edit_in_one_body_lowers_only_its_blocks_item_tree() {
+    const BLOCKS: &str = r#"
+pub fn first(x: u32) -> u32 {
+    struct A;
+    { fn inner() -> u32 { 1 } inner() + x }
+}
+
+pub fn second(x: u32) -> u32 {
+    struct B;
+    x + 2
+}
+"#;
+    let fx = fixture::db(BLOCKS);
+    let file = fx.only_file();
+    let mut db = fx.into_db();
+    let (bodies, _) = defs(&db);
+    let mut blocks = 0;
+    for &def in &bodies {
+        for (block, _) in Body::of(&db, def).blocks(&db) {
+            assert_eq!(block.owner(&db), Some(def), "{block:?}");
+            blocks += 1;
+        }
+    }
+    assert_eq!(blocks, 3, "a block for each fn body and the inner block of `first`");
+
+    db.set_file_text(file.file_id(&db), &BLOCKS.replace("x + 2", "x + 3"));
+    let log = db.executed_in_read_order(|| {
+        for &def in &bodies {
+            Body::of(&db, def).blocks(&db).count();
+        }
+    });
+    assert_eq!(count(&log, "Body::of"), 1, "{log:#?}");
+    assert_eq!(count(&log, "block_item_tree_query"), 1, "only `second`'s block: {log:#?}");
+}
+
+/// A block a macro call in a body expands to has the body as its owner, and its item tree is
+/// the expansion's: its id is of the expansion (there the root's), not of the body's text. The
+/// fn begins the file, so the body's anchor is the fn and not the file's root.
+#[test]
+fn a_block_a_macro_expands_to_is_lowered_from_the_expansion() {
+    let fx = fixture::db(
+        "fn first() -> u32 { macro_rules! m { () => { { struct C; 1 } } } { struct D; m!() } }\n",
+    );
+    let db = fx.into_db();
+    let (bodies, _) = defs(&db);
+    let [def] = bodies[..] else { panic!("one body: {bodies:?}") };
+    let mut in_file = 0;
+    let mut in_macro = 0;
+    for (block, def_map) in Body::of(&db, def).blocks(&db) {
+        assert_eq!(block.owner(&db), Some(def), "{block:?}");
+        assert_eq!(def_map.modules(&db).count(), 1, "{block:?}");
+        match block.ast_id(&db).file_id.is_macro() {
+            true => in_macro += 1,
+            false => in_file += 1,
+        }
+    }
+    assert_eq!((in_file, in_macro), (2, 1), "the fn's body, `{{ struct D; .. }}`, the expansion");
+}
+
+/// A block outside fn bodies (an associated const's, in an `impl` that begins the file) has an
+/// id of the whole file's: its item tree is lowered whichever way its body was.
+#[test]
+fn an_associated_consts_block_has_its_item_tree() {
+    let fx = fixture::db("impl S {\n    const C: u32 = { struct T; 1 };\n}\nstruct S;\n");
+    let db = fx.into_db();
+    let mut blocks = 0;
+    for (_, module) in crate_def_map(&db, db.fetch_test_crate()).modules(&db) {
+        for imp in module.scope(&db).impls() {
+            for &(_, item) in ImplItems::of(&db, imp).0.items.iter() {
+                let AssocItemId::ConstId(it) = item else { continue };
+                for (block, def_map) in Body::of(&db, it.into()).blocks(&db) {
+                    assert_eq!(def_map.modules(&db).count(), 1, "{block:?}");
+                    blocks += 1;
+                }
+            }
+        }
+    }
+    assert_eq!(blocks, 1, "`C`'s block");
+}
+
 /// (c) A body lowered again on this thread, on the scratch the lowering of other bodies left,
 /// is the store it was lowered as the first time.
 #[test]

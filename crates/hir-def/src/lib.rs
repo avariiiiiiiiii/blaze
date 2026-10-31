@@ -618,6 +618,13 @@ pub struct BlockIdLt<'db> {
     /// The containing module.
     #[returns(copy)]
     pub module: ModuleIdLt<'db>,
+    /// The body whose lowering from its own syntax ([`crate::expr_store::body::body_syntax`])
+    /// made the block; `None` for a block of a signature's expression (an array length, a
+    /// const argument) or of a body lowered from its whole file. The item tree of a block written in that body's
+    /// text is lowered from the body's syntax alone, so an edit elsewhere in the file leaves it
+    /// be; one in a macro's expansion, from the expansion.
+    #[returns(copy)]
+    pub owner: Option<DefWithBodyId>,
 }
 pub type BlockId = BlockIdLt<'static>;
 
@@ -632,10 +639,11 @@ impl<'db> BlockIdLt<'db> {
         db: &'db Db,
         ast_id: AstId<ast::BlockExpr>,
         module: ModuleIdLt<'db>,
+        owner: Option<DefWithBodyId>,
         token: TrackedStructToken,
     ) -> Self {
         _ = token;
-        BlockIdLt::new_(db, ast_id, module)
+        BlockIdLt::new_(db, ast_id, module, owner)
     }
 
     /// The same id with its lifetime erased.

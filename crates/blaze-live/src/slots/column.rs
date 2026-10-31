@@ -210,7 +210,9 @@ mod tests {
                     Ok(()) => model.push(value),
                     Err(why) => {
                         assert_eq!(model.len(), limit, "{why}");
-                        assert!(why.contains("the model column") && why.contains(&limit.to_string()));
+                        assert!(
+                            why.contains("the model column") && why.contains(&limit.to_string())
+                        );
                         full += 1;
                     }
                 },

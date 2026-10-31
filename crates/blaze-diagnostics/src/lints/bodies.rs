@@ -519,6 +519,7 @@ fn lowering_failed(db: &Db, source_map: &BodySourceMap) -> bool {
                 | ExpressionStoreDiagnostics::UndeclaredLabel { .. }
                 | ExpressionStoreDiagnostics::UnreachableLabel { .. }
                 | ExpressionStoreDiagnostics::UnresolvedMacroCall { .. }
+                | ExpressionStoreDiagnostics::IntLiteralTooLarge { .. }
         )
     });
     errors

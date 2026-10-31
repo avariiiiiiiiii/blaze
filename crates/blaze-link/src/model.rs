@@ -147,7 +147,7 @@ pub(crate) enum Class {
     /// Code of a full link.
     Text,
     /// Code placed by incremental links since the last full one, and by live patches: kept
-    /// apart so a running program can map it writable.
+    /// apart from the full link's code, which they leave as it is.
     Patch,
     /// The jump table's stubs: one per [`crate::Slot`].
     Stubs,
@@ -1484,7 +1484,7 @@ mod tests {
             platform: None,
             incremental: true,
             debug: crate::Debug::None,
-            live: Some(crate::Live { dir: blaze_core::FileName::new("live").unwrap(), path: "/tmp/live".into() }),
+            live: Some(crate::Live),
             tags: 1 << 32,
             stack: None,
             windows_subsystem: false,

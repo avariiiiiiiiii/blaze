@@ -3,8 +3,8 @@
 //! [`CodeMemory`] instead of a file, written to cargo's path once per content key by
 //! [`Program::command`], and overlaid by the memory before `main`. Each patch is
 //! [`Image::commit_into`] the same memory and announced; the run's `blaze-live` asks for its
-//! message over the channel, answered by [`serve`]. What a `run` and a test binary both start
-//! through.
+//! message over the channel a piece at a time, and says what became of it, answered by
+//! [`serve`] ([`blaze_live::patch::ask`]). What a `run` and a test binary both start through.
 
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError, mpsc};
 
@@ -14,6 +14,8 @@ use blaze_inproc::frame::{Frame, Kind, kinds};
 use blaze_inproc::host::{self, Host, Program, Session, Started};
 use blaze_inproc::{CodeMemory, CodeRange, Format};
 use blaze_link::{DevRun, Image, Staged};
+use blaze_live::patch::Answer;
+use blaze_live::patch::ask::{self, ANSWER, ANSWERED, NO_PATCH, NO_TIERS, PATCH, PATCH_ASK, TIERS_ASK};
 
 #[cfg(test)]
 mod tests;
@@ -32,13 +34,6 @@ pub(crate) const CELLS_PER_FUNCTION: u64 = 32;
 /// The content domain of a dev executable's bytes, its key for [`host::Executable`].
 const DOMAIN: &str = "blaze v2 dev executable 1";
 
-/// `blaze-live`'s asks (fastcompile-inproc 1 item 4): its generation, as a `u64`.
-pub(crate) const PATCH_ASK: Kind = Kind(kinds::LIVE.start);
-/// The answer: one encoded `blaze_live::patch::Message`.
-pub(crate) const PATCH: Kind = Kind(kinds::LIVE.start + 1);
-/// The answer when the run is at the newest generation already.
-pub(crate) const NO_PATCH: Kind = Kind(kinds::LIVE.start + 2);
-
 /// The reservations a dev executable is linked with: the arena, the cells of a tiered run of
 /// `functions` functions (none when not tiered), and no fixed maps (no dependency image).
 pub(crate) fn dev_run(tiered: Option<u64>) -> DevRun {
@@ -54,7 +49,7 @@ struct Patch {
 }
 
 /// What a program's runs failed with outside their own output: a start hook that never
-/// attached, an ask that could not be answered.
+/// attached, an ask that could not be answered, a patch a run did not apply.
 type Failures = Arc<Mutex<Vec<String>>>;
 
 /// A dev executable in its code memory, which every run and test process of it maps.
@@ -162,17 +157,19 @@ fn sessions_of(started: mpsc::Receiver<Result<Session, blaze_inproc::Error>>, pa
     }
 }
 
-/// Answers one run's asks until it hangs up: `blaze-live`'s for the newest patch, and a
-/// refusal naming the kind for any other.
+/// Answers one run's asks until it hangs up: `blaze-live`'s, and a refusal naming the kind
+/// for any other.
 fn serve(session: Session, patch: &Mutex<Patch>, failures: &Mutex<Vec<String>>) {
     let pid = session.pid;
     let (mut reader, sender) = session.split();
+    // alloc: once per run, the answers' body, reused
+    let mut body = Vec::with_capacity(blaze_inproc::ask::MOST_BODY);
     loop {
         let Ok(frame) = reader.recv() else { return };
         let seq = frame.seq;
-        let answered = answer(&frame, &lock(patch));
+        let answered = answer(&frame, &lock(patch), pid, failures, &mut body);
         let sent = match answered {
-            Ok((kind, body)) => sender.send(kind, seq, &body),
+            Ok(kind) => sender.send(kind, seq, &body),
             Err(why) => sender.send(kinds::REFUSED, seq, why.as_bytes()),
         };
         if let Err(error) = sent {
@@ -184,27 +181,42 @@ fn serve(session: Session, patch: &Mutex<Patch>, failures: &Mutex<Vec<String>>) 
     }
 }
 
-/// The answer to one ask of a run: its kind and body, or why it is refused.
-fn answer(frame: &Frame<'_>, patch: &Patch) -> Result<(Kind, Arc<[u8]>), String> {
+/// The answer to one ask of process `pid`: its kind, with its body in `body`, or why it is
+/// refused. A patch the run did not apply is kept in `failures`.
+fn answer(
+    frame: &Frame<'_>,
+    patch: &Patch,
+    pid: u32,
+    failures: &Mutex<Vec<String>>,
+    body: &mut Vec<u8>,
+) -> Result<Kind, String> {
+    body.clear();
     match frame.kind {
         PATCH_ASK => {
-            let mut body = frame.reader(PATCH_ASK).map_err(|it| format!("a patch ask: {it}"))?;
-            let at = body.u64().map_err(|it| format!("a patch ask: {it}"))?;
-            body.finish().map_err(|it| format!("a patch ask: {it}"))?;
+            let (at, offset) = ask::read_patch_ask(frame.body)?;
             match &patch.message {
                 Some(message) if patch.generation > at => {
-                    if message.len() > blaze_inproc::ask::MOST_BODY {
-                        return Err(format!(
-                            "the patch of generation {} is {} bytes, more than an answer holds ({})",
-                            patch.generation,
-                            message.len(),
-                            blaze_inproc::ask::MOST_BODY
-                        ));
-                    }
-                    Ok((PATCH, message.clone()))
+                    ask::piece_into(patch.generation, message, offset, body)
+                        .map_err(|why| format!("the patch of generation {}: {why}", patch.generation))?;
+                    Ok(PATCH)
                 }
-                _ => Ok((NO_PATCH, Arc::from(&[][..]))),
+                _ => Ok(NO_PATCH),
             }
+        }
+        ANSWER => {
+            match Answer::decode(frame.body).map_err(|why| format!("an answer: {why}"))? {
+                Answer::Applied { .. } => {}
+                Answer::RolledBack { generation, to, why } => lock(failures)
+                    .push(format!("process {pid} rolled generation {generation} back to {to}: {why}")),
+                Answer::Declined { generation, why } => {
+                    lock(failures).push(format!("process {pid} did not apply generation {generation}: {why}"))
+                }
+            }
+            Ok(ANSWERED)
+        }
+        TIERS_ASK => {
+            ask::read_tiers_ask(frame.body)?;
+            Ok(NO_TIERS)
         }
         Kind(kind) if kinds::LAZY.contains(&kind) => {
             Err(format!("ask {kind:#06x} is blaze-lazy's, and no lazy runner serves this run"))

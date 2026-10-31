@@ -201,11 +201,26 @@
             --prefix LD_LIBRARY_PATH : ${libPath}
         '';
 
-        # The demo's own source (and the crate it links), copied to a writable directory at run
-        # time; its crates.io dependencies are vendored from Cargo.lock so that needs no network.
+        # The demo's own source and the crates it links (blaze-live and the run side of
+        # blaze-inproc it asks the daemon through), with the root manifest their `workspace = true`
+        # fields come from, copied to a writable directory at run time; its crates.io dependencies
+        # are vendored from Cargo.lock so that needs no network.
         lifeSource = pkgs.lib.fileset.toSource {
           root = ./.;
-          fileset = pkgs.lib.fileset.unions [ ./demo/life ./crates/blaze-live ];
+          fileset = pkgs.lib.fileset.unions [
+            ./Cargo.toml
+            ./demo/life
+            ./crates/blaze-live
+            ./crates/blaze-inproc
+            ./crates/blaze-bytes
+            ./crates/blaze-check
+            ./crates/blaze-core
+            ./crates/blaze-mem
+            ./crates/blaze-radix
+            ./crates/blaze-reclaim
+            ./crates/blaze-rng
+            ./crates/blaze-sha256
+          ];
         };
         lifeVendor = pkgs.rustPlatform.importCargoLock { lockFile = ./demo/life/Cargo.lock; };
         # `nix run github:indexable-inc/blaze#life`: the Game of Life window. On macOS on AArch64 the

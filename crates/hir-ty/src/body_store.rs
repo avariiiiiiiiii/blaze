@@ -255,7 +255,7 @@ impl Store {
             if kind == blaze_query::db::ReadKind::Interned {
                 return ControlFlow::Continue(());
             }
-            let name = storage.ingredient_name(read.ingredient_index());
+            let name = storage.read_name(read, kind);
             match self.facts.classify(db, def, step, read, kind, name) {
                 Classified::Covered => ControlFlow::Continue(()),
                 Classified::Fact(fact) => {

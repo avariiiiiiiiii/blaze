@@ -1023,12 +1023,16 @@ impl Code for ExpressionStoreDiagnostics {
                 node.put(w);
                 kind.put(w);
             }
+            IntLiteralTooLarge { node } => {
+                w.u32(8);
+                node.put(w);
+            }
         }
     }
 
     fn get(r: &mut Read<'_>) -> Result<Self, FormatError> {
         use ExpressionStoreDiagnostics::*;
-        Ok(match r.tag(8, "a diagnostic kind out of range")? {
+        Ok(match r.tag(9, "a diagnostic kind out of range")? {
             0 => InactiveCode { node: r.get()?, cfg: r.get()? },
             1 => UnresolvedMacroCall { node: r.get()?, path: r.get()? },
             2 => UnreachableLabel { node: r.get()?, name: r.get()? },
@@ -1036,7 +1040,8 @@ impl Code for ExpressionStoreDiagnostics {
             4 => UndeclaredLabel { node: r.get()?, name: r.get()? },
             5 => PatternArgInExternFn { node: r.get()? },
             6 => FruInDestructuringAssignment { node: r.get()? },
-            _ => MissingBody { node: r.get()?, kind: r.get()? },
+            7 => MissingBody { node: r.get()?, kind: r.get()? },
+            _ => IntLiteralTooLarge { node: r.get()? },
         })
     }
 }

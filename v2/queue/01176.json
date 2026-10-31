@@ -6,10 +6,10 @@
     "crates/syntax/src/validation.rs"
   ],
   "what": "crates/syntax/src/validation.rs: report rustc \"integer literal is too large\" (rustc_session report_lit_error, LitError::IntTooLarge) for an IntNumber literal whose value does not fit u128 (view IntNumber::value() Err). hir-def hir.rs:275/278 Literal::from lowers it as 0 (error recovery), so the build must stop on the syntax error; today nothing reports it outside attributes.",
-  "state": "open",
+  "state": "applied",
   "created": "2026-10-30T23:27:07Z",
-  "updated": "2026-10-31T16:35:04Z",
-  "taken_by": null,
+  "updated": "2026-10-31T16:39:44Z",
+  "taken_by": "no-fallback-front-def",
   "why": null,
   "source": null,
   "history": [
@@ -42,6 +42,12 @@
       "by": "coordinator",
       "action": "reassign",
       "note": "tests-misc -> no-fallback-front-def: Refused by tests-misc: rustc reports IntTooLarge in AST lowering after cfg stripping (rust#102944), so a syntax-validation error would reject #[cfg(any())] code rustc builds. It belongs at hir-def Literal::from (hir.rs:275/278)."
+    },
+    {
+      "at": "2026-10-31T16:39:44Z",
+      "by": "no-fallback-front-def",
+      "action": "done",
+      "note": "moved to hir-def lowering as tests-misc said: ExpressionStoreDiagnostics::IntLiteralTooLarge from ExprCollector::lower_literal (exprs, literal patterns, range ends), so cfg-removed code is never checked; persist tag 8, source_map moved(). Test expr_store::tests::body::an_integer_literal_past_u128_is_reported_unless_cfg_removes_it. hir arm and lowering queued to no-fallback-front-ty and no-fallback-tools (code in /tmp/blaze-lanes/01176-int-too-large.md)."
     }
   ]
 }

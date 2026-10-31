@@ -1,25 +1,131 @@
 //! What blaze-link and a running program say to each other.
 //!
 //! An image blaze-link made has a descriptor ([`Descriptor`], the symbol [`DESCRIPTOR`]) that
-//! says where its jump table is, where new code and data go, and which directory patches come
-//! through. The linker writes one [`Message`] per file in that directory, named by
-//! [`message_file`] of the generation a program must be at to take it, and the program
-//! answers each in the file [`ANSWER`] ([`Answer`]).
+//! says where its jump table is and where new code and data go. The program runs from the
+//! daemon's code memory (blaze-inproc): each commit writes the image there and announces its
+//! generation, the program asks for the [`Message`] that takes it there over blaze-inproc's
+//! channel, and says what became of it in an [`Answer`] ([`ask`]).
+//!
+//! A message carries no code: the code is in the code memory the program runs, written by
+//! the commit. It carries each function's address, length, name and content hash ([`Code`]),
+//! and the program checks the code it maps against the hash before it switches to it.
 //!
 //! Every address is as linked, before the loader slid the image: the program adds its slide.
 //! Every number is little-endian. Decoding checks every length against the bytes there are,
 //! and refuses unknown kinds, unknown versions and bytes left over.
 //!
 //! The program reads a message in place ([`Message::view`]: one pass over its headers, no
-//! allocation, the bytes of each write borrowed from the mapped file), and the linker writes
-//! one from borrowed bytes ([`PatchRef`]) into one buffer of the exact size.
+//! allocation, the bytes of each write borrowed from the buffer it was read into), and the
+//! linker writes one from borrowed bytes ([`PatchRef`]) into one buffer of the exact size.
 
 /// The name of the descriptor's symbol, which the linker exports.
 pub const DESCRIPTOR: &str = "__blaze_live";
 pub const DESCRIPTOR_MAGIC: [u8; 8] = *b"BLZLIVE2";
-/// The version of [`Descriptor`] this crate reads and writes: 3 since [`Descriptor::table`]
-/// names the [`exec`] header rather than a cell alone.
-pub const DESCRIPTOR_VERSION: u32 = 3;
+/// The version of [`Descriptor`] this crate reads and writes: 4 since it names no directory
+/// (patches come over blaze-inproc's channel).
+pub const DESCRIPTOR_VERSION: u32 = 4;
+
+/// The content hash of a function's code, as the commit wrote it into the code memory: its
+/// SHA-256.
+pub fn hash(code: &[u8]) -> [u8; 32] {
+    blaze_sha256::digest(code)
+}
+
+/// What a run and the daemon say about patches over blaze-inproc's channel: kinds of its
+/// [`LIVE`](blaze_inproc::frame::kinds::LIVE) range, each body little-endian.
+///
+/// A message or the tiers' text can be longer than an answer holds, so it comes a piece at a
+/// time: each ask names the byte to go on from, and each answer is a [piece](piece_into): a
+/// word naming the whole (the generation a message takes the program to, the version of the
+/// text), the whole's length, then as many of its bytes from there as fit. A reader whose
+/// pieces name different wholes starts again.
+pub mod ask {
+    use blaze_inproc::frame::{Kind, kinds};
+
+    /// The run asks for the message a program at a generation takes, from a byte of it on:
+    /// the generation and the offset, each a `u64` ([`patch_ask`]).
+    pub const PATCH_ASK: Kind = Kind(kinds::LIVE.start);
+    /// The answer: a piece of the message, named by the generation it takes the program to.
+    pub const PATCH: Kind = Kind(kinds::LIVE.start + 1);
+    /// The answer when the daemon has no message for a program at that generation newer
+    /// than it: empty.
+    pub const NO_PATCH: Kind = Kind(kinds::LIVE.start + 2);
+    /// The run says what became of a message, or of a panic in a generation's code: an
+    /// encoded [`super::Answer`].
+    pub const ANSWER: Kind = Kind(kinds::LIVE.start + 3);
+    /// The daemon took the answer: empty.
+    pub const ANSWERED: Kind = Kind(kinds::LIVE.start + 4);
+    /// The run asks for what the daemon says of its tiers ([`crate::format::Tiers`]), from a
+    /// byte of the text on: the offset, a `u64`.
+    pub const TIERS_ASK: Kind = Kind(kinds::LIVE.start + 5);
+    /// The answer: a piece of the text, named by its version.
+    pub const TIERS: Kind = Kind(kinds::LIVE.start + 6);
+    /// The answer when the daemon tiers none of the run's functions: empty.
+    pub const NO_TIERS: Kind = Kind(kinds::LIVE.start + 7);
+
+    /// A piece's header: the word naming the whole, and the whole's length.
+    const HEADER: usize = 16;
+    /// The most bytes of the whole one piece carries.
+    pub const PIECE: usize = blaze_inproc::ask::MOST_BODY - HEADER;
+
+    /// A [`PATCH_ASK`]'s body.
+    pub fn patch_ask(generation: u64, offset: u64) -> [u8; 16] {
+        let mut body = [0; 16];
+        body[..8].copy_from_slice(&generation.to_le_bytes());
+        body[8..].copy_from_slice(&offset.to_le_bytes());
+        body
+    }
+
+    /// A [`PATCH_ASK`]'s generation and offset.
+    pub fn read_patch_ask(body: &[u8]) -> Result<(u64, u64), String> {
+        if body.len() != 16 {
+            // alloc: error path
+            return Err(format!("a patch ask of {} bytes, not 16", body.len()));
+        }
+        Ok((super::le64(body), super::le64(&body[8..])))
+    }
+
+    /// A [`TIERS_ASK`]'s offset.
+    pub fn read_tiers_ask(body: &[u8]) -> Result<u64, String> {
+        if body.len() != 8 {
+            // alloc: error path
+            return Err(format!("a tiers ask of {} bytes, not 8", body.len()));
+        }
+        Ok(super::le64(body))
+    }
+
+    /// The piece of `whole`, named by `name`, from `offset` on, into `out` (cleared first):
+    /// an answer's body. An offset past the end is an error naming it.
+    pub fn piece_into(
+        name: u64,
+        whole: &[u8],
+        offset: u64,
+        out: &mut Vec<u8>,
+    ) -> Result<(), String> {
+        let len = whole.len() as u64;
+        if offset > len {
+            // alloc: error path
+            return Err(format!("an ask from byte {offset} of {len}"));
+        }
+        let from = offset as usize;
+        let to = whole.len().min(from + PIECE);
+        out.clear();
+        out.reserve(HEADER + to - from);
+        out.extend_from_slice(&name.to_le_bytes());
+        out.extend_from_slice(&len.to_le_bytes());
+        out.extend_from_slice(&whole[from..to]);
+        Ok(())
+    }
+
+    /// A piece's name, the whole's length and its bytes.
+    pub fn read_piece(body: &[u8]) -> Result<(u64, u64, &[u8]), String> {
+        if body.len() < HEADER || body.len() > HEADER + PIECE {
+            // alloc: error path
+            return Err(format!("a piece of {} bytes", body.len()));
+        }
+        Ok((super::le64(body), super::le64(&body[8..]), &body[HEADER..]))
+    }
+}
 
 /// [`Descriptor::arch`] of x86-64 and of AArch64.
 pub const ARCH_X86_64: u32 = 0;
@@ -78,7 +184,11 @@ pub mod exec {
     /// The header's length for a table of `slots` slots, with the log or without: the log
     /// table and the private map, padded to a word, follow the fixed words.
     pub const fn len(slots: u64, logged: bool) -> u64 {
-        if logged { private_map(slots) + (REGION_HEADER + slots).next_multiple_of(8) } else { HEADER }
+        if logged {
+            private_map(slots) + (REGION_HEADER + slots).next_multiple_of(8)
+        } else {
+            HEADER
+        }
     }
 
     const _: () = assert!(len(3, true) == 48 + 24 + 24 && len(3, false) == HEADER);
@@ -110,13 +220,11 @@ pub struct Descriptor {
     /// `[start, end)` of the region new code is placed in, and of new data's.
     pub patch_code: [u64; 2],
     pub patch_data: [u64; 2],
-    /// The address and length of the UTF-8 path of the directory patches come through.
-    pub dir: [u64; 2],
 }
 
 impl Descriptor {
     /// Its encoded size, which is also its size in memory: every field is aligned as it is.
-    pub const SIZE: usize = 8 + 4 + 4 + 16 + 8 + 8 + 8 + 8 + 16 + 16 + 16;
+    pub const SIZE: usize = 8 + 4 + 4 + 16 + 8 + 8 + 8 + 8 + 16 + 16;
 
     pub fn encode(&self) -> Vec<u8> {
         let mut bytes = Vec::with_capacity(Self::SIZE);
@@ -129,7 +237,6 @@ impl Descriptor {
             .into_iter()
             .chain(self.patch_code)
             .chain(self.patch_data)
-            .chain(self.dir)
         {
             out.u64(value);
         }
@@ -159,12 +266,57 @@ impl Descriptor {
             slots: next()?,
             patch_code: [next()?, next()?],
             patch_data: [next()?, next()?],
-            dir: [next()?, next()?],
         })
     }
 }
 
 const _: () = assert!(Descriptor::SIZE == size_of::<Descriptor>());
+
+/// Code a patch runs, in the patch code region: written by the commit into the code memory,
+/// never carried by the message. The program hashes the `len` bytes it maps at `at` and
+/// takes the patch only when every one is [`hash`]'s `hash`.
+#[derive(Clone, PartialEq, Eq, Debug)] // clone: tests and decoded patches, never the runtime's
+pub struct Code {
+    pub at: u64,
+    pub len: u64,
+    pub hash: [u8; 32],
+    /// The function's name, for the error that refuses a patch whose code differs.
+    pub name: String,
+}
+
+impl Code {
+    /// `code`, placed at `at`, of the function `name`.
+    pub fn of(at: u64, code: &[u8], name: &str) -> Code {
+        // alloc: owned patches (tests, decoded ones); the linker writes `CodeRef`
+        Code { at, len: code.len() as u64, hash: hash(code), name: name.to_owned() }
+    }
+
+    fn borrowed(&self) -> CodeRef<'_> {
+        CodeRef { at: self.at, len: self.len, hash: self.hash, name: &self.name }
+    }
+}
+
+/// A [`Code`] whose name is borrowed: what the linker encodes and the program reads in place.
+// clone: 64 bytes, the name borrowed
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct CodeRef<'a> {
+    pub at: u64,
+    pub len: u64,
+    pub hash: [u8; 32],
+    pub name: &'a str,
+}
+
+impl CodeRef<'_> {
+    /// Its size in a message: the address, length and hash, then the name's length and bytes.
+    const fn encoded_len(&self) -> usize {
+        8 + 8 + 32 + 8 + self.name.len()
+    }
+
+    fn to_code(self) -> Code {
+        // alloc: an owned copy the caller asks for; the runtime reads views
+        Code { at: self.at, len: self.len, hash: self.hash, name: self.name.to_owned() }
+    }
+}
 
 #[derive(PartialEq, Eq, Debug, Default)]
 pub struct Patch {
@@ -172,11 +324,14 @@ pub struct Patch {
     /// Generations count commits of the image; a patch applies on `base` only.
     pub generation: u64,
     pub base: u64,
-    /// Bytes for the patch code region, and for data anywhere in the image (a static's new
-    /// value in place, a new static in the patch data region, a panic location's record).
-    pub code: Vec<(u64, Vec<u8>)>,
+    /// The code the commit wrote into the patch code region, by function.
+    pub code: Vec<Code>,
+    /// Bytes for data anywhere in the image (a static's new value in place, a new static in
+    /// the patch data region, a panic location's record, unwind entries).
     pub data: Vec<(u64, Vec<u8>)>,
-    /// Addresses within those writes holding an unslid image address: add the slide.
+    /// Addresses within the data writes holding an unslid image address: add the slide. Code
+    /// has none: the code memory every run of the program maps holds one copy of it, whatever
+    /// each run's slide.
     pub rebase: Vec<u64>,
     /// Slots and their new targets (unslid).
     pub cells: Vec<(u32, u64)>,
@@ -193,7 +348,7 @@ impl Patch {
     /// The patch with its bytes borrowed, which encodes to the same message.
     pub fn with<R>(&self, f: impl FnOnce(&PatchRef<'_>) -> R) -> R {
         // alloc: owned patches (tests, decoded ones); the linker writes `PatchRef`
-        let code: Vec<(u64, &[u8])> = self.code.iter().map(|(at, it)| (*at, &it[..])).collect();
+        let code: Vec<CodeRef<'_>> = self.code.iter().map(Code::borrowed).collect();
         // alloc: as `code` above
         let data: Vec<(u64, &[u8])> = self.data.iter().map(|(at, it)| (*at, &it[..])).collect();
         f(&PatchRef {
@@ -220,7 +375,7 @@ pub struct PatchRef<'a> {
     pub id: [u8; 16],
     pub generation: u64,
     pub base: u64,
-    pub code: &'a [(u64, &'a [u8])],
+    pub code: &'a [CodeRef<'a>],
     pub data: &'a [(u64, &'a [u8])],
     pub rebase: &'a [u64],
     pub cells: &'a [(u32, u64)],
@@ -240,7 +395,7 @@ impl PatchRef<'_> {
             + 8
             + 8
             + 8
-            + writes(self.code)
+            + self.code.iter().map(CodeRef::encoded_len).sum::<usize>()
             + 8
             + writes(self.data)
             + 8
@@ -262,12 +417,14 @@ impl PatchRef<'_> {
         out.0.extend_from_slice(&self.id);
         out.u64(self.generation);
         out.u64(self.base);
-        for writes in [self.code, self.data] {
-            out.len(writes.len());
-            for &(address, bytes) in writes {
-                out.u64(address);
-                out.bytes(bytes);
-            }
+        out.len(self.code.len());
+        for code in self.code {
+            out.code(code);
+        }
+        out.len(self.data.len());
+        for &(address, bytes) in self.data {
+            out.u64(address);
+            out.bytes(bytes);
         }
         out.len(self.rebase.len());
         self.rebase.iter().for_each(|it| out.u64(*it));
@@ -324,7 +481,7 @@ pub struct PatchView<'a> {
     pub id: [u8; 16],
     pub generation: u64,
     pub base: u64,
-    pub code: WriteList<'a>,
+    pub code: CodeList<'a>,
     pub data: WriteList<'a>,
     /// 8, 12, 16 and 24 bytes per entry.
     rebase: &'a [u8],
@@ -361,7 +518,8 @@ impl<'a> PatchView<'a> {
             id: self.id,
             generation: self.generation,
             base: self.base,
-            code: owned(self.code),
+            // alloc: as `owned` above
+            code: self.code.map(CodeRef::to_code).collect(),
             data: owned(self.data),
             // alloc: as `owned` above
             rebase: self.rebase().collect(),
@@ -408,6 +566,36 @@ impl<'a> Iterator for WriteList<'a> {
 
 impl ExactSizeIterator for WriteList<'_> {}
 
+/// Code read in place: each entry's address, length, hash and name, the name borrowed from
+/// the message, whose bounds and text [`Message::view`] checked.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct CodeList<'a> {
+    len: usize,
+    /// `len` entries: an address, a length, a hash, and a name's length and bytes.
+    bytes: &'a [u8],
+}
+
+impl<'a> Iterator for CodeList<'a> {
+    type Item = CodeRef<'a>;
+
+    fn next(&mut self) -> Option<CodeRef<'a>> {
+        if self.len == 0 {
+            return None;
+        }
+        self.len -= 1;
+        let mut fields = Fields(self.bytes);
+        let code = fields.code().expect("checked by `Message::view`");
+        self.bytes = fields.0;
+        Some(code)
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        (self.len, Some(self.len))
+    }
+}
+
+impl ExactSizeIterator for CodeList<'_> {}
+
 /// A [`Message`] read in place ([`Message::view`]).
 // clone: a `PatchView` or less (see there)
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -432,8 +620,9 @@ impl MessageView<'_> {
 
 const MESSAGE_MAGIC: [u8; 8] = *b"BLZLMSG2";
 const ANSWER_MAGIC: [u8; 8] = *b"BLZLANS2";
-/// The version of [`Message`] and [`Answer`] this crate reads and writes.
-pub const MESSAGE_VERSION: u32 = 1;
+/// The version of [`Message`] and [`Answer`] this crate reads and writes: 2 since a patch's
+/// code is hashes, not bytes ([`Code`]).
+pub const MESSAGE_VERSION: u32 = 2;
 /// A message's or an answer's magic, version and kind.
 const HEADER: usize = 8 + 4 + 4;
 
@@ -489,7 +678,7 @@ impl Message {
                 id: reader.array()?,
                 generation: reader.u64()?,
                 base: reader.u64()?,
-                code: reader.writes()?,
+                code: reader.codes()?,
                 data: reader.writes()?,
                 rebase: reader.list(8)?,
                 cells: reader.list(12)?,
@@ -513,28 +702,7 @@ impl Message {
     }
 }
 
-/// What every message file's name starts with.
-pub const MESSAGE_PREFIX: &str = "message-";
-
-/// The file of the message a program at generation `generation` waits for (a patch on it, or
-/// a rollback or restart from it).
-pub fn message_file(generation: u64) -> String {
-    let mut name = String::with_capacity(MESSAGE_PREFIX.len() + 16);
-    message_file_into(generation, &mut name);
-    name
-}
-
-/// [`message_file`] into `name`, cleared first: no allocation once it has room.
-pub fn message_file_into(generation: u64, name: &mut String) {
-    use std::fmt::Write as _;
-    name.clear();
-    name.push_str(MESSAGE_PREFIX);
-    write!(name, "{generation:016x}").expect("a String takes any text");
-}
-
-/// What the program answers, in the file `ANSWER` of the directory (replaced each time).
-pub const ANSWER: &str = "answer";
-
+/// What the program says of a message or a panic, in an [`ask::ANSWER`].
 #[derive(PartialEq, Eq, Debug)]
 pub enum Answer {
     Applied { generation: u64 },
@@ -640,10 +808,18 @@ impl<'o> Writer<'o> {
         self.len(bytes.len());
         self.0.extend_from_slice(bytes);
     }
+
+    fn code(&mut self, code: &CodeRef<'_>) {
+        self.u64(code.at);
+        self.u64(code.len);
+        self.0.extend_from_slice(&code.hash);
+        self.bytes(code.name.as_bytes());
+    }
 }
 
 /// The patch's fields, read in order. Not `blaze_format::cursor::Reader`: this crate runs
-/// inside the patched program and depends on no other crate.
+/// inside the patched program, which links only what the program needs of blaze to take
+/// patches (blaze-inproc's run side and blaze-sha256).
 struct Fields<'a>(&'a [u8]);
 
 impl<'a> Fields<'a> {
@@ -709,6 +885,21 @@ impl<'a> Fields<'a> {
         Ok(WriteList { len, bytes: &start[..start.len() - self.0.len()] })
     }
 
+    /// One entry of a patch's code.
+    fn code(&mut self) -> Result<CodeRef<'a>, String> {
+        Ok(CodeRef { at: self.u64()?, len: self.u64()?, hash: self.array()?, name: self.str()? })
+    }
+
+    /// A count of code entries, each checked whole, its name UTF-8.
+    fn codes(&mut self) -> Result<CodeList<'a>, String> {
+        let len = self.count(8 + 8 + 32 + 8)?;
+        let start = self.0;
+        for _ in 0..len {
+            self.code()?;
+        }
+        Ok(CodeList { len, bytes: &start[..start.len() - self.0.len()] })
+    }
+
     fn header(&mut self, magic: [u8; 8], what: &str) -> Result<(), String> {
         if self.array::<8>().ok() != Some(magic) {
             // alloc: error path
@@ -751,7 +942,6 @@ mod tests {
             slots: 1234,
             patch_code: [0x1_0100_0000, 0x1_0900_0000],
             patch_data: [0x1_0900_0000, 0x1_0a00_0000],
-            dir: [0x1_0000_9000, 37],
         }
     }
 
@@ -760,7 +950,10 @@ mod tests {
             id: [7; 16],
             generation: 3,
             base: 2,
-            code: vec![(0x1_0100_0000, vec![0xd5, 0x03, 0x20, 0x1f]), (0x1_0100_4000, vec![])],
+            code: vec![
+                Code::of(0x1_0100_0000, &[0xd5, 0x03, 0x20, 0x1f], "life::step"),
+                Code::of(0x1_0100_4000, &[], "the unwind entries' end"),
+            ],
             data: vec![(0x1_0900_0010, vec![1; 24])],
             rebase: vec![0x1_0900_0010, 0x1_0900_0018],
             cells: vec![(0, 0x1_0100_0000), (u32::MAX, 1)],
@@ -803,12 +996,17 @@ mod tests {
                 out.0.extend_from_slice(&patch.id);
                 out.u64(patch.generation);
                 out.u64(patch.base);
-                for writes in [&patch.code, &patch.data] {
-                    out.len(writes.len());
-                    for (address, bytes) in writes {
-                        out.u64(*address);
-                        out.bytes(bytes);
-                    }
+                out.len(patch.code.len());
+                for code in &patch.code {
+                    out.u64(code.at);
+                    out.u64(code.len);
+                    out.0.extend_from_slice(&code.hash);
+                    out.bytes(code.name.as_bytes());
+                }
+                out.len(patch.data.len());
+                for (address, bytes) in &patch.data {
+                    out.u64(*address);
+                    out.bytes(bytes);
                 }
                 out.len(patch.rebase.len());
                 patch.rebase.iter().for_each(|it| out.u64(*it));
@@ -877,8 +1075,19 @@ mod tests {
         for answer in answers() {
             assert_eq!(Answer::decode(&answer.encode()), Ok(answer));
         }
-        assert_eq!(message_file(0x2a), "message-000000000000002a");
-        assert!(message_file(u64::MAX).starts_with(MESSAGE_PREFIX));
+    }
+
+    /// A code entry's hash is SHA-256 of the code, so the linker's and the program's agree
+    /// whichever of them computes it.
+    #[test]
+    fn a_code_entry_is_its_codes_sha256() {
+        let code = Code::of(0x40, b"abc", "f");
+        let sha256_of_abc = [
+            0xba, 0x78, 0x16, 0xbf, 0x8f, 0x01, 0xcf, 0xea, 0x41, 0x41, 0x40, 0xde, 0x5d, 0xae,
+            0x22, 0x23, 0xb0, 0x03, 0x61, 0xa3, 0x96, 0x17, 0x7a, 0x9c, 0xb4, 0x10, 0xff, 0x61,
+            0xf2, 0x00, 0x15, 0xad,
+        ];
+        assert_eq!((code.len, code.hash), (3, sha256_of_abc));
     }
 
     #[test]
@@ -912,10 +1121,10 @@ mod tests {
         let Ok(MessageView::Patch(view)) = Message::view(&bytes) else { panic!("a patch") };
         assert_eq!((view.id, view.generation, view.base), (patch.id, patch.generation, patch.base));
         assert_eq!(view.code.len(), patch.code.len());
-        for ((at, slice), (want_at, want)) in view.code.zip(&patch.code) {
-            assert_eq!((at, slice), (*want_at, &want[..]));
+        for (code, want) in view.code.zip(&patch.code) {
+            assert_eq!(code, want.borrowed());
             let inside = bytes.as_ptr_range();
-            assert!(slice.is_empty() || inside.contains(&slice.as_ptr()), "borrowed, not copied");
+            assert!(inside.contains(&code.name.as_ptr()), "borrowed, not copied");
         }
         assert_eq!(view.data.collect::<Vec<_>>(), vec![(0x1_0900_0010, &[1u8; 24][..])]);
         assert_eq!(view.rebase().collect::<Vec<_>>(), patch.rebase);
@@ -958,8 +1167,8 @@ mod tests {
     fn wrong_headers_kinds_and_text_are_errors() {
         let bytes = Message::RollBack { id: [0; 16], to: 0 }.encode();
         let mut version = bytes.clone();
-        version[8] = 2;
-        assert!(Message::decode(&version).unwrap_err().contains("version 2"));
+        version[8] = 3;
+        assert!(Message::decode(&version).unwrap_err().contains("version 3"));
         let mut kind = bytes.clone();
         kind[12] = 9;
         assert_eq!(Message::decode(&kind), Err("a message of kind 9".to_owned()));
@@ -1020,5 +1229,34 @@ mod tests {
                 read(&corrupt);
             }
         }
+    }
+
+    /// A whole longer than a piece comes back in pieces that each name it and its length,
+    /// and that join to it; an ask past its end is refused, and asks and pieces read back.
+    #[test]
+    fn a_whole_comes_back_in_pieces_that_name_it() {
+        let whole: Vec<u8> = (0..2 * ask::PIECE + 5).map(|it| it as u8).collect();
+        let mut joined = Vec::new();
+        let mut piece = Vec::new();
+        while joined.len() < whole.len() {
+            ask::piece_into(7, &whole, joined.len() as u64, &mut piece).expect("a piece");
+            assert!(piece.len() <= blaze_inproc::ask::MOST_BODY);
+            let (name, total, bytes) = ask::read_piece(&piece).expect("reads back");
+            assert_eq!((name, total), (7, whole.len() as u64));
+            assert!(!bytes.is_empty());
+            joined.extend_from_slice(bytes);
+        }
+        assert_eq!(joined, whole);
+        ask::piece_into(7, &whole, whole.len() as u64, &mut piece).expect("the empty last piece");
+        assert_eq!(ask::read_piece(&piece), Ok((7, whole.len() as u64, &[][..])));
+        let past = ask::piece_into(7, &whole, whole.len() as u64 + 1, &mut piece);
+        assert!(past.expect_err("past the end").contains("from byte"));
+        assert!(ask::read_piece(&[0; 15]).is_err());
+        assert!(ask::read_piece(&vec![0; blaze_inproc::ask::MOST_BODY + 1]).is_err());
+
+        assert_eq!(ask::read_patch_ask(&ask::patch_ask(3, 4096)), Ok((3, 4096)));
+        assert!(ask::read_patch_ask(&[0; 8]).is_err());
+        assert_eq!(ask::read_tiers_ask(&9u64.to_le_bytes()), Ok(9));
+        assert!(ask::read_tiers_ask(&[0; 16]).is_err());
     }
 }

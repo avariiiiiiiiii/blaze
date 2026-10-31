@@ -424,8 +424,7 @@ pub(crate) mod linked {
     /// slot's log stub.
     pub(crate) fn logged(output: Output) -> Logged {
         let arch = output.arch;
-        let live = Live { dir: FileName::new("live").unwrap(), path: "/tmp/blaze-link-exec/live".into() };
-        let output = Output { incremental: true, live: Some(live), exec_log: true, ..output };
+        let output = Output { incremental: true, live: Some(Live), exec_log: true, ..output };
         let OutputKind::Executable { entry } = &output.kind else { panic!("an executable") };
         let entry = entry.clone();
         let (start, g) = (function(arch, 1), function(arch, 2));

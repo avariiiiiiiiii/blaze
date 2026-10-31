@@ -23,6 +23,8 @@
 //!   `Offset` hole. It is taken only when each value of the address has that one use and is a
 //!   stencil's in the access's block, and only when the fused shape exists; otherwise each
 //!   instruction is written apart.
+//! - `fma x (fneg y) z` is the `fma` of `aux` 1 with operands `[x, y, z]`, always, as
+//!   Cranelift's AArch64 lowering matches it (see [`negate`]).
 //!
 //! An instruction neither the glue nor a stencil writes is an error naming its opcode and
 //! type, never a compile by Cranelift.
@@ -64,6 +66,7 @@ pub(super) fn run<A: Glue>(
             if sel.kind == Kind::Stencil {
                 fuse(plan, func, library, inst, &mut sel);
                 confine(plan, func, library, inst, &mut sel);
+                negate(plan, func, library, inst, &mut sel)?;
             }
             plan.sels[inst.as_u32() as usize] = sel;
         }
@@ -400,6 +403,53 @@ fn confine(plan: &mut Plan<'_>, func: &ir::Function, library: &Reader<'_>, inst:
     sel.args = args;
     sel.nargs = nargs as u8;
     sel.offset = i64::from(off);
+}
+
+/// Fuses `inst`, an `fma` whose operand 1 is an `fneg`, into the `fma` of `aux` 1 of the
+/// `fneg`'s operand: Cranelift's AArch64 `fmadd x (fneg y) z` is `fmsub x y z` (lower.isle),
+/// which flips `x`'s sign where the `fneg` flipped `y`'s, so the NaN of a NaN `x` differs
+/// unless the stencils fuse it too. Cranelift matches the `fneg` in any block and whatever its
+/// other uses, so this fusion has no condition; the `fneg` stays for its other uses, or is
+/// dropped. The other `fneg` operands Cranelift folds (`x`, and `z` of a scalar) give the same
+/// bits fused or not.
+fn negate(
+    plan: &mut Plan<'_>,
+    func: &ir::Function,
+    library: &Reader<'_>,
+    inst: ir::Inst,
+    sel: &mut Sel,
+) -> Result<(), Error> {
+    if sel.shape.op != Op::Fma {
+        return Ok(());
+    }
+    let negated = sel.args[1];
+    let ir::ValueDef::Result(fneg, 0) = func.dfg.value_def(negated) else { return Ok(()) };
+    let Data::Unary { opcode: Opcode::Fneg, arg } = func.dfg.insts[fneg] else { return Ok(()) };
+    let y = func.dfg.resolve_aliases(arg);
+    let args = [sel.args[0], y, sel.args[2]];
+    let fused = Shape { aux: 1, srcs: [Src::None; 3], ..sel.shape };
+    let shape = base(plan, func, library, Op::Fma.info(), fused, &args).ok_or_else(|| {
+        // alloc: the error's message, once per failed compile.
+        Error::at(inst, format!("`fma` of {} by an `fneg`: no `fmsub` stencil takes its operands", sel.shape.ty.name()))
+    })?;
+
+    let (n, v) = (negated.as_u32() as usize, y.as_u32() as usize);
+    plan.uses[n] -= 1;
+    if plan.uses[n] == 0 {
+        plan.dead[fneg.as_u32() as usize] = true;
+        plan.sels[fneg.as_u32() as usize].kind = Kind::Fused;
+    } else {
+        plan.uses[v] += 1;
+    }
+    let block = func.layout.inst_block(inst).expect("a selected instruction is in a block");
+    let at = plan.ord[inst.as_u32() as usize];
+    let last = &mut plan.last[v];
+    if *last != GLOBAL {
+        *last = if plan.def_block[v] == block.as_u32() { (*last).max(at) } else { GLOBAL };
+    }
+    sel.shape = shape;
+    sel.args = args;
+    Ok(())
 }
 
 /// Whether `op` is an access some confined op fuses.

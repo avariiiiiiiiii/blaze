@@ -4,7 +4,7 @@
 
 use proc_macro2::TokenStream;
 use quote::quote;
-use syn::ItemStruct;
+use syn::{ItemStruct, ext::IdentExt as _};
 
 use crate::fields::{self, Field, Kind};
 use crate::hygiene::Hygiene;
@@ -68,6 +68,9 @@ fn expand_in(args: TokenStream, item: &ItemStruct) -> syn::Result<TokenStream> {
             identity_tys.push(&it.stored);
         }
     }
+    let tracked = fields.iter().filter(|it| it.tracked);
+    // alloc: expansion time, once per annotated item; no query runs this
+    let tracked_names = tracked.map(|it| it.ident.unraw().to_string());
     let tracked_count = u32::try_from(tracked_tys.len())
         .map_err(|_| syn::Error::new_spanned(ident, "too many tracked fields"))?;
 
@@ -185,6 +188,7 @@ fn expand_in(args: TokenStream, item: &ItemStruct) -> syn::Result<TokenStream> {
                 const NAME: &'static str = ::core::stringify!(#ident);
                 const FILE: &'static str = ::core::file!();
                 const TRACKED_FIELDS: u32 = #tracked_count;
+                const TRACKED_FIELD_NAMES: &'static [&'static str] = &[#(#tracked_names),*];
                 #[inline]
                 fn ingredient() -> &'static #plumbing::Ingredient {
                     &#ingredient

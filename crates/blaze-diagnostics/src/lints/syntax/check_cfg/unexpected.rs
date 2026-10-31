@@ -31,7 +31,7 @@ use syntax::{
 };
 
 use super::{
-    super::{Emitted, Pass, Tree, Walk, source_fact},
+    super::{Emitted, Pass, Stage, Tree, Walk, source_fact},
     CheckCfg, Values, meta, well_known,
 };
 use crate::{
@@ -412,7 +412,7 @@ impl<'db> Lints<'_, '_, 'db> {
         };
         let at = self.at(anchor);
         source_fact(self.cx, &mut diag, at);
-        self.emitted.push(Emitted::new(diag, Phase::Resolve, Pass::Buffered, at));
+        self.emitted.push(Emitted::new(diag, Phase::Resolve, Pass::Buffered, at).buffered(Stage::Collected));
     }
 
     fn span(&self, file: HirFileId, range: TextRange) -> Span {

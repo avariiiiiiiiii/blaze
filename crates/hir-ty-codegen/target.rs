@@ -840,6 +840,38 @@ mod tests {
         }
     }
 
+    /// `f16` and `f128` are lowered on AArch64 under Apple's convention as under System V's,
+    /// and Cranelift's `apple_aarch64` passes and returns them; Windows' x64 refuses them.
+    #[test]
+    fn apple_aarch64_passes_f16_and_f128() {
+        use cranelift_codegen::ir::{self, AbiParam, InstBuilder as _, types};
+        use cranelift_frontend::{FunctionBuilder, FunctionBuilderContext};
+        let apple = Target::parse("aarch64-apple-darwin").expect("a target");
+        assert_eq!(apple.call_conv, cranelift_codegen::isa::CallConv::AppleAarch64);
+        assert!(crate::f16_f128::soft_floats(&apple));
+        assert!(crate::f16_f128::soft_floats(&Target::parse("aarch64-unknown-linux-gnu").expect("a target")));
+        assert!(!crate::f16_f128::soft_floats(&Target::parse("x86_64-pc-windows-msvc").expect("a target")));
+        let isa = apple.isa(Features::BASELINE, "backtracking", false, OptLevel::None).expect("the ISA");
+        let mut signature = ir::Signature::new(apple.call_conv);
+        signature.params.extend([AbiParam::new(types::F16), AbiParam::new(types::F128)]);
+        signature.returns.extend([AbiParam::new(types::F128), AbiParam::new(types::F16)]);
+        let mut func = ir::Function::with_name_signature(ir::UserFuncName::default(), signature);
+        let mut context = FunctionBuilderContext::new();
+        let mut builder = FunctionBuilder::new(&mut func, &mut context);
+        let block = builder.create_block();
+        builder.append_block_params_for_function_params(block);
+        builder.switch_to_block(block);
+        builder.seal_block(block);
+        let [half, quad] = builder.block_params(block) else { panic!("two parameters") };
+        let (half, quad) = (*half, *quad);
+        builder.ins().return_(&[quad, half]);
+        builder.finalize(isa.frontend_config());
+        let mut compiled = cranelift_codegen::Context::for_function(func);
+        if let Err(e) = compiled.compile(&*isa, &mut Default::default()) {
+            panic!("{:?}", e.inner);
+        }
+    }
+
     #[test]
     fn features_cranelift_always_uses_cannot_be_turned_off() {
         let x86 = Target::parse("x86_64-unknown-linux-gnu").expect("a target");

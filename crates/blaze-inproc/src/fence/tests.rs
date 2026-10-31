@@ -312,6 +312,8 @@ fn threads_never_run_freed_code() {
     const LANES: u64 = 4;
     const GENERATIONS: u64 = 6;
     const MOVES: usize = 3000;
+    /// Calls that must land while ranges move: fewer than the lanes make in all.
+    const OVERLAP: u64 = 1000;
     let world = Arc::new(World {
         control: Shared(Arc::new(words())),
         code: (0..RANGES).map(|_| AtomicU64::new(POISON)).collect(),
@@ -369,7 +371,16 @@ fn threads_never_run_freed_code() {
         });
         count
     };
-    for _ in 0..MOVES {
+    // Moves go on until the workers have called through them, however late they are scheduled;
+    // all the lanes having ended (a worker panicked) stops them, to report that panic.
+    let mut moves = 0;
+    while (moves < MOVES || world.calls.load(Ordering::Relaxed) < OVERLAP) && !lanes.iter().all(|it| it.is_finished()) {
+        assert!(
+            Instant::now() < deadline,
+            "{} calls landed in {moves} moves",
+            world.calls.load(Ordering::Relaxed)
+        );
+        moves += 1;
         while free.is_empty() {
             assert!(Instant::now() < deadline, "the fence never passed: {} ranges held", limbo.len());
             freed += collect(&mut fences, &mut limbo, &mut free, &mut listed);
@@ -393,6 +404,7 @@ fn threads_never_run_freed_code() {
         assert!(Instant::now() < deadline, "ranges held after every thread ended: {}", limbo.len());
         freed += collect(&mut fences, &mut limbo, &mut free, &mut listed);
     }
-    assert!(freed >= MOVES - RANGES, "only {freed} of {MOVES} ranges came back");
-    assert!(world.calls.load(Ordering::Relaxed) > 0);
+    assert!(freed >= moves.saturating_sub(RANGES), "only {freed} of {moves} ranges came back");
+    let calls = world.calls.load(Ordering::Relaxed);
+    assert!(calls >= OVERLAP, "only {calls} calls landed while ranges moved");
 }

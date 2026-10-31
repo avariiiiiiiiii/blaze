@@ -66,8 +66,8 @@ use serde::{Deserialize, Serialize};
 /// as enums ([`TargetKind`], [`CrateType`], [`ArtifactKind`], [`Applicability`]), written by
 /// name as before. [`ResponseRef`] reads the same bytes. 15: [`Request::Pack`] and
 /// [`Response::Packed`]. 16: [`Worked::links`]. 17: [`Worked::steps_us`]. 18: [`Request::Doc`],
-/// [`Response::DocPage`] and [`Response::Documented`].
-pub const SCHEMA: u32 = 18;
+/// [`Response::DocPage`] and [`Response::Documented`]. 19: [`Cargo::refused`].
+pub const SCHEMA: u32 = 19;
 
 /// The most bytes a request the daemon reads may be: CBOR from a peer is decoded only up to
 /// this.
@@ -146,6 +146,9 @@ pub struct Cargo {
     /// How many `-v` were given (cargo's `Verbosity`: 1 is `Verbose`, 2 or more `-vv`); 0 with
     /// none or with `-q`, which `args` says.
     pub verbose: u8,
+    /// How many of the functions blaze could not compile a build's error names: the first
+    /// `n`, or with `None` every one (blaze's own `--refused N|all`; 16 without it).
+    pub refused: Option<u32>,
 }
 
 /// [`Cargo::files`], each file's bytes one byte string.
@@ -179,6 +182,7 @@ impl std::fmt::Debug for Cargo {
             .field("color", &self.color)
             .field("width", &self.width)
             .field("verbose", &self.verbose)
+            .field("refused", &self.refused)
             .finish()
     }
 }
@@ -1106,6 +1110,7 @@ mod tests {
             width: Some(100),
             command: "build".to_owned(),
             verbose: 2,
+            refused: None,
         };
         let bytes = blaze_protocol::cbor::to_vec(&cargo).unwrap();
         let files = [0x65, b'f', b'i', b'l', b'e', b's', 0x81, 0x82, 0x62, b'/', b'c', 0x42, 1, 2];

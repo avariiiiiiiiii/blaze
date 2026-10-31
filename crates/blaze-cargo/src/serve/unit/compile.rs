@@ -216,6 +216,8 @@ fn work_out_key(job: &Job, unit: usize, identity: ContentId) -> Result<Key, ApiE
     }
     // The rendered diagnostics' columns: none is rustc's default, apart from every width.
     hasher.update(&job.input.width.map_or(0, |it| u64::from(it) + 1).to_le_bytes());
+    // How many refused functions its error names: every one apart from each count.
+    hasher.update(&job.input.refused.map_or(0, |it| u64::from(it) + 1).to_le_bytes());
     Ok(Key(hasher.finish()))
 }
 
@@ -777,7 +779,7 @@ fn assemble(job: &Job, reader: &UnitReader, unit: usize, phases: &Phases, images
                 Ok(it) => it,
                 Err(errors) => {
                     // clone: error path
-                    let what = crate::refused_error(&u.target.name, errors.len(), errors.iter().cloned());
+                    let what = crate::refused_error(&u.target.name, errors.len(), errors.iter().cloned(), job.input.refused);
                     diagnostics.push(say::refused(what, Some(unit_of), color));
                     return Ok(nothing(diagnostics, false, made));
                 }

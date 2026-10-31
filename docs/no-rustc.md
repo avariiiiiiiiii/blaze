@@ -712,8 +712,9 @@ every call to one being the compiler's own code) is, where something calls it, a
 that says so when it runs. A program that reaches one is not built: a function of its own
 crates blaze refused (its `main`, or one only code of the object calls, its own copy of an
 `#[inline]` function of the library's among them) stops the build before the link, and a stand-in
-the link keeps, the library unit's included, fails it after; either way the error names each
-function and why it was refused (`` `p` reaches 1 function blaze could not compile, and a build
+the link keeps, the library unit's included, fails it after; either way the error names the
+functions and why each was refused, the first 16 or under `--refused N|all` as many as asked
+(`` `p` reaches 1 function blaze could not compile, and a build
 with nothing of rustc's has nothing else to compile it, so it is not built:``), and no
 executable is left. A function the library exports by name that nothing in it calls has no
 stand-in, as one exported under the name could take the place of a definition the program

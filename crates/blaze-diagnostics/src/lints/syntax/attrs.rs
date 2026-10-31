@@ -44,7 +44,7 @@ use syntax::{
     view::{self as ast, AstNode},
 };
 
-use super::{Emitted, Pass, Walk};
+use super::{Emitted, Pass, Stage, Walk};
 use crate::{cx::Cx, lower::Phase, model::Diag};
 
 /// An attribute of a node as rustc's attribute parser takes it: one of a `cfg_attr`'s
@@ -340,7 +340,7 @@ fn written_attributes<'db>(
 pub(crate) fn parsed(diag: Diag, owner: &Owner<'_>) -> Emitted {
     match &owner.buffered_at {
         // clone: a pointer, copied for a lint emitted
-        Some(at) => Emitted::new(diag, Phase::Resolve, Pass::Buffered, at.clone()),
+        Some(at) => Emitted::new(diag, Phase::Resolve, Pass::Buffered, at.clone()).buffered(Stage::Collected),
         None => Emitted::new(diag, Phase::Items, Pass::Delayed, owner.at()),
     }
 }

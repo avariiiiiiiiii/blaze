@@ -28,29 +28,46 @@ pub mod socket;
 pub mod toolchain;
 pub mod unstable;
 
-/// How many of the functions blaze could not compile an error names.
-const REFUSED_SHOWN: usize = 16;
+/// How many of the functions blaze could not compile an error names when the request does not
+/// say ([`blaze_api::Cargo::refused`], `--refused`).
+pub const REFUSED_SHOWN: u32 = 16;
 /// What the first line of [`refused_error`] says, which the daemon's client finds it by.
 pub const REFUSED_SAYS: &str = "blaze could not compile";
 
 /// Why a program with nothing of rustc's is not built: the functions it reaches that blaze
-/// could not compile, `reached` of them, each `name: why`, the first [`REFUSED_SHOWN`] named.
-/// Nothing else compiles them (AGENTS.md, no fallback), and a link without them would fail on
-/// what they leave undefined or keep a stand-in that aborts.
-pub fn refused_error(program: &str, reached: usize, said: impl Iterator<Item = String>) -> String {
+/// could not compile, `reached` of them, each `name: why`, the first `shown` named (every one
+/// with `None`). Nothing else compiles them (AGENTS.md, no fallback), and a link without them
+/// would fail on what they leave undefined or keep a stand-in that aborts.
+pub fn refused_error(program: &str, reached: usize, said: impl Iterator<Item = String>, shown: Option<u32>) -> String {
+    let shown = shown.map_or(usize::MAX, |it| usize::try_from(it).unwrap_or(usize::MAX));
     let mut text = format!(
         "`{program}` reaches {reached} function{} {REFUSED_SAYS}, and a build with nothing of \
          rustc's has nothing else to compile {}, so it is not built:",
         if reached == 1 { "" } else { "s" },
         if reached == 1 { "it" } else { "them" },
     );
-    for line in said.take(REFUSED_SHOWN) {
+    for line in said.take(shown) {
         text += &format!("\n  {line}");
     }
-    if reached > REFUSED_SHOWN {
-        text += &format!("\n  and {} more", reached - REFUSED_SHOWN);
+    if reached > shown {
+        text += &format!("\n  and {} more (`--refused all` names every one)", reached - shown);
     }
     text
+}
+
+#[cfg(test)]
+mod refused_tests {
+    #[test]
+    fn a_refused_error_names_as_many_as_asked() {
+        let said = || (0..20).map(|it| format!("f{it}: why"));
+        let first = super::refused_error("app", 20, said(), Some(super::REFUSED_SHOWN));
+        assert!(first.contains("\n  f15: why\n  and 4 more (`--refused all` names every one)"), "{first}");
+        assert!(!first.contains("f16"), "{first}");
+        let every = super::refused_error("app", 20, said(), None);
+        assert!(every.ends_with("\n  f19: why") && !every.contains("more"), "{every}");
+        let none = super::refused_error("app", 20, said(), Some(0));
+        assert!(none.ends_with("so it is not built:\n  and 20 more (`--refused all` names every one)"), "{none}");
+    }
 }
 
 /// The lock, also after a thread panicked with it: a build that is interrupted or that

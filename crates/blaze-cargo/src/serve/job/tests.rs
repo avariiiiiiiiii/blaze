@@ -105,6 +105,7 @@ fn cargos_own_invocation_is_kept_whole() {
         color: false,
         width: None,
         verbose: 0,
+        refused: Some(16),
     });
     let work = Work::Test { targets: targets.clone(), filter: Vec::new(), all: false, args: Vec::new(), ub: None };
     let made = invocation(&work, Some(&targets), "/elsewhere", &[]);
@@ -130,6 +131,7 @@ fn a_job_is_profiled_when_its_command_line_names_a_directory() {
             color: false,
             width: None,
             verbose: 0,
+            refused: Some(16),
         });
         Work::Build(targets)
     };

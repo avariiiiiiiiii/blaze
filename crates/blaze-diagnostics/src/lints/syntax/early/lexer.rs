@@ -37,7 +37,7 @@ use crate::{
     cx::Cx,
     lints::{
         registry::{LintId, LintSet},
-        syntax::{Emitted, Pass, Walk, source_fact},
+        syntax::{Emitted, Pass, Stage, Walk, source_fact},
     },
     lower::Phase,
     model::{Applicability, Diag, Span, SuggestionStyle},
@@ -385,7 +385,7 @@ fn lexer_lint(cx: &Cx<'_, '_>, file: FileId, text: &str, lexed: Lexed, krate: In
         }
     };
     source_fact(cx, &mut diag, krate);
-    Emitted::new(diag, Phase::Resolve, Pass::Buffered, krate)
+    Emitted::new(diag, Phase::Resolve, Pass::Buffered, krate).buffered(Stage::Parsed)
 }
 
 #[cfg(test)]

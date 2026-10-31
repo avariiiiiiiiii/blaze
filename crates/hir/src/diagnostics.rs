@@ -3024,16 +3024,29 @@ impl<'a, 'db, F: Fn(crate::DefWithBody) -> bool + ?Sized> DiagnosticsCollector<'
         }
     }
 
+    /// The checks of `def`'s fields, read without positions as [`Self::collect_generic_def`]
+    /// reads a signature: their source map only to place a diagnostic.
     fn collect_variant(&mut self, def: VariantId) {
-        let (fields, source_map) = def.fields_with_source_map(self.db);
-        self.collect_expr_store(&fields.store, source_map);
-
-        let lowering = self.db.field_types_with_diagnostics(def);
-        self.collect_anon_consts_and_ty_diagnostics(
-            source_map,
-            lowering.defined_anon_consts(),
-            lowering.diagnostics(),
-        );
+        use hir_def::signatures::VariantFields;
+        let db = self.db;
+        self.collect_blocks(&VariantFields::of(db, def).store);
+        let lowering = db.field_types_with_diagnostics(def);
+        let store_reports = match VariantFields::relative(db, def) {
+            Some((_, map)) => !map.diagnostics().is_empty(),
+            None => !VariantFields::with_source_map(db, def).1.diagnostics().is_empty(),
+        };
+        let reports = store_reports
+            || !lowering.diagnostics().is_empty()
+            || lowering.defined_anon_consts().iter().any(|&it| self.anon_const_reports(it));
+        if reports {
+            let (_, source_map) = def.fields_with_source_map(db);
+            self.collect_store_diagnostics(source_map);
+            self.collect_anon_consts_and_ty_diagnostics(
+                source_map,
+                lowering.defined_anon_consts(),
+                lowering.diagnostics(),
+            );
+        }
     }
 
     fn collect_generic_def_with_body(
@@ -3169,15 +3182,6 @@ impl<'a, 'db, F: Fn(crate::DefWithBody) -> bool + ?Sized> DiagnosticsCollector<'
             ModuleDefId::TypeAliasId(def) => self.collect_only_generic_def(def),
             ModuleDefId::BuiltinType(_) => {}
         }
-    }
-
-    fn collect_expr_store(
-        &mut self,
-        store: &ExpressionStore,
-        source_map: &ExpressionStoreSourceMap,
-    ) {
-        self.collect_blocks(store);
-        self.collect_store_diagnostics(source_map);
     }
 
     /// The items of `store`'s block modules.

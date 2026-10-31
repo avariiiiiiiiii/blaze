@@ -731,9 +731,13 @@ impl<'cx, 'db> Walk<'_, 'cx, 'db> {
             return Ok(());
         }
         let (callee, callee_args) = db.lookup_impl_method(self.fx.env, func, generic_args);
-        let either::Either::Left(callee) = callee else {
-            // alloc: the error's message
-            return Err("call to builtin derive method".to_owned());
+        let callee = match callee {
+            either::Either::Left(callee) => callee,
+            either::Either::Right(derived) => {
+                let derived = crate::unexpanded_derive(db, derived, generic_args.type_at(0));
+                // alloc: the error's message
+                return Err(format!("call to {derived}"));
+            }
         };
         if callee == func
             && let ItemContainerId::TraitId(trait_) = func.lookup(db).container

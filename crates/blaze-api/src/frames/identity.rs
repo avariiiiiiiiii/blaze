@@ -218,6 +218,7 @@ impl Gen {
             width: self.maybe(Gen::u32),
             command: self.text(),
             verbose: self.next() as u8,
+            refused: self.maybe(Gen::u32),
         }
     }
 

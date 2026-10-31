@@ -1784,6 +1784,28 @@ pub fn compile_time_only(db: &Db, func: FunctionId) -> bool {
     AttrFlags::has_word(db, func.into(), "rustc_comptime")
 }
 
+/// The refusal of `method` of the impl a builtin derive makes for `self_ty`, as `lookup_impl_method`
+/// finds it in a database that records builtin derives instead of expanding them: such an impl
+/// has no body to compile, where rustc compiles what the derive expands to.
+pub(crate) fn unexpanded_derive(
+    db: &Db,
+    (impl_, method): (hir_def::BuiltinDeriveImplId, hir_def::builtin_derive::BuiltinDeriveImplMethod),
+    self_ty: impl std::fmt::Debug,
+) -> String {
+    let derive = impl_.loc(db).trait_.name();
+    let (derive, method) = (derive.as_str(), method.name());
+    // A type's `Debug` reads its interned parts from the attached database.
+    hir_ty::attach_db(db, || {
+        // alloc: the error's message
+        format!(
+            "`{derive}::{}` of `{self_ty:?}`, which `#[derive({derive})]` implements: the database \
+             records builtin derives unexpanded, so it has no body to compile (a build's database \
+             expands them, `hir_def::nameres::set_expand_builtin_derives`)",
+            method.as_str()
+        )
+    })
+}
+
 /// Whether `name` is of core's `check_language_ub` or `check_library_ub`, each
 /// `ub_checks() && ..` and the rest true at run time.
 fn is_ub_check(name: &intern::Symbol) -> bool {
@@ -7090,8 +7112,12 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
             return self.reified(fn_ty, false);
         }
         let (callee, callee_args) = db.lookup_impl_method(self.env, func, generic_args);
-        let either::Either::Left(callee) = callee else {
-            unsupported!("fn pointer to a builtin derive method");
+        let callee = match callee {
+            either::Either::Left(callee) => callee,
+            either::Either::Right(derived) => {
+                let derived = unexpanded_derive(db, derived, generic_args.type_at(0));
+                unsupported!("fn pointer to {derived}");
+            }
         };
         // The function takes its caller's location as well, which the shim supplies.
         if track_caller(db, callee) {
@@ -8903,8 +8929,12 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
             unsupported!("generic method in a vtable");
         };
         let (callee, callee_args) = db.lookup_impl_method(self.env, func, args);
-        let either::Either::Left(callee) = callee else {
-            unsupported!("builtin derive method in a vtable");
+        let callee = match callee {
+            either::Either::Left(callee) => callee,
+            either::Either::Right(derived) => {
+                let derived = unexpanded_derive(db, derived, self_ty);
+                unsupported!("{derived}, in a vtable");
+            }
         };
         if !FunctionSignature::of(db, callee).has_body() {
             let method = FunctionSignature::of(db, callee).name.as_str();
@@ -9538,8 +9568,12 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
             return self.call_virtual(func, dyn_ty, receiver, receiver_ty, rest, dst, dst_ty);
         }
         let (callee, callee_args) = db.lookup_impl_method(self.env, func, generic_args);
-        let either::Either::Left(callee) = callee else {
-            unsupported!("call to builtin derive method");
+        let callee = match callee {
+            either::Either::Left(callee) => callee,
+            either::Either::Right(derived) => {
+                let derived = unexpanded_derive(db, derived, generic_args.type_at(0));
+                unsupported!("call to {derived}");
+            }
         };
         if callee == func
             && let ItemContainerId::TraitId(trait_) = func.lookup(db).container

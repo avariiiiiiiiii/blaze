@@ -70,56 +70,61 @@ fn every_lookup_view_is_its_handle() {
     assert_eq!(bodies.len(), 3);
     for (def, file_id) in bodies {
         let (_, source_map) = Body::with_source_map(&db, def);
-        let handles = file_id.parse_or_expand(&db);
-        let root = file_id.root(&db);
-        for node in root.descendants() {
-            if let Some(it) = <view::Expr<'_> as view::AstNode<'_>>::cast(node) {
-                let h = handle::<ast::Expr>(it, &handles);
-                let id = source_map.node_expr_view(InFile::new(file_id, it));
-                assert_eq!(id, source_map.node_expr(InFile::new(file_id, &h)), "{def:?} {node:?}");
-                found[0] += usize::from(id.is_some());
-            }
-            if let Some(it) = <view::Pat<'_> as view::AstNode<'_>>::cast(node) {
-                let h = handle::<ast::Pat>(it, &handles);
-                let id = source_map.node_pat_view(InFile::new(file_id, it));
-                assert_eq!(id, source_map.node_pat(InFile::new(file_id, &h)), "{def:?} {node:?}");
-                found[1] += usize::from(id.is_some());
-            }
-            if let Some(it) = <view::Type<'_> as view::AstNode<'_>>::cast(node) {
-                let h = handle::<ast::Type>(it, &handles);
-                let id = source_map.node_type_view(InFile::new(file_id, it));
-                assert_eq!(id, source_map.node_type(InFile::new(file_id, &h)), "{def:?} {node:?}");
-                found[2] += usize::from(id.is_some());
-            }
-            if let Some(it) = <view::Label<'_> as view::AstNode<'_>>::cast(node) {
-                let h = handle::<ast::Label>(it, &handles);
-                let id = source_map.node_label_view(InFile::new(file_id, it));
-                assert_eq!(id, source_map.node_label(InFile::new(file_id, &h)), "{def:?} {node:?}");
-                found[3] += usize::from(id.is_some());
-            }
-            if let Some(it) = <view::MacroCall<'_> as view::AstNode<'_>>::cast(node) {
-                let h = handle::<ast::MacroCall>(it, &handles);
-                let id = source_map.node_macro_file_view(InFile::new(file_id, it));
-                assert_eq!(id, source_map.node_macro_file(InFile::new(file_id, &h)), "{def:?} {node:?}");
-                assert_eq!(source_map.expansion_view(InFile::new(file_id, it)), source_map.expansion(InFile::new(file_id, &h)));
-                found[4] += usize::from(id.is_some());
-            }
-            if let Some(it) = <view::MacroExpr<'_> as view::AstNode<'_>>::cast(node) {
-                let h = handle::<ast::MacroExpr>(it, &handles);
-                let id = source_map.macro_expansion_expr_view(InFile::new(file_id, it));
-                assert_eq!(id, source_map.macro_expansion_expr(InFile::new(file_id, &h)), "{def:?} {node:?}");
-                found[5] += usize::from(id.is_some());
-            }
-            if let Some(it) = <view::FormatArgsExpr<'_> as view::AstNode<'_>>::cast(node) {
-                let h = handle::<ast::FormatArgsExpr>(it, &handles);
-                let view = source_map.implicit_format_args_view(InFile::new(file_id, it));
-                assert_eq!(view, source_map.implicit_format_args(InFile::new(file_id, &h)), "{def:?} {node:?}");
-                found[6] += usize::from(view.is_some());
-            }
-            if let Some(it) = <view::AsmExpr<'_> as view::AstNode<'_>>::cast(node) {
-                let h = handle::<ast::AsmExpr>(it, &handles);
-                let view = source_map.asm_template_args_view(InFile::new(file_id, it));
-                assert_eq!(view, source_map.asm_template_args(InFile::new(file_id, &h)), "{def:?} {node:?}");
+        // The body's file and those of the macro calls in it: a format string is in its
+        // `format_args!`'s expansion.
+        let expansions = source_map.macro_calls().map(|(_, call)| hir_expand::HirFileId::from(call));
+        for file_id in std::iter::once(file_id).chain(expansions) {
+            let handles = file_id.parse_or_expand(&db);
+            let root = file_id.root(&db);
+            for node in root.descendants() {
+                if let Some(it) = <view::Expr<'_> as view::AstNode<'_>>::cast(node) {
+                    let h = handle::<ast::Expr>(it, &handles);
+                    let id = source_map.node_expr_view(InFile::new(file_id, it));
+                    assert_eq!(id, source_map.node_expr(InFile::new(file_id, &h)), "{def:?} {node:?}");
+                    found[0] += usize::from(id.is_some());
+                }
+                if let Some(it) = <view::Pat<'_> as view::AstNode<'_>>::cast(node) {
+                    let h = handle::<ast::Pat>(it, &handles);
+                    let id = source_map.node_pat_view(InFile::new(file_id, it));
+                    assert_eq!(id, source_map.node_pat(InFile::new(file_id, &h)), "{def:?} {node:?}");
+                    found[1] += usize::from(id.is_some());
+                }
+                if let Some(it) = <view::Type<'_> as view::AstNode<'_>>::cast(node) {
+                    let h = handle::<ast::Type>(it, &handles);
+                    let id = source_map.node_type_view(InFile::new(file_id, it));
+                    assert_eq!(id, source_map.node_type(InFile::new(file_id, &h)), "{def:?} {node:?}");
+                    found[2] += usize::from(id.is_some());
+                }
+                if let Some(it) = <view::Label<'_> as view::AstNode<'_>>::cast(node) {
+                    let h = handle::<ast::Label>(it, &handles);
+                    let id = source_map.node_label_view(InFile::new(file_id, it));
+                    assert_eq!(id, source_map.node_label(InFile::new(file_id, &h)), "{def:?} {node:?}");
+                    found[3] += usize::from(id.is_some());
+                }
+                if let Some(it) = <view::MacroCall<'_> as view::AstNode<'_>>::cast(node) {
+                    let h = handle::<ast::MacroCall>(it, &handles);
+                    let id = source_map.node_macro_file_view(InFile::new(file_id, it));
+                    assert_eq!(id, source_map.node_macro_file(InFile::new(file_id, &h)), "{def:?} {node:?}");
+                    assert_eq!(source_map.expansion_view(InFile::new(file_id, it)), source_map.expansion(InFile::new(file_id, &h)));
+                    found[4] += usize::from(id.is_some());
+                }
+                if let Some(it) = <view::MacroExpr<'_> as view::AstNode<'_>>::cast(node) {
+                    let h = handle::<ast::MacroExpr>(it, &handles);
+                    let id = source_map.macro_expansion_expr_view(InFile::new(file_id, it));
+                    assert_eq!(id, source_map.macro_expansion_expr(InFile::new(file_id, &h)), "{def:?} {node:?}");
+                    found[5] += usize::from(id.is_some());
+                }
+                if let Some(it) = <view::FormatArgsExpr<'_> as view::AstNode<'_>>::cast(node) {
+                    let h = handle::<ast::FormatArgsExpr>(it, &handles);
+                    let view = source_map.implicit_format_args_view(InFile::new(file_id, it));
+                    assert_eq!(view, source_map.implicit_format_args(InFile::new(file_id, &h)), "{def:?} {node:?}");
+                    found[6] += usize::from(view.is_some());
+                }
+                if let Some(it) = <view::AsmExpr<'_> as view::AstNode<'_>>::cast(node) {
+                    let h = handle::<ast::AsmExpr>(it, &handles);
+                    let view = source_map.asm_template_args_view(InFile::new(file_id, it));
+                    assert_eq!(view, source_map.asm_template_args(InFile::new(file_id, &h)), "{def:?} {node:?}");
+                }
             }
         }
     }

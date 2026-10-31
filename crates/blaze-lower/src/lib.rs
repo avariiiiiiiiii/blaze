@@ -306,6 +306,10 @@ pub fn lower_into<T: blaze_query::Tree>(db: Db, lower: Lower<'_, T>) -> Result<L
     let tree = files::Mounts { mounts: &config.mounts, view: root, tree: files, read_view: Cell::new(false) };
     let mut db = db;
     ProcMacros::init_default(&mut db, Durability::HIGH);
+    // rustc compiles, checks and evaluates what a builtin derive expands to: the impls it
+    // writes have bodies, which recording them without expanding (rust-analyzer's fast path)
+    // leaves out.
+    hir_def::nameres::set_expand_builtin_derives(&mut db, true);
     for (index, &is_library) in library.iter().enumerate() {
         let source_root = match is_library {
             true => SourceRoot::new_library(FileSet::default()),

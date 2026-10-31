@@ -589,7 +589,8 @@ pub mod bar;
     let before = super::publish::Slices::of(&db, krate);
     let extra = krate.extra_data(&db).clone();
 
-    db.set_file_text(file, &text("0"));
+    let work = work_of(&mut db, krate, |db| db.set_file_text(file, &text("0")));
+    assert_eq!(work.slices, 0, "inputs the maintainer set, though each ends as it was: {work:?}");
     let after = super::publish::Slices::of(&db, krate);
     assert_eq!(before.differing(&after), Vec::<&str>::new(), "fields of the crate's resolution set");
     assert_eq!(*krate.extra_data(&db), extra, "the crate's extra data");

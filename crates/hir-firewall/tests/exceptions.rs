@@ -34,7 +34,7 @@ fn assert_clean(report: &Report) {
 fn an_edit_of_each_function_reaches_only_it() {
     let report = run(
         r#"
-//- minicore: sized, copy, fn, option
+//- minicore: sized, copy, fn, option, slice
 pub struct Point { pub x: u32, pub y: u32 }
 
 impl Point {
@@ -52,7 +52,7 @@ impl Area for Point {
 }
 
 pub fn first<T: Copy>(items: &[T]) -> Option<T> {
-    if items.is_empty() { None } else { Some(items[0]) }
+    if items.len() == 0 { None } else { Some(items[0]) }
 }
 
 pub fn caller() -> u32 {

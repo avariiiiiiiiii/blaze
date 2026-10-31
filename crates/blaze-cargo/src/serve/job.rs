@@ -1651,6 +1651,7 @@ impl<S: Steps> Jobs<S> {
             short,
             width: cargo.and_then(|it| it.width),
             verbose: cargo.map_or(0, |it| it.verbose),
+            refused: cargo.map_or(Some(crate::REFUSED_SHOWN), |it| it.refused),
             goal: goal_of(&job.work),
             cancelled: job.cancelled.clone(), // clone: a refcount, once per view
         };

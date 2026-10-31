@@ -132,6 +132,9 @@ pub struct JobInput {
     pub width: Option<u32>,
     /// How many `-v` the request gave ([`blaze_api::Cargo::verbose`]).
     pub verbose: u8,
+    /// How many of the functions blaze could not compile an error names, every one with `None`
+    /// ([`blaze_api::Cargo::refused`]; [`crate::REFUSED_SHOWN`] for an agent's request).
+    pub refused: Option<u32>,
     pub goal: Goal,
     /// Set once the job is cancelled: long work looks at it between pieces and stops with
     /// [`Failed::Again`], which the loop drops for a cancelled job.

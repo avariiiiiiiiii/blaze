@@ -20,6 +20,8 @@ use crate::{
 const CODE: &str = r#"
 pub struct S { x: u32 }
 
+// With an attribute, the `impl` is the anchor of its `fn`s' bodies, not each `fn` its own.
+#[allow(dead_code)]
 impl S {
     pub fn get(&self) -> u32 { self.x }
     pub fn with(&self, y: u32) -> u32 {

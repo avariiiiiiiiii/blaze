@@ -92,7 +92,9 @@ a build first needs it.
 (`crates/blaze-cargo/src/cli/args.rs`), with clap's errors and exit code 1 for a command line
 cargo would refuse. `-C DIRECTORY` (with `-Z unstable-options`) and the global flags before
 the command work as in cargo. `test` alone takes four flags of blaze's own (extensions,
-[below](#which-tests-run)): `--reached`, `--ub`, `--ub-seed N` and `--ub-schedules K`.
+[below](#which-tests-run)): `--reached`, `--ub`, `--ub-seed N` and `--ub-schedules K`. `build`,
+`check`, `run`, `test` and `bench` take `--refused N|all`: how many of the functions blaze could
+not compile a build's error names, the first `N` (16 without it) or every one.
 `serve` is the daemon itself ([below](#the-daemon)); `codegen-inputs`, `trace` and `tables`
 print what the daemon's last build of the checkout did (each instance it made with its code
 hash, every result with its edges as CBOR, the size of each long-lived table); `pack` checks

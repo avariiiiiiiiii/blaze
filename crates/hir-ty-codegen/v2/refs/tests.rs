@@ -345,6 +345,51 @@ fn a_dyn_fn_call_lists_the_closure_vtable() {
     assert!(count(&reached, |def| *def == InstanceDef::DropGlue) >= 1, "{reached:?}");
 }
 
+const DERIVED: &str = r#"
+//- minicore: sized, copy, clone, derive, eq, unsize, coerce_unsized, dispatch_from_dyn
+#[derive(Clone, PartialEq)]
+pub struct Pair(pub u32, pub u64);
+pub fn roots(p: &Pair) -> bool {
+    let q = p.clone();
+    let other: &dyn PartialEq<Pair> = &q;
+    *p == q && other.eq(p)
+}
+"#;
+
+/// rustc compiles what a builtin derive expands to. Where the database expands them, the
+/// derived `clone` and `eq` are reached as written methods are, called and in the vtable of
+/// `dyn PartialEq`; where it only records them, the call is refused naming the derive.
+#[test]
+fn a_derived_method_is_reached_where_derives_are_expanded() {
+    let mut expanded = fixture::db(DERIVED).into_db();
+    hir_def::nameres::set_expand_builtin_derives(&mut expanded, true);
+    let db: &'static TestDB = Box::leak(Box::new(expanded));
+    let expanding =
+        HirFrontend::new(Databases::new(db), HashSource::ById(ById), std::sync::Arc::new(BuildTime(Default::default())));
+    let reached = reach(&expanding, expanding.root(function(db, "roots")));
+    assert_reached(db, &reached, &["clone", "eq"]);
+
+    let (db, frontend) = frontend(DERIVED);
+    let root = frontend.root(function(db, "roots"));
+    let refused = frontend.with(|db, homes| walk(db, &root, false, homes)).expect_err("the call of `clone`");
+    assert!(refused.contains("`Clone::clone` of") && refused.contains("#[derive(Clone)]"), "{refused}");
+}
+
+const SOFT_FLOATS: &str = r#"
+//- minicore: sized
+pub fn roots(a: f128, b: f16) -> f128 { a * a + b as f128 }
+"#;
+
+/// `f16` and `f128` arithmetic lists the compiler-builtins functions LLVM calls for it, on
+/// each target whose code generator lowers them: Apple's AArch64 as System V's.
+#[test]
+fn soft_float_arithmetic_lists_its_builtins() {
+    let (_, reached) = reach_from(SOFT_FLOATS, "roots");
+    for symbol in ["__multf3", "__addtf3", "__extendhftf2"] {
+        assert_extern(root_walk(&reached), symbol);
+    }
+}
+
 const OVERFLOW: &str = r#"
 //- minicore: sized, index, slice, panic_location
 #![feature(lang_items, rustc_attrs)]

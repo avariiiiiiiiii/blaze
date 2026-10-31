@@ -16,7 +16,7 @@ use syntax::{NodeOrToken, SyntaxKind, SyntaxNodePtr, T, TextRange, TextSize, vie
 use super::{edition_at, emitted, span};
 use crate::{
     cx::Cx,
-    lints::syntax::{Emitted, Pass, Tree, Walk},
+    lints::syntax::{Emitted, Pass, Stage, Tree, Walk},
     model::{Applicability, Diag, Span},
 };
 
@@ -104,7 +104,7 @@ fn varargs_without_pattern(
         "_: ...",
         Applicability::MachineApplicable,
     );
-    Some(emitted(cx, diag, Pass::Buffered, crate_at, tree.ptr(param)))
+    Some(emitted(cx, diag, Pass::Buffered, crate_at, tree.ptr(param)).buffered(stage(tree)))
 }
 
 /// `break_with_label_and_loop`: `break 'label` whose value is an unlabeled `loop`, `while`,
@@ -143,9 +143,18 @@ fn break_with_label_and_loop(
         vec![(left, "(".to_owned()), (right, ")".to_owned())],
         Applicability::MachineApplicable,
     );
-    Some(emitted(cx, diag, Pass::Buffered, crate_at, tree.ptr(node)))
+    Some(emitted(cx, diag, Pass::Buffered, crate_at, tree.ptr(node)).buffered(stage(tree)))
 }
 
 fn span_at(cx: &Cx<'_, '_>, tree: &Tree<'_>, offset: TextSize) -> Span {
     span(cx, tree, TextRange::empty(offset))
+}
+
+/// When the parser buffers a lint of `tree`: a file as the crate is parsed, what a macro
+/// expands to as expansion parses it.
+fn stage(tree: &Tree<'_>) -> Stage {
+    match tree.call {
+        None => Stage::Parsed,
+        Some(_) => Stage::Expanded,
+    }
 }

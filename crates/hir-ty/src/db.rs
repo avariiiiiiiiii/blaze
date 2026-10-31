@@ -1328,6 +1328,9 @@ pub mod kinds {
         ENUM_VARIANT_IDS = 0x2455, "enum_variant_ids";
         DESTRUCTOR = 0x2456, "destructor";
         STRUCT_TAIL_MAY_BE_UNSIZED = 0x2457, "struct_tail_may_be_unsized";
+        CRATE_TARGET_ARCH = 0x2458, "crate_target_arch";
+        DECLARED_TARGET_FEATURES = 0x2459, "declared_target_features";
+        CRATE_TARGET_FEATURES = 0x245a, "crate_target_features";
 
         // Method resolution, impls, coherence, specialization.
         LOOKUP_IMPL_METHOD = 0x2460, "lookup_impl_method_stored";
@@ -1362,6 +1365,9 @@ pub mod kinds {
         IN_CRATE_TRAIT_VALUE_ITEMS = 0x247a, "in_crate_trait_value_items";
         CRATES_THAT_NAME = 0x247b, "crates_that_name";
         MAY_SPECIALIZE = 0x247c, "may_specialize";
+        RELEVANT_IMPLS = 0x247d, "relevant_impls";
+        MODULE_TRAIT_SET = 0x247e, "module_trait_set";
+        MODULE_ITEMS_NAMED = 0x247f, "module_items_named";
 
         // Opaque types.
         IMPL_TYPE_ALIASES = 0x2480, "impl_type_aliases";
@@ -1435,6 +1441,13 @@ pub mod kinds {
         // Bodies served from the check cache.
         SERVED_PART = 0x24f0, "served_part";
         SERVED_ITEMS = 0x24f1, "served_items";
+        LOCATION_LITERALS = 0x24f2, "location_literals";
+        INFERENCE_VALUE = 0x24f3, "inference_value";
+        MIR_VALUE = 0x24f4, "mir_value";
+
+        // Goals answered from the crate's own impls (`next_solver/global_goals`).
+        AUTO_TRAIT_DEPTH = 0x2500, "auto_trait_depth";
+        COPY_CLONE_IMPL = 0x2501, "copy_clone_impl";
 
         // Inputs.
         FROZEN_IMPLS = 0x25e0, "FrozenImpls";
@@ -1445,6 +1458,7 @@ pub mod kinds {
         IMPL_SLICES = 0x25e5, "ImplSlices";
         IMPL_IDENTITIES = 0x25e6, "ImplIdentities";
         SERVED_BODIES = 0x25e7, "ServedBodies";
+        KEPT_CONSTS = 0x25e8, "KeptConsts";
 
         // Interned ids.
         INTERNED_OPAQUE_TY = 0x25f0, "InternedOpaqueTyId";
@@ -1453,6 +1467,7 @@ pub mod kinds {
         INTERNED_COROUTINE_CLOSURE = 0x25f3, "InternedCoroutineClosureId";
         ANON_CONST = 0x25f4, "AnonConstId";
         IMPL_PAIR = 0x25f5, "ImplPair";
+        RELEVANT_IMPLS_KEY = 0x25f6, "RelevantImplsKey";
     }
 
     #[cfg(test)]
@@ -1480,13 +1495,17 @@ pub mod kinds {
             assert_eq!(super::name(QueryKind(RANGE.end - 1)), None);
         }
 
-        /// The queries and interned ids declared in the source of hir-ty, as [`ALL`] names them.
+        /// The queries and interned ids declared in the source of hir-ty, as [`ALL`] names them,
+        /// outside test modules: a test's query is in no schema.
         fn declared() -> Vec<String> {
             let mut found = Vec::new();
             let mut dirs = vec![Path::new(env!("CARGO_MANIFEST_DIR")).join("src")];
             while let Some(dir) = dirs.pop() {
                 for entry in std::fs::read_dir(&dir).unwrap() {
                     let path = entry.unwrap().path();
+                    if path.file_stem().is_some_and(|it| it == "tests") {
+                        continue;
+                    }
                     if path.is_dir() {
                         dirs.push(path);
                     } else if path.extension().is_some_and(|it| it == "rs") {

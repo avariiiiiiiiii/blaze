@@ -182,6 +182,7 @@ fn targets(cargo: bool) -> Targets {
             width: Some(100),
             command: "build".to_owned(),
             verbose: 2,
+            refused: Some(16),
         }),
         target: Some("x86_64-unknown-linux-gnu".to_owned()),
         profile: "dev".to_owned(),

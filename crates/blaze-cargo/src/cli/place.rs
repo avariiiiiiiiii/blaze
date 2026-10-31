@@ -252,6 +252,7 @@ pub fn cargo(
         color,
         width,
         verbose: verbose(asked),
+        refused: asked.flags.refused.unwrap_or(Some(crate::REFUSED_SHOWN)),
     })
 }
 

@@ -302,13 +302,25 @@ fn a_flat_tree_converts_as_the_cursor_does() {
 /// [`crate::call_input`] of a view is the token tree the cursor's walk of the same node makes:
 /// for the file, each `fn` (an attribute macro's input) and each token tree (a call's input),
 /// from a full parse and from an outline, whose `fn` bodies are lazy parts it enters.
+/// The nodes of the tree under `root` by kind and range, the first in preorder of each: what
+/// a walk finding the first node of a kind at a range finds, made once for every view.
+fn nodes_by_kind_and_range(
+    root: &syntax::SyntaxNode,
+) -> FxHashMap<(syntax::SyntaxKind, syntax::TextRange), syntax::SyntaxNode> {
+    let mut nodes = FxHashMap::default();
+    for node in root.descendants() {
+        nodes.entry((node.kind(), node.text_range())).or_insert(node);
+    }
+    nodes
+}
+
 #[test]
 fn a_views_call_input_is_the_cursors_token_tree() {
     use syntax::SyntaxKind::{FN, TOKEN_TREE};
     for (path, text) in corpus() {
         let path = path.display();
         let full = ast::SourceFile::parse_shared(text.clone(), Edition::CURRENT);
-        let full_node = full.syntax_node();
+        let full_nodes = nodes_by_kind_and_range(&full.syntax_node());
         let outline = ast::SourceFile::parse_outline(text, Edition::CURRENT);
         for parse in [&full, &outline] {
             let root = parse.root();
@@ -319,9 +331,8 @@ fn a_views_call_input_is_the_cursors_token_tree() {
                 if range.is_empty() {
                     continue;
                 }
-                let node = full_node
-                    .descendants()
-                    .find(|it| it.kind() == view.kind() && it.text_range() == range)
+                let node = full_nodes
+                    .get(&(view.kind(), range))
                     .unwrap_or_else(|| panic!("{path}: no {:?} of {range:?} in the full parse", view.kind()));
                 for mode in [DocCommentDesugarMode::Mbe, DocCommentDesugarMode::ProcMacro] {
                     let new = crate::call_input(view, DummyTestSpanMap, DUMMY, mode);
@@ -369,7 +380,7 @@ fn a_views_modified_input_is_the_cursors() {
     for (seed, (path, text)) in (0u64..).zip(corpus()) {
         let path = path.display();
         let full = ast::SourceFile::parse_shared(text.clone(), Edition::CURRENT);
-        let full_node = full.syntax_node();
+        let full_nodes = nodes_by_kind_and_range(&full.syntax_node());
         let outline = ast::SourceFile::parse_outline(text, Edition::CURRENT);
         for parse in [&full, &outline] {
             let root = parse.root();
@@ -379,9 +390,8 @@ fn a_views_modified_input_is_the_cursors() {
                 if range.is_empty() {
                     continue;
                 }
-                let node = full_node
-                    .descendants()
-                    .find(|it| it.kind() == view.kind() && it.text_range() == range)
+                let node = full_nodes
+                    .get(&(view.kind(), range))
                     .unwrap_or_else(|| panic!("{path}: no {:?} of {range:?} in the full parse", view.kind()));
                 let mut rng = SplitMix64::new(seed);
                 let (mut remove, mut view_remove) =
@@ -548,9 +558,10 @@ fn assert_same_as_reference(
 }
 
 /// Every view a caller can take of `tree`, at every depth: what is left from each token tree
-/// on (all of them for a small tree, the last 8 of a level for a large one, whose views are
-/// long), and each run of up to 4 token trees, a matcher's window, which ends inside the tree
-/// (never inside a lifetime). None starts inside a lifetime either.
+/// on (all of them at the top level of a small tree, the views that end where the tree does and
+/// are read in place; the last 8 of every other level, whose views end inside the tree and are
+/// copied, as the windows are), and each run of up to 4 token trees, a matcher's window, which
+/// ends inside the tree (never inside a lifetime). None starts inside a lifetime either.
 fn every_view(tree: &tt::TopSubtree) -> Vec<tt::TokenTreesView<'_>> {
     fn level<'a>(iter: tt::iter::TtIter<'a>, small: bool, out: &mut Vec<tt::TokenTreesView<'a>>) {
         let is_quote = |it: &Option<TtElement<'_>>| {
@@ -576,7 +587,7 @@ fn every_view(tree: &tt::TopSubtree) -> Vec<tt::TokenTreesView<'_>> {
             let next = at.next();
             after_quote = is_quote(&next);
             match next {
-                Some(TtElement::Subtree(_, inner)) => level(inner, small, out),
+                Some(TtElement::Subtree(_, inner)) => level(inner, false, out),
                 Some(TtElement::Leaf(_)) => (),
                 None => break,
             }

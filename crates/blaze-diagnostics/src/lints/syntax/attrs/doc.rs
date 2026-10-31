@@ -31,7 +31,7 @@ use syntax::{
 };
 
 use self::meta::{Item, Lit, List, MetaArgs, MetaItem};
-use super::super::{Emitted, Pass, Walk, source_fact};
+use super::super::{Emitted, Pass, Stage, Walk, source_fact};
 use super::{Args, Attr, Owner, Target, checked, parsed};
 use stdx::list::Join;
 use crate::{
@@ -122,7 +122,7 @@ fn macro_call(cx: &Cx<'_, '_>, owner: &Owner<'_>, modules: &mut comments::Module
             // clone: a pointer, copied for a lint emitted
             source_fact(cx, &mut diag, at.clone());
             // clone: as above
-            emitted.push(Emitted::new(diag, Phase::Resolve, Pass::Buffered, at.clone()));
+            emitted.push(Emitted::new(diag, Phase::Resolve, Pass::Buffered, at.clone()).buffered(Stage::Collected));
         }
     }
 }
@@ -178,7 +178,7 @@ impl Parser<'_, '_, '_> {
                 // clone: a pointer, copied for a lint emitted
                 source_fact(self.cx, &mut diag, at.clone());
                 // clone: as above
-                self.emitted.push(Emitted::new(diag, Phase::Resolve, Pass::Buffered, at.clone()));
+                self.emitted.push(Emitted::new(diag, Phase::Resolve, Pass::Buffered, at.clone()).buffered(Stage::Collected));
             }
             None => {
                 source_fact(self.cx, &mut diag, self.owner.at());

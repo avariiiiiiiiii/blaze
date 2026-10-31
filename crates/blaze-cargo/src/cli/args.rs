@@ -38,23 +38,23 @@ impl Clap for Command {
         match self {
             Command::Build => &[
                 GLOBAL, FUTURE, MESSAGE, SILENT, PACKAGES, TARGETS, FEATURES, RELEASE, DEBUG, PROFILE, JOBS,
-                KEEP_GOING, TARGET, ARTIFACT, REPORTS, COMPILE_TIME_DEPS, MANIFEST,
+                KEEP_GOING, TARGET, ARTIFACT, REPORTS, COMPILE_TIME_DEPS, MANIFEST, REFUSED,
             ],
             Command::Check => &[
                 GLOBAL, FUTURE, MESSAGE, SILENT, PACKAGES, TARGETS, FEATURES, JOBS, KEEP_GOING, RELEASE,
-                PROFILE, TARGET, REPORTS, COMPILE_TIME_DEPS, MANIFEST,
+                PROFILE, TARGET, REPORTS, COMPILE_TIME_DEPS, MANIFEST, REFUSED,
             ],
             Command::Run => &[
                 GLOBAL, MESSAGE, SILENT, PACKAGE, RUN_TARGETS, FEATURES, JOBS, KEEP_GOING, RELEASE, PROFILE,
-                TARGET, MANIFEST, REPORTS,
+                TARGET, MANIFEST, REPORTS, REFUSED,
             ],
             Command::Test => &[
                 GLOBAL, RUNNING, FUTURE, MESSAGE, PACKAGES, TARGETS, TEST_ONLY, FEATURES, JOBS, NO_KEEP_GOING,
-                RELEASE, PROFILE, TARGET, REPORTS, MANIFEST,
+                RELEASE, PROFILE, TARGET, REPORTS, MANIFEST, REFUSED,
             ],
             Command::Bench => &[
                 GLOBAL, RUNNING, MESSAGE, SILENT, PACKAGES, TARGETS, FEATURES, JOBS, NO_KEEP_GOING, PROFILE,
-                TARGET, REPORTS, MANIFEST,
+                TARGET, REPORTS, MANIFEST, REFUSED,
             ],
             Command::Doc => &[
                 GLOBAL, DOC_ONLY, MESSAGE, SILENT, PACKAGES, DOC_TARGETS, FEATURES, JOBS, KEEP_GOING, RELEASE,
@@ -263,9 +263,13 @@ const TEST_ONLY: &[Flag] = &[
     Flag::new("ub-schedules", None, Takes::Value, "K"),
 ];
 
+/// `--refused N|all` is blaze's: how many of the functions blaze could not compile a build's
+/// error names, the first `N` or every one ([`blaze_api::Cargo::refused`]).
+const REFUSED: &[Flag] = &[Flag::new("refused", None, Takes::Value, "N|all")];
+
 /// blaze's own flags: read here, never on cargo's command line.
 fn blaze_only(flag: &Flag) -> bool {
-    matches!(flag.long, Some("reached" | "ub" | "ub-seed" | "ub-schedules"))
+    matches!(flag.long, Some("reached" | "ub" | "ub-seed" | "ub-schedules" | "refused"))
 }
 const RUNNING: &[Flag] = &[Flag::switch("no-run"), Flag::switch("no-fail-fast")];
 
@@ -305,7 +309,8 @@ pub enum DaemonVerb {
 pub struct Invocation {
     pub command: Option<Command>,
     /// The words before `--`, as typed, flags typed before the command first: cargo's to read.
-    /// None of `run`'s program arguments, nor blaze's own `--reached` and `--ub*`, nor `-C`.
+    /// None of `run`'s program arguments, nor blaze's own `--reached`, `--ub*` and `--refused`,
+    /// nor `-C`.
     pub args: Vec<String>,
     /// `test`'s and `bench`'s `TESTNAME`.
     pub filter: Option<String>,
@@ -413,6 +418,8 @@ pub struct Flags {
     pub ub: bool,
     pub ub_seed: Option<u64>,
     pub ub_schedules: Option<u32>,
+    /// `--refused`: `None` without it, `Some(None)` for `all`, else `Some(Some(N))`.
+    pub refused: Option<Option<u32>>,
     /// `--unit-graph` and `--timings`, by name, as given.
     pub reports: Vec<&'static str>,
 }
@@ -466,6 +473,7 @@ impl Flags {
                 self.ub = true;
                 self.ub_schedules = value.and_then(|it| it.parse().ok());
             }
+            "refused" => self.refused = value.map(|it| it.parse().ok()),
             _ => {}
         }
     }
@@ -804,6 +812,10 @@ fn check_value(flag: &'static Flag, value: Option<&str>) -> Result<(), Said> {
     let not_number = |why: String| Said::NotNumber { value: value.to_owned(), flag, why };
     match flag.long {
         Some("ub-seed") => return value.parse::<u64>().map(drop).map_err(|it| not_number(it.to_string())),
+        Some("refused") if value == "all" => return Ok(()),
+        Some("refused") => {
+            return value.parse::<u32>().map(drop).map_err(|it| not_number(format!("{it}: a count, or `all`")));
+        }
         // `value_parser!(u32).range(1..)`.
         Some("ub-schedules") => {
             return match value.parse::<u32>() {

@@ -159,6 +159,19 @@ fn ub_values_clap_refuses() {
 }
 
 #[test]
+fn refused_is_blazes_a_count_or_all() {
+    assert_eq!(cargo(&["build"]).flags.refused, None);
+    let all = cargo(&["build", "--refused", "all", "--release"]);
+    assert_eq!(all.flags.refused, Some(None));
+    assert_eq!(all.args, ["--release"], "cargo never sees `--refused`");
+    assert_eq!(cargo(&["test", "--refused=100000"]).flags.refused, Some(Some(100_000)));
+    assert_eq!(cargo(&["run", "--refused", "0"]).flags.refused, Some(Some(0)));
+    assert!(refused(&["check", "--refused", "every"]).starts_with("error: invalid value 'every' for '--refused <N|all>': "));
+    assert!(parse(os(&["doc", "--refused", "all"])).is_err(), "doc compiles no program");
+    assert!(parse(os(&["build", "--refused"])).is_err());
+}
+
+#[test]
 fn run_has_the_rest() {
     let asked = cargo(&["run", "--release", "a", "--verbose", "--", "b"]);
     assert_eq!(asked.args, ["--release"]);

@@ -20,7 +20,7 @@ use std::borrow::Cow;
 
 use syntax::Edition;
 
-use super::{Emitted, Pass, Walk};
+use super::{Emitted, Pass, Stage, Walk};
 use crate::{
     cx::Cx,
     emit::{Sources, Style},
@@ -314,7 +314,7 @@ fn builtin_cfgs(cx: &Cx<'_, '_>, specs: &[String], walk: &Walk<'_>) -> Result<Ve
     let mut cfgs: Vec<(String, Option<String>)> = Vec::with_capacity(specs.len());
     for spec in specs {
         let cfg = parse_cfg_diag(spec, cx.edition)
-            .map_err(|diag| Emitted::unplaced(diag, Phase::Resolve, Pass::Buffered))?;
+            .map_err(|diag| Emitted::unplaced(diag, Phase::Resolve, Pass::Buffered).buffered(Stage::Configured))?;
         if !cfgs.contains(&cfg) {
             cfgs.push(cfg);
         }
@@ -343,7 +343,7 @@ fn builtin_cfgs(cx: &Cx<'_, '_>, specs: &[String], walk: &Walk<'_>) -> Result<Ve
         // alloc: as above
         diag.note(format!("config `{name}` is only supposed to be controlled by `{controlled_by}`"));
         diag.note("manually setting a built-in cfg can and does create incoherent behaviors");
-        emitted.push(Emitted::new(diag, Phase::Resolve, Pass::Buffered, at));
+        emitted.push(Emitted::new(diag, Phase::Resolve, Pass::Buffered, at).buffered(Stage::Configured));
     }
     Ok(emitted)
 }

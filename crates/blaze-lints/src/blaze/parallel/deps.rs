@@ -1244,9 +1244,35 @@ impl<'db> Look<'_, '_, 'db> {
                 break 'min_max None;
             };
             let passed = read.unwrap_or(local);
+            // An assignment reads its right side into a temporary of its own before it assigns
+            // (`read_assigned`), so the result may come through more than one.
+            let copied_from = |temp: LocalId| {
+                self.occurrences(temp).into_iter().find_map(|(block, at)| {
+                    match assigned(self.statement(block, at?), temp)? {
+                        Rvalue::Use(Operand {
+                            kind: OperandKind::Copy(from) | OperandKind::Move(from),
+                            ..
+                        }) if from.projection.as_slice().is_empty() => Some(from.local),
+                        _ => None,
+                    }
+                })
+            };
             let into = match written {
                 None => destination.local == local,
-                Some(temp) => destination.local == temp && private(temp),
+                Some(mut temp) => {
+                    let mut steps = 0;
+                    loop {
+                        if steps == 4 || !private(temp) {
+                            break false;
+                        }
+                        if temp == destination.local {
+                            break true;
+                        }
+                        let Some(from) = copied_from(temp) else { break false };
+                        temp = from;
+                        steps += 1;
+                    }
+                }
             };
             let shape = args.len() == 2
                 && args.iter().filter(|it| bare(it, passed)).count() == 1

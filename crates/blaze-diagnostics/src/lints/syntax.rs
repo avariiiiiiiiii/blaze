@@ -73,11 +73,30 @@ pub(crate) enum Pass {
     Delayed,
 }
 
+/// When a [`Pass::Buffered`] lint was buffered: those of one node come in the order rustc
+/// buffered them.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub(crate) enum Stage {
+    /// As the session is configured from the command line (`build_configuration`), before
+    /// anything is parsed.
+    Configured,
+    /// By the lexer or the parser, before expansion.
+    Parsed,
+    /// As expansion collects a node: stripping its `cfg`s, and for a macro call checking its
+    /// attributes (`check_attributes` of `collect_bang`), before the call is expanded.
+    Collected,
+    /// As a macro call is expanded or what it expands to is parsed, or after: resolution and
+    /// AST validation.
+    #[default]
+    Expanded,
+}
+
 /// A diagnostic found by one of this module's parts, and when rustc emits it.
 #[derive(Clone, Debug)]
 pub(crate) struct Emitted {
     pub(crate) found: Found,
     pub(crate) pass: Pass,
+    pub(crate) stage: Stage,
     /// The node rustc's walk emits it at; with none, it comes before those of its pass that
     /// have one (what resolution says as it runs, before the early lint pass).
     pub(crate) place: Option<InFile<SyntaxNodePtr>>,
@@ -87,19 +106,24 @@ impl Emitted {
     /// The lint `diag` of `phase`, its level decided at `at`, emitted in `pass` as rustc's walk
     /// comes to `at`.
     pub(crate) fn new(diag: Diag, phase: Phase, pass: Pass, at: InFile<SyntaxNodePtr>) -> Emitted {
-        Emitted { found: Found::lint(diag, phase, at), pass, place: Some(at) }
+        Emitted { found: Found::lint(diag, phase, at), pass, stage: Stage::default(), place: Some(at) }
     }
 
     /// `diag`, an error or warning that is no lint's, emitted in `pass` as rustc's walk comes
     /// to `at` (E0783 of the early lint pass).
     pub(crate) fn placed(diag: Diag, phase: Phase, pass: Pass, at: InFile<SyntaxNodePtr>) -> Emitted {
-        Emitted { found: Found::new(diag, phase), pass, place: Some(at) }
+        Emitted { found: Found::new(diag, phase), pass, stage: Stage::default(), place: Some(at) }
     }
 
     /// `diag`, an error or warning that is no lint's, emitted in `pass` before the walk (the
     /// label-shadowing warning of late resolution).
     pub(crate) fn unplaced(diag: Diag, phase: Phase, pass: Pass) -> Emitted {
-        Emitted { found: Found::new(diag, phase), pass, place: None }
+        Emitted { found: Found::new(diag, phase), pass, stage: Stage::default(), place: None }
+    }
+
+    /// This, buffered at `stage`.
+    pub(crate) fn buffered(self, stage: Stage) -> Emitted {
+        Emitted { stage, ..self }
     }
 }
 
@@ -514,7 +538,7 @@ pub(crate) fn lints(cx: &Cx<'_, '_>, cmd: &CommandLine) -> Vec<Found> {
     // the output.
     let mut keyed: Vec<_> = emitted
         .into_iter()
-        .map(|Emitted { found, pass, place }| {
+        .map(|Emitted { found, pass, stage, place }| {
             let group = match pass {
                 Pass::PreExpansion => 0u8,
                 Pass::Delayed => 2,
@@ -526,7 +550,7 @@ pub(crate) fn lints(cx: &Cx<'_, '_>, cmd: &CommandLine) -> Vec<Found> {
             };
             let place = place.map(|at| walk.place(cx, at, pass)).unwrap_or_default();
             let rank = found.diag.lint_name().map_or(EARLY_PASSES.len(), pass_rank);
-            ((found.phase, group, module, place, pass, rank), found)
+            ((found.phase, group, module, place, pass, stage, rank), found)
         })
         // alloc: per diagnostic found, nothing when there is none
         .collect();

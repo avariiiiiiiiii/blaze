@@ -28,11 +28,17 @@ pub(super) fn soft(ty: Type) -> bool {
 }
 
 /// Whether the target's `f16` and `f128` are lowered here: AArch64 and x86-64 with the
-/// System V convention, where every lowering below was checked against rustc's. Apple's
-/// AArch64 convention has no `f128` in Cranelift.
+/// System V convention, where every lowering below was checked against rustc's, and Apple's
+/// AArch64. Apple's convention passes both as AAPCS64 does, `f16` in an `h` and `f128` in a
+/// `q` register, which Cranelift's `apple_aarch64` does under `enable_llvm_abi_extensions`;
+/// LLVM's calls for them are AArch64's, `long double`'s `fmodl` among them though Apple's
+/// `long double` is an `f64`, which is why std's `f128` math is off there.
 pub(super) fn soft_floats(target: &Target) -> bool {
-    matches!(target.arch, Arch::Aarch64 | Arch::X86_64)
-        && target.call_conv == isa::CallConv::SystemV
+    match (target.arch, target.call_conv) {
+        (Arch::Aarch64, isa::CallConv::SystemV | isa::CallConv::AppleAarch64) => true,
+        (Arch::X86_64, isa::CallConv::SystemV) => true,
+        _ => false,
+    }
 }
 
 /// The bits of the `f128` that is exactly `-magnitude` or `magnitude`, which has at most 113

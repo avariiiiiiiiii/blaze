@@ -61,6 +61,7 @@ struct Pair<'t> {
 }
 
 /// One way an arm can match: what is still to be tested for it.
+#[cfg_attr(test, derive(Clone))] // clone: tests run the old and the new tree on the same arms
 struct Candidate<'t> {
     arm: usize,
     pairs: Vec<Pair<'t>, &'t Frame>,

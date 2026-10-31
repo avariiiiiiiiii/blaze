@@ -97,8 +97,7 @@ impl Attrs {
 }
 
 /// A call site of a function. 64 bytes, its `args` on the heap.
-#[derive(Serialize, Deserialize, PartialEq, Eq, Hash, Debug)]
-#[cfg_attr(test, derive(Clone))] // clone: inside `Summary`, which only tests copy
+#[derive(Serialize, Deserialize, PartialEq, Eq, Hash, Debug, Clone)] // clone: inside `Summary`
 pub struct Call {
     pub callee: InstanceKey,
     /// How many call sites of it the function has.

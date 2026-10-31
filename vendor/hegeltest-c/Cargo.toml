@@ -28,7 +28,9 @@ crate-type = ["rlib"]
 [dependencies]
 rand = { version = "0.10", default-features = false }
 dashu-int = { version = "0.6.1", default-features = false }
-miniz_oxide = { version = "0.8", default-features = false, features = ["with-alloc"] }
+# blaze: upstream asks for 0.8; 0.9 keeps the two calls the engine makes
+# (`compress_to_vec_zlib`, `decompress_to_vec_zlib_with_limit`) and `with-alloc`.
+miniz_oxide = { version = "0.9.1", default-features = false, features = ["with-alloc"] }
 rustc-hash = { version = "2", default-features = false }
 hashbrown = { version = "0.17", default-features = false, features = ["inline-more"] }
 libm = { version = "0.2", default-features = false }

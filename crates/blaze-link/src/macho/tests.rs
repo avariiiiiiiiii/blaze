@@ -148,7 +148,7 @@ fn decode_binds(stream: &[u8], segments: &[u64]) -> Vec<(u64, i64, Vec<u8>, u8, 
                 flags = immediate;
                 name = c_string(stream, &mut at);
             }
-            macho::BIND_OPCODE_SET_TYPE_IMM => assert_eq!(immediate, macho::BIND_TYPE_POINTER),
+            macho::BIND_OPCODE_SET_TYPE_IMM => assert_eq!(immediate, macho::BIND_TYPE_POINTER.0),
             macho::BIND_OPCODE_SET_ADDEND_SLEB => addend = sleb(stream, &mut at),
             macho::BIND_OPCODE_SET_SEGMENT_AND_OFFSET_ULEB => {
                 address = segments[immediate as usize] + uleb(stream, &mut at);

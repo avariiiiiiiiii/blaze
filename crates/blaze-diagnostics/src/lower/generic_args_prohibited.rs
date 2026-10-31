@@ -254,7 +254,7 @@ fn args_after_name(segment: ast::PathSegment<'_>) -> Option<TextRange> {
 
 /// A segment's generic arguments blaze can't report as rustc does: an error naming why, never
 /// nothing.
-fn refused(cx: &Cx<'_, '_>, file: hir::HirFileId, segment: ast::PathSegment<'_>, why: &str) -> Vec<Found> {
+fn refused<'db>(cx: &Cx<'_, 'db>, file: hir::HirFileId, segment: ast::PathSegment<'db>, why: &str) -> Vec<Found> {
     // alloc: the error's text, for an error hir found
     let message = format!("blaze can't report these generic arguments as rustc does: {why}");
     let mut diag = Diag::error(None, message, cx.span(InFile::new(file, segment.syntax().text_range())));
@@ -377,7 +377,7 @@ fn type_relative_variant<'db>(
     finish(cx, diag, file, segment)
 }
 
-fn finish(cx: &Cx<'_, '_>, mut diag: Diag, file: hir::HirFileId, segment: ast::PathSegment<'_>) -> Vec<Found> {
+fn finish<'db>(cx: &Cx<'_, 'db>, mut diag: Diag, file: hir::HirFileId, segment: ast::PathSegment<'db>) -> Vec<Found> {
     site_fact(cx, &mut diag, InFile::new(file, segment.syntax()));
     vec![Found::new(diag, phase_at(segment.syntax()))] // alloc: the error found
 }

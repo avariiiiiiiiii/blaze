@@ -30,12 +30,14 @@ pub trait Database: Sync + 'static {
     fn storage_mut(&mut self) -> &mut Storage;
 }
 
-/// The storage's view: bumped by every write, so "verified in this view" is one compare.
+/// The storage's view as hosts see it: how many views it has opened, bumped by every write and
+/// never reused, so `==` on two of them says no write came between. Rows hold a 28-bit stamp
+/// instead, which renumbering at its limit reuses; this count is untouched by that.
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
-pub struct View(pub(crate) u32);
+pub struct View(pub(crate) u64);
 
 impl View {
-    pub fn as_u32(self) -> u32 {
+    pub fn as_u64(self) -> u64 {
         self.0
     }
 }
@@ -135,6 +137,8 @@ pub struct Storage {
     /// compares one word with one load.
     clock: AtomicU64,
     view: u32,
+    /// [`Storage::view`]: views opened, never renumbered.
+    opened: u64,
     /// The last view an input of each kind or above changed in.
     last_changed: [u32; Durability::KINDS],
     /// `written[i]`: the OR of the [`input_bits`] of every field written in the last `i + 1`
@@ -192,6 +196,7 @@ impl Storage {
         Storage {
             clock: AtomicU64::new(u64::from(view | VALUE)),
             view,
+            opened: u64::from(view),
             last_changed: [view; Durability::KINDS],
             written: [[0; 2]; HISTORY],
             dirs,
@@ -219,7 +224,7 @@ impl Storage {
 
     #[inline]
     pub fn view(&self) -> View {
-        View(self.view)
+        View(self.opened)
     }
 
     /// What a current row's `verified` equals, or a word no row has once readers are stopped.
@@ -359,6 +364,7 @@ impl Storage {
             self.renumber();
         }
         self.view += 1;
+        self.opened += 1;
         *self.clock.get_mut() = u64::from(self.view | VALUE);
         for at in (1..HISTORY).rev() {
             self.written[at] = or(self.written[at - 1], written);

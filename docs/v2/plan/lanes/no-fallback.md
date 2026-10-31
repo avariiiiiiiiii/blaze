@@ -51,6 +51,24 @@ reads these shapes: `unwrap_or`/`unwrap_or_default`/`unwrap_or_else` on a value 
 needs, `.ok()` dropping an error, `Err(_) =>` that continues, `if let Ok` with a silent else, a
 retry with no bound, and a slow path taken when a fast one refuses.
 
+## Where it stands (2026-10-30 20:30)
+
+The area tables hold about 184 errors, 227 rules and 24 dead paths. Every error row's edit went
+into the round checkpoints through `fd6947867d` or is in the tree for the next round, all
+uncompiled until the coordinator's check. The speed case is whole end to end. blaze-cargo's
+`link` keeps the image on every path and names a full link's reason (`Linking::Full`). It
+reaches the client as `blaze_api::Worked::links` (SCHEMA 16), and blaze-ui and the CLI print
+it as `link: <path> (<how>)`. `harness/bench.py` fails an edit that was not spliced, or that
+printed no link line, before timing it. Codegen no longer hands a function LLVM refuses to
+Cranelift (`CodegenError::LlvmRefused`). Visibility, the prelude and const and struct paths
+report rustc's errors instead of guessing.
+
+Open: request 01195 (the coordinator's blaze-wasm `project()` after the no-std-uses-core
+fallback went), 01239 (format: pattern-type range ends), 01164 (harness/v2 engine.py and
+oracle.py in the bench's shape), the `AdtSelfType` struct-path row in
+[no-fallback/front/ty.md](no-fallback/front/ty.md), and a region out of room that leaves the
+image unpatchable ([no-fallback/link/native.md](no-fallback/link/native.md)).
+
 ## Found by the lead (link area, handed to no-fallback-link)
 
 | site | kind | what | becomes |

@@ -44,7 +44,9 @@ use cranelift_codegen::{
 use cranelift_module::{ModuleReloc, ModuleRelocTarget};
 use serde_derive::{Deserialize, Serialize};
 use smallvec::SmallVec;
-use wasm_encoder::{BlockType, Encode, Instruction as I, InstructionSink, MemArg, ValType};
+use wasm_encoder::{
+    BlockType, Encode, Instruction as I, InstructionSink, MemArg, MemArgTarget, ValType,
+};
 
 use super::target::Calls;
 
@@ -486,7 +488,7 @@ const MEMORY: u32 = 0;
 type Returns = SmallVec<[u32; 8]>;
 
 fn mem(offset: u64) -> MemArg {
-    MemArg { offset, align: 0, memory_index: MEMORY }
+    MemArg { offset, align: 0, target: MemArgTarget::Memory(MEMORY), ordering: None }
 }
 
 impl<'a> Lower<'a> {

@@ -549,7 +549,8 @@ fn assert_same_as_reference(
 
 /// Every view a caller can take of `tree`, at every depth: what is left from each token tree
 /// on (all of them for a small tree, the last 8 of a level for a large one, whose views are
-/// long), and each run of up to 4 token trees, a matcher's window, which ends inside the tree.
+/// long), and each run of up to 4 token trees, a matcher's window, which ends inside the tree
+/// (never inside a lifetime).
 fn every_view(tree: &tt::TopSubtree) -> Vec<tt::TokenTreesView<'_>> {
     fn level<'a>(iter: tt::iter::TtIter<'a>, small: bool, out: &mut Vec<tt::TokenTreesView<'a>>) {
         let n = iter.clone().count();
@@ -561,8 +562,14 @@ fn every_view(tree: &tt::TopSubtree) -> Vec<tt::TokenTreesView<'_>> {
             let start = at.savepoint();
             let mut end = at.clone();
             for _ in 0..4.min(n - i) {
-                end.next();
-                out.push(end.from_savepoint(start));
+                // A lifetime's `'` and its name are one token: no window ends between them.
+                let quote = matches!(
+                    end.next(),
+                    Some(TtElement::Leaf(Leaf::Punct(Punct { char: '\'', .. })))
+                );
+                if !quote {
+                    out.push(end.from_savepoint(start));
+                }
             }
             match at.next() {
                 Some(TtElement::Subtree(_, inner)) => level(inner, small, out),
@@ -748,12 +755,14 @@ fn lexing_then_parsing_gives_the_files_tree() {
             .unwrap_or_else(|| panic!("{path}: the corpus lexes"));
         let converted = call_input(full, StaticSpanMap, DUMMY, DocCommentDesugarMode::ProcMacro);
         assert_eq!(lexed, converted, "{path}");
-        // A doc comment is trivia in the file and an attribute in its tokens.
-        let has_docs = full.descendants_with_tokens().any(|it| {
-            it.as_token().is_some_and(|it| {
+        // A doc comment is a `DOC_COMMENT` node in the file (or a comment where no item or
+        // field follows it) and an attribute in its tokens.
+        let has_docs = full.descendants_with_tokens().any(|it| match it {
+            NodeOrToken::Node(it) => it.kind() == syntax::SyntaxKind::DOC_COMMENT,
+            NodeOrToken::Token(it) => {
                 it.kind() == syntax::SyntaxKind::COMMENT
                     && ["///", "//!", "/**", "/*!"].iter().any(|doc| it.text().starts_with(doc))
-            })
+            }
         });
         if has_docs {
             continue;

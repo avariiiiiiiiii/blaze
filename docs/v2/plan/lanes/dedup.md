@@ -158,16 +158,22 @@ second version left in `Cargo.lock` is forced by an upstream's newest release, a
 |---|---|
 | `object` 0.39 beside 0.40 | `ar_archive_writer` 0.5.3, the build-dependency of `psm` 0.1.32 (under `stacker`, in `stdx`) that writes its assembly archive; 0.40 is the workspace's and cranelift 0.137's |
 | `hashbrown` 0.16 beside 0.17 | `gimli` 0.33, the one cranelift 0.137 pins (`gimli` itself is a single version) |
-| `sha2`, `digest`, `block-buffer`, `crypto-common` 0.10 beside 0.11 | cranelift-codegen 0.137's incremental cache (`sha2` 0.10); 0.11 is `lzma-rust2` 0.24's and `sha1` 0.11's |
-| `getrandom` 0.2, `rand_core` 0.6 | `ring` 0.17.14 and `im-rc` 15.1.0 (`rand_xoshiro`), both their newest |
+| `sha2`, `digest`, `block-buffer`, `crypto-common`, `cpufeatures` 0.10/0.2 beside 0.11/0.3 | none once the lock re-resolves: they came from cranelift-codegen's `incremental-cache`, which hir-ty-codegen turned on and never used; it now asks for `enable-serde` alone (2026-10-30). 0.11 stays for `lzma-rust2` 0.24's `xz` check and `sha1` 0.11 (`blaze-web`) |
+| `getrandom` 0.2 | `ring` 0.17.14 (under `rustls`, in blaze-ci and blaze-global), its newest |
+| `rand_core` 0.9 beside 0.10 | `imbl` 7.0.2 (`rand_xoshiro` 0.7, for its vectors' quicksort pivots), blaze-resolve's persistent maps, its newest; 0.10 is `rand`'s under `hegeltest-c`. `im-rc` 15 (unmaintained, `rand_core` 0.6, `sized-chunks`, `bitmaps`, `typenum`) went for it (2026-10-30) |
+| `getrandom` 0.3 beside 0.4, `r-efi` 5 beside 6 | `ahash` 0.8.12 under `sonic-rs` (blaze-api, blaze-ci); goes if `sonic-rs` gives way to `serde_json` (below) |
+| `bitflags` 1 beside 2 | `defmt` 1.2 under `jiff`, under `cargo-util-schemas` =0.14.3 (cargo 1.99's pin) |
+| `miniz_oxide` 0.8 beside 0.9 | none once the lock re-resolves: `vendor/hegeltest-c` asks for 0.9.1 like `flate2` (vendor/hegeltest/SOURCE.md, change 5; 2026-10-30) |
+| `rustc-literal-escaper` 0.0.7 beside 0.0.8 | `ra-ap-rustc_parse_format` 0.166 (blaze-diagnostics, hir-def); 0.179 is waiting for its source (01151) |
+| `wasmparser`, `wasm-metadata`, `wit-component`, `wit-parser` 0.244, `hashbrown` 0.15, `foldhash` 0.1 | none: left in the lock by the deleted Wasmtime hosts; the workspace's `wasm-encoder` 0.263 without default features names no `wasmparser`, so the next re-resolve drops them |
 | `windows-sys` 0.52 | `ring` 0.17.14 |
 | `embedded-io` 0.4 beside 0.6 | `postcard` 1.1.3, which names both |
 | `syn` 2 beside 3 | both majors are in use upstream (syn 2: `serde_derive`, `thiserror-impl`, `tracing-attributes`, `zerocopy-derive`; syn 3: `clap_derive`, `async-trait`, `rkyv_derive`); the workspace's own `syn` is 2, which `synstructure` needs |
-| `rand` 0.8, `thiserror` 1, `nix` 0.23, `bitflags` 1, `memoffset` 0.6, `windows` 0.34 and 0.62 | `tango-bench` 0.9.0 (its newest), blaze-bench's paired benchmark harness, a dev-dependency only |
+| `rand` 0.8, `thiserror` 1, `nix` 0.23, `memoffset` 0.6, `windows` 0.34 (and its five `windows_*` 0.34 targets), `colored` 2 | none once the lock re-resolves: they were `tango-bench` 0.9's, which blaze-bench's own paired runner (`crates/blaze-bench/src/lib.rs`, the same statistic) replaced (2026-10-30) |
 | `unicode-width` 0.1 | `blaze-fmt` keeps the pinned nightly rustfmt's versions (`rustfmt-unicode-width`) |
 | `wit-bindgen` 0.57 (no dependencies of its own) | `wasip2` 1.0.3, under `getrandom` 0.3.4 (`ahash`, in `sonic-rs`); `wasm-encoder` is the workspace's 0.263 alone once `getrandom` 0.4 is at 0.4.3, which dropped `wasip2`/`wasip3` and with them the `wit-*` 0.244 crates (queue 01236) |
 
 Where two libraries do one job, one stays: seeded randomness is `blaze-rng` (hir-ty-mir's
-`oorandom` went). Still to decide, each with its owner: `im-rc` (blaze-resolve; no release since
-2021) against its maintained fork `imbl` 7; `sonic-rs` (blaze-api, blaze-ci; SIMD) against
+`oorandom` went). blaze-resolve's persistent maps are `imbl` (im-rc's maintained fork, with `Rc` counts as
+im-rc's). Still to decide, each with its owner: `sonic-rs` (blaze-api, blaze-ci; SIMD) against
 `serde_json` everywhere else; `crossbeam-channel` against the nightly `std::sync::mpmc`.

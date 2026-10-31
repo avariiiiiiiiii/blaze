@@ -71,7 +71,7 @@ impl TestDb {
     }
 
     fn ran(&self, query: &'static str, key: Id) {
-        let view = self.storage.view().as_u32();
+        let view = self.storage.view_bits();
         self.log.lock().unwrap().push((query, key.as_u32(), view));
     }
 
@@ -1030,6 +1030,7 @@ fn views_renumber_at_the_limit_and_every_answer_holds() {
     let mut db = TestDb::new();
     let start = VIEW_MASK - 6;
     db.storage_mut().start_at_view(start);
+    let before = db.storage().view();
     let cell = Cell::new(&db, 3, 7);
     let still = Cell::new(&db, 21, 0);
     let other = Cell::new(&db, 0, 0);

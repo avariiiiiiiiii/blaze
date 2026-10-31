@@ -20,12 +20,12 @@
 //! - `cycle/fixpoint`: a write to the input of a cycle of [`CYCLE`] queries, then the cycle run
 //!   again to its fixpoint from `cycle_initial` (two iterations).
 //!
-//! Every benchmark does the same work on every run, so that tango can pair the binary of a
-//! change with the binary of its base.
+//! Every benchmark does the same work on every run, so that `blaze_bench` can pair the binary of
+//! a change with the binary of its base.
 
 use std::hint::black_box;
 
-use tango_bench::{IntoBenchmarks, benchmark_fn, tango_benchmarks};
+use blaze_bench::{IntoBenchmarks, benchmark_fn};
 
 const KEYS: usize = 65_536;
 const POOL: usize = 4096;
@@ -751,4 +751,4 @@ fn benchmarks() -> impl IntoBenchmarks {
     [a0, b0, a1, b1, a2, b2, a3, b3, a4, b4, a5, b5, a6, b6, a7, b7, a8, b8]
 }
 
-tango_benchmarks!(benchmarks());
+blaze_bench::main!(benchmarks());

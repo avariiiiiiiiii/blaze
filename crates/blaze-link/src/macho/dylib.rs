@@ -417,12 +417,12 @@ pub(crate) fn trie_differential(trie: &[u8]) -> Result<bool, String> {
 
 /// What a terminal node's export info says: the symbol's kind and whether it is weak.
 fn export(info: &[u8], classify: &impl Fn(u64) -> SymbolKind) -> Result<(SymbolKind, bool), String> {
-    let known = (macho::EXPORT_SYMBOL_FLAGS_KIND_MASK
-        | macho::EXPORT_SYMBOL_FLAGS_WEAK_DEFINITION
-        | macho::EXPORT_SYMBOL_FLAGS_REEXPORT
-        | macho::EXPORT_SYMBOL_FLAGS_STUB_AND_RESOLVER
-        | macho::EXPORT_SYMBOL_FLAGS_STATIC_RESOLVER)
-        .0;
+    let known = macho::EXPORT_SYMBOL_FLAGS_KIND_MASK
+        | (macho::EXPORT_SYMBOL_FLAGS_WEAK_DEFINITION
+            | macho::EXPORT_SYMBOL_FLAGS_REEXPORT
+            | macho::EXPORT_SYMBOL_FLAGS_STUB_AND_RESOLVER
+            | macho::EXPORT_SYMBOL_FLAGS_STATIC_RESOLVER)
+            .0;
     let mut info = Reader::new(info);
     let flags = info.uleb().map_err(trie_error)?;
     if flags & !known != 0 {
@@ -430,7 +430,7 @@ fn export(info: &[u8], classify: &impl Fn(u64) -> SymbolKind) -> Result<(SymbolK
         return Err(format!("unknown export flags {:#x}", flags & !known));
     }
     let weak = flags & macho::EXPORT_SYMBOL_FLAGS_WEAK_DEFINITION.0 != 0;
-    let kind = (flags & macho::EXPORT_SYMBOL_FLAGS_KIND_MASK.0) as u8;
+    let kind = (flags & macho::EXPORT_SYMBOL_FLAGS_KIND_MASK) as u8;
     let tls = kind == macho::EXPORT_SYMBOL_FLAGS_KIND_THREAD_LOCAL.0;
     if kind > macho::EXPORT_SYMBOL_FLAGS_KIND_ABSOLUTE.0 {
         // alloc: error path

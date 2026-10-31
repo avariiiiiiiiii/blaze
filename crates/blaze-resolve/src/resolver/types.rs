@@ -1,6 +1,7 @@
 use super::CargoResult;
 use super::features::{CliFeatures, RequestedFeatures};
 use crate::interning::InternedString;
+use crate::persistent;
 use crate::{Dependency, PackageId, SourceId, Summary};
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, BTreeSet};
@@ -267,12 +268,12 @@ pub(super) struct RemainingDeps {
     /// the data is augmented by the insertion time.
     /// This insures that no two items will cmp eq.
     /// Forcing the `OrdSet` into a multi set.
-    data: im_rc::OrdSet<(DepsFrame, u32)>,
+    data: persistent::OrdSet<(DepsFrame, u32)>,
 }
 
 impl RemainingDeps {
     pub(super) fn new() -> RemainingDeps {
-        RemainingDeps { time: 0, data: im_rc::OrdSet::new() }
+        RemainingDeps { time: 0, data: persistent::OrdSet::new() }
     }
     pub(super) fn push(&mut self, x: DepsFrame) {
         let insertion_time = self.time;

@@ -15,7 +15,7 @@ use cranelift_codegen::ir::{
     condcodes::{FloatCC, IntCC},
     types,
 };
-use wasm_encoder::{Instruction as I, MemArg};
+use wasm_encoder::{Instruction as I, MemArg, MemArgTarget};
 
 use super::{Class, Lower, MEMORY, mem};
 
@@ -53,7 +53,7 @@ macro_rules! instructions {
 /// What an atomic instruction says of the address it is given: its natural alignment, which
 /// the format requires it to say.
 const fn atomic(align: u32) -> MemArg {
-    MemArg { offset: 0, align, memory_index: MEMORY }
+    MemArg { offset: 0, align, target: MemArgTarget::Memory(MEMORY), ordering: None }
 }
 
 instructions! {

@@ -10,13 +10,15 @@ use std::hash::Hash;
 
 use rustc_hash::{FxBuildHasher, FxHashSet};
 
+use crate::persistent;
+
 pub struct Graph<N: Clone, E: Clone> {
-    nodes: im_rc::OrdMap<N, im_rc::OrdMap<N, E>>,
+    nodes: persistent::OrdMap<N, persistent::OrdMap<N, E>>,
 }
 
 impl<N: Eq + Ord + Clone, E: Default + Clone> Graph<N, E> {
     pub fn new() -> Graph<N, E> {
-        Graph { nodes: im_rc::OrdMap::new() }
+        Graph { nodes: persistent::OrdMap::new() }
     }
 
     pub fn add(&mut self, node: N) {

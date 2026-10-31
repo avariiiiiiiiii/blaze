@@ -24,8 +24,8 @@ pub(super) struct Kept {
 }
 
 /// Once per crate and revision of it: the standard library's is found once a daemon.
-#[blaze_query::tracked(returns(ref))]
-pub(super) fn kept<'db>(db: &'db Db, krate: Crate) -> Kept {
+#[salsa::tracked(returns(ref))]
+pub(super) fn kept(db: &Db, krate: Crate) -> Kept {
     // alloc: once a crate a revision, the memo's lists and the walk's two stacks
     let (mut functions, mut statics) = (Vec::new(), Vec::new());
     // alloc: as above

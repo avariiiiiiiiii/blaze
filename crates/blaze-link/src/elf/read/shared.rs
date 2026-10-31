@@ -43,7 +43,7 @@ pub(super) fn read(name: &str, data: &[u8]) -> Result<Shared, String> {
     // for the local and global indexes, which name no version. Reserved whole, so it never
     // grows: untouched pages past the highest index seen are never written.
     let mut slots: Vec<Option<Option<u16>>> =
-        Vec::with_capacity(if table.is_some() { usize::from(elf::VERSYM_VERSION.0) + 1 } else { 0 });
+        Vec::with_capacity(if table.is_some() { usize::from(elf::VERSYM_VERSION) + 1 } else { 0 });
     for (index, symbol) in dynsym.enumerate() {
         if index.0 == 0 || symbol.st_shndx(ENDIAN) == elf::SHN_UNDEF {
             continue;

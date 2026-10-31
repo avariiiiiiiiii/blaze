@@ -444,6 +444,10 @@ class Round:
             out.detail = f"not blaze's: {inc.not_blazes or scratch.not_blazes}"
         else:
             apart = compare(inc, scratch, ("the incremental build", "the build from scratch")) + stale
+            # An edit that laid its image out whole again instead of patching it is a finding,
+            # never a time (AGENTS.md, no-fallback), as bench.py's `failed_link`.
+            if out.kind != "start" and out.link and out.link.startswith(("full link", "placed whole")):
+                apart.insert(0, out.link)
             if apart:
                 out.verdict, out.detail = "fail", "\n".join(apart)
         if out.rejects:

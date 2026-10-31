@@ -639,8 +639,20 @@ class V2(Engine):
         def total(field: str) -> int:
             return sum(work_count(label, line, field) for label, line in lines)
 
-        placed = [label for label, line in lines if line["link"] == "placed"]
-        link = "patched in place" if not placed else f"placed whole: {placed[0]}"
+        # A first link of an image none was kept of is not a fallback; one laid out whole
+        # although an image was kept is.
+        if any("links" not in line for _, line in lines):
+            raise Failed(f"what the daemon of {home} did: a `blaze-work` line without `links`")
+        full = [(label, it) for label, line in lines for it in line["links"] if it["how"] == "full"]
+        first = [(label, it) for label, line in lines for it in line["links"] if it["how"] == "first"]
+        if full:
+            label, it = full[0]
+            link = f"placed whole: {label}: {it['path']} ({', '.join(it['why'])})"
+        elif first:
+            label, it = first[0]
+            link = f"first link: {label}: {it['path']}"
+        else:
+            link = "patched in place"
         return Work(compiled=total("compiled"), reran=total("reran"), found=total("found"), link=link,
                     said="\n".join(json.dumps(line, sort_keys=True) for _, line in lines), green=total("green"))
 

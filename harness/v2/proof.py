@@ -397,7 +397,10 @@ def v2_work_wrong() -> list[str]:
     """`engine.V2` reading what requests did from the `blaze-work` lines of canned output, the
     form `blaze_ui::api::work_json` prints."""
     line = ('{"reason": "blaze-work", "reran": %d, "green": 300, "compiled": %d, "found": 40, '
-            '"link": "%s", "critical_path_us": %d}')
+            '"link": "%s", "critical_path_us": %d, "links": %s}')
+    spliced = '[{"path": "target/debug/app", "how": "spliced", "why": []}]'
+    full = '[{"path": "target/debug/app", "how": "full", "why": ["exports", "debug"]}]'
+    first = '[{"path": "target/debug/new", "how": "first", "why": []}]'
 
     class Canned(engine.V2):
         def __init__(self, said: list[str]):
@@ -412,8 +415,8 @@ def v2_work_wrong() -> list[str]:
     home, ws = Path("/h"), Path("/w")
     env = {"BLAZE_HOME": str(home)}
     json_ = ["--message-format=json"]
-    eng = Canned(['{"reason": "compiler-artifact"}\n' + line % (12, 2, "patched", 1500) + "\n",
-                  line % (3, 1, "placed", 2_500_000) + "\n", "test a ... ok\n" + line % (1, 0, "patched", 9) + "\n"])
+    eng = Canned(['{"reason": "compiler-artifact"}\n' + line % (12, 2, "patched", 1500, spliced) + "\n",
+                  line % (3, 1, "placed", 2_500_000, full) + "\n", "test a ... ok\n" + line % (1, 0, "patched", 9, spliced) + "\n"])
     eng.build("cold", ws, env, json_)
     mark = eng.mark(home)
     eng.build("edit", ws, env, json_)
@@ -421,11 +424,25 @@ def v2_work_wrong() -> list[str]:
     work = eng.work_since(home, mark)
     if (work.compiled, work.reran, work.found, work.green) != (1, 4, 80, 600):
         wrong.append(f"V2.work_since sums {work}")
-    if work.link != "placed whole: edit (`blaze build --message-format=json`)":
+    if work.link != "placed whole: edit (`blaze build --message-format=json`): target/debug/app (exports, debug)":
         wrong.append(f"V2.work_since: link {work.link!r}")
+    # A first link of a new image is not a fallback; a line without `links` is refused.
+    for links, want in ((first, "first link: edit (`blaze build --message-format=json`): target/debug/new"),
+                        (spliced, "patched in place")):
+        other = Canned([line % (1, 1, "placed", 1, links) + "\n"])
+        other.build("edit", ws, env, json_)
+        if (got := other.work_since(home, engine.Mark({"requests": 0})).link) != want:
+            wrong.append(f"V2.work_since: link {got!r}, wanted {want!r}")
+    other = Canned([line.replace(', "links": %s', "") % (1, 1, "patched", 1) + "\n"])
+    other.build("edit", ws, env, json_)
+    try:
+        other.work_since(home, engine.Mark({"requests": 0}))
+        wrong.append("V2.work_since read a `blaze-work` line without `links`")
+    except engine.Failed:
+        pass
     if eng.critical_path_s(ws, env) != 9e-6:
         wrong.append(f"V2.critical_path_s: {eng.critical_path_s(ws, env)}")
-    for args, said in ((json_, "test a ... ok\n"), ([], line % (1, 1, "patched", 1))):
+    for args, said in ((json_, "test a ... ok\n"), ([], line % (1, 1, "patched", 1, spliced))):
         mark = eng.mark(home)
         eng.said.append(said)
         eng.build("unsaid", ws, env, args, command="test")
@@ -440,14 +457,14 @@ def v2_work_wrong() -> list[str]:
             wrong.append("V2.critical_path_s read a request that printed no `blaze-work` line")
         except engine.Failed:
             pass
-    bad = [line % (1, 1, "spliced", 1), line.replace('"found": 40', '"found": -1') % (1, 1, "patched", 1)]
+    bad = [line % (1, 1, "spliced", 1, spliced), line.replace('"found": 40', '"found": -1') % (1, 1, "patched", 1, spliced)]
     for said in bad:
         try:
             engine.required("bad", engine.worked_lines(said)[0])
             wrong.append(f"engine.required took {said}")
         except engine.Failed:
             pass
-    if len(engine.worked_lines(line % (1, 1, "patched", 1) + "\n{not json\n")) != 1:
+    if len(engine.worked_lines(line % (1, 1, "patched", 1, spliced) + "\n{not json\n")) != 1:
         wrong.append("engine.worked_lines does not skip a line that is not JSON")
     return wrong
 

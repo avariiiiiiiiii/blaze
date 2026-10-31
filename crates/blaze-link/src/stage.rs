@@ -1766,7 +1766,7 @@ mod tests {
         };
         let bare = bare_code();
         let with = Code {
-            imports: vec![("puts".to_owned(), Import { module: "env".to_owned(), field: "puts".to_owned(), ty: sig })],
+            imports: vec![("puts".to_owned(), Import { module: "env".to_owned(), field: "puts".to_owned(), ty: sig.clone() })],
             ..bare_code()
         };
         for code in [&bare, &with] {

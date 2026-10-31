@@ -815,6 +815,27 @@
    ]
   },
   {
+   "path": "crates/hir-def/src/nameres/facts/tests/differential.rs",
+   "edits": [
+    {
+     "old": "    \"../macro_expansion_tests/mod.rs\",\n    \"../macro_expansion_tests/builtin_derive_macro.rs\",\n",
+     "new": "    \"../macro_expansion_tests/mod.rs\",\n    \"../macro_expansion_tests/budgets.rs\",\n    \"../macro_expansion_tests/builtin_derive_macro.rs\",\n"
+    },
+    {
+     "old": "    \"../macro_expansion_tests/builtin_derive_macro.rs\",\n    \"../macro_expansion_tests/builtin_fn_macro.rs\",\n",
+     "new": "    \"../macro_expansion_tests/builtin_derive_macro.rs\",\n    \"../macro_expansion_tests/builtin_errors.rs\",\n    \"../macro_expansion_tests/builtin_fn_macro.rs\",\n"
+    },
+    {
+     "old": "    check_files(&MACRO_EXPANSION[..5]);\n",
+     "new": "    check_files(&MACRO_EXPANSION[..7]);\n"
+    },
+    {
+     "old": "    check_files(&MACRO_EXPANSION[5..]);\n",
+     "new": "    check_files(&MACRO_EXPANSION[7..]);\n"
+    }
+   ]
+  },
+  {
    "path": "crates/hir-def/src/nameres/facts/tests/impls.rs",
    "edits": [
     {
@@ -855,6 +876,75 @@
    ]
   },
   {
+   "path": "crates/hir-def/src/nameres/tests/incremental.rs",
+   "edits": [
+    {
+     "old": "        \"#]],\n        expect![[r#\"\n            [\n                \"EditionedFileId::parse\",\n                \"HirFileId::ast_id_map\",\n                \"file_item_tree_query\",\n                \"real_span_map\",\n                \"EnumVariants::of\",\n",
+     "new": "        \"#]],\n        expect![[r#\"\n            [\n                \"EditionedFileId::parse_\",\n                \"file_item_tree_query\",\n                \"real_span_map\",\n                \"EnumVariants::of\",\n"
+    },
+    {
+     "old": "                \"EditionedFileId::parse_\",\n                \"file_item_tree_query\",\n                \"real_span_map\",\n                \"EnumVariants::of\",\n",
+     "new": "                \"EditionedFileId::parse_\",\n                \"file_item_tree_query\",\n                \"HirFileId::ast_id_map_\",\n                \"real_span_map\",\n                \"EnumVariants::of\",\n"
+    },
+    {
+     "old": "                \"EnumVariants::of\",\n",
+     "new": ""
+    },
+    {
+     "old": "            ]\n        \"#]],\n        expect![[r#\"\n            [\n                \"EditionedFileId::parse\",\n                \"HirFileId::ast_id_map\",\n                \"file_item_tree_query\",\n                \"real_span_map\",\n                \"MacroCallId::macro_arg\",\n                \"MacroCallId::parse_macro_expansion\",\n",
+     "new": "            ]\n        \"#]],\n        expect![[r#\"\n            [\n                \"EditionedFileId::parse_\",\n                \"file_item_tree_query\",\n                \"real_span_map\",\n                \"MacroCallId::macro_arg\",\n                \"MacroCallId::parse_macro_expansion\",\n"
+    },
+    {
+     "old": "                \"EditionedFileId::parse_\",\n                \"file_item_tree_query\",\n                \"real_span_map\",\n                \"MacroCallId::macro_arg\",\n",
+     "new": "                \"EditionedFileId::parse_\",\n                \"file_item_tree_query\",\n                \"HirFileId::ast_id_map_\",\n                \"real_span_map\",\n                \"MacroCallId::macro_arg\",\n"
+    },
+    {
+     "old": "                \"MacroCallId::macro_arg\",\n                \"MacroCallId::parse_macro_expansion\",\n                \"HirFileId::ast_id_map\",\n",
+     "new": "                \"MacroCallId::macro_arg_\",\n                \"MacroCallId::parse_macro_expansion_\",\n                \"HirFileId::ast_id_map_\",\n"
+    },
+    {
+     "old": "            ]\n        \"#]],\n        expect![[r#\"\n            [\n                \"EditionedFileId::parse\",\n                \"HirFileId::ast_id_map\",\n                \"file_item_tree_query\",\n                \"real_span_map\",\n                \"MacroCallId::macro_arg\",\n                \"MacroCallId::proc_macro_expansion\",\n",
+     "new": "            ]\n        \"#]],\n        expect![[r#\"\n            [\n                \"EditionedFileId::parse_\",\n                \"HirFileId::ast_id_map_\",\n                \"file_item_tree_query\",\n                \"real_span_map\",\n                \"MacroCallId::macro_arg\",\n                \"MacroCallId::proc_macro_expansion\",\n"
+    },
+    {
+     "old": "                \"MacroCallId::macro_arg\",\n                \"MacroCallId::proc_macro_expansion\",\n                \"MacroCallId::parse_macro_expansion\",\n                \"HirFileId::ast_id_map\",\n",
+     "new": "                \"MacroCallId::macro_arg_\",\n                \"MacroCallId::proc_macro_expansion_\",\n                \"MacroCallId::parse_macro_expansion_\",\n                \"HirFileId::ast_id_map_\",\n"
+    },
+    {
+     "old": "        \"#]],\n        expect![[r#\"\n            [\n                \"EditionedFileId::parse\",\n                \"HirFileId::ast_id_map\",\n                \"file_item_tree_query\",\n                \"real_span_map\",\n                \"MacroCallId::macro_arg\",\n",
+     "new": "        \"#]],\n        expect![[r#\"\n            [\n                \"EditionedFileId::parse_\",\n                \"file_item_tree_query\",\n                \"real_span_map\",\n                \"MacroCallId::macro_arg\",\n"
+    },
+    {
+     "old": "                \"EditionedFileId::parse_\",\n                \"file_item_tree_query\",\n                \"real_span_map\",\n                \"MacroCallId::macro_arg\",\n",
+     "new": "                \"EditionedFileId::parse_\",\n                \"file_item_tree_query\",\n                \"HirFileId::ast_id_map_\",\n                \"real_span_map\",\n                \"MacroCallId::macro_arg\",\n"
+    },
+    {
+     "old": "                \"MacroCallId::macro_arg\",\n                \"AstId::decl_macro_expander\",\n                \"MacroCallId::macro_arg\",\n                \"MacroCallId::macro_arg\",\n",
+     "new": "                \"MacroCallId::macro_arg_\",\n                \"AstId < ast :: Macro >::decl_macro_expander_\",\n                \"MacroCallId::macro_arg_\",\n"
+    },
+    {
+     "old": "                \"Modules::module\",\n",
+     "new": ""
+    },
+    {
+     "old": "        &[(\"file_item_tree_query\", 1), (\"parse_macro_expansion\", 0)],\n        expect![[r#\"\n            [\n                \"EditionedFileId::parse\",\n                \"HirFileId::ast_id_map\",\n                \"file_item_tree_query\",\n                \"real_span_map\",\n                \"MacroCallId::macro_arg\",\n",
+     "new": "        &[(\"file_item_tree_query\", 1), (\"parse_macro_expansion\", 0)],\n        expect![[r#\"\n            [\n                \"EditionedFileId::parse_\",\n                \"HirFileId::ast_id_map_\",\n                \"file_item_tree_query\",\n                \"real_span_map\",\n                \"MacroCallId::macro_arg\",\n"
+    },
+    {
+     "old": "                \"MacroCallId::macro_arg\",\n                \"MacroCallId::macro_arg\",\n                \"MacroCallId::macro_arg\",\n",
+     "new": "                \"MacroCallId::macro_arg_\",\n                \"MacroCallId::macro_arg_\",\n                \"MacroCallId::macro_arg_\",\n"
+    },
+    {
+     "old": "                \"EditionedFileId::parse\",\n                \"HirFileId::ast_id_map\",\n",
+     "new": "                \"EditionedFileId::parse_\",\n"
+    },
+    {
+     "old": "                \"EditionedFileId::parse_\",\n                \"file_item_tree_query\",\n                \"real_span_map\",\n            ]\n",
+     "new": "                \"EditionedFileId::parse_\",\n                \"file_item_tree_query\",\n                \"HirFileId::ast_id_map_\",\n                \"real_span_map\",\n            ]\n"
+    }
+   ]
+  },
+  {
    "path": "crates/hir-def/src/nameres/tests/stale_ids.rs",
    "edits": [
     {
@@ -864,6 +954,15 @@
     {
      "old": "    // New modules, so salsa may hand `foo`'s freed slot to one of them.\n",
      "new": "    // New modules, which must not be handed `foo`'s id.\n"
+    }
+   ]
+  },
+  {
+   "path": "crates/hir-def/src/nameres/tests/views_definition_source.txt",
+   "edits": [
+    {
+     "old": "crate root: FileId(EditionedFileId(Id(580))) SourceFile SOURCE_FILE@0..321, 153 elements\nblock: FileId(EditionedFileId(Id(580))) BlockExpr BLOCK_EXPR@205..320, 47 elements\nblock: FileId(EditionedFileId(Id(580))) BlockExpr BLOCK_EXPR@229..318, 34 elements\nblock: FileId(EditionedFileId(Id(580))) BlockExpr BLOCK_EXPR@273..312, 12 elements\nfile: FileId(EditionedFileId(Id(582))) SourceFile SOURCE_FILE@0..74, 47 elements\nblock: FileId(EditionedFileId(Id(582))) BlockExpr BLOCK_EXPR@51..73, 12 elements\ninline: FileId(EditionedFileId(Id(582))) Module MODULE@0..37, 23 elements\ninline: FileId(EditionedFileId(Id(580))) Module MODULE@10..80, 35 elements\nblock: FileId(EditionedFileId(Id(580))) BlockExpr BLOCK_EXPR@46..78, 12 elements\ninline: MacroFile(MacroCallId(Id(c00))) Module MODULE@0..29, 14 elements\n",
+     "new": "crate root: FileId(EditionedFileId(Id(13312))) SourceFile SOURCE_FILE@0..321, 153 elements\nblock: FileId(EditionedFileId(Id(13312))) BlockExpr BLOCK_EXPR@205..320, 47 elements\nblock: FileId(EditionedFileId(Id(13312))) BlockExpr BLOCK_EXPR@229..318, 34 elements\nblock: FileId(EditionedFileId(Id(13312))) BlockExpr BLOCK_EXPR@273..312, 12 elements\nfile: FileId(EditionedFileId(Id(13314))) SourceFile SOURCE_FILE@0..74, 47 elements\nblock: FileId(EditionedFileId(Id(13314))) BlockExpr BLOCK_EXPR@51..73, 12 elements\ninline: FileId(EditionedFileId(Id(13314))) Module MODULE@0..37, 23 elements\ninline: FileId(EditionedFileId(Id(13312))) Module MODULE@10..80, 35 elements\nblock: FileId(EditionedFileId(Id(13312))) BlockExpr BLOCK_EXPR@46..78, 12 elements\ninline: MacroFile(MacroCallId(Id(27648))) Module MODULE@0..29, 14 elements\n"
     }
    ]
   },
@@ -886,6 +985,24 @@
     {
      "old": "    /// Compared by its content, not a hash of it: salsa compares a new value with the old one\n",
      "new": "    /// Compared by its content, not a hash of it: the query database compares a new value with the old one\n"
+    }
+   ]
+  },
+  {
+   "path": "crates/hir-def/src/src/child_source_view.txt",
+   "edits": [
+    {
+     "old": "variant 0 field 0: FileId(EditionedFileId(Id(580))) Some((TUPLE_FIELD, 207..220))\nvariant 0 field 1: FileId(EditionedFileId(Id(580))) Some((TUPLE_FIELD, 239..244))\nvariant 0 field 2: FileId(EditionedFileId(Id(580))) None\nvariant 1 field 0: FileId(EditionedFileId(Id(580))) Some((RECORD_FIELD, 270..274))\nvariant 1 field 1: FileId(EditionedFileId(Id(580))) Some((RECORD_FIELD, 310..319))\nvariant 1 field 2: FileId(EditionedFileId(Id(580))) None\nvariant 2 field 0: FileId(EditionedFileId(Id(580))) Some((RECORD_FIELD, 337..343))\nvariant 2 field 1: FileId(EditionedFileId(Id(580))) Some((RECORD_FIELD, 381..387))\nvariant 2 field 2: FileId(EditionedFileId(Id(580))) None\nvariant 3 field 0: FileId(EditionedFileId(Id(580))) None\nvariant 4 field 0: FileId(EditionedFileId(Id(580))) Some((TUPLE_FIELD, 417..419))\nvariant 4 field 1: FileId(EditionedFileId(Id(580))) Some((TUPLE_FIELD, 437..444))\nvariant 4 field 2: FileId(EditionedFileId(Id(580))) None\nvariant 5 field 0: FileId(EditionedFileId(Id(580))) Some((RECORD_FIELD, 455..460))\nvariant 5 field 1: FileId(EditionedFileId(Id(580))) Some((RECORD_FIELD, 462..479))\nvariant 5 field 2: FileId(EditionedFileId(Id(580))) None\nvariant 6 field 0: FileId(EditionedFileId(Id(580))) None\ngenerics 0 type or const 0: FileId(EditionedFileId(Id(580))) Some((TYPE_PARAM, 591..598))\ngenerics 0 type or const 1: FileId(EditionedFileId(Id(580))) None\ngenerics 0 lifetime 0: FileId(EditionedFileId(Id(580))) Some((LIFETIME_PARAM, 587..589))\ngenerics 0 lifetime 1: FileId(EditionedFileId(Id(580))) None\ngenerics 1 type or const 0: FileId(EditionedFileId(Id(580))) Some((TYPE_PARAM, 182..189))\ngenerics 1 type or const 1: FileId(EditionedFileId(Id(580))) Some((CONST_PARAM, 191..205))\ngenerics 1 type or const 2: FileId(EditionedFileId(Id(580))) None\ngenerics 1 lifetime 0: FileId(EditionedFileId(Id(580))) Some((LIFETIME_PARAM, 178..180))\ngenerics 1 lifetime 1: FileId(EditionedFileId(Id(580))) None\ngenerics 2 type or const 0: FileId(EditionedFileId(Id(580))) Some((TYPE_PARAM, 261..262))\ngenerics 2 type or const 1: FileId(EditionedFileId(Id(580))) None\ngenerics 2 lifetime 0: FileId(EditionedFileId(Id(580))) None\ngenerics 3 type or const 0: FileId(EditionedFileId(Id(580))) None\ngenerics 3 lifetime 0: FileId(EditionedFileId(Id(580))) None\ngenerics 4 type or const 0: FileId(EditionedFileId(Id(580))) None\ngenerics 4 lifetime 0: FileId(EditionedFileId(Id(580))) Some((LIFETIME_PARAM, 398..400))\ngenerics 4 lifetime 1: FileId(EditionedFileId(Id(580))) None\ngenerics 5 type or const 0: FileId(EditionedFileId(Id(580))) Some((TRAIT, 485..543))\ngenerics 5 type or const 1: FileId(EditionedFileId(Id(580))) Some((TYPE_PARAM, 498..499))\ngenerics 5 type or const 2: FileId(EditionedFileId(Id(580))) Some((CONST_PARAM, 501..514))\ngenerics 5 type or const 3: FileId(EditionedFileId(Id(580))) None\ngenerics 5 lifetime 0: FileId(EditionedFileId(Id(580))) Some((LIFETIME_PARAM, 494..496))\ngenerics 5 lifetime 1: FileId(EditionedFileId(Id(580))) None\ngenerics 6 type or const 0: FileId(EditionedFileId(Id(580))) Some((TYPE_PARAM, 561..562))\ngenerics 6 type or const 1: FileId(EditionedFileId(Id(580))) Some((CONST_PARAM, 564..575))\ngenerics 6 type or const 2: FileId(EditionedFileId(Id(580))) None\ngenerics 6 lifetime 0: FileId(EditionedFileId(Id(580))) Some((LIFETIME_PARAM, 549..551))\ngenerics 6 lifetime 1: FileId(EditionedFileId(Id(580))) Some((LIFETIME_PARAM, 553..559))\ngenerics 6 lifetime 2: FileId(EditionedFileId(Id(580))) None\ngenerics 7 type or const 0: FileId(EditionedFileId(Id(580))) None\ngenerics 7 lifetime 0: FileId(EditionedFileId(Id(580))) None\ngenerics 8 type or const 0: FileId(EditionedFileId(Id(580))) Some((TYPE_PARAM, 141..148))\ngenerics 8 type or const 1: FileId(EditionedFileId(Id(580))) None\ngenerics 8 lifetime 0: FileId(EditionedFileId(Id(580))) Some((LIFETIME_PARAM, 137..139))\ngenerics 8 lifetime 1: FileId(EditionedFileId(Id(580))) None\n",
+     "new": "variant 0 field 0: FileId(EditionedFileId(Id(13312))) Some((TUPLE_FIELD, 207..220))\nvariant 0 field 1: FileId(EditionedFileId(Id(13312))) Some((TUPLE_FIELD, 239..244))\nvariant 0 field 2: FileId(EditionedFileId(Id(13312))) None\nvariant 1 field 0: FileId(EditionedFileId(Id(13312))) Some((RECORD_FIELD, 270..274))\nvariant 1 field 1: FileId(EditionedFileId(Id(13312))) Some((RECORD_FIELD, 310..319))\nvariant 1 field 2: FileId(EditionedFileId(Id(13312))) None\nvariant 2 field 0: FileId(EditionedFileId(Id(13312))) Some((RECORD_FIELD, 337..343))\nvariant 2 field 1: FileId(EditionedFileId(Id(13312))) Some((RECORD_FIELD, 381..387))\nvariant 2 field 2: FileId(EditionedFileId(Id(13312))) None\nvariant 3 field 0: FileId(EditionedFileId(Id(13312))) None\nvariant 4 field 0: FileId(EditionedFileId(Id(13312))) Some((TUPLE_FIELD, 417..419))\nvariant 4 field 1: FileId(EditionedFileId(Id(13312))) Some((TUPLE_FIELD, 437..444))\nvariant 4 field 2: FileId(EditionedFileId(Id(13312))) None\nvariant 5 field 0: FileId(EditionedFileId(Id(13312))) Some((RECORD_FIELD, 455..460))\nvariant 5 field 1: FileId(EditionedFileId(Id(13312))) Some((RECORD_FIELD, 462..479))\nvariant 5 field 2: FileId(EditionedFileId(Id(13312))) None\nvariant 6 field 0: FileId(EditionedFileId(Id(13312))) None\ngenerics 0 type or const 0: FileId(EditionedFileId(Id(13312))) Some((TYPE_PARAM, 591..598))\ngenerics 0 type or const 1: FileId(EditionedFileId(Id(13312))) None\ngenerics 0 lifetime 0: FileId(EditionedFileId(Id(13312))) Some((LIFETIME_PARAM, 587..589))\ngenerics 0 lifetime 1: FileId(EditionedFileId(Id(13312))) None\ngenerics 1 type or const 0: FileId(EditionedFileId(Id(13312))) Some((TYPE_PARAM, 182..189))\ngenerics 1 type or const 1: FileId(EditionedFileId(Id(13312))) Some((CONST_PARAM, 191..205))\ngenerics 1 type or const 2: FileId(EditionedFileId(Id(13312))) None\ngenerics 1 lifetime 0: FileId(EditionedFileId(Id(13312))) Some((LIFETIME_PARAM, 178..180))\ngenerics 1 lifetime 1: FileId(EditionedFileId(Id(13312))) None\ngenerics 2 type or const 0: FileId(EditionedFileId(Id(13312))) Some((TYPE_PARAM, 261..262))\ngenerics 2 type or const 1: FileId(EditionedFileId(Id(13312))) None\ngenerics 2 lifetime 0: FileId(EditionedFileId(Id(13312))) None\ngenerics 3 type or const 0: FileId(EditionedFileId(Id(13312))) None\ngenerics 3 lifetime 0: FileId(EditionedFileId(Id(13312))) None\ngenerics 4 type or const 0: FileId(EditionedFileId(Id(13312))) None\ngenerics 4 lifetime 0: FileId(EditionedFileId(Id(13312))) Some((LIFETIME_PARAM, 398..400))\ngenerics 4 lifetime 1: FileId(EditionedFileId(Id(13312))) None\ngenerics 5 type or const 0: FileId(EditionedFileId(Id(13312))) Some((TRAIT, 485..543))\ngenerics 5 type or const 1: FileId(EditionedFileId(Id(13312))) Some((TYPE_PARAM, 498..499))\ngenerics 5 type or const 2: FileId(EditionedFileId(Id(13312))) Some((CONST_PARAM, 501..514))\ngenerics 5 type or const 3: FileId(EditionedFileId(Id(13312))) None\ngenerics 5 lifetime 0: FileId(EditionedFileId(Id(13312))) Some((LIFETIME_PARAM, 494..496))\ngenerics 5 lifetime 1: FileId(EditionedFileId(Id(13312))) None\ngenerics 6 type or const 0: FileId(EditionedFileId(Id(13312))) Some((TYPE_PARAM, 561..562))\ngenerics 6 type or const 1: FileId(EditionedFileId(Id(13312))) Some((CONST_PARAM, 564..575))\ngenerics 6 type or const 2: FileId(EditionedFileId(Id(13312))) None\ngenerics 6 lifetime 0: FileId(EditionedFileId(Id(13312))) Some((LIFETIME_PARAM, 549..551))\ngenerics 6 lifetime 1: FileId(EditionedFileId(Id(13312))) Some((LIFETIME_PARAM, 553..559))\ngenerics 6 lifetime 2: FileId(EditionedFileId(Id(13312))) None\ngenerics 7 type or const 0: FileId(EditionedFileId(Id(13312))) None\ngenerics 7 lifetime 0: FileId(EditionedFileId(Id(13312))) None\ngenerics 8 type or const 0: FileId(EditionedFileId(Id(13312))) Some((TYPE_PARAM, 141..148))\ngenerics 8 type or const 1: FileId(EditionedFileId(Id(13312))) None\ngenerics 8 lifetime 0: FileId(EditionedFileId(Id(13312))) Some((LIFETIME_PARAM, 137..139))\ngenerics 8 lifetime 1: FileId(EditionedFileId(Id(13312))) None\n"
+    }
+   ]
+  },
+  {
+   "path": "crates/hir-def/src/src/use_tree_views.txt",
+   "edits": [
+    {
+     "old": "use 0 tree 0: FileId(EditionedFileId(Id(580))) (USE_TREE, 4..56)\nuse 0 tree 1: FileId(EditionedFileId(Id(580))) (USE_TREE, 10..30)\nuse 0 tree 2: FileId(EditionedFileId(Id(580))) (USE_TREE, 16..20)\nuse 0 tree 3: FileId(EditionedFileId(Id(580))) (USE_TREE, 22..29)\nuse 0 tree 4: FileId(EditionedFileId(Id(580))) (USE_TREE, 32..46)\nuse 0 tree 5: FileId(EditionedFileId(Id(580))) (USE_TREE, 48..55)\nuse 1 tree 0: FileId(EditionedFileId(Id(580))) (USE_TREE, 62..84)\n",
+     "new": "use 0 tree 0: FileId(EditionedFileId(Id(13312))) (USE_TREE, 4..56)\nuse 0 tree 1: FileId(EditionedFileId(Id(13312))) (USE_TREE, 10..30)\nuse 0 tree 2: FileId(EditionedFileId(Id(13312))) (USE_TREE, 16..20)\nuse 0 tree 3: FileId(EditionedFileId(Id(13312))) (USE_TREE, 22..29)\nuse 0 tree 4: FileId(EditionedFileId(Id(13312))) (USE_TREE, 32..46)\nuse 0 tree 5: FileId(EditionedFileId(Id(13312))) (USE_TREE, 48..55)\nuse 1 tree 0: FileId(EditionedFileId(Id(13312))) (USE_TREE, 62..84)\n"
     }
    ]
   },

@@ -10,6 +10,27 @@
      "new": "//! Each value dropped keeps its memo, its fingerprint and the edges it read (the query database's\n"
     }
    ]
+  },
+  {
+   "path": "crates/hir/src/tests/lower.rs",
+   "edits": [
+    {
+     "old": "            // Elaboration has every trait's implicit `Self: MetaSized` (and `MetaSized`'s\n            // `PointeeSized`), as rustc's; the memo is the written bounds' hierarchy, which method\n            // and associated item lookup read, and has those two only through a written `Sized`.\n",
+     "new": "            // Elaboration has every trait's implicit `Self: MetaSized`, as rustc's, and never\n            // `PointeeSized`, whose bound lowers to no clause. The memo is the written bounds'\n            // hierarchy, which method and associated item lookup read: `MetaSized` only through\n            // a written `Sized`, and `MetaSized`'s own `PointeeSized`. Neither has items.\n"
+    },
+    {
+     "old": "            let implicit = [lang.MetaSized, lang.PointeeSized];\n",
+     "new": ""
+    },
+    {
+     "old": "                elaborated.retain(|it| !implicit.contains(&Some(*it)));\n",
+     "new": "                elaborated.retain(|it| Some(*it) != lang.MetaSized);\n"
+    },
+    {
+     "old": "            let mut memo = hir_ty::all_super_traits(&db, trait_).to_vec();\n            elaborated.sort();\n",
+     "new": "            let mut memo = hir_ty::all_super_traits(&db, trait_).to_vec();\n            memo.retain(|it| Some(*it) != lang.PointeeSized);\n            elaborated.sort();\n"
+    }
+   ]
   }
  ]
 }

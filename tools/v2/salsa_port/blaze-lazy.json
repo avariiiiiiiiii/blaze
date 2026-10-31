@@ -1,6 +1,6 @@
 {
  "crate": "crates/blaze-lazy",
- "base": "b8c752e457596472d86888086afc758ecfcb8f38",
+ "base": "9023f3e6d7d8a2d1954423c4ccdd89b220701525",
  "files": [
   {
    "path": "crates/blaze-lazy/src/compile.rs",

@@ -88,7 +88,7 @@ impl Sid {
                 let unit = unsafe { text.add(at) };
                 // SAFETY: `unit` points at a `u16` of that allocation, which lives until the
                 // `LocalFree` below.
-                unsafe { *unit } != 0
+                (unsafe { *unit }) != 0
             })
             .count();
         // SAFETY: the `len` units before the zero are initialized `u16`s of the allocation, which is

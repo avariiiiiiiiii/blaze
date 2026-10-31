@@ -67,9 +67,9 @@ pub enum ResponseRef<'a> {
         pack: &'a [u8],
     },
     DocPage {
-        path: &'a str,
         #[serde(deserialize_with = "blaze_protocol::bytes::borrow")]
         page: &'a [u8],
+        path: &'a str,
     },
     Documented(Documented),
 }

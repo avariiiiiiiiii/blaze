@@ -77,7 +77,24 @@ pub(crate) fn parsed<'f, 'db>(
         }
         push(cx, owner, Phase::Expand, &mut errors, found);
         let start = lowered.attrs.len();
-        lower(cx, session, owner, &mut errors, &mut lowered.attrs);
+        match owner.target {
+            // Expansion parses a macro call's attributes one at a time (`check_attributes` of
+            // `collect_bang`): none is checked against another.
+            Target::MacroCall => {
+                for &attr in &owner.attrs {
+                    let alone = Owner {
+                        node: owner.node,
+                        target: owner.target,
+                        // alloc: an owner of the one attribute, for a macro call's attributes only
+                        attrs: vec![attr],
+                        // clone: a pointer, copied with it
+                        buffered_at: owner.buffered_at.clone(),
+                    };
+                    lower(cx, session, &alone, &mut errors, &mut lowered.attrs);
+                }
+            }
+            _ => lower(cx, session, owner, &mut errors, &mut lowered.attrs),
+        }
         let phase = match owner.target {
             Target::MacroCall => {
                 lowered.attrs.truncate(start);

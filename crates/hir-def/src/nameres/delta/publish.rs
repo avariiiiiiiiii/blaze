@@ -189,6 +189,49 @@ pub(in crate::nameres) fn published(db: &Db, krate: Crate) -> Option<(DefMap, Lo
     Some((def_map, local))
 }
 
+/// What [`published`] reads of a crate's resolution, by field, to compare across a write: a
+/// write that changes none of them runs no `crate_local_def_map` of the crate again.
+#[cfg(test)]
+pub(super) struct Slices {
+    resolution: CrateResolution,
+    root: ModuleId,
+    local: LocalDefMap,
+    data: Arc<DefMapCrateData>,
+    prelude: Option<(ModuleId, Option<UseId>)>,
+    macro_use_prelude: FxHashMap<Name, (MacroId, Option<ExternCrateId>)>,
+    session_macros: bool,
+}
+
+#[cfg(test)]
+impl Slices {
+    pub(super) fn of(db: &Db, krate: Crate) -> Slices {
+        let resolution = *Resolutions::get(db).crates(db).get(&krate).expect("the crate is maintained");
+        Slices {
+            resolution,
+            root: resolution.root(db),
+            local: LocalDefMap { extern_prelude: resolution.local(db).extern_prelude.clone() },
+            data: resolution.data(db).clone(),
+            prelude: resolution.prelude(db),
+            macro_use_prelude: resolution.macro_use_prelude(db).clone(),
+            session_macros: resolution.session_macros(db),
+        }
+    }
+
+    /// The fields that differ between `self` and `other`, by name.
+    pub(super) fn differing(&self, other: &Slices) -> Vec<&'static str> {
+        let fields = [
+            ("resolution", self.resolution == other.resolution),
+            ("root", self.root == other.root),
+            ("local", self.local == other.local),
+            ("data", self.data == other.data),
+            ("prelude", self.prelude == other.prelude),
+            ("macro_use_prelude", self.macro_use_prelude == other.macro_use_prelude),
+            ("session_macros", self.session_macros == other.session_macros),
+        ];
+        fields.into_iter().filter(|&(_, same)| !same).map(|(name, _)| name).collect()
+    }
+}
+
 // What the maintainer sets.
 
 /// A module's scope input after a run: made for a new module, set where the scope or the

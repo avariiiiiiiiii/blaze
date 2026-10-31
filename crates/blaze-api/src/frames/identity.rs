@@ -287,7 +287,7 @@ impl Gen {
             },
             21 => Request::Memory,
             22 => Request::Pack { view: self.view(0), targets: self.targets(), program: self.text() },
-            23 => Request::Doc { view: self.view(0), targets: self.targets(), no_deps: self.yes(), private: self.yes() },
+            23 => Request::Doc { view: self.view(0), no_deps: self.yes(), private: self.yes(), targets: self.targets() },
             _ => Request::Stop,
         }
     }
@@ -612,11 +612,11 @@ impl Gen {
                 committed_high_water: self.wide(),
             }),
             26 => Response::Packed { pack: self.bytes() },
-            27 => Response::DocPage { path: self.text(), page: self.bytes() },
+            27 => Response::DocPage { page: self.bytes(), path: self.text() },
             28 => Response::Documented(Documented {
                 dir: self.text(),
-                crates: self.many(depth, |g| DocumentedCrate { name: g.text(), package: g.text(), asked: g.yes() }),
                 pages: self.wide(),
+                crates: self.many(depth, |g| DocumentedCrate { name: g.text(), asked: g.yes(), package: g.text() }),
                 source_pages: self.wide(),
             }),
             _ => {

@@ -724,6 +724,7 @@ dependencies = [
  "hir-expand",
  "hir-ty",
  "hir-ty-borrowck",
+ "hir-ty-matchck",
  "la-arena",
  "rustc-hash",
  "rustc_type_ir",

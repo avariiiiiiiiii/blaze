@@ -2704,7 +2704,7 @@ impl<'a, 'db, F: Fn(crate::DefWithBody) -> bool + ?Sized> DiagnosticsCollector<'
     /// Whether [`Self::collect_anon_const`] finds anything in `def`, from the results it reads.
     fn anon_const_reports(&self, def: AnonConstId<'db>) -> bool {
         let db = self.db;
-        !InferenceResult::of(db, def.into()).diagnostics().is_empty()
+        !InferenceResult::of(db, def).diagnostics().is_empty()
             || !hir_ty::coroutine_obligations::coroutine_obligation_errors(db, def.into()).is_empty()
             || !hir_ty_borrowck::borrowck_anon_const(db, def).diagnostics.is_empty()
             || hir_ty::const_valtree::anon_const_valtree_error(db, def).is_some()

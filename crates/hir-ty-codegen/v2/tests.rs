@@ -215,17 +215,20 @@ fn a_shape_is_the_same_each_time() {
 
 const SHARED: &str = r#"
 //- minicore: sized
+#[lang = "type_id"]
+pub struct TypeId { data: [*const (); 2] }
 #[rustc_intrinsic]
-pub fn type_id<T: ?Sized + 'static>() -> u128;
+#[rustc_comptime]
+pub fn type_id<T: ?Sized>() -> TypeId;
 pub struct A(pub u32);
 pub struct B(pub u32);
 pub fn id<T>(x: T) -> T { x }
-pub fn tid<T: 'static>() -> u128 { type_id::<T>() }
-pub fn roots() -> u128 {
+pub fn tid<T: 'static>() -> TypeId { const { type_id::<T>() } }
+pub fn roots() -> (TypeId, TypeId) {
     let (a, b) = (A(1), B(2));
     id(&a);
     id(&b);
-    tid::<&'static A>() ^ tid::<&'static B>()
+    (tid::<&'static A>(), tid::<&'static B>())
 }
 "#;
 

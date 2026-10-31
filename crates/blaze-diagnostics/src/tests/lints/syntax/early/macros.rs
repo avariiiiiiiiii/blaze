@@ -6,7 +6,7 @@ mod matchers;
 use crate::{
     Options,
     emit::Style,
-    tests::{Mode, ui},
+    tests::{Mode, ui, ui_core_as},
 };
 
 /// [`crate::tests::ui_as`] of a fixture of several files: a UI test, its auxiliary crates
@@ -479,7 +479,9 @@ LL | #![warn(semicolon_in_expressions_from_macros)]
    = note: this warning originates in the macro `foo` (in Nightly builds, run with -Z macro-backtrace for more info)
 
 "#;
-    assert_eq!(ui("semicolon-in-expressions-from-macros.rs", "2018", source), expected);
+    // A core with `Future`, as rustc has std: the test's `async fn`s are lowered with it.
+    let stderr = ui_core_as(Mode::Other, "semicolon-in-expressions-from-macros.rs", "2018", "future", source, &Options::default());
+    assert_eq!(stderr, expected);
 }
 
 #[test]

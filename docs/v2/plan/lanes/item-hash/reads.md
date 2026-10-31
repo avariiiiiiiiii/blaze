@@ -109,6 +109,7 @@ walks every module's inherent impls inline in inference). It is refused.
 | `const_eval_query` of a const without generics, with no arguments and no environment | I M | `ConstValue(const)` | the evaluation lane items hashes |
 | `infer_body_query` of the body itself, from M or B | M B | `StepInfer(body)` (0x1803), valued by `hir_ty::body_store::step_value` | the earlier step's answer, as the store encodes it |
 | `mir_body_query` of the body itself, and `mir_body_for_closure_query` and `mir_body_for_coroutine_query` of a closure, async closure or async block written in it, from B | B | `StepMir(body)` (0x1804) | the step value hashes the body's built MIR and every such closure's and coroutine's, in expression order |
+| `match_check` of the body itself | B | `MatchCheck(body)` (0x1805) | the value hashes whether match checking failed, the one part of it the borrow check reads (to skip the body) |
 
 `AttrFlags::query` and the two member lists are lane items' `fact_of_read` too, as
 `Signature`; this table takes them first, as `Signature` misses a rename and the unobserved

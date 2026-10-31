@@ -163,6 +163,11 @@ struct Unit;
     derives.sort_by_key(|&(at, _)| at);
     let [(_, wide), (_, unit)] = derives[..] else { panic!("two derives: {derives:?}") };
     let (wide, unit) = (fresh(&db, wide), fresh(&db, unit));
+    // The thread's query stacks grow to their high-water marks once: a miss of each, unmeasured,
+    // first (one call deeper, so the measured ones still miss).
+    for warm in [fresh(&db, wide), fresh(&db, unit)] {
+        let _ = warm.macro_arg_considering_derives(&db, &warm.loc(&db).kind);
+    }
     let (_, run) = blaze_alloc_count::measure(|| {
         let _ = unit.macro_arg_considering_derives(&db, &unit.loc(&db).kind);
     });

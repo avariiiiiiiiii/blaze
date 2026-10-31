@@ -320,7 +320,7 @@ fn a_dyn_coercion_lists_its_vtable() {
 }
 
 const DYN_FN: &str = r#"
-//- minicore: sized, unsize, coerce_unsized, dispatch_from_dyn, fn, drop
+//- minicore: sized, copy, unsize, coerce_unsized, dispatch_from_dyn, fn, drop
 pub struct Held(pub u32);
 impl Drop for Held { fn drop(&mut self) {} }
 pub fn call_dyn(f: &dyn Fn(u32) -> u32, x: u32) -> u32 { f(x) }

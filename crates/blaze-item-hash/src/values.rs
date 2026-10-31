@@ -52,11 +52,14 @@ pub mod kinds {
     pub const STEP_INFER: QueryKind = QueryKind(0x1803);
     /// A body's built MIR with its closures' and async coroutines', as its borrow check reads it.
     pub const STEP_MIR: QueryKind = QueryKind(0x1804);
+    /// Whether a body's match checking failed, which keeps its borrow check from running.
+    pub const MATCH_CHECK: QueryKind = QueryKind(0x1805);
 }
 
 const FIELDS_DOMAIN: &str = "blaze v2 item-hash fields 1";
 const ATTRS_DOMAIN: &str = "blaze v2 item-hash attrs 1";
 const CRATE_ROOT_DOMAIN: &str = "blaze v2 item-hash crate root 1";
+const MATCH_CHECK_DOMAIN: &str = "blaze v2 item-hash match check 1";
 const ABSENT_DOMAIN: &str = "blaze v2 item-hash absent 1";
 
 /// The value `fact` has now, `None` when it cannot be hashed or names what is no fact.
@@ -84,18 +87,34 @@ pub fn value(db: &Db, fact: FactRef) -> Option<ContentId> {
         }
     } else if kind == kinds::STEP_INFER || kind == kinds::STEP_MIR {
         let step = if kind == kinds::STEP_INFER { Step::Infer } else { Step::Mir };
-        let body = match key::resolve(db, ItemKey(fact.subject)) {
-            None => return Some(absent(kind)),
-            Some(Resolved::Item(ItemId::Function(it))) => DefWithBodyId::FunctionId(it),
-            Some(Resolved::Item(ItemId::Const(it))) => DefWithBodyId::ConstId(it),
-            Some(Resolved::Item(ItemId::Static(it))) => DefWithBodyId::StaticId(it),
-            Some(Resolved::Variant(it)) => DefWithBodyId::VariantId(it),
-            Some(_) => return None,
-        };
-        step_value(db, body, step)
+        match body_of(db, fact.subject)? {
+            None => Some(absent(kind)),
+            Some(body) => step_value(db, body, step),
+        }
+    } else if kind == kinds::MATCH_CHECK {
+        match body_of(db, fact.subject)? {
+            None => Some(absent(kind)),
+            Some(body) => {
+                let failed = hir_ty_matchck::match_check(db, body).failed;
+                Some(Hasher::new(MATCH_CHECK_DOMAIN).update(&[u8::from(failed)]).finish())
+            }
+        }
     } else {
         None
     }
+}
+
+/// The body a step fact's subject names: `Some(None)` when it no longer resolves, `None` when
+/// it names what has no body.
+fn body_of(db: &Db, subject: ContentId) -> Option<Option<DefWithBodyId>> {
+    Some(Some(match key::resolve(db, ItemKey(subject)) {
+        None => return Some(None),
+        Some(Resolved::Item(ItemId::Function(it))) => DefWithBodyId::FunctionId(it),
+        Some(Resolved::Item(ItemId::Const(it))) => DefWithBodyId::ConstId(it),
+        Some(Resolved::Item(ItemId::Static(it))) => DefWithBodyId::StaticId(it),
+        Some(Resolved::Variant(it)) => DefWithBodyId::VariantId(it),
+        Some(_) => return None,
+    }))
 }
 
 /// The fact of `step` of `def`, as a later step of it reads it; `None` for the borrow check,
@@ -106,13 +125,22 @@ pub fn step_fact(db: &Db, def: DefWithBodyId, step: Step) -> Option<FactRef> {
         Step::Mir => kinds::STEP_MIR,
         Step::Borrowck => return None,
     };
-    let subject = match def {
+    Some(FactRef { kind, subject: body_key(db, def), object: FactObject::None })
+}
+
+/// The `MatchCheck` fact of `def`, as its borrow check reads it.
+pub fn match_check(db: &Db, def: DefWithBodyId) -> FactRef {
+    FactRef { kind: kinds::MATCH_CHECK, subject: body_key(db, def), object: FactObject::None }
+}
+
+fn body_key(db: &Db, def: DefWithBodyId) -> ContentId {
+    match def {
         DefWithBodyId::FunctionId(it) => key::item_key(db, ItemId::Function(it)),
         DefWithBodyId::ConstId(it) => key::item_key(db, ItemId::Const(it)),
         DefWithBodyId::StaticId(it) => key::item_key(db, ItemId::Static(it)),
         DefWithBodyId::VariantId(it) => key::variant_key(db, it),
-    };
-    Some(FactRef { kind, subject: subject.0, object: FactObject::None })
+    }
+    .0
 }
 
 /// The value of a fact of `kind` whose subject this database has no item for.

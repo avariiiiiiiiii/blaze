@@ -105,6 +105,9 @@ pub(crate) enum Rule {
     /// for another body's, for an inline const's, for a coroutine kind whose MIR the step's
     /// value leaves out, and for the same or a later step.
     OwnStep(Step),
+    /// `match_check(def)` of the body itself, which the borrow check reads to skip a body
+    /// whose patterns failed: its `MatchCheck` fact. Refused for another body's.
+    OwnMatchCheck,
 }
 
 /// The arguments of a [`Rule::DepCrate`] read, as the query's key interns them.
@@ -247,6 +250,7 @@ pub(crate) const RULES: &[(&str, &str, Rule)] = &[
     ("lang_items", "hir-def/src/lang_item.rs", Rule::OwnCrate(Else::CrateRoot)),
     ("loaded_crates", "hir-ty/src/method_resolution.rs", Rule::OwnCrate(Else::CrateRoot)),
     ("macros_writing_impls", "hir-ty/src/method_resolution.rs", Rule::WholeCrate),
+    ("match_check", "hir-ty-matchck/src/lib.rs", Rule::OwnMatchCheck),
     ("may_specialize", "hir-ty/src/specialization.rs", Rule::Items),
     ("mir_body_for_closure_query", "hir-ty/src/providers.rs", Rule::OwnStep(Step::Mir)),
     ("mir_body_for_coroutine_query", "hir-ty/src/providers.rs", Rule::OwnStep(Step::Mir)),
@@ -454,6 +458,10 @@ fn apply(
             }
             values::step_fact(db, def, earlier)
         }
+        Rule::OwnMatchCheck => match arg::<DefWithBodyId>(db, key) {
+            Some(body) if body == def => Some(values::match_check(db, def)),
+            _ => None,
+        },
         Rule::ConstEval => match hir_ty::consteval::const_eval_query::arguments(db, key) {
             Some((konst, subst, None))
                 if subst.as_ref().is_empty()

@@ -538,3 +538,59 @@ pub mod error { pub trait Error {} }
     check_db(db, "a noprelude core", &Exempt::NONE, false, &mut failures);
     assert!(failures.is_empty(), "{failures}");
 }
+
+#[test]
+fn an_edit_in_a_body_of_a_macro_heavy_file_sets_nothing_the_def_map_reads() {
+    let text = |body: &str| {
+        format!(
+            "
+fn f() {{{body}}}
+
+m!(X);
+macro_rules! m2 {{
+    ($ident:ident) => {{
+        fn f2() {{
+            $ident + $ident;
+        }};
+    }}
+}}
+m2!(X);
+
+#[proc_macros::identity]
+#[derive(proc_macros::DeriveIdentity)]
+pub struct S {{}}
+"
+        )
+    };
+    let fx = fixture::db(&format!(
+        r"
+//- proc_macros: identity, derive_identity
+//- /lib.rs
+macro_rules! m {{
+    ($ident:ident) => {{
+        fn fm() {{
+            $ident + $ident;
+        }};
+    }}
+}}
+mod foo;
+
+//- /foo/mod.rs
+pub mod bar;
+
+//- /foo/bar.rs
+{}",
+        text("")
+    ));
+    let file = fx.files().last().expect("the fixture's files").file_id(fx.db());
+    let mut db = fx.into_db();
+    let krate = crate::test_db::TestDBExt::fetch_test_crate(&db);
+    crate_local_def_map(&db, krate);
+    let before = super::publish::Slices::of(&db, krate);
+    let extra = krate.extra_data(&db).clone();
+
+    db.set_file_text(file, &text("0"));
+    let after = super::publish::Slices::of(&db, krate);
+    assert_eq!(before.differing(&after), Vec::<&str>::new(), "fields of the crate's resolution set");
+    assert_eq!(*krate.extra_data(&db), extra, "the crate's extra data");
+}

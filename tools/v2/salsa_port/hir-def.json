@@ -1,6 +1,6 @@
 {
  "crate": "crates/hir-def",
- "base": "b8c752e457596472d86888086afc758ecfcb8f38",
+ "base": "fd6947867d60c44cd95f580924a79f2acb08bdae",
  "files": [
   {
    "path": "crates/hir-def/src/attrs.rs",
@@ -390,6 +390,14 @@
      "new": "/// the query database backdated it would list differently) and the rest the same, `unresolved` and the maps\n"
     },
     {
+     "old": "            // orders `None` first, then by index and generation.\n",
+     "new": "            // orders `None` first, then by its id's `as_u32`.\n"
+    },
+    {
+     "old": "                            1u128 << 64 | u128::from(radix::pack_32(id.index(), id.generation()))\n",
+     "new": "                            1u128 << 64 | u128::from(id.as_u32())\n"
+    },
+    {
      "old": "    /// A salsa id of no database: the scope only packs and compares it.\n",
      "new": "    /// An id of no database: the scope only packs and compares it.\n"
     },
@@ -509,6 +517,14 @@
     {
      "old": "const _: () = assert!(size_of::<MacroRulesLoc>() == 28);\n",
      "new": "const _: () = assert!(size_of::<MacroRulesLoc>() == 20);\n"
+    },
+    {
+     "old": "// 32 bytes per proc macro (module 8, `AstId` 16, expander 4, kind 1, edition 1, 2 of padding);\n",
+     "new": "// 24 bytes per proc macro (module 4, `AstId` 12, expander 4, kind 1, edition 1, 2 of padding);\n"
+    },
+    {
+     "old": "const _: () = assert!(size_of::<ProcMacroLoc>() == 32);\n",
+     "new": "const _: () = assert!(size_of::<ProcMacroLoc>() == 24);\n"
     },
     {
      "old": "    /// deleted it, salsa panics or gives the fields of another `BlockId`; it is never UB\n    /// (salsa's `FromId` is safe for every lifetime).\n",

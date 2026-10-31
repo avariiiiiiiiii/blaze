@@ -583,9 +583,9 @@ impl Hash for ProcMacroLoc {
     }
 }
 
-// 32 bytes per proc macro (module 8, `AstId` 16, expander 4, kind 1, edition 1, 2 of padding);
+// 24 bytes per proc macro (module 4, `AstId` 12, expander 4, kind 1, edition 1, 2 of padding);
 // hashed in 4 Fx rounds (module, file, expander, the rest in one word).
-const _: () = assert!(size_of::<ProcMacroLoc>() == 32);
+const _: () = assert!(size_of::<ProcMacroLoc>() == 24);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, blaze_query::Value)]
 pub enum LoweringMode {

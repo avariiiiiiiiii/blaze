@@ -454,7 +454,7 @@ pub struct L;
     let lib = *all_crates(&loaded.db).iter().find(|it| **it != main).expect("the crate `lib`");
     let map = crate_local_def_map(&loaded.db, lib).def_map(&loaded.db);
     assert!(map.module(&loaded.db, map.root).scope(&loaded.db).type_(&name("L")).is_some(), "`lib` is maintained");
-    base_db::set_all_crates_with_durability(&mut loaded.db, [main], salsa::Durability::LOW);
+    base_db::set_all_crates_with_durability(&mut loaded.db, [main], blaze_query::db::Durability::LOW);
     let db = &loaded.db;
     let map = crate_local_def_map(db, main).def_map(db);
     assert!(map.module(db, map.root).scope(db).type_(&name("M")).is_some(), "`main` is still maintained");

@@ -1525,14 +1525,14 @@ impl ItemScope {
             // The position last keeps a def's names in column order, which is the order
             // `name_of` (the first) and `names_of` (the first `Some`) answer in.
             // `(at >> 30, it.def_tag, it.def, at & POS_MASK)` packed in order: an `Option<Id>`
-            // orders `None` first, then by index and generation.
+            // orders `None` first, then by its id's `as_u32`.
             scratch::with_u32s(|spare| {
                 radix::sort_copy_by_key_in(
                     all,
                     |&at| {
                         let it = self.entry_at(at);
                         let def = it.def.map_or(0, |id| {
-                            1u128 << 64 | u128::from(radix::pack_32(id.index(), id.generation()))
+                            1u128 << 64 | u128::from(id.as_u32())
                         });
                         u128::from(at >> 30) << 97
                             | u128::from(it.def_tag) << 89

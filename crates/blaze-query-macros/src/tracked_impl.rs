@@ -210,17 +210,14 @@ fn method_query(
     let output = Both::of(&output, &db_lt);
 
     let name = &sig.ident;
-    // `NAME` is what `Db::log` expectations and the kind tables hold: the self type's tokens
-    // (`Modules < 'db >`) and the body's name (`module_`).
+    // `NAME` is what the kind tables and `Db::log` expectations hold: `SelfTy::method`, the
+    // type's name without its generics (`Modules::module`), or `self_ty`'s text when given.
     // alloc: expansion time, once per annotated item; no query runs this
     let inner_name = hygiene.ident(&name.to_string());
     let struct_name = format_ident!("{type_name}_{name}");
-    let named_ty = options.self_ty.as_ref().unwrap_or(&self_ty);
-    let query_name = quote!(::core::concat!(
-        ::core::stringify!(#named_ty),
-        "::",
-        ::core::stringify!(#inner_name)
-    ));
+    let named = options.self_ty.as_ref().map_or_else(|| quote!(#type_name), |it| quote!(#it));
+    let query_name =
+        quote!(::core::concat!(::core::stringify!(#named), "::", ::core::stringify!(#name)));
     // clone: expansion time, the argument names, used again after the query takes the arguments
     let idents: Vec<syn::Ident> = query_args.iter().map(|it| it.ident.clone()).collect();
     let call = if has_self {

@@ -805,10 +805,13 @@ impl<'db> Cx<'db> {
         let mut f = Form::new("hidden types");
         f.len(count);
         for index in 0..count as u32 {
+            // A caller that sees through the opaque then reads impls and methods by the hidden
+            // type's items' keys, so the hidden type is by name as well as by content.
             match self.hidden(owner, index) {
                 Some(hidden) => {
                     f.u8(1);
                     self.ty_in(&mut f, hidden);
+                    self.names_of_ty(&mut f, hidden);
                 }
                 None => f.u8(0),
             }
@@ -835,7 +838,19 @@ impl<'db> Cx<'db> {
             f.error(Missed::ErrorType);
             return f;
         };
-        self.ty_in(&mut f, hidden);
+        // Where the opaque has a type or const parameter, whether an auto trait holds for it at
+        // given arguments (`Vec<T>` or `Rc<T>` at `T = u8`) is more than whether it holds at the
+        // parameters: the hidden type itself is the fact, by name as well as by content, as an
+        // auto trait's impls are of a type by its key. Lifetimes change no answer, as an auto
+        // trait's impls are fully generic.
+        let generic = hir_ty::generics::generics(db, def)
+            .iter(false)
+            .any(|(id, _)| !matches!(id, GenericParamId::LifetimeParamId(_)));
+        f.bool(generic);
+        if generic {
+            self.ty_in(&mut f, hidden);
+            self.names_of_ty(&mut f, hidden);
+        }
         let krate = owner.krate(db);
         let traits = loaded_auto_traits(db, krate);
         f.len(traits.len());

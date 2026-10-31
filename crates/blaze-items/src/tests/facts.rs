@@ -349,6 +349,7 @@ impl A { fn n(&self) {} }
 fn a_drop_impl_changes_drop_check() {
     let (mut db, file) = single(
         r#"
+#![feature(lang_items)]
 #[lang = "drop"]
 pub trait Drop { fn drop(&mut self); }
 struct S;
@@ -360,6 +361,7 @@ struct S;
         &mut db,
         file,
         r#"
+#![feature(lang_items)]
 #[lang = "drop"]
 pub trait Drop { fn drop(&mut self); }
 struct S;

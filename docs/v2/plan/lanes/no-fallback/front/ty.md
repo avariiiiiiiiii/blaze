@@ -123,12 +123,12 @@ request (see the report).
 | `infer/path.rs:98,189` invalid `Self` reference, first segment unresolved | E0411 / E0433 |
 | `infer/closure.rs:512` closure signature deduction obligations dropped | rule: rustc drops them too (`deduce_sig_from_projection` "may discard the goal") |
 | `method_resolution.rs:219` a private method picked | rule: E0624 is reported by blaze-diagnostics `lower/private_assoc_item.rs` from the pick |
-| `method_resolution/probe.rs:411` autoderef reached the recursion limit while probing | E0055 `report_autoderef_recursion_limit_error` (emitted nowhere) |
-| `method_resolution/probe.rs:425` method on a raw pointer to an unknown pointee, edition 2018+ | E0699 `MethodCallOnUnknownRawPointee` (the 2015 lint `tyvar_behind_raw_pointer` too) |
-| `method_resolution/probe.rs:451` self type still a var | rule: E0282 is reported at writeback for a var still unresolved (`TypeMustBeKnown`); rustc reports it here, earlier |
+| `method_resolution/probe.rs:411` autoderef reached the recursion limit while probing | E0055 `report_autoderef_recursion_limit_error`. **Done**: `InferenceDiagnostic::AutoderefRecursionLimit`, reported by every inference walk (the table's, `place_op`, `callee`, coercion) as rustc's `Autoderef::next` does, and by the probe from its steps. The walk's limit was a hard-coded 20, so a receiver more than 20 derefs deep got no method; it is now the crate's `recursion_limit` (128 by default) |
+| `method_resolution/probe.rs:425` method on a raw pointer to an unknown pointee, edition 2018+ | E0282 with rustc's label (E0699 is no longer emitted). **Done**: the edition test was backwards (2018+ went on silently, 2015 errored); now `MethodOnUnknownRawPointee` from 2018. Open: the 2015 warn-by-default lint `tyvar_behind_raw_pointer` |
+| `method_resolution/probe.rs:451` receiver that derefs to a type variable | E0282 from `probe_op`. **Done**: `TypeMustBeKnown` at the call, unless the body is already tainted. Before, a variable resolved later in the body left the failed call unreported |
 | `method_resolution/confirm.rs:619` | rule: the allow-by-default `supertrait_item_shadowing_usage` lint; no program meaning |
-| `infer/pat.rs:594` deref pattern past the recursion limit | E0055 |
+| `infer/pat.rs:594` deref pattern past the recursion limit | E0055. **Done**: `AutoderefRecursionLimit` at the pattern |
 | `infer/pat.rs:1053` a path pattern naming a function, static, local or generic | E0532 / E0530 / E0158. **Done**: `NotAStructPath` with `StructPathFound::Def`. Open: a `Self` that is not a struct (`infer/path.rs:98`) |
-| `infer/pat.rs:1426,1464,1501` `&mut` pattern on an inherited shared ref (`ref_pat_eat_one_layer_2024*` only) | E0308 |
+| `infer/pat.rs:1426,1464,1501` `&mut` pattern on an inherited shared ref (`ref_pat_eat_one_layer_2024*` only) | E0308. **Done**: `InheritedRefMutabilityMismatch` |
 | `infer/expr.rs:1259,1351` missing fields | rule: E0063 is reported by blaze-diagnostics `lower/missing_fields.rs` |
-| `infer/expr.rs:2319` `Fn*` call whose `Args` is not a tuple (`unboxed_closures` only) | E0059 |
+| `infer/expr.rs:2319` `Fn*` call whose `Args` is not a tuple (`unboxed_closures` only) | E0059. **Done**: `FnTraitArgsNotTuple` |

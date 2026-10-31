@@ -199,20 +199,24 @@ fn what_a_request_did_is_one_json_line_of_blazes() {
         link: blaze_api::LinkKind::Patched,
         found: 3,
         green: 40,
+        links: vec![blaze_api::Linked { how: blaze_api::LinkHow::Spliced, path: "target/debug/foo".to_owned() }],
         reran: 2,
         served: Vec::new(),
         compiled: 1,
         critical_path_us: 1500,
     };
     let json = Shown { format: Format::Json { short: false, ansi: false, render_diagnostics: false }, ..Shown::default() };
-    let (out, _) = printed(json, &[Response::Work(worked.clone()), Response::Done { ok: true }], true);
+    let (out, err) = printed(json, &[Response::Work(worked.clone()), Response::Done { ok: true }], true);
     assert_eq!(
         out,
         "{\"reason\": \"blaze-work\", \"reran\": 2, \"green\": 40, \"compiled\": 1, \"found\": 3, \"link\": \
-         \"patched\", \"critical_path_us\": 1500}\n{\"reason\":\"build-finished\",\"success\":true}\n"
+         \"patched\", \"critical_path_us\": 1500, \"links\": [{\"path\": \"target/debug/foo\", \"how\": \
+         \"spliced\", \"why\": []}]}\n{\"reason\":\"build-finished\",\"success\":true}\n"
     );
-    let (out, _) = printed(Shown::default(), &[Response::Work(worked), Response::Done { ok: true }], true);
-    assert_eq!(out, "", "under the human format it is not printed");
+    assert!(err.starts_with("link: target/debug/foo (spliced)\n"), "{err}");
+    let (out, err) = printed(Shown::default(), &[Response::Work(worked), Response::Done { ok: true }], true);
+    assert_eq!(out, "", "under the human format the work line is not printed");
+    assert!(err.starts_with("link: target/debug/foo (spliced)\n"), "but how it linked is: {err}");
 }
 
 #[test]
@@ -222,6 +226,7 @@ fn each_dependency_crate_is_one_served_line_after_the_work() {
         link: blaze_api::LinkKind::Placed,
         found: 0,
         green: 0,
+        links: Vec::new(),
         reran: 1,
         served: vec![
             ServedCrate { why: None, bodies: ServedPart::Served, outcome: ServedPart::Served, package: "itoa".to_owned() },
@@ -241,7 +246,7 @@ fn each_dependency_crate_is_one_served_line_after_the_work() {
         out,
         concat!(
             "{\"reason\": \"blaze-work\", \"reran\": 1, \"green\": 0, \"compiled\": 0, \"found\": 0, \"link\": \
-             \"placed\", \"critical_path_us\": 7}\n",
+             \"placed\", \"critical_path_us\": 7, \"links\": []}\n",
             "{\"reason\": \"blaze-served\", \"package\": \"itoa\", \"outcome\": \"served\", \"bodies\": \"served\", \
              \"why\": null}\n",
             "{\"reason\": \"blaze-served\", \"package\": \"serde\", \"outcome\": \"checked\", \"bodies\": \"refused\", \

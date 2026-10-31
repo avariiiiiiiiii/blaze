@@ -123,6 +123,7 @@ fn infer(db: &TestDB, function: FunctionId) {
 }
 
 const DROP: &str = r#"
+#![feature(lang_items)]
 #[lang = "drop"]
 pub trait Drop {
     fn drop(&mut self);
@@ -177,7 +178,7 @@ fn method_db() -> (TestDB, FileId, FunctionId) {
 fn a_method_of_another_name_leaves_the_lookup() {
     let (mut db, impl_file, caller) = method_db();
     let cold = db.log_executed(|| infer(&db, caller));
-    assert!(ran(&cold, "::for_body"), "{cold:#?}");
+    assert!(ran(&cold, "infer_body_query"), "{cold:#?}");
     assert!(ran(&cold, "impl_value_item"), "{cold:#?}");
 
     db.set_file_text(
@@ -186,7 +187,7 @@ fn a_method_of_another_name_leaves_the_lookup() {
     );
     let warm = db.log_executed(|| infer(&db, caller));
     assert!(ran(&warm, "impl_value_item"), "{warm:#?}");
-    assert!(!ran(&warm, "::for_body"), "{warm:#?}");
+    assert!(!ran(&warm, "infer_body_query"), "{warm:#?}");
 }
 
 #[test]
@@ -196,7 +197,7 @@ fn removing_the_method_reruns_the_lookup() {
 
     db.set_file_text(impl_file, "pub struct A;\nimpl A {\n    pub fn k(&self) {}\n}\n");
     let warm = db.log_executed(|| infer(&db, caller));
-    assert!(ran(&warm, "::for_body"), "{warm:#?}");
+    assert!(ran(&warm, "infer_body_query"), "{warm:#?}");
 }
 
 const SPECIALIZING: &str = "#![feature(specialization)]
@@ -425,14 +426,14 @@ fn a_constant_added_to_the_impl_leaves_its_bodies() {
     let (mut db, file) = single_file(&format!("{ATPIT}}}\n"));
     let m = impl_function_named(&db, "m");
     let cold = db.log_executed(|| infer(&db, m));
-    assert!(ran(&cold, "::for_body"), "{cold:#?}");
+    assert!(ran(&cold, "infer_body_query"), "{cold:#?}");
     assert!(ran(&cold, "impl_type_aliases"), "{cold:#?}");
 
     db.set_file_text(file, &format!("{ATPIT}    const C: u32 = 0;\n}}\n"));
     let m = impl_function_named(&db, "m");
     let warm = db.log_executed(|| infer(&db, m));
     assert!(ran(&warm, "impl_type_aliases"), "{warm:#?}");
-    assert!(!ran(&warm, "::for_body"), "{warm:#?}");
+    assert!(!ran(&warm, "infer_body_query"), "{warm:#?}");
 }
 
 #[test]
@@ -444,7 +445,7 @@ fn an_associated_type_added_to_the_impl_reruns_its_bodies() {
     db.set_file_text(file, &format!("{ATPIT}    type X = u32;\n}}\n"));
     let m = impl_function_named(&db, "m");
     let warm = db.log_executed(|| infer(&db, m));
-    assert!(ran(&warm, "::for_body"), "{warm:#?}");
+    assert!(ran(&warm, "infer_body_query"), "{warm:#?}");
 }
 
 const TABLES: &str = r#"
@@ -860,7 +861,7 @@ fn a_trait_method_of_another_name_leaves_the_lookup() {
     db.set_file_text(trait_file, &added);
     let warm = db.log_executed(|| infer(&db, caller));
     assert!(!ran(&warm, "in_crate_trait_value_items"), "{warm:#?}");
-    assert!(!ran(&warm, "::for_body"), "{warm:#?}");
+    assert!(!ran(&warm, "infer_body_query"), "{warm:#?}");
 }
 
 #[test]
@@ -870,7 +871,7 @@ fn removing_the_trait_method_reruns_the_lookup() {
 
     db.set_file_text(trait_file, &TRAIT_DEF.replace("fn m(&self);", "fn k(&self);"));
     let warm = db.log_executed(|| infer(&db, caller));
-    assert!(ran(&warm, "::for_body"), "{warm:#?}");
+    assert!(ran(&warm, "infer_body_query"), "{warm:#?}");
 }
 
 const SPECIALIZED_CHAIN: &str = r#"//- /dep.rs crate:dep

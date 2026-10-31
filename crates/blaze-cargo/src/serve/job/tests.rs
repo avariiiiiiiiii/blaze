@@ -65,6 +65,11 @@ fn work_is_placed_whole_when_any_link_was() {
     assert_eq!(link_kind(&[link(Linking::Spliced), link(Linking::Spliced)]), LinkKind::Patched);
     assert_eq!(link_kind(&[link(Linking::Spliced), link(Linking::First)]), LinkKind::Placed);
     assert_eq!(link_kind(&[link(Linking::Full(Full::NotIncremental))]), LinkKind::Placed);
+
+    use blaze_api::LinkHow;
+    assert_eq!(Linking::Spliced.how(), LinkHow::Spliced);
+    assert_eq!(Linking::First.how(), LinkHow::First);
+    assert_eq!(Linking::Full(Full::NotIncremental).how(), LinkHow::Full { why: vec!["not incremental".to_owned()] });
 }
 
 #[test]

@@ -64,8 +64,8 @@ use crate::{
         col::{Col, SlabLayout, SlabWriter},
         columns::{self, Frozen, HirColumns},
         persist::{
-            Code, Column, Node, Placed, Read, Words, WordsRec, blank_segments, names_blank,
-            syntax_context, with_slots,
+            Code, Column, Node, Placed, Read, Words, WordsRec, blank_segments, lifetime_index,
+            names_blank, syntax_context, with_slots,
         },
     },
     lang_item::LangItemTarget,
@@ -1709,7 +1709,13 @@ fn get_label((): (), r: &mut Read<'_>) -> Result<Label, FormatError> {
 fn put_lifetime(lifetime: &LifetimeRef, w: &mut Words) -> u32 {
     let kind = match lifetime {
         LifetimeRef::Named(name) => {
-            w.put(name);
+            match lifetime_index(name) {
+                Some(at) => {
+                    w.str("");
+                    w.u32(at);
+                }
+                None => w.put(name),
+            }
             LifetimeRefKind::Named
         }
         LifetimeRef::Static => LifetimeRefKind::Static,

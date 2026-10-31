@@ -121,6 +121,8 @@ impl<'db, 'f> InferenceContext<'db, 'f> {
             call_span: call_expr.into(),
             receiver_span: receiver.into(),
             frame: self.frame,
+            // A second probe of a call the first already reported for.
+            errors: None,
         };
         ctx.probe_for_name(Mode::MethodCall, name, self_ty)
     }

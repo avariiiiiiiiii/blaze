@@ -2328,6 +2328,8 @@ impl Sink {
                 self.word(49);
                 self.span(*span);
             }
+            D::InheritedRefMutabilityMismatch { pat } => self.words.extend([53, local(*pat)]),
+            D::FnTraitArgsNotTuple { call_expr } => self.words.extend([54, local(*call_expr)]),
         }
     }
 
@@ -3292,6 +3294,8 @@ impl Source<'_> {
                 suggested_limit: self.word()?,
             },
             49 => D::MethodOnUnknownRawPointee { span: self.span()? },
+            53 => D::InheritedRefMutabilityMismatch { pat: self.local()? },
+            54 => D::FnTraitArgsNotTuple { call_expr: self.local()? },
             _ => return Err(self.invalid("an inference diagnostic of no kind")),
         })
     }
@@ -3666,6 +3670,8 @@ mod tests {
                 suggested_limit: 256,
             },
             D::MethodOnUnknownRawPointee { span: Span::PatId(pat(4)) },
+            D::InheritedRefMutabilityMismatch { pat: pat(3) },
+            D::FnTraitArgsNotTuple { call_expr: expr(9) },
             D::BreakOutsideOfLoop { expr: expr(8), is_break: false, bad_value_break: true },
             D::UnlabeledJumpInLabeledBlock { expr: expr(8), is_break: true },
             D::UnlabeledJumpInLabeledBlock { expr: expr(9), is_break: false },

@@ -797,6 +797,19 @@ pub enum InferenceDiagnostic {
         #[type_visitable(ignore)]
         span: Span,
     },
+    /// E0308 "mismatched types" of a `&mut` pattern `pat` matching an inherited shared
+    /// reference (rustc's `error_inherited_ref_mutability_mismatch`, only under
+    /// `ref_pat_eat_one_layer_2024*`): noted "cannot match inherited `&` with `&mut` pattern".
+    InheritedRefMutabilityMismatch {
+        #[type_visitable(ignore)]
+        pat: PatId,
+    },
+    /// E0059 of a call through an `Fn*` trait whose arguments type is not a tuple (only under
+    /// `unboxed_closures`).
+    FnTraitArgsNotTuple {
+        #[type_visitable(ignore)]
+        call_expr: ExprId,
+    },
 }
 
 /// What a struct literal's or pattern's path names instead (`InferenceDiagnostic::NotAStructPath`).
@@ -817,6 +830,9 @@ pub enum StructPathFound {
     AssocType { segment: u32 },
     /// `segment` follows an enum variant, which has no items: E0433.
     AfterVariant { segment: u32 },
+    /// A tuple struct pattern whose last segment, after a type, is this associated function or
+    /// constant of it (`AssocFn` or `AssocConst`): rustc's E0164.
+    TypeRelative(StructPathDef),
 }
 
 /// The kind of item `StructPathFound::Def` names, as rustc's `Res::descr` words it.
@@ -837,6 +853,8 @@ pub enum StructPathDef {
     Static,
     ConstParam,
     Local,
+    AssocFn,
+    AssocConst,
 }
 
 fn not_a_struct_path(
@@ -2934,7 +2952,9 @@ impl<'db, 'f> InferenceContext<'db, 'f> {
 
     /// Whether an error has been reported in this body so far.
     fn tainted_by_errors(&self) -> bool {
-        self.diagnostics.any(InferenceDiagnostic::taints_body) || self.table.has_trait_errors()
+        self.diagnostics.any(InferenceDiagnostic::taints_body)
+            || self.table.has_trait_errors()
+            || !self.table.recursion_limit_errors.is_empty()
     }
 
     fn record_deferred_call_resolution(
@@ -3273,6 +3293,32 @@ impl<'db, 'f> InferenceContext<'db, 'f> {
             });
         }
         self.types.types.error
+    }
+
+    /// rustc's E0282 of a method probe whose receiver derefs to the type variable `ty`
+    /// (`emit_inference_failure_err` from `probe_op`), at the call `span`: not once the body
+    /// has an error, and once per call.
+    pub(crate) fn report_unknown_receiver(&self, span: Span, ty: Ty<'db>, raw_pointer: bool) {
+        let reported = |diagnostic: &InferenceDiagnostic| match diagnostic {
+            InferenceDiagnostic::TypeMustBeKnown { at_point, .. }
+            | InferenceDiagnostic::MethodOnUnknownRawPointee { span: at_point } => *at_point == span,
+            _ => false,
+        };
+        if self.tainted_by_errors() || self.diagnostics.any(reported) {
+            return;
+        }
+        self.push_diagnostic(match raw_pointer {
+            true => InferenceDiagnostic::MethodOnUnknownRawPointee { span },
+            false => InferenceDiagnostic::TypeMustBeKnown {
+                at_point: span,
+                top_term: None,
+                kind: TypeAnnotationNeeded::E0282,
+                ambiguity: None,
+                origin: crate::solver_errors::variable_origin(&self.table.infer_ctxt, ty.into()),
+                named: None,
+                cause: ObligationCauseCode::Misc,
+            },
+        });
     }
 
     pub(crate) fn require_type_is_sized(

@@ -2316,7 +2316,9 @@ impl<'db, 'f> InferenceContext<'db, 'f> {
                 _ => {
                     // Otherwise, there's a mismatch, so clear out what we're expecting, and set
                     // our input types to err_args so we don't blow up the error messages
-                    // FIXME: Emit an error.
+                    if !tuple_type.is_ty_error() {
+                        self.push_diagnostic(InferenceDiagnostic::FnTraitArgsNotTuple { call_expr });
+                    }
                     let mut formal = Vec::with_capacity_in(provided_args.len(), frame);
                     formal.resize(provided_args.len(), self.types.types.error);
                     (formal, None)

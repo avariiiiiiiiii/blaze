@@ -358,11 +358,17 @@ impl<'a, O: Write, E: Write> Printer<'a, O, E> {
             }
             // blaze's own, for the proof harness: what the request did, then what became of each
             // dependency crate's check.
-            ResponseRef::Work(worked) if self.shown.format.json() => {
-                self.to(true)?;
-                // alloc: two texts a request, at its end.
-                self.line.push_str(&blaze_ui::api::work_json(&worked));
-                self.line.push_str(&blaze_ui::api::served_json(&worked.served));
+            // How each image was linked goes to stderr in every format: a link that was not
+            // spliced is never silent.
+            ResponseRef::Work(worked) => {
+                if self.shown.format.json() {
+                    self.to(true)?;
+                    // alloc: two texts a request, at its end.
+                    self.line.push_str(&blaze_ui::api::work_json(&worked));
+                    self.line.push_str(&blaze_ui::api::served_json(&worked.served));
+                }
+                self.to(false)?;
+                blaze_ui::api::link_lines(&mut self.line, &worked.links);
             }
             ResponseRef::Error(error) => {
                 self.to(false)?;

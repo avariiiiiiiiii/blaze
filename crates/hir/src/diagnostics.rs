@@ -261,6 +261,8 @@ diagnostics![AnyDiagnostic<'db> ->
     NotAStructPath<'db>,
     AutoderefRecursionLimit<'db>,
     MethodOnUnknownRawPointee,
+    InheritedRefMutabilityMismatch,
+    FnTraitArgsNotTuple,
     ConstParamTyNotAllowed<'db>,
     ValTreeError<'db>,
     UnplacedDiagnostic<'db>,
@@ -1811,6 +1813,21 @@ pub struct AutoderefRecursionLimit<'db> {
 #[derive(Debug)]
 pub struct MethodOnUnknownRawPointee {
     pub site: SpanSyntax,
+}
+
+/// E0308 "mismatched types" at a `&mut` pattern's prefix matching an inherited shared
+/// reference: noted "cannot match inherited `&` with `&mut` pattern", suggested "replace this
+/// `&mut` pattern with `&`".
+#[derive(Debug)]
+pub struct InheritedRefMutabilityMismatch {
+    pub pat: InFile<ExprOrPatPtr>,
+}
+
+/// E0059 "cannot use call notation; the first type parameter for the function trait is
+/// neither a tuple nor unit", at the call.
+#[derive(Debug)]
+pub struct FnTraitArgsNotTuple {
+    pub call: InFile<ExprOrPatPtr>,
 }
 
 /// rustc's two errors of `check_expr_unsafe_binder_cast`: for `Wrap`, "`wrap_binder!()` can
@@ -3818,6 +3835,12 @@ impl<'db> AnyDiagnostic<'db> {
             }
             InferenceDiagnostic::MethodOnUnknownRawPointee { span } => {
                 MethodOnUnknownRawPointee { site: span_syntax(*span)? }.into()
+            }
+            &InferenceDiagnostic::InheritedRefMutabilityMismatch { pat } => {
+                InheritedRefMutabilityMismatch { pat: pat_syntax(pat)? }.into()
+            }
+            &InferenceDiagnostic::FnTraitArgsNotTuple { call_expr } => {
+                FnTraitArgsNotTuple { call: expr_syntax(call_expr)? }.into()
             }
             InferenceDiagnostic::UnsafeBinderCastOfNonBinder { expr, kind, found } => {
                 UnsafeBinderCastOfNonBinder {

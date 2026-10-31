@@ -566,9 +566,9 @@ def link_kind(text, linked=frozenset()):
     'first link'
     >>> link_kind("link: target/debug/app (first link)\\n", {"target/debug/app"})
     'full link: target/debug/app was linked before and its image was not kept'
-    >>> link_kind("link: a (spliced)\\nlink: b (not spliced: the output changed: exports)\\n")
-    'full link: b: the output changed: exports'
-    >>> failed_link("full link: b: the output changed: exports"), failed_link("first link"), failed_link(None)
+    >>> link_kind("link: a (spliced)\\nlink: b (not spliced: exports, debug)\\n")
+    'full link: b: exports, debug'
+    >>> failed_link("full link: b: exports, debug"), failed_link("first link"), failed_link(None)
     (True, False, False)
     """
     found = links(text)
@@ -768,8 +768,11 @@ def measure(name, spec, backend, runs, work, reference_dir, cold_runs=1, setup_n
 
     def edit_link(kind, step, said):
         """How the build of an edit linked, from what it and the daemon `said`. One that laid an
-        image out whole again ends the project's run there, before the step is timed."""
+        image out whole again, or said no link at all, ends the project's run there, before the
+        step is timed."""
         link = link_kind(said, frozenset(linked))
+        if link is None:
+            raise Failed(f"{name} {backend}: the {kind} {step} said no `link:` line: how it linked is unknown")
         if failed_link(link):
             raise Failed(f"{name} {backend}: the {kind} {step} was not spliced: {link}")
         linked.update(image for image, _ in links(said))

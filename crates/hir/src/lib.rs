@@ -5777,6 +5777,7 @@ impl<'db> Type<'db> {
                 call_span: hir_ty::Span::Dummy,
                 receiver_span: hir_ty::Span::Dummy,
                 frame,
+                errors: None,
             };
             f(&ctx)
         })

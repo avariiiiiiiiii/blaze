@@ -292,32 +292,6 @@ impl<'db, 'f> InferenceContext<'db, 'f> {
         }
         result
     }
-
-    /// rustc's E0282 of a method probe whose receiver derefs to a type variable
-    /// (`emit_inference_failure_err` from `probe_op`): not once the body has an error, and once
-    /// per call.
-    fn report_unknown_receiver(&self, span: Span, ty: Ty<'db>, raw_pointer: bool) {
-        let reported = |diagnostic: &InferenceDiagnostic| match diagnostic {
-            InferenceDiagnostic::TypeMustBeKnown { at_point, .. }
-            | InferenceDiagnostic::MethodOnUnknownRawPointee { span: at_point } => *at_point == span,
-            _ => false,
-        };
-        if self.tainted_by_errors() || self.diagnostics.any(reported) {
-            return;
-        }
-        self.push_diagnostic(match raw_pointer {
-            true => InferenceDiagnostic::MethodOnUnknownRawPointee { span },
-            false => InferenceDiagnostic::TypeMustBeKnown {
-                at_point: span,
-                top_term: None,
-                kind: TypeAnnotationNeeded::E0282,
-                ambiguity: None,
-                origin: crate::solver_errors::variable_origin(&self.table.infer_ctxt, ty.into()),
-                named: None,
-                cause: ObligationCauseCode::Misc,
-            },
-        });
-    }
 }
 
 /// Used by `FnCtxt::lookup_method_for_operator` with `-Znext-solver`.

@@ -284,14 +284,26 @@ pub fn classify(
         ReadKind::Accumulator => return Classified::Refused,
         ReadKind::Input | ReadKind::TrackedStruct | ReadKind::Query => {}
     }
+    let name = listed_name(name);
     match rule_of(db, read, name) {
         Some(rule) => apply(db, def, step, read, name, rule),
         None => Classified::Refused,
     }
 }
 
+/// `name` as [`RULES`] lists it. Salsa names a method of a `#[salsa::tracked] impl` after its
+/// hygienic inner function, the method's name with `_` added (`Body::of_`); a free tracked
+/// function or a field keeps its name.
+pub(crate) fn listed_name(name: &str) -> &str {
+    match name.contains("::") {
+        true => name.trim_end_matches('_'),
+        false => name,
+    }
+}
+
 /// The rule for `name`, if one is had for the ingredient `read` is of.
 pub(crate) fn rule_of(db: &Db, read: salsa::DatabaseKeyIndex, name: &str) -> Option<Rule> {
+    let name = listed_name(name);
     let first = RULES.partition_point(|&(it, _, _)| it < name);
     let same = RULES[first..].iter().take_while(|&&(it, _, _)| it == name);
     let mut file = None;

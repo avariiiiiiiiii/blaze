@@ -191,13 +191,13 @@ impl Walk<'_, '_> {
                     if let AsmOperand::Sym(path) = *operand {
                         let path = store.path_at(path);
                         self.path(store, at, also, path, store.expr_path_hygiene(id))?;
-                        self.collect().on_path(path);
+                        self.gather().on_path(path);
                     }
                 }
             }
             _ => {}
         }
-        store.visit_expr_children(id, self.collect());
+        store.visit_expr_children(id, self.gather());
         self.drain(store, at, also)
     }
 
@@ -219,14 +219,14 @@ impl Walk<'_, '_> {
                     }
                     _ => {}
                 }
-                let collect = self.collect();
+                let collect = self.gather();
                 store.visit_pat_children(pat, collect);
             } else if let Some(ty) = self.types.pop() {
                 let ty = TypeRefId::from_raw(RawIdx::from_u32(ty));
                 if let TypeRef::Path(path) = store.type_ref(ty) {
                     self.path(store, at, also, path, store.type_path_hygiene(ty))?;
                 }
-                let collect = self.collect();
+                let collect = self.gather();
                 store.visit_type_ref_children(ty, collect);
             } else if let Some(lifetime) = self.lifetimes.pop() {
                 self.lifetime(at, &store[LifetimeRefId::from_raw(RawIdx::from_u32(lifetime))]);
@@ -236,7 +236,7 @@ impl Walk<'_, '_> {
         }
     }
 
-    fn collect(&mut self) -> Collect<'_> {
+    fn gather(&mut self) -> Collect<'_> {
         Collect { pats: &mut self.pats, types: &mut self.types, lifetimes: &mut self.lifetimes }
     }
 

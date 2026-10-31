@@ -220,6 +220,20 @@ impl Linking {
     pub(crate) fn placed(self) -> bool {
         !matches!(self, Linking::Spliced)
     }
+
+    /// As [`blaze_api::Worked::links`] says it.
+    pub(crate) fn how(self) -> blaze_api::LinkHow {
+        match self {
+            Linking::First => blaze_api::LinkHow::First,
+            Linking::Spliced => blaze_api::LinkHow::Spliced,
+            // alloc: a name a field that differs, for a link that was not spliced
+            Linking::Full(Full::Output(fields)) => {
+                blaze_api::LinkHow::Full { why: fields.names().map(str::to_owned).collect() }
+            }
+            // alloc: one name, for a link that was not spliced
+            Linking::Full(Full::NotIncremental) => blaze_api::LinkHow::Full { why: vec!["not incremental".to_owned()] },
+        }
+    }
 }
 
 impl std::fmt::Display for Linking {

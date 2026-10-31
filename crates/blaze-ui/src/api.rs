@@ -9,8 +9,8 @@
 use std::fmt;
 
 use blaze_api::{
-    Diagnostic, FetchVerb, How, Level, LinkKind, Ranked, Response, ServedCrate, TestOutcome,
-    TestResult, Traced, Verb, Worked,
+    Diagnostic, FetchVerb, How, Level, LinkHow, LinkKind, Linked, Ranked, Response, ServedCrate,
+    TestOutcome, TestResult, Traced, Verb, Worked,
 };
 use blaze_ids::ContentId;
 use blaze_query::QueryKey;
@@ -85,6 +85,7 @@ pub fn lines_into(out: &mut String, response: &Response, color: bool) {
                 worked.found,
                 worked.critical_path_us
             );
+            link_lines(out, &worked.links);
         }
         Response::CodegenInputs(inputs) => {
             for (instance, code) in inputs {
@@ -375,11 +376,38 @@ pub fn work_json(worked: &Worked) -> String {
         LinkKind::Placed => "placed",
     };
     // alloc: the CLI's, once per request
-    format!(
+    let mut out = format!(
         "{{\"reason\": \"blaze-work\", \"reran\": {}, \"green\": {}, \"compiled\": {}, \
-         \"found\": {}, \"link\": \"{link}\", \"critical_path_us\": {}}}\n",
+         \"found\": {}, \"link\": \"{link}\", \"critical_path_us\": {}, \"links\": [",
         worked.reran, worked.green, worked.compiled, worked.found, worked.critical_path_us
-    )
+    );
+    for (at, it) in worked.links.iter().enumerate() {
+        out.push_str(if at == 0 { "{\"path\": " } else { ", {\"path\": " });
+        quoted(&mut out, &it.path);
+        let (how, why) = match &it.how {
+            LinkHow::First => ("first", &[][..]),
+            LinkHow::Spliced => ("spliced", &[][..]),
+            LinkHow::Full { why } => ("full", &why[..]),
+        };
+        put!(&mut out, ", \"how\": \"{how}\", \"why\": [");
+        for (at, it) in why.iter().enumerate() {
+            if at > 0 {
+                out.push_str(", ");
+            }
+            quoted(&mut out, it);
+        }
+        out.push_str("]}");
+    }
+    out.push_str("]}\n");
+    out
+}
+
+/// One `link: <path> (<how>)` line an image the request linked, in its order: what
+/// `harness/bench.py`'s `link_kind` reads, so it is written in every format.
+pub fn link_lines(out: &mut String, links: &[Linked]) {
+    for it in links {
+        put!(out, "link: {} ({})\n", it.path, it.how);
+    }
 }
 
 /// What became of each dependency crate's check ([`Worked::served`]), as the CLI prints it under
@@ -554,16 +582,55 @@ mod tests {
             compiled: 2,
             found: 40,
             link: LinkKind::Patched,
+            links: Vec::new(),
             critical_path_us: 1500,
         };
         let line = work_json(&worked);
         assert_eq!(
             line,
             "{\"reason\": \"blaze-work\", \"reran\": 12, \"green\": 300, \"compiled\": 2, \
-             \"found\": 40, \"link\": \"patched\", \"critical_path_us\": 1500}\n"
+             \"found\": 40, \"link\": \"patched\", \"critical_path_us\": 1500, \"links\": []}\n"
         );
         let value: serde_json::Value = serde_json::from_str(&line).unwrap();
         assert_eq!(value["link"], "patched");
+    }
+
+    /// Each link is a `link:` line in the form `harness/bench.py`'s `link_kind` reads, and an
+    /// entry of the `blaze-work` line's `links`.
+    #[test]
+    fn each_link_says_how_it_went() {
+        let links = vec![
+            Linked { how: LinkHow::Spliced, path: "target/debug/app".to_owned() },
+            Linked { how: LinkHow::First, path: "target/debug/deps/m.so".to_owned() },
+            Linked {
+                how: LinkHow::Full { why: vec!["exports".to_owned(), "debug".to_owned()] },
+                path: "target/debug/deps/p.so".to_owned(),
+            },
+        ];
+        let mut text = String::new();
+        link_lines(&mut text, &links);
+        assert_eq!(
+            text,
+            "link: target/debug/app (spliced)\n\
+             link: target/debug/deps/m.so (first link)\n\
+             link: target/debug/deps/p.so (not spliced: exports, debug)\n"
+        );
+        let worked = Worked {
+            reran: 0,
+            green: 0,
+            served: Vec::new(),
+            compiled: 0,
+            found: 0,
+            link: LinkKind::Placed,
+            links,
+            critical_path_us: 0,
+        };
+        assert!(lines(&Response::Work(worked.clone()), false).ends_with(&text));
+        let value: serde_json::Value = serde_json::from_str(&work_json(&worked)).unwrap();
+        let spliced = serde_json::json!({"path": "target/debug/app", "how": "spliced", "why": []});
+        assert_eq!(value["links"][0], spliced);
+        assert_eq!(value["links"][2]["how"], "full");
+        assert_eq!(value["links"][2]["why"], serde_json::json!(["exports", "debug"]));
     }
 
     /// One line a crate in the shape `harness/v2/frontend/cases.py` reads, its strings as

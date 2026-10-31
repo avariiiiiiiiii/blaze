@@ -12,6 +12,7 @@ mod infer_vars;
 mod inhabitedness;
 mod layout_errors;
 mod lowering_errors;
+mod probe_errors;
 mod qualifier_resolutions;
 mod ref_mut_bindings;
 mod sizedness;

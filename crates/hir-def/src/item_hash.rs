@@ -13,7 +13,7 @@
 //! that a rename keeps them.
 
 use base_db::{Crate, Db};
-use hir_expand::{MacroCallId, mod_path::ModPath};
+use hir_expand::{MacroCallId, mod_path::ModPath, name::Name};
 use salsa::plumbing::{AsId, FromId};
 use span::SyntaxContext;
 
@@ -139,8 +139,14 @@ fn id<T: FromId>(bits: u64) -> T {
 /// `blank` holds, for each path of the store by [`mod_path_index`], how many of its leading
 /// segments the caller hashes by what they resolve to; they are written empty. Each literal of
 /// `slots` (what a location macro expanded to, whose value the records fill from where the
-/// body is) is written as its kind and type, not its value.
-pub fn portable_body(body: &Body, blank: &[u16], slots: &[ExprId]) -> PortableBody {
+/// body is) is written as its kind and type, not its value. A named lifetime of `lifetimes`
+/// (the owner's lifetime parameters in scope, outermost first) is written as its index there.
+pub fn portable_body(
+    body: &Body,
+    blank: &[u16],
+    slots: &[ExprId],
+    lifetimes: &[Name],
+) -> PortableBody {
     let Body { store, params, self_param } = body;
     let mut table = Relocation::new();
     let mut anonymous_as = Anonymous {
@@ -148,6 +154,8 @@ pub fn portable_body(body: &Body, blank: &[u16], slots: &[ExprId]) -> PortableBo
         blank: blank.to_vec(),
         // alloc: the scope's slots, once per identity of a body that calls a location macro
         slots: slots.iter().map(|it| it.into_raw().into_u32()).collect(),
+        // alloc: the scope's copy of `lifetimes`, once per identity computed
+        lifetimes: lifetimes.to_vec(),
     };
     anonymous_as.slots.sort_unstable();
     // alloc: the one buffer of the body, once per identity computed

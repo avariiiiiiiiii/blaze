@@ -2242,7 +2242,7 @@ pub(crate) mod tests {
         let mut starts: Vec<Vec<u64>> = vec![vec![0]; n];
         let mut bounds: Vec<Vec<u64>> = vec![Vec::new(); n];
         for sym in &obj.symbols {
-            if sym.n_type & macho::N_TYPE.0 != SECT
+            if sym.n_type & macho::N_TYPE != SECT
                 || matches!(sym.name.as_bytes()[0], b'L' | b'l')
                 || sym.n_desc & macho::N_ALT_ENTRY.0 != 0
             {
@@ -2280,7 +2280,7 @@ pub(crate) mod tests {
 
         let mut symbols = Vec::new();
         for sym in &obj.symbols {
-            let (def, kind) = if sym.n_type & macho::N_TYPE.0 == SECT {
+            let (def, kind) = if sym.n_type & macho::N_TYPE == SECT {
                 let s = usize::from(sym.n_sect) - 1;
                 let offset = sym.n_value - obj.sections[s].addr;
                 let j = atom(s, offset);

@@ -19,7 +19,7 @@ blaze-ids.workspace = true
 blaze-source.workspace = true
 rustc-hash.workspace = true
 cargo-platform.workspace = true
-im-rc.workspace = true
+imbl.workspace = true
 semver.workspace = true
 serde = { workspace = true, features = ["derive"] }
 stdx.workspace = true

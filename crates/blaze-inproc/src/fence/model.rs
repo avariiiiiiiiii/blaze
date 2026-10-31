@@ -677,6 +677,11 @@ fn explore(config: Config) -> Result<Explored, String> {
     };
     while let Some(at) = stack.pop() {
         let state = states[at as usize];
+        // Past the free nothing is checked: the daemon steps no more, and liveness asks only
+        // that a freed state be reached.
+        if state.daemon.pc == Dpc::Done {
+            continue;
+        }
         next.clear();
         for thread in 0..MOST_THREADS {
             thread_steps(&state, thread, &config, &mut next);

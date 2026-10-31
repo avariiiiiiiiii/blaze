@@ -172,7 +172,7 @@ fn code_walk<'db>(
 }
 
 #[salsa::tracked(returns(ref))]
-fn start_walk<'db>(db: &'db Db, main: FunctionId) -> Result<Walked, String> {
+fn start_walk(db: &Db, main: FunctionId) -> Result<Walked, String> {
     let env = ParamEnvAndCrate { param_env: ParamEnv::empty(), krate: main.krate(db) };
     scratch(db, env, None, false, |walk| walk.start_shim(main))
 }

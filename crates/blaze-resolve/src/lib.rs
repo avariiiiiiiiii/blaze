@@ -26,6 +26,7 @@ pub mod metadata;
 mod names;
 mod package_id;
 mod package_id_spec;
+mod persistent;
 mod poll;
 mod registry;
 mod resolve;

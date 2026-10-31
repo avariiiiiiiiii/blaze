@@ -461,13 +461,35 @@ fn main() {
 }
 "#;
 
+/// Asserts the scripts `a` and `b` (`how` says what differs) reach the same instances with the
+/// same part of the identity each, and that their `main`s' bodies have the same identity,
+/// naming the first that differs.
+#[track_caller]
+fn same_parts(a: &str, b: &str, how: &str) {
+    let parts = |crates: &str| {
+        let (db, main) = script(crates);
+        hir_ty::attach_db(&db, || {
+            let main_body = blaze_item_hash::identity::identity(&db, main.into()).map_err(|it| it.what);
+            (main_body, crate::walk::identity_parts(&db, main))
+        })
+    };
+    let ((main_a, parts_a), (main_b, parts_b)) = (parts(a), parts(b));
+    assert_eq!(main_a, main_b, "{how}: the identity of `main`'s body (blaze_item_hash)");
+    let names = |parts: &[(String, Result<ContentId, String>)]| parts.iter().map(|it| it.0.clone()).collect::<Vec<_>>();
+    assert_eq!(names(&parts_a), names(&parts_b), "{how}: the instances the walk reaches");
+    for ((name, a), (_, b)) in parts_a.iter().zip(&parts_b) {
+        assert_eq!(a, b, "{how}: the part of the identity of {name}");
+    }
+}
+
 #[test]
 fn a_moved_or_reformatted_script_has_the_same_identity() {
     let first = identity(HELPER_SCRIPT);
-    let moved = identity(&HELPER_SCRIPT.replace("//- /build.rs ", "//- /tools/gen/build.rs "));
+    let moved_text = HELPER_SCRIPT.replace("//- /build.rs ", "//- /tools/gen/build.rs ");
+    same_parts(HELPER_SCRIPT, &moved_text, "moved");
+    let moved = identity(&moved_text);
     assert_eq!(first, moved, "the script's file is not in its identity");
-    let reformatted = identity(
-        r#"
+    let reformatted_text = r#"
 //- /build.rs crate:build_script deps:std
 use std::{env, fs, path::Path};
 
@@ -485,8 +507,9 @@ fn emit(path: &Path, text: &str)
 {
     fs::write(path, text).unwrap();
 }
-"#,
-    );
+"#;
+    same_parts(HELPER_SCRIPT, reformatted_text, "reformatted");
+    let reformatted = identity(reformatted_text);
     assert_eq!(first, reformatted, "whitespace, comments and item order are not in the identity");
 }
 

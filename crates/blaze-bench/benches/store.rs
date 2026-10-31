@@ -1,14 +1,14 @@
 //! The store's hot paths: the key a value is kept under, a put, and a read of the store that finds a value (checked against its content hash) or does
 //! not, of a store committed to disk.
 //!
-//! Every benchmark does the same work on every run, so that tango can pair the binary of a
-//! change with the binary of its base.
+//! Every benchmark does the same work on every run, so that `blaze_bench` can pair the binary of
+//! a change with the binary of its base.
 
 use std::hint::black_box;
 
 use blaze_cas::{Driven, Handle, Key, Kind};
 use blaze_ids::ContentId;
-use tango_bench::{IntoBenchmarks, benchmark_fn, tango_benchmarks};
+use blaze_bench::{IntoBenchmarks, benchmark_fn};
 
 /// What the store holds when the benchmarks read it: a thousand values of 512 bytes.
 const COUNT: usize = 1000;
@@ -78,4 +78,4 @@ fn benchmarks() -> impl IntoBenchmarks {
     ]
 }
 
-tango_benchmarks!(benchmarks());
+blaze_bench::main!(benchmarks());

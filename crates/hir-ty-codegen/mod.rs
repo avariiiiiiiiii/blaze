@@ -895,7 +895,7 @@ fn rows_of(db: &Db, compiled: &CompiledFunction) -> Vec<Row> {
 
 /// The code of a non-generic function.
 #[salsa::tracked(returns(ref))]
-fn compiled_root<'db>(db: &'db Db, func: FunctionId) -> Result<CompiledFunction> {
+fn compiled_root(db: &Db, func: FunctionId) -> Result<CompiledFunction> {
     let _span = tracing::info_span!(target: "blaze", "compiled_root").entered();
     counted::compiles(func.krate(db));
     let _flight = flight::Flight::root(db, func);
@@ -1617,7 +1617,7 @@ type Walked = Vec<(Instance, StoredParamEnvAndCrate)>;
 
 /// The value of a static that rustc exports no symbol for.
 #[salsa::tracked(returns(ref))]
-fn compiled_static<'db>(db: &'db Db, id: StaticId) -> Result<CompiledStatic> {
+fn compiled_static(db: &Db, id: StaticId) -> Result<CompiledStatic> {
     let checked = crate_checks_overflow(db, id.krate(db)).unwrap_or(false);
     let mut cg = Recorder::new(db, &**target()?, selected_target()?, checked);
     let env =
@@ -1741,10 +1741,7 @@ fn written_place(
 /// File, line and column of where a function is declared, from its visibility or `fn` on:
 /// what a pointer to a `#[track_caller]` function reports as its caller, as rustc's shim does.
 #[salsa::tracked]
-fn declaration_location<'db>(
-    db: &'db Db,
-    func: FunctionId,
-) -> Option<(base_db::FileId, u32, u32)> {
+fn declaration_location(db: &Db, func: FunctionId) -> Option<(base_db::FileId, u32, u32)> {
     let source = written_node(db, func.lookup(db));
     location_of(db, source.file_id, written_range(source.value))
 }

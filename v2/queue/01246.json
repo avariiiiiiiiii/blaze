@@ -1,0 +1,28 @@
+{
+  "id": "01246",
+  "from_lane": "query-unify",
+  "owner": "query-unify-port",
+  "paths": [
+    "crates/hir-ty-mir/src/tests/incremental.rs",
+    "crates/hir-def/src/nameres/tests/incremental.rs",
+    "crates/hir-def/src/expr_store/tests/invalidation.rs",
+    "crates/hir-ty-mir/tests/mir/source_maps.rs",
+    "crates/blaze-items/src/tests/narrow.rs",
+    "crates/hir-ty/src/method_resolution/delta/tests/cost.rs"
+  ],
+  "what": "01226 fixed in blaze-query-macros (both trees, tracked_impl.rs): a tracked impl method's NAME is now the contract's `SelfTy::method` (type name without generics, the user's method name; `self_ty` text when given), not the fork's `Modules < 'db >::module_`. That makes the kind tables (hir-ty db.rs ItemBounds::of etc., blaze-item-hash RULES, blaze-items goals.rs) match. In blaze-v2-qu rewrite the ~200 log expectations that copied the fork form, as a recorded replay step: in the listed files replace regex `\"([A-Z][A-Za-z0-9]*)(?: < [^\"]*? >)?::([a-z_0-9]+?)_\"` with `\"\\1::\\2\"` (hir-ty-mir incremental.rs 164, hir-def nameres incremental.rs 28, invalidation.rs 3, source_maps.rs 2; the two doc comments in narrow.rs:33 and cost.rs:77 by hand). Then rg `::[a-z_0-9]+_\"` in crates/ should find nothing.",
+  "state": "open",
+  "created": "2026-10-31T07:11:08Z",
+  "updated": "2026-10-31T07:11:08Z",
+  "taken_by": null,
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-10-31T07:11:08Z",
+      "by": "query-unify",
+      "action": "add",
+      "note": ""
+    }
+  ]
+}

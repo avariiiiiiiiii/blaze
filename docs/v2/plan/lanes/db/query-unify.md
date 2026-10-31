@@ -361,7 +361,9 @@ pub struct MemoryUsage { pub name: &'static str, pub rows: u64, pub row_bytes: u
 /// id and calls this for a field whose type implements it (hir-def lib.rs, hir-ty next_solver/ty.rs).
 pub trait NamesIds { fn names_ids(&self, out: &mut Vec<Id>); }
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
-pub struct View(u32);                            // replaces salsa::Revision; View::as_u32()
+pub struct View(u64);                            // replaces salsa::Revision; View::as_u64(): views opened,
+                                                 // never reused (R17, 01243: rows' 28-bit stamps renumber at
+                                                 // their limit, this count doesn't; caches key on it)
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
 pub struct Durability(u8);                       // LOW = 0, MEDIUM = 1, HIGH = 2; Durability::KINDS = 3
 

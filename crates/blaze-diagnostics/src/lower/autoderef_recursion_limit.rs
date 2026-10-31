@@ -15,7 +15,7 @@ use crate::{
     model::{Diag, Span},
 };
 
-pub(crate) fn lower(cx: &Cx<'_, '_>, d: &hir::AutoderefRecursionLimit<'_>) -> Vec<Found> {
+pub(crate) fn lower<'db>(cx: &Cx<'_, 'db>, d: &hir::AutoderefRecursionLimit<'db>) -> Vec<Found> {
     let at = method_name_span(cx, d.site);
     let ty = cx.ty(&d.ty);
     // alloc: the error's text, for an error hir found

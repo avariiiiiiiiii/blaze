@@ -637,7 +637,7 @@ impl<'d, C: CoffHeader> Reader<'_, 'd, C> {
         let align = alignment(flags).ok_or_else(|| {
             self.err(format_args!(
                 "section {section_name} has alignment bits {:#x}",
-                flags & pe::IMAGE_SCN_ALIGN_MASK.0
+                flags & pe::IMAGE_SCN_ALIGN_MASK
             ))
         })?;
         let base = section_name.split('$').next().unwrap_or_default();
@@ -1172,7 +1172,7 @@ fn alternate(object: &mut Object, from: Name, to: Name) {
 
 /// A COFF section's alignment: 16 when it states none, as the format says.
 pub(super) fn alignment(flags: u32) -> Option<u64> {
-    match (flags & pe::IMAGE_SCN_ALIGN_MASK.0) >> 20 {
+    match (flags & pe::IMAGE_SCN_ALIGN_MASK) >> 20 {
         0 => Some(16),
         bits @ 1..=14 => Some(1 << (bits - 1)),
         _ => None,

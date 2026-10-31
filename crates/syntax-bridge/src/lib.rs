@@ -11,6 +11,7 @@ extern crate rustc_driver as _;
 use std::{
     alloc::{Allocator, Global},
     cell::Cell,
+    collections::VecDeque,
     fmt,
 };
 
@@ -1020,9 +1021,43 @@ where
 }
 
 /// A node's walk as a view, with removals and appends keyed by element id.
+/// The leaves a modified conversion's callback and appends gave, waiting for their place in
+/// its output: as many as the events between two tokens give, which a run of closing nodes
+/// makes as many as the tree is deep. Kept per thread at the most it ever held
+/// (`blaze_mem::scratch`), so a warm conversion allocates nothing for them.
+#[derive(Default)]
+struct PendingLeaves(VecDeque<tt::Leaf>);
+
+thread_local! {
+    static PENDING_LEAVES: Cell<VecDeque<tt::Leaf>> = const { Cell::new(VecDeque::new()) }; // alloc: none, empty
+}
+
+impl blaze_mem::scratch::Shelved for PendingLeaves {
+    fn empty(&mut self) {
+        self.0.clear();
+    }
+
+    fn held(&self) -> usize {
+        self.0.capacity()
+    }
+
+    fn unshelve() -> Option<Self> {
+        let leaves = PENDING_LEAVES.try_with(Cell::take).ok()?;
+        (leaves.capacity() != 0).then_some(PendingLeaves(leaves))
+    }
+
+    fn shelve(self) {
+        // A thread that is ending: the buffer is freed.
+        let _ = PENDING_LEAVES.try_with(|shelf| {
+            let kept = shelf.take();
+            shelf.set(if kept.capacity() >= self.0.capacity() { kept } else { self.0 });
+        });
+    }
+}
+
 struct ViewConverter<'t, SpanMap, OnEvent, A: Allocator + Clone> {
     current: Option<syntax::view::Token<'t>>,
-    current_leaves: SmallVec<[tt::Leaf; 4]>,
+    current_leaves: blaze_mem::scratch::Lent<PendingLeaves>,
     preorder: syntax::view::PreorderWithTokens<'t>,
     range: TextRange,
     punct_offset: Option<(syntax::view::Token<'t>, TextSize)>,
@@ -1059,7 +1094,7 @@ where
             append,
             remove,
             call_site,
-            current_leaves: SmallVec::new(),
+            current_leaves: blaze_mem::scratch::lend(),
             mode,
             on_event,
         };
@@ -1070,7 +1105,7 @@ where
     fn next_token(&mut self) -> Option<syntax::view::Token<'t>> {
         while let Some(ev) = self.preorder.next() {
             let (keep_event, insert_leaves) = (self.on_event)(&mut self.preorder, &ev);
-            self.current_leaves.extend(insert_leaves);
+            self.current_leaves.0.extend(insert_leaves);
             if !keep_event {
                 continue;
             }
@@ -1080,7 +1115,7 @@ where
                         if let syntax::NodeOrToken::Node(node) = element {
                             self.preorder.skip_subtree();
                             if let Some(v) = self.append.remove(&node.id()) {
-                                self.current_leaves.extend(v);
+                                self.current_leaves.0.extend(v);
                             }
                         }
                         continue;
@@ -1091,7 +1126,7 @@ where
                 }
                 WalkEvent::Leave(element) => {
                     if let Some(v) = self.append.remove(&element.id()) {
-                        self.current_leaves.extend(v);
+                        self.current_leaves.0.extend(v);
                     }
                 }
             }
@@ -1184,8 +1219,7 @@ where
             return Some((ViewToken::Punct { token: *punct, offset }, range));
         }
 
-        if !self.current_leaves.is_empty() {
-            let leaf = self.current_leaves.remove(0);
+        if let Some(leaf) = self.current_leaves.0.pop_front() {
             return Some((ViewToken::Leaf(leaf), TextRange::empty(TextSize::new(0))));
         }
 

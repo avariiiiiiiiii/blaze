@@ -35,3 +35,6 @@ Changes, each marked `blaze:`:
    uses only `toml::de::{DeTable, DeValue, DeString}` and `toml::Spanned`, which 1.1.2 has.
 4. The manifests name `[lints.clippy] too_many_arguments = "allow"` (the hegel workspace's
    lints) in place of `[lints] workspace = true`, and turn off target auto-discovery.
+5. `hegeltest-c` asks for `miniz_oxide` 0.9.1 (upstream 0.8), the one `flate2` uses in blaze's
+   lock; `compress_to_vec_zlib` and `decompress_to_vec_zlib_with_limit` are the same in 0.9.
+   Blobs it compressed before still decode (zlib), though the bytes it writes may differ.

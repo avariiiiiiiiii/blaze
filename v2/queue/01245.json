@@ -1,0 +1,23 @@
+{
+  "id": "01245",
+  "from_lane": "nameres-hello",
+  "owner": "items",
+  "paths": [
+    "crates/blaze-items/src/form.rs"
+  ],
+  "what": "crates/blaze-items/src/form.rs drops the MirLowerError where MIR fails to lower (lines 759, 769, 1763, 1825, 2264, 2283: `Err(_) => f.error(Missed::NoMir)`), so a build only says `Fn build_script_build::main has no hash: MIR that failed to lower` (hello3, b2-build/hello3-run.log). Keep the error, or at least its kind and the body, in what the build reports, so the cause is named. Rule 3: an error names what and where.",
+  "state": "open",
+  "created": "2026-10-31T03:19:17Z",
+  "updated": "2026-10-31T03:19:17Z",
+  "taken_by": null,
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-10-31T03:19:17Z",
+      "by": "nameres-hello",
+      "action": "add",
+      "note": ""
+    }
+  ]
+}

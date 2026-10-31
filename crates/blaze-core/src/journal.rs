@@ -30,7 +30,7 @@ impl Names {
 
     /// Adds `name` if it is a [`FileName`]'s text; `false`, adding nothing, if not.
     pub fn push_str(&mut self, name: &str) -> bool {
-        let ok = FileName::new(name).is_some() && !name.as_bytes().contains(&0);
+        let ok = FileName::is_valid(name) && !name.as_bytes().contains(&0);
         if ok {
             self.push_unchecked(name);
         }
@@ -40,7 +40,7 @@ impl Names {
     /// Adds `name`, which the caller holds as a [`FileName`]'s text already (a name of a column
     /// that was checked as it was opened): not checked again.
     pub fn push_checked(&mut self, name: &str) {
-        debug_assert!(FileName::new(name).is_some() && !name.as_bytes().contains(&0), "{name:?}");
+        debug_assert!(FileName::is_valid(name) && !name.as_bytes().contains(&0), "{name:?}");
         self.push_unchecked(name);
     }
 
@@ -57,7 +57,7 @@ impl Names {
                     name.split_last().is_some_and(|(nul, name)| {
                         *nul == 0
                             && std::str::from_utf8(name)
-                                .is_ok_and(|it| FileName::new(it).is_some() && !it.contains('\0'))
+                                .is_ok_and(|it| FileName::is_valid(it) && !it.contains('\0'))
                     })
                 }),
             "not names laid out as Names keeps them"
@@ -75,7 +75,7 @@ impl Names {
         }
         self.bytes.extend_from_slice(rest.as_bytes());
         let ok = std::str::from_utf8(&self.bytes[start..])
-            .is_ok_and(|it| FileName::new(it).is_some() && !it.as_bytes().contains(&0));
+            .is_ok_and(|it| FileName::is_valid(it) && !it.as_bytes().contains(&0));
         if ok {
             self.bytes.push(0);
             self.starts.push(u32::try_from(start).expect("names of under 4 GiB"));

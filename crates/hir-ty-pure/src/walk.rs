@@ -225,6 +225,24 @@ pub fn script_purity(db: &Db, main: FunctionId) -> Purity {
     })
 }
 
+/// Each instance the walk from `main` reaches, in walk order, by name with its part of the
+/// identity ([`identity::content`]): what a test names when two scripts' identities differ.
+#[cfg(test)]
+pub(crate) fn identity_parts(
+    db: &Db,
+    main: FunctionId,
+) -> Vec<(String, Result<blaze_ids::ContentId, String>)> {
+    let stored = ParamEnvAndCrate { param_env: ParamEnv::empty(), krate: main.krate(db) }.store();
+    let root = Instance { def: Def::Fn(main), args: GenericArgs::new_from_slice(&[]).store() };
+    let (order, _) = reached(db, &stored, std::iter::once(&root));
+    order
+        .iter()
+        // clone: a test's names and parts; the query's key, reference counts
+        .map(|it| (name_of(db, it), identity::content(db, stored.clone(), it.clone()).clone()))
+        // alloc: a test's list of parts
+        .collect()
+}
+
 /// Every instance `roots` reach, in walk order (depth first, each callee in the order of its
 /// sites, each instance where it is first reached), and each one's place in it.
 fn reached<'a>(

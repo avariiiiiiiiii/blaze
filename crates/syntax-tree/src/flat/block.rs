@@ -146,8 +146,12 @@ impl Block {
 
     /// A block of `size` bytes ([`room`]) holding `held`, which columns are borrowed from.
     pub(super) fn holding(size: usize, held: Bytes) -> Block {
+        // Not `Block { held, ..Block::new(size) }`: that copies the new block's pointer out of a
+        // temporary whose drop then frees it.
+        let mut block = Block::new(size);
         // alloc: the stored bytes' owner, once per tree read in place
-        Block { held: Some(Box::new(held)), ..Block::new(size) }
+        block.held = Some(Box::new(held));
+        block
     }
 
     /// The bytes it holds.
@@ -332,7 +336,9 @@ impl<T: fmt::Debug> fmt::Debug for Col<T> {
 mod tests {
     use std::{mem::size_of, ops::Range};
 
+    use blaze_bytes::Bytes;
     use blaze_ids::rng::SplitMix64;
+    use blaze_mem::{Tag, frame, tag};
 
     use super::{room, Block, Col};
     use crate::{FlatTree, FlatTreeBuilder, SyntaxKind};
@@ -525,5 +531,29 @@ mod tests {
     fn a_column_past_the_room_is_refused() {
         let mut block = Block::new(room::<u32>(0, 3));
         let _ = block.put(&[1u32, 2, 3, 4]);
+    }
+
+    /// A block holding stored bytes owns its allocation: made once and not freed while it
+    /// lives (its tag's line keeps its bytes once the making thread's frees are folded, at
+    /// its end; no other test of this crate makes a block of [`Tag::Fuzz`]), and the column
+    /// it fills reads back what was written after other allocations of its size.
+    #[test]
+    fn a_holding_block_keeps_its_allocation() {
+        let tag = Tag::Fuzz;
+        let before = tag::snapshot().get(tag).live;
+        let (block, col) = std::thread::spawn(move || {
+            frame::task(tag, |_| {
+                let mut block = Block::holding(room::<u64>(0, 64), Bytes::from_static(b"stored"));
+                let col = block.fill(64, |n| n as u64 * 7);
+                (block, col)
+            })
+        })
+        .join()
+        .expect("the thread ran");
+        assert!(block.is_held());
+        assert_eq!(tag::snapshot().get(tag).live, before + block.size() as u64);
+        let others: Vec<Vec<u64>> = (0..16).map(|_| vec![u64::MAX; 64]).collect();
+        assert!(col.iter().enumerate().all(|(n, &it)| it == n as u64 * 7), "overwritten");
+        drop(others);
     }
 }

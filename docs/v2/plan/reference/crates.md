@@ -83,9 +83,8 @@ against `admission::Estimates`; queries read files through `Cx::file` and facts 
 | safety | `crates/hir-ty-ub/`, `crates/blaze-check/`, `fuzz/` |
 
 Every other path (the cargo crate `blaze-new`; `cfg`,
-`edition`, `paths`, `stdx`, `profile`, `toolchain`, `macros`, `rustc_abi`, `test-utils`,
-`blaze-doc`, `blaze-fmt`, `blaze-lints`, `blaze-fuzz`, `blaze-bench`, `blaze-cache`,
-`blaze-cache-macros`, `blaze-wasm`,
+`edition`, `paths`, `stdx`, `macros`, `rustc_abi`, `test-utils`,
+`blaze-doc`, `blaze-fmt`, `blaze-lints`, `blaze-fuzz`, `blaze-bench`, `blaze-wasm`,
 `library/`, `harness/` but `harness/v2/`, `.github/`, `docs/` but the lanes' notes) is the
 coordinator's: a change there is a request.
 

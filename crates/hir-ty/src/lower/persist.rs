@@ -37,7 +37,7 @@ use crate::{
         diagnostics::{
             AssocTypeFailure, AssocTypeQself, ElidedLifetimeSite, GenericArgsProhibitedReason,
             IncorrectGenericsLenKind, MissingLifetimeKind, PathGenericsSource,
-            PathLoweringDiagnostic,
+            PathLoweringDiagnostic, PatternTypeUnsupported,
         },
     },
     next_solver::{
@@ -370,7 +370,7 @@ impl ColdBatch {
 impl Persist for ColdBatch {
     const SCHEMA: SchemaHash = schema_of(&[
         Part::Str("ColdBatch"),
-        Part::U64(4),
+        Part::U64(5),
         Part::Schema(<BatchRoot as Record>::SCHEMA),
     ]);
     type Ref<'a> = ColdBatchRef<'a>;
@@ -899,6 +899,15 @@ pub(crate) fn put_diagnostic(w: &mut Vec<u32>, diagnostic: &TyLoweringDiagnostic
             w.push(8);
             put_local(w, *source);
         }
+        TyLoweringDiagnostic::PatternTypeNotLowered { source, reason } => {
+            w.push(9);
+            put_local(w, *source);
+            w.push(match reason {
+                PatternTypeUnsupported::Pattern => 0,
+                PatternTypeUnsupported::ExclusiveEnd => 1,
+                PatternTypeUnsupported::OpenEnd => 2,
+            });
+        }
     }
 }
 
@@ -914,6 +923,7 @@ pub(crate) fn put_path_diagnostic(w: &mut Vec<u32>, diagnostic: &PathLoweringDia
                 GenericArgsProhibitedReason::Static => 5,
                 GenericArgsProhibitedReason::LocalVariable => 6,
                 GenericArgsProhibitedReason::EnumVariant => 7,
+                GenericArgsProhibitedReason::TypeRelativeVariant => 8,
             };
             w.extend([0, reason, segments.len() as u32]);
             w.extend_from_slice(segments);
@@ -1196,6 +1206,15 @@ impl Words<'_> {
                 TyLoweringDiagnostic::MissingSelfDefaultParams { source, trait_, params }
             }
             8 => TyLoweringDiagnostic::ObjectWithoutTrait { source: self.local()? },
+            9 => TyLoweringDiagnostic::PatternTypeNotLowered {
+                source: self.local()?,
+                reason: match self.u32()? {
+                    0 => PatternTypeUnsupported::Pattern,
+                    1 => PatternTypeUnsupported::ExclusiveEnd,
+                    2 => PatternTypeUnsupported::OpenEnd,
+                    _ => return Err(self.invalid("a pattern type not lowered for no reason")),
+                },
+            },
             _ => return Err(self.invalid("a lowering diagnostic of no kind")),
         })
     }
@@ -1212,6 +1231,7 @@ impl Words<'_> {
                     5 => GenericArgsProhibitedReason::Static,
                     6 => GenericArgsProhibitedReason::LocalVariable,
                     7 => GenericArgsProhibitedReason::EnumVariant,
+                    8 => GenericArgsProhibitedReason::TypeRelativeVariant,
                     _ => return Err(self.invalid("a prohibition of no reason")),
                 };
                 let len = self.u32()? as usize;
@@ -1419,6 +1439,18 @@ mod tests {
                 params: Box::new([TypeParamId::from_unchecked(param)]),
             },
             TyLoweringDiagnostic::ObjectWithoutTrait { source },
+            TyLoweringDiagnostic::PatternTypeNotLowered {
+                source,
+                reason: PatternTypeUnsupported::Pattern,
+            },
+            TyLoweringDiagnostic::PatternTypeNotLowered {
+                source,
+                reason: PatternTypeUnsupported::ExclusiveEnd,
+            },
+            TyLoweringDiagnostic::PatternTypeNotLowered {
+                source,
+                reason: PatternTypeUnsupported::OpenEnd,
+            },
             TyLoweringDiagnostic::InferVarsNotAllowed { sources: Box::new([Span::TypeRefId(source)]) },
             TyLoweringDiagnostic::InferVarsNotAllowed {
                 sources: Box::new([Span::ExprId(Idx::from_raw(RawIdx::from_u32(1))), Span::TypeRefId(source)]),

@@ -294,6 +294,12 @@ impl Storage {
         self.clock() >> 32 != 0
     }
 
+    /// Clears [`Storage::stop_readers`] without a write: with `&mut` no reader is left, so the
+    /// stop did its work. Opens no view and re-verifies nothing.
+    pub fn resume_readers(&mut self) {
+        *self.clock.get_mut() &= !(1 << 32);
+    }
+
     /// Whether [`Storage::stop_readers`] was called since the last write.
     pub fn readers_stopped(&self) -> bool {
         self.stopped()
@@ -346,15 +352,68 @@ impl Storage {
         self.view
     }
 
-    /// Bumps the view, the clock (clearing the stop flag) and the written-field history.
+    /// Bumps the view, the clock (clearing the stop flag) and the written-field history; at
+    /// the last view, renumbers first.
     fn next_view(&mut self, written: Summary) {
-        assert!(self.view < VIEW_MASK, "the query database ran out of views ({VIEW_MASK})");
+        if self.view >= VIEW_MASK {
+            self.renumber();
+        }
         self.view += 1;
         *self.clock.get_mut() = u64::from(self.view | VALUE);
         for at in (1..HISTORY).rev() {
             self.written[at] = or(self.written[at - 1], written);
         }
         self.written[0] = written;
+    }
+
+    /// Renumbers the views at the limit, under `&mut` (no reader, no running row): every view
+    /// stamp in use (the view, `last_changed`, each node's color, each row's verified view and
+    /// `changed`) becomes its rank among them, so every order between two stamps is kept, and
+    /// the view is the largest. The written-field history becomes all ones: a row verified
+    /// before it walks once (a [`super::Reads`] of an old view is never read again: its view
+    /// is past every new one until the next renumbering). `O(stamps log stamps)`, once per
+    /// 2^28 writes.
+    #[cold]
+    fn renumber(&mut self) {
+        // alloc: once per 2^28 views, a stamp per row and node
+        let mut stamps: Vec<u32> = Vec::new();
+        self.restamp(&mut Restamp::Collect(&mut stamps));
+        stamps.sort_unstable();
+        stamps.dedup();
+        assert!(
+            stamps.len() < VIEW_MASK as usize,
+            "the query database ran out of views: all {VIEW_MASK} are stamps still in use"
+        );
+        self.restamp(&mut Restamp::Rank(&stamps));
+        self.written = [ALL; HISTORY];
+    }
+
+    /// Passes every view stamp the storage holds through `restamp`, storing what it gives.
+    fn restamp(&mut self, restamp: &mut Restamp<'_>) {
+        self.view = restamp.apply(self.view);
+        for kind in &mut self.last_changed {
+            *kind = restamp.apply(*kind);
+        }
+        for node in 1..self.nodes_made() {
+            let painted = self.color_of(node);
+            let (verified, changed) = ((painted >> 32) as u32, painted as u32);
+            let verified = if verified < FIELD { restamp.apply(verified) } else { verified };
+            self.repaint(node, color(verified, restamp.apply(changed)));
+        }
+        for index in self.live() {
+            if let Some(rows) = ingredient::vtable(index).and_then(|it| it.restamp) {
+                rows(self, index, restamp);
+            }
+        }
+    }
+
+    /// Starts a fresh storage at view `view`, to test the renumbering near the limit.
+    #[cfg(test)]
+    pub(crate) fn start_at_view(&mut self, view: u32) {
+        assert_eq!(self.nodes_made(), 1, "a fresh storage");
+        self.view = view;
+        self.last_changed = [view; Durability::KINDS];
+        *self.clock.get_mut() = u64::from(view | VALUE);
     }
 
     /// Applies every `lru` cap: with `&mut`, no reader holds a value.
@@ -632,6 +691,29 @@ impl fmt::Debug for Storage {
 pub(crate) trait Table: Send + Sync + Sized + 'static {
     fn new(storage: &Storage, index: u32) -> Self;
     fn pages(&self) -> &Pages;
+}
+
+/// The renumbering's two passes over every view stamp: collect the stamps in use (0, "never",
+/// is not one), then replace each with its rank among them, from 1.
+pub(crate) enum Restamp<'a> {
+    Collect(&'a mut Vec<u32>),
+    /// The stamps in use, sorted, unique.
+    Rank(&'a [u32]),
+}
+
+impl Restamp<'_> {
+    pub(crate) fn apply(&mut self, stamp: u32) -> u32 {
+        match self {
+            _ if stamp == 0 => 0,
+            Restamp::Collect(stamps) => {
+                stamps.push(stamp); // alloc: the renumbering's stamp list, once per 2^28 views
+                stamp
+            }
+            Restamp::Rank(stamps) => {
+                stamps.binary_search(&stamp).expect("a stamp the first pass collected") as u32 + 1
+            }
+        }
+    }
 }
 
 /// The old edge array, while compaction copies spans out of it.

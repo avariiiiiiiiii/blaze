@@ -312,7 +312,6 @@ unicode-normalization = "=0.1.25"
 unicode-security = "=0.1.2"
 
 # Dependencies of one member, moved to the root (dedup, 2026-10-30).
-blaze-cache-macros = { version = "0.1.0", path = "crates/blaze-cache-macros" }
 blaze-cargo = { path = "crates/blaze-cargo" }
 blaze-registry = { path = "crates/blaze-registry" }
 cargo-platform = "0.3.3"
@@ -362,7 +361,7 @@ tokio = "1.54.1"
 toml_edit = { version = "=0.25.12", default-features = false }
 uds_windows = "1.2.1"
 unicode-segmentation = "=1.12.0"
-wasm-encoder = { version = "0.244.0", default-features = false }
+wasm-encoder = { version = "0.263.0", default-features = false }
 winnow = { version = "1.0.4", default-features = false }
 zip = { version = "9.1.3", default-features = false }
 

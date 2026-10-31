@@ -114,6 +114,9 @@ pub struct ProbeErrors<'db> {
     /// E0282: the receiver's autoderef ended at this type variable, with whether it went
     /// through a raw pointer to reach it.
     pub(crate) unknown_receiver: std::cell::Cell<Option<(Ty<'db>, bool)>>,
+    /// `tyvar_behind_raw_pointer`: as `unknown_receiver` through a raw pointer, in edition 2015,
+    /// where rustc lints and goes on.
+    pub(crate) tyvar_behind_raw_pointer: std::cell::Cell<bool>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, blaze_query::Value)]
@@ -289,6 +292,9 @@ impl<'db, 'f> InferenceContext<'db, 'f> {
         }
         if let Some((ty, raw_pointer)) = errors.unknown_receiver.take() {
             self.report_unknown_receiver(call_span, ty, raw_pointer);
+        }
+        if errors.tyvar_behind_raw_pointer.take() {
+            self.lint_tyvar_behind_raw_pointer(call_span);
         }
         result
     }

@@ -510,6 +510,8 @@ pub(crate) fn cancellable<T>(work: impl FnOnce() -> T) -> Result<T, Failed> {
         Err(payload) => {
             if payload.is::<blaze_query::db::Cancelled>() || payload.is::<blaze_graph::Cancelled>() {
                 Err(Failed::Again)
+            } else if let Some(it) = hir_def::nameres::Unmaintained::of_payload(&*payload) {
+                Err(Failed::Error(ApiError::new(it.to_string(), None))) // alloc: an error, once
             } else {
                 std::panic::resume_unwind(payload)
             }

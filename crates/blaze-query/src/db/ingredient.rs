@@ -3,7 +3,10 @@
 
 use std::sync::atomic::{AtomicPtr, AtomicU32, Ordering};
 
-use super::{Id, Storage, storage::Relocate};
+use super::{
+    Id, Storage,
+    storage::{Relocate, Restamp},
+};
 use crate::sync::Mutex;
 
 /// Ingredients a binary may have: the front end has ~600. Node keys give an ingredient 12 bits.
@@ -44,6 +47,9 @@ pub struct Vtable {
     pub(crate) sweep: Option<fn(storage: &mut Storage, ingredient: u32)>,
     /// Moves each of its rows' edge spans into the compacted array.
     pub(crate) relocate: Option<fn(storage: &mut Storage, ingredient: u32, moved: &mut Relocate)>,
+    /// Passes each view stamp its rows hold through `restamp`, storing what it gives: the
+    /// renumbering at the view limit, under `&mut`.
+    pub(crate) restamp: Option<fn(storage: &Storage, ingredient: u32, restamp: &mut Restamp<'_>)>,
     /// Drops its rows and its table.
     pub(crate) drop: fn(storage: &mut Storage, ingredient: u32),
 }

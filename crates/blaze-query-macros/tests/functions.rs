@@ -6,7 +6,7 @@ mod common;
 
 use std::cell::Cell;
 
-use blaze_query::db::{AsId, Cycle, Id, Setter};
+use blaze_query::db::{AsId, Cycle, Database, Durability, Id, Setter};
 use common::{TestDb, keyed_runs, runs};
 
 #[blaze_query_macros::input(debug)]
@@ -153,6 +153,33 @@ fn an_lru_query_evicts_its_values_and_runs_again() {
     assert_eq!(doubled::evict_values(&mut db), 0);
     assert_eq!((doubled(&db, a), doubled(&db, b)), (2, 4));
     assert_eq!(runs(), ["doubled", "doubled"]);
+}
+
+#[blaze_query_macros::tracked(returns(copy), lru = 3)]
+fn tripled(db: &TestDb, source: Source) -> u32 {
+    source.weight(db) * 3
+}
+
+#[test]
+fn an_lru_cap_set_at_runtime_applies_at_the_next_view() {
+    let mut db = TestDb::new();
+    let sources: Vec<Source> = (0..6).map(|i| Source::new(&db, String::new(), i)).collect();
+    let fetch_all = |db: &TestDb| {
+        for (&source, weight) in sources.iter().zip(0..) {
+            assert_eq!(tripled(db, source), weight * 3);
+        }
+    };
+    tripled::set_lru_capacity(&mut db, 5);
+    fetch_all(&db);
+    assert_eq!(runs().len(), 6);
+    db.storage_mut().synthetic_write(Durability::LOW);
+    fetch_all(&db);
+    assert_eq!(runs(), ["tripled"], "five values kept, one evicted and run again");
+
+    tripled::set_lru_capacity(&mut db, 0);
+    db.storage_mut().synthetic_write(Durability::LOW);
+    fetch_all(&db);
+    assert!(runs().is_empty(), "no cap: nothing evicted");
 }
 
 #[blaze_query_macros::tracked(returns(copy), mem_tag = Infer, revisions = usize::MAX)]

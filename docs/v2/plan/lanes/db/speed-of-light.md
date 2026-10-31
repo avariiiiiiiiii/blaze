@@ -2007,6 +2007,19 @@ A "line" is as in the salsa section: a dependent load, 4.5 cycles from L1, 110 n
   thread's walk stack, so the walk has no recursion and allocates nothing once warm. **At the
   bound** on each of the three paths.
 
+### Renumbering the views (at view 2^28 − 1, request 01217)
+
+- **Work:** views are 28 bits of a row's word. At the last one, the next write maps every view
+  stamp in use (the view, `last_changed`, each node's color, each function row's verified view
+  and `changed`) to its rank among them, which keeps every order between two stamps, so every
+  answer stays the same. The written-field history becomes all ones, so each row verified
+  before the renumbering walks its edges once.
+- **Cost:** with \(r\) function rows and \(n\) nodes, two passes collect and rewrite up to
+  \(2n + 2r\) stamps, and a sort and dedup costs \(O(s \log s)\) for \(s\) stamps. At 1M nodes and
+  rows that is about 4M stamps, ≈ 16 MB and ≈ 50 ms on one core. It happens once per 2^28
+  writes, under `&mut`, so ≈ 0.2 ns per write amortized; the hit path doesn't change. Each row
+  then walks once: one verify per row in the next view.
+
 ### Interning a hit (`intern`, `intern_by`)
 
 - **Work:** hash the value, find its row, compare.

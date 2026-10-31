@@ -37,6 +37,23 @@ pub enum TyLoweringDiagnostic {
     /// A trait object whose bounds are only relaxed ones (`dyn ?Sized`), at the first:
     /// E0224. A `dyn` with no trait written at all is the parser's.
     ObjectWithoutTrait { source: TypeRefId },
+    /// The pattern of the pattern type `source` (`#![feature(pattern_types)]`), or one of its
+    /// `|` alternatives, which is not lowered for `reason`.
+    PatternTypeNotLowered { source: TypeRefId, reason: PatternTypeUnsupported },
+}
+
+/// Why a pattern type's pattern is not lowered.
+#[derive(Debug, PartialEq, Eq, Clone, Copy, Hash)]
+pub enum PatternTypeUnsupported {
+    /// Neither a range, `!null` nor `|`: rustc's "pattern not supported in pattern types"
+    /// (`pat_to_ty_pat` in `rustc_builtin_macros/src/pattern_type.rs`).
+    Pattern,
+    /// `a..b`, which rustc's `lower_excluded_range_end` makes `a..=RangeSub::sub_one(b)` with
+    /// an anon const hir-def does not make yet.
+    ExclusiveEnd,
+    /// `a..` or `..=b`, which rustc's `lower_ty_pat_range_end` completes with an anon const of
+    /// `RangeMin::MIN` or `RangeMax::MAX` that hir-def does not make yet.
+    OpenEnd,
 }
 
 /// Where a lifetime is left out.
@@ -80,6 +97,9 @@ pub enum GenericArgsProhibitedReason {
     /// When there is a generic enum, within the expression `Enum::Variant`,
     /// either `Enum` or `Variant` are allowed to have generic arguments, but not both.
     EnumVariant,
+    /// A variant a struct path reaches through a type (`<E>::V`, `Alias::V`, `Self::V`), which
+    /// rustc's `lower_assoc_path` gives no generic arguments.
+    TypeRelativeVariant,
 }
 
 /// A path can have many generic arguments: each segment may have one associated with the

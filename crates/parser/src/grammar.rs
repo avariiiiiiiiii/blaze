@@ -154,9 +154,11 @@ pub(crate) mod entry {
         pub(crate) fn expr(p: &mut Parser<'_>) {
             let m = p.start();
             // With no expression, what was read (attributes of none, `/// x` alone) and its
-            // error are no one tree, so the `ERROR` node holds them.
+            // error are no one tree, so the `ERROR` node holds them. Empty input reads nothing
+            // and leaves the one `ERROR` node of its error.
+            let empty = p.at(EOF);
             let parsed = expressions::expr(p).is_some();
-            if parsed && p.at(EOF) {
+            if (parsed || empty) && p.at(EOF) {
                 m.abandon(p);
                 return;
             }

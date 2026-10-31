@@ -60,6 +60,7 @@ impl Vtable {
             reset: None,
             sweep: None,
             relocate: None,
+            restamp: None,
             drop: drop_table::<T>,
         }
     }

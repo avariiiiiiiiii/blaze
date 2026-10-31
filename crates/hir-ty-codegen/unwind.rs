@@ -6,7 +6,7 @@
 
 use blaze_format::cursor::Reader;
 use cranelift_codegen::{
-    CompiledCode, Context, FinalizedMachExceptionHandler,
+    CompiledCode, Context, MachExceptionHandler,
     gimli::{
         self, RunTimeEndian, SectionId,
         write::{
@@ -128,7 +128,7 @@ impl FunctionUnwind {
         let mut lands = false;
         for call_site in code.buffer.call_sites() {
             for handler in call_site.exception_handlers {
-                let FinalizedMachExceptionHandler::Tag(..) = handler else {
+                let MachExceptionHandler::Tag(..) = handler else {
                     // alloc: the error's message
                     return Err("unexpected exception handler".to_owned());
                 };
@@ -277,9 +277,11 @@ fn call_entries(code: &CompiledCode) -> impl Iterator<Item = CallEntry> + '_ {
         let handlers = call_site.exception_handlers;
         let plain = handlers.is_empty().then_some(CallEntry { start, landing_pad: 0, catch: false });
         let handled = handlers.iter().filter_map(move |handler| match *handler {
-            FinalizedMachExceptionHandler::Tag(tag, landing_pad) => {
-                Some(CallEntry { start, landing_pad, catch: tag.as_u32() == CATCH })
-            }
+            MachExceptionHandler::Tag(tag, landing_pad) => Some(CallEntry {
+                start,
+                landing_pad: landing_pad.as_offset(),
+                catch: tag.as_u32() == CATCH,
+            }),
             _ => None,
         });
         plain.into_iter().chain(handled)

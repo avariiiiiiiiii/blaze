@@ -91,6 +91,10 @@ fn a_method_on_a_raw_pointer_to_an_unknown_type_is_e0282_from_2018() {
         found.iter().any(|it| matches!(it, InferenceDiagnostic::MethodOnUnknownRawPointee { .. })),
         "{found:?}",
     );
+    assert!(
+        !found.iter().any(|it| matches!(it, InferenceDiagnostic::TyvarBehindRawPointer { .. })),
+        "the lint is 2015's: {found:?}",
+    );
 }
 
 #[test]
@@ -104,6 +108,11 @@ fn a_method_on_a_raw_pointer_to_an_unknown_type_only_lints_in_2015() {
         !found.iter().any(|it| matches!(it, InferenceDiagnostic::MethodOnUnknownRawPointee { .. })),
         "{found:?}",
     );
+    let lints = found
+        .iter()
+        .filter(|it| matches!(it, InferenceDiagnostic::TyvarBehindRawPointer { .. }))
+        .count();
+    assert_eq!(lints, 1, "rustc's `tyvar_behind_raw_pointer`, once: {found:?}");
 }
 
 #[test]

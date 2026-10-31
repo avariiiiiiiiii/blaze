@@ -1,0 +1,24 @@
+{
+  "id": "01236",
+  "from_lane": "dedup-bumps",
+  "owner": "coordinator",
+  "paths": [
+    "Cargo.lock",
+    "crates/blaze-wasm/Cargo.lock"
+  ],
+  "what": "In the next round, after the re-lock: cargo update -p getrandom@0.4.2 (to 0.4.3). getrandom 0.4.3 has no wasip2/wasip3 dependency, so wasip3 0.4, wit-bindgen 0.51, wit-bindgen-core/-rust/-rust-macro, wit-component, wit-parser, wasm-metadata and wasm-encoder/wasmparser 0.244 leave the lock. Also re-lock crates/blaze-wasm (excluded; its manifest now asks for wasm-encoder/wasmparser 0.263).",
+  "state": "open",
+  "created": "2026-10-31T02:50:14Z",
+  "updated": "2026-10-31T02:50:14Z",
+  "taken_by": null,
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-10-31T02:50:14Z",
+      "by": "dedup-bumps",
+      "action": "add",
+      "note": ""
+    }
+  ]
+}

@@ -74,7 +74,7 @@ pub use hir_def::{VariantId, expr_store::MissingBodyItemKind, hir::UnsafeBinderC
 pub use hir_expand::BuiltinChild;
 pub use hir_ty::{
     AssocTypeFailure, GenericArgsProhibitedReason, IncorrectGenericsLenKind, MissingLifetimeKind,
-    ReturnKind, StructPathDef, StructPathFound,
+    PatternTypeUnsupported, ReturnKind, StructPathDef, StructPathFound,
     const_param_ty::ConstParamTyReason,
     consteval::CreateConstError,
     diagnostics::{CaseType, IdentType, IncorrectCase},
@@ -179,6 +179,7 @@ diagnostics![AnyDiagnostic<'db> ->
     ConflictingAssocTypeBindings,
     MissingSelfDefaultParams,
     ObjectWithoutTrait,
+    PatternTypeNotLowered,
     InactiveCode,
     IncoherentImpl,
     IncorrectCase,
@@ -261,8 +262,10 @@ diagnostics![AnyDiagnostic<'db> ->
     NotAStructPath<'db>,
     AutoderefRecursionLimit<'db>,
     MethodOnUnknownRawPointee,
+    TyvarBehindRawPointer,
     InheritedRefMutabilityMismatch,
     FnTraitArgsNotTuple,
+    SelfCtorNotTupleOrUnit<'db>,
     ConstParamTyNotAllowed<'db>,
     ValTreeError<'db>,
     UnplacedDiagnostic<'db>,
@@ -1474,6 +1477,13 @@ pub struct ObjectWithoutTrait {
     pub bound: InFile<AstPtr<ast::Type>>,
 }
 
+/// The pattern of the pattern type `ty`, which is not lowered for `reason`.
+#[derive(Debug)]
+pub struct PatternTypeNotLowered {
+    pub ty: InFile<AstPtr<ast::Type>>,
+    pub reason: PatternTypeUnsupported,
+}
+
 #[derive(Debug)]
 pub struct UnionExprMustHaveExactlyOneField {
     pub expr: InFile<ExprOrPatPtr>,
@@ -1815,6 +1825,13 @@ pub struct MethodOnUnknownRawPointee {
     pub site: SpanSyntax,
 }
 
+/// `tyvar_behind_raw_pointer` "type annotations needed" of a method call on a raw pointer to an
+/// unknown pointee in edition 2015, a hard error from 2018.
+#[derive(Debug)]
+pub struct TyvarBehindRawPointer {
+    pub site: SpanSyntax,
+}
+
 /// E0308 "mismatched types" at a `&mut` pattern's prefix matching an inherited shared
 /// reference: noted "cannot match inherited `&` with `&mut` pattern", suggested "replace this
 /// `&mut` pattern with `&`".
@@ -1828,6 +1845,14 @@ pub struct InheritedRefMutabilityMismatch {
 #[derive(Debug)]
 pub struct FnTraitArgsNotTuple {
     pub call: InFile<ExprOrPatPtr>,
+}
+
+/// "the `Self` constructor can only be used with tuple or unit structs", at a `Self`
+/// expression whose impl's `self_ty` has no constructor.
+#[derive(Debug)]
+pub struct SelfCtorNotTupleOrUnit<'db> {
+    pub expr: InFile<ExprOrPatPtr>,
+    pub self_ty: Type<'db>,
 }
 
 /// rustc's two errors of `check_expr_unsafe_binder_cast`: for `Wrap`, "`wrap_binder!()` can
@@ -3836,11 +3861,21 @@ impl<'db> AnyDiagnostic<'db> {
             InferenceDiagnostic::MethodOnUnknownRawPointee { span } => {
                 MethodOnUnknownRawPointee { site: span_syntax(*span)? }.into()
             }
+            InferenceDiagnostic::TyvarBehindRawPointer { span } => {
+                TyvarBehindRawPointer { site: span_syntax(*span)? }.into()
+            }
             &InferenceDiagnostic::InheritedRefMutabilityMismatch { pat } => {
                 InheritedRefMutabilityMismatch { pat: pat_syntax(pat)? }.into()
             }
             &InferenceDiagnostic::FnTraitArgsNotTuple { call_expr } => {
                 FnTraitArgsNotTuple { call: expr_syntax(call_expr)? }.into()
+            }
+            InferenceDiagnostic::SelfCtorNotTupleOrUnit { expr, self_ty } => {
+                SelfCtorNotTupleOrUnit {
+                    expr: expr_syntax(*expr)?,
+                    self_ty: new_ty(self_ty.as_ref()),
+                }
+                .into()
             }
             InferenceDiagnostic::UnsafeBinderCastOfNonBinder { expr, kind, found } => {
                 UnsafeBinderCastOfNonBinder {
@@ -4370,6 +4405,10 @@ impl<'db> AnyDiagnostic<'db> {
             }
             TyLoweringDiagnostic::ObjectWithoutTrait { source } => {
                 ObjectWithoutTrait { bound: Self::type_syntax(*source, source_map)? }.into()
+            }
+            TyLoweringDiagnostic::PatternTypeNotLowered { source, reason } => {
+                PatternTypeNotLowered { ty: Self::type_syntax(*source, source_map)?, reason: *reason }
+                    .into()
             }
         })
     }

@@ -78,9 +78,11 @@ fn executed(db: &mut Db, f: impl FnOnce(&mut Db)) -> Vec<(String, salsa::Id)> {
         .collect()
 }
 
-/// What a write of `text` to `file` of [`FIXTURE`] executed, with the database after it.
+/// What a write of `text` to `file` of [`FIXTURE`] executed, with the database after it. The
+/// def map is read once before it, so [`def_map_reran`] sees a run again, not the first one.
 fn write(file: &str, text: &str) -> (Loaded, Vec<(String, salsa::Id)>) {
     let mut loaded = Loaded::new(FIXTURE);
+    _ = crate_def_map(&loaded.db, loaded.krate());
     let file = loaded.file(file);
     let events = executed(&mut loaded.db, |db| db.set_file_text(file, text));
     (loaded, events)

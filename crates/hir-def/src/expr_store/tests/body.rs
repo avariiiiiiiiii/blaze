@@ -176,7 +176,7 @@ fn every_variant_pretty_prints() {
         EVERY_VARIANT,
         expect![[r#"
             fn main(x, s, v, r) {
-                let _ = const { /* Idx::<Expr>(1) */ };
+                let _ = const { /* Idx::<Expr<'_>>(1) */ };
                 let _ = ("s", "ab", "c\0", 'c', 97u8, true, 3, 1i64, 2u8, 16, 1.5, 2.5f32, 2f64, );
                 let _ = (2, -x, !true, *r, &mut x, &raw x, x as u8, �, );
                 let _ = (x + 1 * 2, x == 1 && true, v[0], s.a, _, include_bytes!(_), );

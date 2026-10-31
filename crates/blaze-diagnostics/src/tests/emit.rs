@@ -425,6 +425,103 @@ For more information about this error, try `rustc --explain E0624`.
     assert_eq!(stderr(&[diag], &File::sources(&[&main, &other]), Style::default()), expected);
 }
 
+// tests/ui/match/postfix-match/pf-match-exhaustiveness.rs: its note points into core, whose
+// source rustc under compiletest doesn't have, so the note is where it is and its label a note.
+#[test]
+fn labels_in_a_file_whose_source_is_not_shown() {
+    let main = File::new(
+        "pf-match-exhaustiveness.rs",
+        r#"#![feature(postfix_match)]
+
+fn main() {
+    Some(1).match { //~ ERROR non-exhaustive patterns
+        None => {},
+    }
+}
+"#,
+    );
+    let option = File {
+        name: "$SRC_DIR/core/src/option.rs".to_owned(),
+        text: "pub enum Option<T> {\n    /// No value.\n    None,\n    /// Some value of type `T`.\n    Some(T),\n}\n"
+            .to_owned(),
+    };
+    let at = main.span("Some(1).match");
+    let mut diag = Diag::error(Some("E0004"), "non-exhaustive patterns: `Some(_)` not covered", at.clone());
+    diag.span_label(at, "pattern `Some(_)` not covered");
+    let mut defined = MultiSpan::of(option.span("pub enum Option<T>"));
+    defined.labels.push((option.span("Some(T)"), "not covered".to_owned()));
+    diag.span_note(defined, "`Option<i32>` defined here");
+    diag.note("the matched value is of type `Option<i32>`");
+    diag.suggestion_verbose(
+        main.span("None => {}").shrink_to_hi(),
+        "ensure that all possible cases are being handled by adding a match arm with a wildcard pattern or an \
+         explicit pattern as shown",
+        "\n        Some(_) => todo!()",
+        Applicability::HasPlaceholders,
+    );
+    let mut sources = File::sources(&[&main]);
+    sources.add_unshown(&option.name, option.text.clone());
+    let expected = text(
+        r#"
+error[E0004]: non-exhaustive patterns: `Some(_)` not covered
+  --> $DIR/pf-match-exhaustiveness.rs:4:5
+   |
+LL |     Some(1).match {
+   |     ^^^^^^^ pattern `Some(_)` not covered
+   |
+note: `Option<i32>` defined here
+  --> $SRC_DIR/core/src/option.rs:LL:COL
+  ::: $SRC_DIR/core/src/option.rs:LL:COL
+   |
+   = note: not covered
+   = note: the matched value is of type `Option<i32>`
+help: ensure that all possible cases are being handled by adding a match arm with a wildcard pattern or an explicit pattern as shown
+   |
+LL ~         None => {},
+LL ~         Some(_) => todo!(),
+   |
+
+error: aborting due to 1 previous error
+
+For more information about this error, try `rustc --explain E0004`.
+"#,
+    );
+    assert_eq!(stderr(&[diag], &sources, Style::default()), expected);
+}
+
+#[test]
+fn a_file_whose_source_is_not_shown_is_placed_but_neither_quoted_nor_spliced() {
+    let main = File::new("main.rs", "fn main() { None::<u8>; }\n");
+    let option = File {
+        name: "$SRC_DIR/core/src/option.rs".to_owned(),
+        text: "pub enum Option<T> {\n    None,\n}\n".to_owned(),
+    };
+    let mut sources = File::sources(&[&main]);
+    sources.add_unshown(&option.name, option.text.clone());
+    assert_eq!(sources.position(&option.name, 25), Some((2, 5)));
+
+    let at = main.span("None");
+    let mut diag = Diag::error(None, "x", at.clone());
+    diag.span_label(at, "here");
+    diag.span_label(option.span("None"), "defined here");
+    let unspliced = emit::written(&diag, &sources, ui(Style::default()));
+    diag.suggestion_verbose(
+        option.span("None"),
+        "a suggestion into a file not shown",
+        "Some",
+        Applicability::MachineApplicable,
+    );
+    assert_eq!(emit::written(&diag, &sources, ui(Style::default())), unspliced);
+    assert!(unspliced.contains(" $SRC_DIR/core/src/option.rs:2:4\n"), "{unspliced}");
+    assert!(!unspliced.contains("LL |     None,"), "{unspliced}");
+    assert!(unspliced.ends_with("   = note: defined here\n\n"), "{unspliced}");
+
+    let json: serde_json::Value = serde_json::from_str(&emit::json(&diag, &sources, Style::default())).unwrap();
+    let defined = &json["spans"][1];
+    assert_eq!((&defined["line_start"], &defined["column_start"]), (&serde_json::json!(2), &serde_json::json!(5)));
+    assert_eq!(defined["text"], serde_json::json!([]));
+}
+
 // tests/ui/rust-2024/unsafe-extern-blocks/extern-items-unsafe.rs, edition 2024
 #[test]
 fn notes_without_spans() {

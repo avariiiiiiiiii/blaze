@@ -36,6 +36,10 @@ const LAYERS: usize = 64;
 const WIDTH: usize = 1024;
 const FAN: usize = EDGES;
 const LEAVES: usize = 4;
+/// Writes a database takes before `verify/deep_unrelated` builds it again: each write opens a
+/// view, and `blaze_query::db` has 2^28 of them, which a run of tens of ns an iteration spends
+/// in seconds.
+const REBUILD: u32 = 1 << 24;
 
 const _: () = assert!(LAYERS * WIDTH * FAN == 1 << 20);
 
@@ -244,6 +248,7 @@ mod fork {
         top: Node,
         other: Other,
         tick: u32,
+        runs: u32,
         pub(crate) expected: u64,
     }
 
@@ -258,13 +263,17 @@ mod fork {
                 .map(|(layer, index)| Node::new(&db, layer, index))
                 .collect();
             let top = nodes[LAYERS * WIDTH];
-            Graph::builder(leaves, nodes).durability(Durability::MEDIUM).new(&db);
+            let _ = Graph::builder(leaves, nodes).durability(Durability::MEDIUM).new(&db);
             let other = Other::builder(0).durability(Durability::MEDIUM).new(&db);
             let expected = node(&db, top);
-            Deep { db, top, other, tick: 0, expected }
+            Deep { db, top, other, tick: 0, runs: 0, expected }
         }
 
         pub(crate) fn run(&mut self) -> u64 {
+            if self.runs == super::REBUILD {
+                *self = Deep::new();
+            }
+            self.runs += 1;
             self.tick ^= 1;
             self.other.set_value(&mut self.db).with_durability(Durability::MEDIUM).to(self.tick);
             node(&self.db, self.top)
@@ -553,6 +562,7 @@ mod engine {
         top: Node,
         other: Other,
         tick: u32,
+        runs: u32,
         pub(crate) expected: u64,
     }
 
@@ -567,13 +577,17 @@ mod engine {
                 .map(|(layer, index)| Node::new(&db, layer, index))
                 .collect();
             let top = nodes[LAYERS * WIDTH];
-            Graph::builder(leaves, nodes).durability(Durability::MEDIUM).new(&db);
+            let _ = Graph::builder(leaves, nodes).durability(Durability::MEDIUM).new(&db);
             let other = Other::builder(0).durability(Durability::MEDIUM).new(&db);
             let expected = node(&db, top);
-            Deep { db, top, other, tick: 0, expected }
+            Deep { db, top, other, tick: 0, runs: 0, expected }
         }
 
         pub(crate) fn run(&mut self) -> u64 {
+            if self.runs == super::REBUILD {
+                *self = Deep::new();
+            }
+            self.runs += 1;
             self.tick ^= 1;
             self.other.set_value(&mut self.db).with_durability(Durability::MEDIUM).to(self.tick);
             node(&self.db, self.top)

@@ -62,7 +62,19 @@ const RESOLVER: &[&str] = &[
 
 /// The queries `f` executed: each ingredient's name and its key's id.
 fn executed(db: &TestDB, f: impl FnOnce()) -> Vec<(String, salsa::Id)> {
-    db.log_in_read_order(f)
+    let events = db.log_in_read_order(f);
+    named(db, events)
+}
+
+/// [`executed`] of a write and what reads after it: every write ends in the nameres
+/// maintainer, which runs the `module_decls` of the modules whose source the write changed.
+fn executed_write(db: &mut TestDB, f: impl FnOnce(&mut Db)) -> Vec<(String, salsa::Id)> {
+    let events = db.log_write_in_read_order(f);
+    named(db, events)
+}
+
+fn named(db: &TestDB, events: Vec<salsa::Event>) -> Vec<(String, salsa::Id)> {
+    events
         .into_iter()
         .filter_map(|event| match event.kind {
             salsa::EventKind::WillExecute { database_key } => Some((
@@ -111,7 +123,7 @@ fn set(paths: &[&str]) -> FxHashSet<String> {
 }
 
 /// A database of [`FIXTURE`] with the new map collected, then `file` set to `text`: the
-/// resolver queries the next collection executes.
+/// resolver queries the write and the next collection execute.
 fn edit(file: usize, text: &str) -> (TestDB, Vec<(String, salsa::Id)>) {
     let fx = fixture::db(FIXTURE);
     let files = fx.files().to_vec();
@@ -119,9 +131,9 @@ fn edit(file: usize, text: &str) -> (TestDB, Vec<(String, salsa::Id)>) {
     let krate = db.fetch_test_crate();
     new_crate_local_def_map(&db, krate);
     let file_id = files[file].file_id(&db);
-    db.set_file_text(file_id, text);
-    let events = executed(&db, || {
-        new_crate_local_def_map(&db, krate);
+    let events = executed_write(&mut db, |db| {
+        db.set_file_text(file_id, text);
+        new_crate_local_def_map(db, krate);
     });
     let mut diff = String::new();
     compare_db(&db, "trace edit", &Exempt::NONE, &mut diff);

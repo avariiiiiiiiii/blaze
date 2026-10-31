@@ -3443,7 +3443,7 @@ pub mod future {
 
     #[test]
     fn choice_layout() {
-        assert_eq!(size_of::<Segment>(), 16);
+        assert_eq!(size_of::<Segment>(), 8);
         assert!(size_of::<Choice>() <= 28);
     }
 

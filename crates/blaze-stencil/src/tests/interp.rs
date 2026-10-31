@@ -70,7 +70,7 @@ fn interpretable(func: &ir::Function) -> ir::Function {
             let xor = cursor.ins().bxor(x, y);
             let one = cursor.ins().iconst(types::I32, 1);
             let half = cursor.ins().ushr(xor, one);
-            cursor.func.dfg.replace(inst).isub(or, half);
+            cursor.func.replace(inst).isub(or, half);
         }
     }
     func

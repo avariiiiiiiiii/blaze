@@ -780,6 +780,23 @@ pub enum InferenceDiagnostic {
         found: StructPathFound,
         ty: Option<StoredTy>,
     },
+    /// E0055: an autoderef walk at `span` (a method call, a field access, a deref pattern)
+    /// went past the crate's recursion limit at `ty`. `suggested_limit` is rustc's: twice the
+    /// limit, 2 for a limit of 0.
+    AutoderefRecursionLimit {
+        #[type_visitable(ignore)]
+        span: Span,
+        ty: StoredTy,
+        #[type_visitable(ignore)]
+        suggested_limit: u32,
+    },
+    /// E0282 of a method called at `span` on a raw pointer whose pointee is still a type
+    /// variable, edition 2018 on, without `arbitrary_self_types` (rustc's label "cannot call a
+    /// method on a raw pointer with an unknown pointee type"; edition 2015 only lints).
+    MethodOnUnknownRawPointee {
+        #[type_visitable(ignore)]
+        span: Span,
+    },
 }
 
 /// What a struct literal's or pattern's path names instead (`InferenceDiagnostic::NotAStructPath`).

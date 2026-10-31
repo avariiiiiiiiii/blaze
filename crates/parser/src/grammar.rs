@@ -153,8 +153,10 @@ pub(crate) mod entry {
 
         pub(crate) fn expr(p: &mut Parser<'_>) {
             let m = p.start();
-            expressions::expr(p);
-            if p.at(EOF) {
+            // With no expression, what was read (attributes of none, `/// x` alone) and its
+            // error are no one tree, so the `ERROR` node holds them.
+            let parsed = expressions::expr(p).is_some();
+            if parsed && p.at(EOF) {
                 m.abandon(p);
                 return;
             }

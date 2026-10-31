@@ -407,8 +407,26 @@ impl<'a, 'db> MethodResolutionContext<'a, 'db> {
         choice: Choice,
         facts: &mut ProbeFacts,
     ) -> Choice::FinalChoice {
-        if steps.reached_recursion_limit {
-            // FIXME: Report an error.
+        if steps.reached_recursion_limit
+            && let Some(errors) = self.errors
+        {
+            self.infcx.probe(|_| {
+                let ty = &steps.steps.last().expect("reached the recursion limit in 0 steps").self_ty;
+                let ty = self
+                    .infcx
+                    .instantiate_query_response_and_region_obligations(
+                        &ObligationCause::new(self.call_span),
+                        self.param_env,
+                        orig_values,
+                        ty,
+                    )
+                    .unwrap_or_else(|_| panic!("instantiating {:?} failed?", ty));
+                let ty = self
+                    .infcx
+                    .deeply_resolve_ignoring_regions(ty.value)
+                    .replace_infer_with_error(self.infcx.interner);
+                errors.recursion_limit.set(Some(ty));
+            });
         }
         facts.cacheable = !steps.reached_recursion_limit && steps.opt_bad_ty.is_none();
 
@@ -417,12 +435,12 @@ impl<'a, 'db> MethodResolutionContext<'a, 'db> {
         if let Some(bad_ty) = &steps.opt_bad_ty {
             if bad_ty.reached_raw_pointer
                 && !self.features.arbitrary_self_types_pointers
-                && self.edition.at_least_2018()
+                && !self.edition.at_least_2018()
             {
                 // this case used to be allowed by the compiler,
                 // so we do a future-compat lint here for the 2015 edition
                 // (see https://github.com/rust-lang/rust/issues/46906)
-                // FIXME: Emit the lint.
+                // FIXME: Emit the lint (`tyvar_behind_raw_pointer`, warn by default).
                 // self.tcx.node_span_lint(
                 //     lint::builtin::TYVAR_BEHIND_RAW_POINTER,
                 //     scope_expr_id,
@@ -448,7 +466,11 @@ impl<'a, 'db> MethodResolutionContext<'a, 'db> {
                 let ty = self.infcx.deeply_resolve_ignoring_regions(ty.value);
                 match ty.kind() {
                     TyKind::Infer(InferTy::TyVar(_)) => {
-                        // FIXME: Report "type annotations needed" error.
+                        let raw_pointer =
+                            bad_ty.reached_raw_pointer && !self.features.arbitrary_self_types;
+                        if let Some(errors) = self.errors {
+                            errors.unknown_receiver.set(Some((ty, raw_pointer)));
+                        }
                     }
                     TyKind::Error(_) => {}
                     _ => panic!("unexpected bad final type in method autoderef"),

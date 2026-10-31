@@ -64,7 +64,7 @@ use crate::{
 /// resolver (`nameres.rs`, without `frozen`, which serves and checks images and is the same for
 /// both). A query of its own, so the tracked structs it makes live in one.
 #[salsa::tracked(returns(ref))]
-pub(super) fn old_crate_local_def_map(db: &Db, krate: Crate) -> DefMapPair<'_> {
+pub(in crate::nameres) fn old_crate_local_def_map(db: &Db, krate: Crate) -> DefMapPair<'_> {
     let root_file_id = krate.root_file_id(db);
     let module_data = ModuleData::new(
         ModuleOrigin::CrateRoot { definition: root_file_id },

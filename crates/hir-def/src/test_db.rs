@@ -30,6 +30,15 @@ pub(crate) trait TestDBExt {
 
     /// The names of the queries `f` executed, in [`TestDBExt::log_in_read_order`]'s order.
     fn executed_in_read_order(&self, f: impl FnOnce()) -> Vec<String>;
+
+    /// [`TestDBExt::log_in_read_order`] of a write and what reads after it: `f` gets the
+    /// database to set inputs on, so the events include what the write-side maintainers ran in
+    /// it ([`Db::log_mut`]). Every write ends in them: what a read once ran first, the write
+    /// runs now.
+    fn log_write_in_read_order(&mut self, f: impl FnOnce(&mut Db)) -> Vec<salsa::Event>;
+
+    /// The names of the queries `f` executed, in [`TestDBExt::log_write_in_read_order`]'s order.
+    fn executed_in_write(&mut self, f: impl FnOnce(&mut Db)) -> Vec<String>;
 }
 
 impl TestDBExt for Db {
@@ -92,6 +101,28 @@ impl TestDBExt for Db {
         let executed = self.log_executed(f);
         set_run_order(order);
         executed
+    }
+
+    fn log_write_in_read_order(&mut self, f: impl FnOnce(&mut Db)) -> Vec<salsa::Event> {
+        let order = set_run_order(RunOrder::LeftToReaders);
+        let events = self.log_mut(f);
+        set_run_order(order);
+        events
+    }
+
+    fn executed_in_write(&mut self, f: impl FnOnce(&mut Db)) -> Vec<String> {
+        let events = self.log_write_in_read_order(f);
+        let db: &Db = self;
+        events
+            .into_iter()
+            .filter_map(|event| match event.kind {
+                salsa::EventKind::WillExecute { database_key } => Some(
+                    salsa::Database::ingredient_debug_name(db, database_key.ingredient_index())
+                        .into_owned(),
+                ),
+                _ => None,
+            })
+            .collect()
     }
 }
 

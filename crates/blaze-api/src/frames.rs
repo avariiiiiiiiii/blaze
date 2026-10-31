@@ -263,7 +263,10 @@ pub fn encode_into<T: Serialize>(
 ) -> Result<(), ApiError> {
     let start = out.len();
     out.extend_from_slice(&[0; 4]);
-    item_into(writer, out, envelope)?;
+    if let Err(error) = item_into(writer, out, envelope) {
+        out.truncate(start);
+        return Err(error);
+    }
     let len = (out.len() - start - 4) as u32;
     out[start..start + 4].copy_from_slice(&len.to_be_bytes());
     Ok(())

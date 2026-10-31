@@ -24,6 +24,9 @@ use crate::{
 pub(crate) struct Checked {
     pub(crate) db: TestDB,
     pub(crate) names: HashMap<FileId, String>,
+    /// Minicore's file, if the fixture has it: core's, whose source rustc under compiletest
+    /// places spans in but doesn't show.
+    pub(crate) core: Option<FileId>,
     pub(crate) diags: Vec<Diag>,
 }
 
@@ -35,10 +38,15 @@ impl Checked {
 
     /// The sources of the fixture's files, by the names diagnostics give them.
     pub(crate) fn sources(&self) -> Sources {
-        let files = self.names.iter().map(|(file, name)| {
-            (name.clone(), self.db.file_text(*file).text(&self.db).as_str().to_owned())
-        });
-        Sources::of(files)
+        let mut sources = Sources::default();
+        for (file, name) in &self.names {
+            let text = self.db.file_text(*file).text(&self.db).as_str().to_owned();
+            match Some(*file) == self.core {
+                true => sources.add_unshown(name, text),
+                false => sources.add(name, Some(text)),
+            }
+        }
+        sources
     }
 
     /// What rustc writes to its stderr: each diagnostic, as text, in order.
@@ -79,19 +87,41 @@ fn paths(fixture: &str) -> Vec<String> {
 pub(crate) fn checked_with(fixture: &str, prefix: &str, options: &Options) -> Checked {
     let fx = fixture::db(fixture);
     let files = fx.files().to_vec();
+    let sysroot = fx.sysroot_files().to_vec();
     let db = fx.into_db();
-    let names: HashMap<FileId, String> = files
+    let mut names: HashMap<FileId, String> = files
         .iter()
         .zip(paths(fixture))
         .map(|(file, path)| (file.file_id(&db), format!("{prefix}{path}")))
         .collect();
+    let (has_core, has_proc_macros) = sysroot_of(fixture);
+    let mut sysroot = sysroot.into_iter();
+    let core = has_core.then(|| sysroot.next().expect("a fixture with minicore has its file"));
+    if let Some(core) = core {
+        names.insert(core, CORE_NAME.to_owned());
+    }
+    if has_proc_macros {
+        let proc_macros = sysroot.next().expect("a fixture with proc macros has their crate's file");
+        names.insert(proc_macros, format!("{prefix}auxiliary/proc_macros.rs"));
+    }
     let diags = hir::attach_db(&db, || {
         hir::check::workspace_crates(&db)
             .into_iter()
             .flat_map(|krate| crate::check::check_crate(&db, krate, Files::new(&names, ""), options))
             .collect()
     });
-    Checked { db, names, diags }
+    Checked { db, names, core, diags }
+}
+
+/// The name minicore's file is shown by: core's root as compiletest names it, the library under
+/// `$SRC_DIR`.
+const CORE_NAME: &str = "$SRC_DIR/core/src/lib.rs";
+
+/// Whether `fixture` has minicore (`//- minicore:`) and the proc macros' crate
+/// (`//- proc_macros:`): the files after its own, in that order.
+fn sysroot_of(fixture: &str) -> (bool, bool) {
+    let says = |meta: &str| fixture.lines().any(|line| line.trim_start().starts_with(meta));
+    (says("//- minicore:"), says("//- proc_macros:"))
 }
 
 /// A frame for a test that makes its own [`crate::Cx`], as a check's task has one.
@@ -172,9 +202,14 @@ pub(crate) fn compiletest(mode: Mode, options: &Options) -> Options {
 }
 
 /// compiletest's normalization of a UI test's output (`runtest.rs`, `normalize_output`) as far
-/// as a one-file crate needs it: tabs shown as `\t`, and the test's `//~` annotations removed
-/// with the white space before them (its regex `\s*//(\[.*\])?~.*`).
+/// as a one-file crate needs it: tabs shown as `\t`, the test's `//~` annotations removed
+/// with the white space before them (its regex `\s*//(\[.*\])?~.*`), and the line and column
+/// of a place in the library as `LL:COL`.
 pub(crate) fn normalized(output: &str) -> String {
+    src_dir_positions(&annotations_removed(output))
+}
+
+fn annotations_removed(output: &str) -> String {
     let output = output.replace('\t', "\\t");
     let mut out = String::with_capacity(output.len());
     let mut rest = output.as_str();
@@ -193,6 +228,51 @@ pub(crate) fn normalized(output: &str) -> String {
     }
     out.push_str(rest);
     out
+}
+
+/// compiletest's `SRC_DIR(.+):\d+:\d+(: \d+:\d+)?` replaced by `SRC_DIR$1:LL:COL`, on each line:
+/// the last line and column after a `SRC_DIR`, and a second pair right after them.
+fn src_dir_positions(output: &str) -> String {
+    let mut out = String::with_capacity(output.len());
+    for line in output.split_inclusive('\n') {
+        let Some(from) = line.find("SRC_DIR").map(|it| it + "SRC_DIR".len() + 1) else {
+            out.push_str(line);
+            continue;
+        };
+        let digits = |at: usize| {
+            let n = line.get(at..)?.bytes().take_while(u8::is_ascii_digit).count();
+            (n > 0).then_some(at + n)
+        };
+        // `\d+:\d+` from `at`: where it ends.
+        let pair = |at: usize| {
+            let at = digits(at)?;
+            line[at..].starts_with(':').then_some(())?;
+            digits(at + 1)
+        };
+        let found = (from..line.len())
+            .rev()
+            .filter(|&at| line.as_bytes()[at] == b':')
+            .find_map(|at| Some((at, pair(at + 1)?)));
+        let Some((at, mut end)) = found else {
+            out.push_str(line);
+            continue;
+        };
+        if line[end..].starts_with(": ")
+            && let Some(second) = pair(end + 2)
+        {
+            end = second;
+        }
+        out.push_str(&line[..at]);
+        out.push_str(":LL:COL");
+        out.push_str(&line[end..]);
+    }
+    out
+}
+
+#[test]
+fn library_positions_are_normalized() {
+    let output = "  --> $SRC_DIR/core/src/lib.rs:12:4\n  --> $DIR/a.rs:3:1\n";
+    assert_eq!(normalized(output), "  --> $SRC_DIR/core/src/lib.rs:LL:COL\n  --> $DIR/a.rs:3:1\n");
 }
 
 #[test]

@@ -4,7 +4,7 @@
 use base_db::{Crate, all_crates};
 use hir_expand::fixture;
 
-use crate::nameres::{crate_def_map, frozen, tests::{TestDB, TestDBExt}};
+use crate::nameres::{crate_def_map, frozen, tests::TestDB};
 
 const LIB: &str = r#"
 pub struct Fields { pub a: u8 }
@@ -36,20 +36,16 @@ fn crate_named(db: &TestDB, name: &str) -> Crate {
         .unwrap()
 }
 
-/// How many times `crate_local_def_map` ran while `f` did.
-fn def_maps_run(db: &TestDB, f: impl FnOnce()) -> usize {
-    db.executed_in_read_order(f).iter().filter(|it| it.contains("crate_local_def_map")).count()
-}
-
 struct Edited {
     lib_bytes: (Vec<u8>, Vec<u8>),
     main_bytes: (Vec<u8>, Vec<u8>),
-    /// Whether the def map of `main` ran again once `lib`'s was brought up to date.
+    /// Whether the write resolved groups of `main` again once `lib`'s were brought up to date.
     main_ran: usize,
 }
 
-/// Collects both crates, writes `lib.rs` as `edited`, and collects them again: `lib` first, then
-/// `main` on its own, so what `main` runs is only what `lib`'s def map changing made it run.
+/// Collects both crates, then writes `lib.rs` as `edited`. The write ends in the nameres
+/// maintainer, which resolves `lib` first, then the groups of `main` that read a binding of
+/// `lib` the write changed: what `main` runs is only what `lib`'s change made it run.
 fn edit_lib(edited: &str) -> Edited {
     let fx = fixture::db(&fixture());
     let files = fx.files().to_vec();
@@ -60,13 +56,17 @@ fn edit_lib(edited: &str) -> Edited {
     let lib_before = frozen::encode(&db, lib).unwrap();
     let main_before = frozen::encode(&db, main).unwrap();
 
+    db.keep_maintained(true);
+    let mut maintained = Vec::new();
+    db.take_maintained(&mut maintained);
+    maintained.clear();
     db.set_file_text(files[0].file_id(&db), edited);
-    def_maps_run(&db, || {
-        crate_def_map(&db, lib);
-    });
-    let main_ran = def_maps_run(&db, || {
-        crate_def_map(&db, main);
-    });
+    db.take_maintained(&mut maintained);
+    db.keep_maintained(false);
+    let main_ran = maintained
+        .iter()
+        .filter(|it| it.maintainer == "nameres" && it.krate == main && it.work.region > 0)
+        .count();
     Edited {
         lib_bytes: (lib_before, frozen::encode(&db, lib).unwrap()),
         main_bytes: (main_before, frozen::encode(&db, main).unwrap()),

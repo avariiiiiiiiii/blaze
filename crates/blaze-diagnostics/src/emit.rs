@@ -97,6 +97,10 @@ struct File {
     /// The length of the byte order mark taken out, if there was one.
     bom: u32,
     ascii: bool,
+    /// Whether rustc shows its source (`should_show_source_code`): false for a file of another
+    /// crate whose source is not present, whose spans rustc places but neither shows, quotes
+    /// nor splices into.
+    shown: bool,
 }
 
 impl File {
@@ -120,7 +124,7 @@ impl File {
         };
         let lines = span::LineIndex::new(&text);
         let ascii = text.is_ascii();
-        File { text, lines, crs, len, bom: bom as u32, ascii }
+        File { text, lines, crs, len, bom: bom as u32, ascii, shown: true }
     }
 
     /// Where byte `read` of the file as read is in `text`.
@@ -178,9 +182,10 @@ impl File {
         self.text.get(lo..hi)
     }
 
-    /// The text of `span` as rustc has it, when the file holds it: `span_to_snippet`.
+    /// The text of `span` as rustc has it, when the file holds it and rustc has its source:
+    /// `span_to_snippet`.
     fn snippet(&self, span: &Span) -> Option<&str> {
-        match self.holds(span) {
+        match self.shown && self.holds(span) {
             true => self.slice(self.norm(span.lo), self.norm(span.hi)),
             false => None,
         }
@@ -223,6 +228,18 @@ impl Sources {
                 (files.len() - 1) as u32
             }
             None => UNREAD,
+        });
+    }
+
+    /// The text of the file `name`, which rustc places spans in but whose source it doesn't
+    /// have to show: a file of another crate when `ensure_source_file_source_present` fails, as
+    /// core's does under compiletest. Its spans are written as rustc's `unannotated_messages`,
+    /// where they are with no snippet. A name given twice keeps its first text.
+    pub fn add_unshown(&mut self, name: &str, text: String) {
+        let Sources { names, files } = self;
+        names.entry_ref(name).or_insert_with(|| {
+            files.push(File { shown: false, ..File::new(text) });
+            (files.len() - 1) as u32
         });
     }
 
@@ -536,7 +553,12 @@ fn render<'a>(diag: &'a Diag, placed: &Placed<'a>, style: Style) -> String {
     let mut group = Group::with_title(title);
 
     if diag.span.primary_span().is_some() {
-        group = snippets(group, &diag.span, extra, placed);
+        let unshown = Unshown {
+            level: level_of(diag.level),
+            short: style.short,
+            pad_last: diag.children.first().is_some_and(|it| it.span.is_empty()),
+        };
+        group = snippets(group, &diag.span, extra, placed, &mut report, unshown);
     }
 
     for child in &diag.children {
@@ -550,7 +572,8 @@ fn render<'a>(diag: &'a Diag, placed: &Placed<'a>, style: Style) -> String {
         if child.span.primary_span().is_some() {
             let mut extra: Labels<'a> = SmallVec::new();
             macro_labels(&child.span, &mut extra);
-            group = snippets(group, &child.span, extra, placed);
+            let unshown = Unshown { level: sublevel_of(child.level), short: style.short, pad_last: false };
+            group = snippets(group, &child.span, extra, placed, &mut report, unshown);
         }
     }
     if let Some(note) = diag.origin_note()
@@ -666,12 +689,28 @@ struct Annotation<'a> {
 /// The labels of a span by file, each file's in the order rustc shows them.
 type Annotated<'a> = SmallVec<[(&'a str, &'a File, SmallVec<[Annotation<'a>; 4]>); 2]>;
 
-/// The snippets of `span` with `extra` labels on it, the file of its primary span first.
+/// How [`snippets`] writes the labels of a file whose source rustc doesn't show.
+struct Unshown {
+    /// The level of the diagnostic or child the span is of, which starts the group of each such
+    /// file after the first.
+    level: annotate_snippets::Level<'static>,
+    short: bool,
+    /// The diagnostic's first child has no span: after the last file, when it is one not
+    /// shown, a padding line comes before it.
+    pad_last: bool,
+}
+
+/// The snippets of `span` with `extra` labels on it, the file of its primary span first. A file
+/// rustc doesn't show the source of is written as where its labels are, each label a note
+/// (rustc's `unannotated_messages`), and nothing under `short`; a group that starts for one is
+/// pushed to `report`.
 fn snippets<'a>(
     mut group: Group<'a>,
     span: &'a MultiSpan,
     extra: Labels<'a>,
     placed: &Placed<'a>,
+    report: &mut Vec<Group<'a>>,
+    unshown: Unshown,
 ) -> Group<'a> {
     let mut files = collect_annotations(span, extra, placed);
     // As rustc finds it: by a binary search of the files in the order they were met.
@@ -680,9 +719,57 @@ fn snippets<'a>(
     {
         files.swap(0, at);
     }
-    for (name, file, annotations) in files {
-        if let Some(snippet) = annotated_snippet(name, file, annotations) {
-            group = group.element(snippet);
+    let last = files.len().saturating_sub(1);
+    for (at, (name, file, annotations)) in files.into_iter().enumerate() {
+        if file.shown {
+            if let Some(snippet) = annotated_snippet(name, file, annotations) {
+                group = group.element(snippet);
+            }
+        } else if !unshown.short {
+            group = unannotated(group, name, file, annotations, at, report, &unshown.level);
+            if unshown.pad_last && at == last {
+                group = group.element(annotate_snippets::Padding);
+            }
+        }
+    }
+    group
+}
+
+/// rustc's `unannotated_messages`: the labels of the `at`th file of a span, one whose source is
+/// not shown, as the line and column of each (one per line) with its label as a note.
+fn unannotated<'a>(
+    mut group: Group<'a>,
+    name: &'a str,
+    file: &'a File,
+    annotations: SmallVec<[Annotation<'a>; 4]>,
+    at: usize,
+    report: &mut Vec<Group<'a>>,
+    level: &annotate_snippets::Level<'static>,
+) -> Group<'a> {
+    let path = shown(name);
+    let mut lines: SmallVec<[usize; 4]> = SmallVec::new();
+    for (i, annotation) in annotations.into_iter().enumerate() {
+        if i != 0 && annotation.label.is_none() {
+            continue;
+        }
+        if i == 0 && at != 0 {
+            // clone: a `'static` level, for a file after the first of a diagnostic written
+            report.push(std::mem::replace(&mut group, Group::with_level(level.clone())));
+        }
+        // Without the source rustc's display column is the column in chars.
+        let (lo_line, lo_column) = file.position(annotation.lo);
+        let (hi_line, hi_column) = file.position(annotation.hi);
+        if !lines.contains(&lo_line) && (i == 0 || hi_line <= lo_line) {
+            lines.push(lo_line);
+            group = group.element(annotate_snippets::Origin::path(path).line(lo_line).char_column(lo_column));
+        }
+        let label = annotation.label.filter(|it| !it.is_empty());
+        if hi_line > lo_line && label.is_some() && !lines.contains(&hi_line) {
+            lines.push(hi_line);
+            group = group.element(annotate_snippets::Origin::path(path).line(hi_line).char_column(hi_column));
+        }
+        if let Some(label) = label {
+            group = group.element(annotate_snippets::Padding).element(annotate_snippets::Level::NOTE.message(label));
         }
     }
     group
@@ -767,7 +854,7 @@ struct Part<'a> {
 }
 
 /// The ways to substitute of a suggestion that rustc shows: those whose parts are all in one
-/// file it holds them in, each with its parts in order, leaving out the parts that change
+/// file it holds them in and shows, each with its parts in order, leaving out the parts that change
 /// nothing, and the ways left with no part.
 fn substitutions<'a>(
     substitutions: &'a [Vec<(Span, String)>],
@@ -780,7 +867,7 @@ fn substitutions<'a>(
         if parts.iter().any(|(span, _)| span.file != name) {
             continue;
         }
-        let Some(file) = placed.get(name) else { continue };
+        let Some(file) = placed.get(name).filter(|it| it.shown) else { continue };
         if parts.iter().any(|(span, _)| !file.holds(span)) {
             continue;
         }

@@ -65,12 +65,16 @@ struct State {
     diffs: Vec<(String, String, Vec<Change>)>,
 }
 
-fn state(vfs: &Vfs) -> State {
-    let heads: Vec<(String, ContentId, u64)> = vfs
-        .heads()
+/// Each head's root and sequence, reading no file.
+fn heads(vfs: &Vfs) -> Vec<(String, ContentId, u64)> {
+    vfs.heads()
         .into_iter()
         .map(|(name, root)| (name.to_owned(), root, vfs.sequence(name).expect("a sequence")))
-        .collect();
+        .collect()
+}
+
+fn state(vfs: &Vfs) -> State {
+    let heads = heads(vfs);
     let (mut files, mut dirs) = (BTreeMap::new(), BTreeMap::new());
     for (name, root, _) in &heads {
         let node = vfs.root(*root).expect("a head's root");
@@ -343,6 +347,11 @@ impl Crash {
 
     /// The whole run; `false` when it ended before its stop.
     fn go(mut self) -> bool {
+        // The random commits can all fail (seed 2's do), leaving an image of the empty root
+        // alone, which no collection drops: `main` holds a file before the first image.
+        let first =
+            Op::Write { mode: Mode::Regular, path: "src/first".into(), bytes: b"first".to_vec() };
+        self.both(&Act::Commit("main", vec![first]));
         self.history(6);
         if self.point() || self.round() {
             return true;
@@ -421,7 +430,7 @@ fn a_start_reads_the_journals_tail_and_no_file_until_one_is_read() {
     assert!(journal.len() < 512, "the journal holds no file the image has: {}", journal.len());
     let (back, found) = Vfs::restore(file(), 0, &journal, Some(mapping(&image)));
     assert_eq!(found.image, ImageUse::Used { name: mark.name, nodes: mark.nodes, disks: None });
-    assert_eq!(state(&back).heads, state(&vfs).heads);
+    assert_eq!(heads(&back), heads(&vfs));
 
     let mapped = Arc::clone(back.tree.table().mapped().expect("a mapped base"));
     let (image, blobs) = (&mapped.image, &mapped.blobs);

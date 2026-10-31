@@ -171,6 +171,7 @@ fn span<'a>(
     // A suggestion that removes from the start of a line to its end removes the line.
     if column_start == 0
         && suggestion.is_some_and(|(replacement, _)| replacement.is_empty())
+        && file.shown
         && file.text[end..].starts_with('\n')
     {
         end += 1;
@@ -208,9 +209,10 @@ fn span<'a>(
 }
 
 /// rustc's `DiagnosticSpanLine::from_span` (`span_to_lines`): each line `lo..hi` is on, with
-/// the columns of it on that line, 1-based in chars.
+/// the columns of it on that line, 1-based in chars; none in a file whose source rustc doesn't
+/// show.
 fn lines(file: &File, lo: usize, hi: usize) -> Vec<DiagnosticSpanLine<'_>> {
-    if lo > hi {
+    if lo > hi || !file.shown {
         return Vec::new(); // alloc: empty, allocates nothing
     }
     let ((lo_line, lo_column), (hi_line, hi_column)) = (file.position(lo), file.position(hi));

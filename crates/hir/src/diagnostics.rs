@@ -259,6 +259,8 @@ diagnostics![AnyDiagnostic<'db> ->
     UnsafeBinderCastOfNonBinder<'db>,
     InvalidConstArg,
     NotAStructPath<'db>,
+    AutoderefRecursionLimit<'db>,
+    MethodOnUnknownRawPointee,
     ConstParamTyNotAllowed<'db>,
     ValTreeError<'db>,
     UnplacedDiagnostic<'db>,
@@ -1793,6 +1795,22 @@ pub struct NotAStructPath<'db> {
     pub node: InFile<ExprOrPatPtr>,
     pub found: StructPathFound,
     pub ty: Option<Type<'db>>,
+}
+
+/// E0055 "reached the recursion limit while auto-dereferencing `{ty}`", with rustc's help to
+/// add `#![recursion_limit = "{suggested_limit}"]`.
+#[derive(Debug)]
+pub struct AutoderefRecursionLimit<'db> {
+    pub site: SpanSyntax,
+    pub ty: Type<'db>,
+    pub suggested_limit: u32,
+}
+
+/// E0282 "type annotations needed" of a method call on a raw pointer to an unknown pointee,
+/// labelled "cannot call a method on a raw pointer with an unknown pointee type".
+#[derive(Debug)]
+pub struct MethodOnUnknownRawPointee {
+    pub site: SpanSyntax,
 }
 
 /// rustc's two errors of `check_expr_unsafe_binder_cast`: for `Wrap`, "`wrap_binder!()` can
@@ -3790,6 +3808,17 @@ impl<'db> AnyDiagnostic<'db> {
                 ty: ty.as_ref().map(|it| new_ty(it.as_ref())),
             }
             .into(),
+            InferenceDiagnostic::AutoderefRecursionLimit { span, ty, suggested_limit } => {
+                AutoderefRecursionLimit {
+                    site: span_syntax(*span)?,
+                    ty: new_ty(ty.as_ref()),
+                    suggested_limit: *suggested_limit,
+                }
+                .into()
+            }
+            InferenceDiagnostic::MethodOnUnknownRawPointee { span } => {
+                MethodOnUnknownRawPointee { site: span_syntax(*span)? }.into()
+            }
             InferenceDiagnostic::UnsafeBinderCastOfNonBinder { expr, kind, found } => {
                 UnsafeBinderCastOfNonBinder {
                     expr: expr_syntax(*expr)?,

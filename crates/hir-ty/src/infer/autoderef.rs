@@ -18,6 +18,7 @@ use crate::{
 impl<'db> InferenceTable<'db> {
     pub(crate) fn autoderef(&self, base_ty: Ty<'db>, span: Span) -> Autoderef<'_, 'db, usize> {
         Autoderef::new(&self.infer_ctxt, self.param_env, base_ty, span)
+            .reporting_to(&self.recursion_limit_errors)
     }
 
     pub(crate) fn autoderef_with_tracking(
@@ -26,6 +27,7 @@ impl<'db> InferenceTable<'db> {
         span: Span,
     ) -> Autoderef<'_, 'db> {
         Autoderef::new_with_tracking(&self.infer_ctxt, self.param_env, base_ty, span)
+            .reporting_to(&self.recursion_limit_errors)
     }
 }
 

@@ -7,7 +7,9 @@
 use blaze_ids::rng::SplitMix64;
 
 use crate::frame::{self, FrameError, Header, Kind, Reader, Writer, kinds};
-use crate::handshake::{Grant, Hello, Lookup, MOST_BINDS, MOST_NAME, Overlay, Place, VERSION, hex, host_var, unhex};
+use crate::handshake::{
+    Grant, Hello, Lookup, MOST_BINDS, MOST_NAME, OVERLAY_BYTES, Overlay, Place, VERSION, hex, host_var, unhex,
+};
 use crate::image::tests::{R, RX, elf};
 use crate::sys::Rights;
 use crate::{Access, CodeMemory, CodeRange, Format, ImageWrite, Layout, Segment};
@@ -321,7 +323,7 @@ fn a_grant_is_checked_against_the_image_relative_to_its_header() {
 /// Where the writes' count is in an encoded grant: after the header, the objects and the
 /// overlays.
 fn writes_at(grant: &Grant) -> usize {
-    25 + 4 + 9 * grant.objects.len() + 4 + 35 * grant.overlays.len()
+    25 + 4 + 9 * grant.objects.len() + 4 + OVERLAY_BYTES * grant.overlays.len()
 }
 
 #[test]

@@ -270,7 +270,7 @@ pub enum Request {
     /// `targets` asks (its build scripts run and its proc macros loaded in the sandbox, every
     /// expansion of the program recorded) as one file for blaze's in-browser compiler
     /// (`blaze_wasm_pack::Pack`); answered with [`Response::Packed`].
-    Pack { view: ViewRef, targets: Targets, program: String },
+    Pack { view: ViewRef, program: String, targets: Targets },
 }
 
 /// `blaze test --ub`: each selected test run under `hir_ty_ub::run_test`, nothing compiled.

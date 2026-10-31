@@ -13,7 +13,9 @@ use crate::{
 };
 
 pub(crate) fn lower(cx: &Cx<'_, '_>, d: &hir::AdditionalNonAutoTraits) -> Vec<Found> {
-    let span_of = |ty| cx.span(cx.node_view(ty).map(|it| it.syntax().text_range()));
+    let span_of = |ty: hir::InFile<syntax::AstPtr<syntax::ast::Type>>| {
+        cx.span(cx.node_view(ty).map(|it| it.syntax().text_range()))
+    };
     let first = span_of(d.first);
     let &second = d.additional.first().expect("hir reports a second non-auto trait at least");
     let mut diag = Diag::error(

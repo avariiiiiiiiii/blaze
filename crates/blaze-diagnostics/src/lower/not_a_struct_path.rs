@@ -174,7 +174,7 @@ fn path_of<'t>(node: Either<ast::Expr<'t>, ast::Pat<'t>>) -> Option<ast::Path<'t
 
 /// `Res::descr` of what hir found: a struct, variant or alias as the path resolves it
 /// (`def_descr` words a struct by its kind: "tuple struct", "unit struct", "struct").
-fn descr(cx: &Cx<'_, '_>, def: StructPathDef, path: ast::Path<'_>) -> &'static str {
+fn descr<'db>(cx: &Cx<'_, 'db>, def: StructPathDef, path: ast::Path<'db>) -> &'static str {
     match def {
         StructPathDef::Struct | StructPathDef::Variant | StructPathDef::Union => {
             match cx.vsema.resolve_path(path) {

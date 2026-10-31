@@ -320,8 +320,8 @@ fn crate_attrs_with_disabled_cfg_in_source() {
 #![cfg(false)]
 #![no_core]
         "#,
+        // rustc appends `-Zcrate-attr`s to the source's and stops at the first false `cfg`.
         expect![[r#"
-            #![no_std]
             #![cfg(false)]
         "#]],
     );

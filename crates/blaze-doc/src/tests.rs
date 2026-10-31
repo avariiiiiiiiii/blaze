@@ -752,7 +752,10 @@ fn deref_methods_follow_the_chain() {
         .iter()
         .map(|it| (it.target.plain(), it.members.iter().map(|m| m.name.as_str()).collect()))
         .collect();
-    assert_eq!(sections, [("Chain".to_owned(), vec!["read"]), ("[u8]".to_owned(), vec!["len"])]);
+    assert_eq!(
+        sections,
+        [("Chain".to_owned(), vec!["read"]), ("[u8]".to_owned(), vec!["len", "iter"])]
+    );
     assert_eq!(bytes.impls.deref[1].anchor, "deref-methods-%5Bu8%5D");
 }
 

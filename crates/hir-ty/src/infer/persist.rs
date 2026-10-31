@@ -982,7 +982,7 @@ impl InferenceRecord {
 impl Persist for InferenceRecord {
     const SCHEMA: SchemaHash = schema_of(&[
         Part::Str("InferenceRecord"),
-        Part::U64(21),
+        Part::U64(22),
         Part::Schema(<InferRoot as Record>::SCHEMA),
     ]);
     type Ref<'a> = InferenceRecordRef<'a>;
@@ -2318,6 +2318,16 @@ impl Sink {
                 }
                 self.opt_ty(tys, ty.as_ref());
             }
+            D::AutoderefRecursionLimit { span, ty, suggested_limit } => {
+                self.word(48);
+                self.span(*span);
+                self.ty(tys, ty);
+                self.word(*suggested_limit);
+            }
+            D::MethodOnUnknownRawPointee { span } => {
+                self.word(49);
+                self.span(*span);
+            }
         }
     }
 
@@ -3276,6 +3286,12 @@ impl Source<'_> {
                 }
                 D::NotAStructPath { node, found, ty }
             }
+            48 => D::AutoderefRecursionLimit {
+                span: self.span()?,
+                ty: self.ty(tys)?,
+                suggested_limit: self.word()?,
+            },
+            49 => D::MethodOnUnknownRawPointee { span: self.span()? },
             _ => return Err(self.invalid("an inference diagnostic of no kind")),
         })
     }
@@ -3644,6 +3660,12 @@ mod tests {
                 found: StructPathFound::AfterVariant { segment: 2 },
                 ty: None,
             },
+            D::AutoderefRecursionLimit {
+                span: Span::ExprId(expr(7)),
+                ty: ty(types.never),
+                suggested_limit: 256,
+            },
+            D::MethodOnUnknownRawPointee { span: Span::PatId(pat(4)) },
             D::BreakOutsideOfLoop { expr: expr(8), is_break: false, bad_value_break: true },
             D::UnlabeledJumpInLabeledBlock { expr: expr(8), is_break: true },
             D::UnlabeledJumpInLabeledBlock { expr: expr(9), is_break: false },

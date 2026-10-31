@@ -188,7 +188,11 @@ fn child_source_view() {
             seen += 1;
         }
     }
-    assert!(seen >= 30, "the fixture's children: {seen}");
+    assert_eq!(
+        seen, 27,
+        "the fixture's children: 10 fields, 10 type or const parameters (with `Tr`'s `Self`) and \
+         7 lifetimes"
+    );
     expect_file!["child_source_view.txt"].assert_eq(&out);
 }
 
@@ -216,6 +220,6 @@ fn use_tree_views() {
             seen += 1;
         }
     }
-    assert!(seen >= 8, "the fixture's use trees: {seen}");
+    assert_eq!(seen, 7, "the fixture's use trees");
     expect_file!["use_tree_views.txt"].assert_eq(&out);
 }

@@ -304,7 +304,12 @@ impl Client {
             if left.is_zero() {
                 return Err(waited());
             }
-            stream.set_read_timeout(Some(left))?;
+            match stream.set_read_timeout(Some(left)) {
+                Ok(()) => {}
+                // macOS refuses SO_RCVTIMEO once the peer has closed; a read then never blocks.
+                Err(error) if error.kind() == io::ErrorKind::InvalidInput => {}
+                Err(error) => return Err(error.into()),
+            }
             let most = self.frames.wanted(RECEIVE);
             match self.frames.fill(stream, most) {
                 Ok(0) => return Ok(()),

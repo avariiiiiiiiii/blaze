@@ -2070,6 +2070,28 @@ it green with no walk; the fork has its 62-bit closure filter (`graph::bloom`) o
 edges. Its closure holds few inputs so that 128 bits stay sparse: with 1024 leaves every bit
 would be set and every check a walk.
 
-**blaze_query::db**: the same nine cases are written on the engine with its macros
-(`db/<case>`, beside `salsa/<case>` in one binary), not yet run: from 15:21 no lane runs cargo,
-and the coordinator runs the bench. Both engines' numbers go here from that run.
+**Both engines**, one binary (`db/<case>` beside `salsa/<case>`), the coordinator's round 3b,
+2026-10-30 18:30, commit `d79d33bf1c`, the same Mac, loaded (load average about 100):
+
+| case | salsa min | salsa mean | db min | db mean | db / salsa (mean) |
+|---|---|---|---|---|---|
+| hit, sequential | 10.7 ns | 12.4 ns | 2.9 ns | 3.5 ns | 0.28 |
+| hit, scattered | 13.6 ns | 16.8 ns | 3.4 ns | 5.5 ns | 0.33 |
+| hit in query, sequential (64K hits) | 1.2 ms | 1.5 ms | 673 µs | 833 µs | 0.56 |
+| hit in query, scattered (64K hits) | 1.6 ms | 1.9 ms | 778 µs | 1.7 ms | 0.89 |
+| verify, other durability | 371 µs | 453 µs | 139 µs | 160 µs | 0.35 |
+| verify, same durability | 907 µs | 1.1 ms | 466 µs | 602 µs | 0.55 |
+| deep unrelated | 500 ns | 769 ns | not measured | | |
+| interned hit | not measured | | not measured | | |
+| cycle of 8 to fixpoint | not measured | | not measured | | |
+
+Per op, the engine's hit is 3.5 ns in order and 5.5 ns scattered (the bound above is ≈ 5.4 ns
+hot); a hit from inside a query is 12.7 ns in order and 26 ns scattered (its minimum, 11.9 ns,
+says the scattered mean is mostly the load); verify is 9.8 ns a reader by durability and
+2.3 ns an edge by walk.
+
+The run stopped at `db/verify/deep_unrelated`: the engine spent all 2^28 views (one a write)
+within tango's 8 s, about 30 ns an iteration, and `Storage::next_view` panicked, so the last
+three rows are missing on both sides. The view limit is queued to query-unify-engine (01215);
+until it is fixed the case builds its database again every 2^24 writes (`REBUILD`), on both
+engines, so the rebuild lands in one sample and leaves the minimum alone.

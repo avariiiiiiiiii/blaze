@@ -2857,7 +2857,7 @@ mod tests {
     /// 8 bytes (salsa's index and generation).
     #[test]
     fn sizes() {
-        assert_eq!(size_of::<Entry>(), 40);
+        assert_eq!(size_of::<Entry>(), 36);
         assert_eq!(size_of::<Index>(), 8);
         assert_eq!(size_of::<Visibility>(), 12);
         assert_eq!(size_of::<ModuleDefId>(), 16);

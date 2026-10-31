@@ -1,4 +1,4 @@
-//! The AArch64 glue against Cranelift 0.136.2's own code of the same functions, with the flags
+//! The AArch64 glue against Cranelift 0.137's own code of the same functions, with the flags
 //! `hir-ty-codegen/target.rs` gives the dev ISA: the frame record, the probe, the unwind rows
 //! and Windows codes, the relocations of calls, addresses and thread-locals, where stack
 //! arguments go, the jump table sequence, and the places of arguments in AAPCS64 and Apple's
@@ -8,7 +8,7 @@
 use std::sync::OnceLock;
 
 use cranelift_codegen::{
-    Context, FinalizedRelocTarget,
+    Context, RelocTarget,
     binemit::Reloc,
     control::ControlPlane,
     ir::{
@@ -141,8 +141,8 @@ fn cranelift(func: &ir::Function, target: &Target) -> Clif {
             at: reloc.offset,
             kind: reloc.kind,
             name: match &reloc.target {
-                FinalizedRelocTarget::ExternalName(name) => name_of(func, name),
-                FinalizedRelocTarget::Func(at) => Name::Own(*at),
+                RelocTarget::ExternalName(name) => name_of(func, name),
+                RelocTarget::Label(at) => Name::Own(at.as_offset()),
             },
             addend: reloc.addend,
         })

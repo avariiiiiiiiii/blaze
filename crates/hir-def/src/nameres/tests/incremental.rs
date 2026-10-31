@@ -23,6 +23,8 @@ fn check_def_map_is_not_recomputed(
     let pos = fx.position();
     let mut db = fx.into_db();
     let krate = db.fetch_test_crate();
+    // The fixture's write resolved the crate: the first read takes what the maintainer
+    // published.
     execute_assert_events(
         &db,
         || {
@@ -31,12 +33,12 @@ fn check_def_map_is_not_recomputed(
         &[],
         expecta,
     );
-    db.set_file_text(pos.file_id.file_id(&db), ra_fixture_change);
-
-    execute_assert_events(
-        &db,
-        || {
-            crate_def_map(&db, krate);
+    let file_id = pos.file_id.file_id(&db);
+    execute_assert_write(
+        &mut db,
+        |db| {
+            db.set_file_text(file_id, ra_fixture_change);
+            crate_def_map(db, krate);
         },
         &[("crate_local_def_map", 0)],
         expectb,
@@ -66,7 +68,7 @@ pub const BAZ: u32 = 0;
 
     let all_crates_before = all_crates(&db);
 
-    {
+    let new_crate_graph = {
         // Add dependencies: c -> b, b -> a.
         let mut new_crate_graph = CrateGraphBuilder::default();
 
@@ -105,19 +107,15 @@ pub const BAZ: u32 = 0;
         new_crate_graph
             .add_dep(b, DependencyBuilder::new(CrateName::new("a").unwrap(), a))
             .unwrap();
-        new_crate_graph.set_in_db(&mut db);
-    }
+        new_crate_graph
+    };
 
-    let all_crates_after = all_crates(&db);
-    assert!(
-        std::sync::Arc::ptr_eq(&all_crates_before, &all_crates_after),
-        "the all_crates list should not have been invalidated"
-    );
-    execute_assert_events(
-        &db,
-        || {
-            for &krate in all_crates(&db).iter() {
-                crate_def_map(&db, krate);
+    execute_assert_write(
+        &mut db,
+        |db| {
+            new_crate_graph.set_in_db(db);
+            for &krate in all_crates(db).iter() {
+                crate_def_map(db, krate);
             }
         },
         // `c` gets invalidated as its dependency `b` changed
@@ -130,6 +128,11 @@ pub const BAZ: u32 = 0;
                 "crate_local_def_map",
             ]
         "#]],
+    );
+    let all_crates_after = all_crates(&db);
+    assert!(
+        std::sync::Arc::ptr_eq(&all_crates_before, &all_crates_after),
+        "the all_crates list should not have been invalidated"
     );
 }
 
@@ -173,19 +176,6 @@ fn no() {}
         expect![[r#"
             [
                 "crate_local_def_map",
-                "file_item_tree_query",
-                "HirFileId::ast_id_map_",
-                "EditionedFileId::parse_",
-                "real_span_map",
-                "file_item_tree_query",
-                "HirFileId::ast_id_map_",
-                "EditionedFileId::parse_",
-                "real_span_map",
-                "file_item_tree_query",
-                "HirFileId::ast_id_map_",
-                "EditionedFileId::parse_",
-                "real_span_map",
-                "EnumVariants::of_",
             ]
         "#]],
         expect![[r#"
@@ -231,24 +221,6 @@ pub struct S {}
         expect![[r#"
             [
                 "crate_local_def_map",
-                "file_item_tree_query",
-                "HirFileId::ast_id_map_",
-                "EditionedFileId::parse_",
-                "real_span_map",
-                "AstId < ast :: Macro >::decl_macro_expander_",
-                "file_item_tree_query",
-                "HirFileId::ast_id_map_",
-                "EditionedFileId::parse_",
-                "real_span_map",
-                "file_item_tree_query",
-                "HirFileId::ast_id_map_",
-                "EditionedFileId::parse_",
-                "real_span_map",
-                "MacroId::definition_",
-                "file_item_tree_query",
-                "HirFileId::ast_id_map_",
-                "MacroCallId::parse_macro_expansion_",
-                "MacroCallId::macro_arg_",
             ]
         "#]],
         expect![[r#"
@@ -289,33 +261,6 @@ fn f() { foo }
         expect![[r#"
             [
                 "crate_local_def_map",
-                "file_item_tree_query",
-                "HirFileId::ast_id_map_",
-                "EditionedFileId::parse_",
-                "real_span_map",
-                "crate_local_def_map",
-                "ProcMacros::get_for_crate_",
-                "file_item_tree_query",
-                "HirFileId::ast_id_map_",
-                "EditionedFileId::parse_",
-                "real_span_map",
-                "file_item_tree_query",
-                "HirFileId::ast_id_map_",
-                "EditionedFileId::parse_",
-                "real_span_map",
-                "file_item_tree_query",
-                "HirFileId::ast_id_map_",
-                "EditionedFileId::parse_",
-                "real_span_map",
-                "Modules < 'db >::module_",
-                "ModuleScope < 'db >::name_",
-                "MacroId::definition_",
-                "file_item_tree_query",
-                "HirFileId::ast_id_map_",
-                "MacroCallId::parse_macro_expansion_",
-                "MacroCallId::proc_macro_expansion_",
-                "MacroCallId::macro_arg_",
-                "proc_macro_span",
             ]
         "#]],
         expect![[r#"
@@ -415,45 +360,6 @@ pub struct S {}
         expect![[r#"
             [
                 "crate_local_def_map",
-                "file_item_tree_query",
-                "HirFileId::ast_id_map_",
-                "EditionedFileId::parse_",
-                "real_span_map",
-                "crate_local_def_map",
-                "ProcMacros::get_for_crate_",
-                "file_item_tree_query",
-                "HirFileId::ast_id_map_",
-                "EditionedFileId::parse_",
-                "real_span_map",
-                "AstId < ast :: Macro >::decl_macro_expander_",
-                "file_item_tree_query",
-                "HirFileId::ast_id_map_",
-                "EditionedFileId::parse_",
-                "real_span_map",
-                "file_item_tree_query",
-                "HirFileId::ast_id_map_",
-                "EditionedFileId::parse_",
-                "real_span_map",
-                "MacroId::definition_",
-                "file_item_tree_query",
-                "HirFileId::ast_id_map_",
-                "MacroCallId::parse_macro_expansion_",
-                "MacroCallId::macro_arg_",
-                "AstId < ast :: Macro >::decl_macro_expander_",
-                "MacroId::definition_",
-                "file_item_tree_query",
-                "HirFileId::ast_id_map_",
-                "MacroCallId::parse_macro_expansion_",
-                "MacroCallId::macro_arg_",
-                "Modules < 'db >::module_",
-                "ModuleScope < 'db >::name_",
-                "MacroId::definition_",
-                "file_item_tree_query",
-                "HirFileId::ast_id_map_",
-                "MacroCallId::parse_macro_expansion_",
-                "MacroCallId::proc_macro_expansion_",
-                "MacroCallId::macro_arg_",
-                "proc_macro_span",
             ]
         "#]],
         expect![[r#"
@@ -534,36 +440,11 @@ m!(Z);
             );
             assert_eq!(module_data.scope(&db).resolutions().count(), 4);
         },
-        &[("file_item_tree_query", 6), ("parse_macro_expansion", 3)],
+        // The fixture's write made the six item trees and the three expansions.
+        &[("file_item_tree_query", 0), ("parse_macro_expansion", 0)],
         expect![[r#"
             [
                 "crate_local_def_map",
-                "file_item_tree_query",
-                "HirFileId::ast_id_map_",
-                "EditionedFileId::parse_",
-                "real_span_map",
-                "AstId < ast :: Macro >::decl_macro_expander_",
-                "file_item_tree_query",
-                "HirFileId::ast_id_map_",
-                "EditionedFileId::parse_",
-                "real_span_map",
-                "file_item_tree_query",
-                "HirFileId::ast_id_map_",
-                "EditionedFileId::parse_",
-                "real_span_map",
-                "MacroId::definition_",
-                "file_item_tree_query",
-                "HirFileId::ast_id_map_",
-                "MacroCallId::parse_macro_expansion_",
-                "MacroCallId::macro_arg_",
-                "file_item_tree_query",
-                "HirFileId::ast_id_map_",
-                "MacroCallId::parse_macro_expansion_",
-                "MacroCallId::macro_arg_",
-                "file_item_tree_query",
-                "HirFileId::ast_id_map_",
-                "MacroCallId::parse_macro_expansion_",
-                "MacroCallId::macro_arg_",
                 "Modules < 'db >::module_",
             ]
         "#]],
@@ -575,17 +456,16 @@ fn quux() { 92 }
 m!(Y);
 m!(Z);
 "#;
-    db.set_file_text(pos.file_id.file_id(&db), new_text);
-
-    execute_assert_events(
-        &db,
-        || {
-            let crate_def_map = crate_def_map(&db, krate);
-            let module_data = &crate_def_map.module(
-                &db,
-                crate_def_map.modules_for_file(&db, pos.file_id.file_id(&db)).next().unwrap(),
-            );
-            assert_eq!(module_data.scope(&db).resolutions().count(), 4);
+    let file_id = pos.file_id.file_id(&db);
+    execute_assert_write(
+        &mut db,
+        |db| {
+            db.set_file_text(file_id, new_text);
+            let db: &TestDB = db;
+            let crate_def_map = crate_def_map(db, krate);
+            let module_data =
+                &crate_def_map.module(db, crate_def_map.modules_for_file(db, file_id).next().unwrap());
+            assert_eq!(module_data.scope(db).resolutions().count(), 4);
         },
         &[("file_item_tree_query", 1), ("parse_macro_expansion", 0)],
         expect![[r#"
@@ -627,25 +507,21 @@ pub type Ty = ();
         || {
             file_item_tree(&db, pos.file_id.into(), fixture::test_crate(&db));
         },
-        &[("file_item_tree_query", 1), ("parse", 1)],
+        // The fixture's write made the tree, resolving the crate.
+        &[("file_item_tree_query", 0), ("parse", 0)],
         expect![[r#"
-            [
-                "file_item_tree_query",
-                "HirFileId::ast_id_map_",
-                "EditionedFileId::parse_",
-                "real_span_map",
-            ]
+            []
         "#]],
     );
 
     let file_id = pos.file_id.file_id(&db);
-    let file_text = db.file_text(file_id).text(&db);
-    db.set_file_text(file_id, &format!("{file_text}\n"));
-
-    execute_assert_events(
-        &db,
-        || {
-            file_item_tree(&db, pos.file_id.into(), fixture::test_crate(&db));
+    let file_text = format!("{}\n", db.file_text(file_id).text(&db));
+    execute_assert_write(
+        &mut db,
+        |db| {
+            db.set_file_text(file_id, &file_text);
+            let db: &TestDB = db;
+            file_item_tree(db, pos.file_id.into(), fixture::test_crate(db));
         },
         &[("file_item_tree_query", 1), ("parse", 1)],
         expect![[r#"
@@ -666,6 +542,22 @@ fn execute_assert_events(
     expect: Expect,
 ) {
     let events = db.executed_in_read_order(f);
+    assert_events(&events, required, expect);
+}
+
+/// [`execute_assert_events`] of a write and what reads after it: every write ends in the
+/// nameres maintainer, which runs in it what a read once ran first.
+fn execute_assert_write(
+    db: &mut TestDB,
+    f: impl FnOnce(&mut TestDB),
+    required: &[(&str, usize)],
+    expect: Expect,
+) {
+    let events = db.executed_in_write(f);
+    assert_events(&events, required, expect);
+}
+
+fn assert_events(events: &[String], required: &[(&str, usize)], expect: Expect) {
     for (event, count) in required {
         let n = events.iter().filter(|it| it.contains(event)).count();
         assert_eq!(n, *count, "Expected {event} to be executed {count} times, but only got {n}");

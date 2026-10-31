@@ -7,10 +7,14 @@ use std::panic::{AssertUnwindSafe, catch_unwind};
 use blaze_ids::rng::SplitMix64;
 
 use super::*;
-use crate::nameres::collector::{RESOLVE_IMPORT_CALLS, RESOLVE_STRATEGY, ResolveStrategy};
+use crate::nameres::{
+    collector::{RESOLVE_IMPORT_CALLS, RESOLVE_STRATEGY, ResolveStrategy},
+    facts::tests::old_crate_local_def_map,
+};
 
-/// Every crate's def map with its diagnostics, collected with `strategy`, and the imports it
-/// resolved on the way; `None` if collecting panicked.
+/// Every crate's def map with its diagnostics, collected by the old collector with `strategy`,
+/// and the imports it resolved on the way; `None` if collecting panicked. The import loop is
+/// the old collector's: the maintainer that resolves `crate_def_map` has none.
 fn collected_with(
     strategy: ResolveStrategy,
     #[rust_analyzer::rust_fixture] ra_fixture: &str,
@@ -21,7 +25,7 @@ fn collected_with(
         let db = fixture::db(ra_fixture).into_db();
         let mut out = String::new();
         for &krate in base_db::all_crates(&db).iter() {
-            let def_map = crate_def_map(&db, krate);
+            let def_map = old_crate_local_def_map(&db, krate).def_map(&db);
             out.push_str(&def_map.dump(&db));
             for diagnostic in def_map.diagnostics(&db) {
                 writeln!(out, "{diagnostic:?}").unwrap();

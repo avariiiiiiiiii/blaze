@@ -154,6 +154,8 @@ pub(in crate::nameres) const NAMERES: &[(&str, &str)] = sources![
     "tests/uses.rs",
     "tests/views.rs",
     "tests/worklist.rs",
+    "tests/prelude.rs",
+    "tests/stale_ids.rs",
 ];
 
 pub(in crate::nameres) const MACRO_EXPANSION: &[(&str, &str)] = sources![
@@ -207,6 +209,11 @@ fn nameres_tests_mod_resolution() {
 #[test]
 fn nameres_tests_incremental_and_scheduling() {
     check_files(&[NAMERES[1], NAMERES[2], NAMERES[5], NAMERES[9]]);
+}
+
+#[test]
+fn nameres_tests_traits_uses_views_worklist_prelude_stale_ids() {
+    check_files(&NAMERES[10..]);
 }
 
 #[test]

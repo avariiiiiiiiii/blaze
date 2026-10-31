@@ -8,10 +8,10 @@
     "docs/v2/plan/lanes/db/query-unify.md"
   ],
   "what": "R15 Contract + engine + macros: a runtime `lru` cap, `f::set_lru_capacity(db: &mut D, capacity: usize)` on functions with `lru = N` (an inherent fn of `struct f` like `evict_values`; `N` the initial cap, 0 no cap), applied at the next view boundary. Today `F::LRU` is a const. Users: base-db editioned_file_id.rs `Db::admit_parses` (`parse_::set_lru_capacity(self, next)`, the parse budget per revision) and hir-ty providers.rs:103-118 (12 MIR-body queries). The port (worktree blaze-v2-qu) keeps those calls as written.",
-  "state": "open",
+  "state": "taken",
   "created": "2026-10-31T01:26:31Z",
-  "updated": "2026-10-31T01:26:31Z",
-  "taken_by": null,
+  "updated": "2026-10-31T01:51:50Z",
+  "taken_by": "query-unify",
   "why": null,
   "source": null,
   "history": [
@@ -19,6 +19,12 @@
       "at": "2026-10-31T01:26:31Z",
       "by": "query-unify-port",
       "action": "add",
+      "note": ""
+    },
+    {
+      "at": "2026-10-31T01:51:50Z",
+      "by": "query-unify",
+      "action": "take",
       "note": ""
     }
   ]

@@ -1,0 +1,24 @@
+{
+  "id": "01247",
+  "from_lane": "query-unify-port",
+  "owner": "query-unify",
+  "paths": [
+    "crates/blaze-query/src/db/value.rs",
+    "crates/blaze-query/Cargo.toml"
+  ],
+  "what": "blaze-query/src/db/value.rs: add `container_values!(either::Either<L, R>);` (SAFETY as the other containers: every kept parameter is a Value), and an `either` dep in crates/blaze-query/Cargo.toml if missing. hir-ty mir.rs:2280 stores Either<L, R> in a query value; salsa fork had default_salsa_value!(Either<L, R>). Only hir-ty error left in qu-check4 (query-unify-port-hirty fixed the other 19). Blocks hir-ty and everything above it in blaze-v2-qu.",
+  "state": "open",
+  "created": "2026-10-31T10:05:33Z",
+  "updated": "2026-10-31T10:05:33Z",
+  "taken_by": null,
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-10-31T10:05:33Z",
+      "by": "query-unify-port",
+      "action": "add",
+      "note": ""
+    }
+  ]
+}

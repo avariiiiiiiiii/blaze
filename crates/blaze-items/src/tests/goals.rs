@@ -371,11 +371,16 @@ fn a_crate_fact_changes_with_its_dependencies_files_and_cfg_alone() {
     let mut cfg = CfgOptions::default();
     cfg.insert_atom(Symbol::intern("blaze_items_dep"));
     dep.set_cfg_options(&mut db, cfg);
-    assert_ne!(val(&db), before, "the dependency's cfg changes it");
+    // A crate's key names each dependency by its key, which names its cfg: `main` is keyed anew.
+    let renamed = whole_crate(&db, main);
+    assert_ne!(renamed, fact, "the dependency's cfg is in its key");
+    let now = value(&db, &renamed).ok();
+    assert_ne!(now, before, "the dependency's cfg changes it");
 
     let (nowhere, elsewhere) = (Fact::Crate(id(8)), Fact::Crate(id(9)));
     assert_eq!(value(&db, &nowhere).ok(), value(&db, &elsewhere).ok(), "no crate is absent");
-    assert_ne!(value(&db, &nowhere).ok(), val(&db));
+    assert_eq!(val(&db), value(&db, &nowhere).ok(), "the old key names no crate");
+    assert_ne!(value(&db, &nowhere).ok(), now);
 }
 
 #[test]

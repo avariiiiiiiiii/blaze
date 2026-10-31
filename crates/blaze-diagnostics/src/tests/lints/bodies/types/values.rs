@@ -1145,13 +1145,10 @@ fn transmute_bool_u8() {
 
 #[test]
 fn lint_enum_intrinsics_non_enums() {
-    check(
-        "lint-enum-intrinsics-non-enums.rs",
-        "sized, discriminant",
-        DISCRIMINANT,
-        include_str!("values/ui/lint-enum-intrinsics-non-enums.rs"),
-        include_str!("values/ui/lint-enum-intrinsics-non-enums.stderr"),
-    );
+    let source = include_str!("values/ui/lint-enum-intrinsics-non-enums.rs");
+    let library = &["variant_count"];
+    let actual = ui(Ui { name: "lint-enum-intrinsics-non-enums.rs", core: "sized, discriminant", std: Some(("", DISCRIMINANT)), library, source, ..Ui::default() });
+    assert_eq!(actual, include_str!("values/ui/lint-enum-intrinsics-non-enums.stderr"));
 }
 
 #[test]
@@ -1191,37 +1188,28 @@ fn unnecessary_transmutation() {
 /// it needs minicore's `non_zero` to have them (requested of the owner of `test-utils`).
 #[test]
 fn invalid_value() {
-    check(
-        "invalid_value.rs",
-        "sized, option, result, send, non_null, non_zero, pat, manually_drop, fn",
-        UNINIT,
-        include_str!("values/ui/invalid_value.rs"),
-        include_str!("values/ui/invalid_value.stderr"),
-    );
+    let source = include_str!("values/ui/invalid_value.rs");
+    let library = &["pattern_type_macro"];
+    let actual = ui(Ui { name: "invalid_value.rs", core: "sized, option, result, send, non_null, non_zero, pat, manually_drop, fn", std: Some(("", UNINIT)), library, source, ..Ui::default() });
+    assert_eq!(actual, include_str!("values/ui/invalid_value.stderr"));
 }
 
 #[test]
 fn const_item_interior_mutations_const_cell() {
-    check(
-        "const-item-interior-mutations-const-cell.rs",
-        "sized, copy, option, result, fn, add, deref",
-        CELLS,
-        include_str!("values/ui/const-item-interior-mutations-const-cell.rs"),
-        include_str!("values/ui/const-item-interior-mutations-const-cell.stderr"),
-    );
+    let source = include_str!("values/ui/const-item-interior-mutations-const-cell.rs");
+    let library = &["once_cell_try", "once_cell_try_insert", "sync_unsafe_cell", "unsafe_cell_access"];
+    let actual = ui(Ui { name: "const-item-interior-mutations-const-cell.rs", core: "sized, copy, option, result, fn, add, deref", std: Some(("", CELLS)), library, source, ..Ui::default() });
+    assert_eq!(actual, include_str!("values/ui/const-item-interior-mutations-const-cell.stderr"));
 }
 
 /// `mutex.lock().unwrap()` needs minicore's `Result::unwrap` (requested of the owner of
 /// `crates/test-utils`).
 #[test]
 fn const_item_interior_mutations_const() {
-    check(
-        "const-item-interior-mutations-const.rs",
-        "sized, copy, option, result, fn, eq, drop, fmt",
-        SYNC,
-        include_str!("values/ui/const-item-interior-mutations-const.rs"),
-        include_str!("values/ui/const-item-interior-mutations-const.stderr"),
-    );
+    let source = include_str!("values/ui/const-item-interior-mutations-const.rs");
+    let library = &["lock_value_accessors", "once_cell_try", "once_cell_try_insert"];
+    let actual = ui(Ui { name: "const-item-interior-mutations-const.rs", core: "sized, copy, option, result, fn, eq, drop, fmt", std: Some(("", SYNC)), library, source, ..Ui::default() });
+    assert_eq!(actual, include_str!("values/ui/const-item-interior-mutations-const.stderr"));
 }
 
 #[test]

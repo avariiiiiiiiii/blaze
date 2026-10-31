@@ -42,15 +42,18 @@ impl DefMap {
     /// Calls `f` with each associated item of `trait_` an import from it binds, and its name,
     /// in declaration order, as this def map (being collected, or collected) can see them.
     /// Allocates nothing: a trait of this def map is read from its syntax as it goes, so on
-    /// [`ItemsFromMacros`] `f` has seen the items before the one that stopped it.
+    /// [`ItemsFromMacros`] `f` has seen the items before the one that stopped it. `collected`:
+    /// this def map is complete (a dependency's a path reached), so its own traits are listed
+    /// by [`TraitItems`] too.
     pub(crate) fn for_each_trait_item_for_import(
         &self,
         db: &Db,
         trait_: TraitId,
+        collected: bool,
         mut f: impl FnMut(Name, AssocItemId),
     ) -> Result<(), ItemsFromMacros> {
         let ItemLoc { container: module, id } = *trait_.lookup(db);
-        if module.krate(db) != self.krate || module.block(db) != self.block_id() {
+        if collected || module.krate(db) != self.krate || module.block(db) != self.block_id() {
             for &(name, item) in &TraitItems::query(db, trait_).items {
                 f(name, item);
             }
@@ -113,7 +116,7 @@ impl DefMap {
         let (types, values) = (res.types.map(|it| it.def), res.values.map(|it| it.def));
         if kind == ImportKind::Glob {
             if let Some(ModuleDefId::TraitId(it)) = types {
-                match self.for_each_trait_item_for_import(db, it, |_, _| {}) {
+                match self.for_each_trait_item_for_import(db, it, false, |_, _| {}) {
                     Err(ItemsFromMacros) => f(TraitItemImport::ItemsFromMacros),
                     Ok(()) if !enabled => f(TraitItemImport::Unstable),
                     Ok(()) => {}

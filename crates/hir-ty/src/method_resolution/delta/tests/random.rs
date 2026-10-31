@@ -342,6 +342,33 @@ fn hashes(db: &Db, krate: Crate) -> Vec<String> {
     out
 }
 
+/// What `krate`'s def maps declare, as the hashes read it: each trait with its items, and each
+/// module's impls by the trait they name, sorted so two databases compare.
+fn declarations(db: &Db, krate: Crate) -> Vec<String> {
+    use hir_def::{ModuleDefId, nameres::crate_def_map, signatures::TraitSignature};
+
+    use crate::db::HirDatabase as _;
+
+    let mut out = Vec::new();
+    for (_, module) in crate_def_map(db, krate).modules(db) {
+        let scope = module.scope(db);
+        for def in scope.declarations() {
+            if let ModuleDefId::TraitId(it) = def {
+                let items: Vec<&str> =
+                    it.trait_items(db).items.iter().map(|(name, _)| name.as_str()).collect();
+                out.push(format!("trait {}: {items:?}", TraitSignature::of(db, it).name.as_str()));
+            }
+        }
+        for imp in scope.impls() {
+            let trait_ = db.impl_trait(imp).map(|it| it.skip_binder().def_id.0);
+            let name = trait_.map(|it| TraitSignature::of(db, it).name.as_str().to_owned());
+            out.push(format!("impl of {}", name.as_deref().unwrap_or("(inherent)")));
+        }
+    }
+    out.sort();
+    out
+}
+
 /// A trait of `krate` or of its dependencies by name (`Clone` is minicore's).
 fn trait_named_anywhere(db: &Db, krate: Crate, name: &str) -> TraitId {
     if TRAITS.contains(&name) {
@@ -386,10 +413,12 @@ fn every_slice_and_reader_is_the_fresh_one_after_each_edit() {
         let fresh = Loaded::new(&model.fixture());
         let (maintained, made) = (hashes(&loaded.db, krate), hashes(&fresh.db, fresh.krate()));
         if maintained != made {
+            let kept = declarations(&loaded.db, krate);
+            let fresh = declarations(&fresh.db, fresh.krate());
             _ = writeln!(
                 failures,
                 "seed {seed}: the hashes differ from a fresh database's:\n{maintained:#?}\n\
-                 {made:#?}"
+                 {made:#?}\nthe declarations, maintained then fresh:\n{kept:#?}\n{fresh:#?}"
             );
         }
     }

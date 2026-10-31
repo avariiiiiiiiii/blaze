@@ -190,6 +190,24 @@ pub(crate) fn ui_core_as(
     ui_fixture_as(mode, &fixture, options)
 }
 
+/// The name of the crate [`library_features`] writes, for a fixture's `deps:`.
+pub(crate) const LIBRARY_FEATURES: &str = "lib_features";
+
+/// A staged crate [`LIBRARY_FEATURES`] whose stability attributes define the library
+/// `features`, for a test that enables features of std's its fixture's std is too small to
+/// have: rustc knows a library feature only from a staged crate of the crate graph, and an
+/// unknown one is E0635.
+pub(crate) fn library_features(features: &[&str]) -> String {
+    let mut out = format!(
+        "//- /{LIBRARY_FEATURES}.rs crate:{LIBRARY_FEATURES} library\n#![feature(staged_api)]\n\
+         #![stable(feature = \"{LIBRARY_FEATURES}\", since = \"1.0.0\")]\n"
+    );
+    for feature in features {
+        out.push_str(&format!("#[unstable(feature = \"{feature}\", issue = \"none\")]\npub fn {feature}() {{}}\n"));
+    }
+    out
+}
+
 /// [`ui`] beside a core of the builtin macros of core's prelude the UI tests call, as
 /// `library/core/src/macros/mod.rs` writes them: `compile_error!` and `#[cfg_accessible]`.
 pub(crate) fn ui_builtins(name: &str, edition: &str, source: &str) -> String {

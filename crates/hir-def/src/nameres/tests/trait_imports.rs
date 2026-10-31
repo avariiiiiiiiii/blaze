@@ -175,6 +175,8 @@ use self::Tr::f as h;
         expect![[r#"
             crate
             - Tr : type
+            - h : _
+            - (legacy) m : macro!
         "#]],
         &["unresolved", "ItemsFromMacros"],
     );

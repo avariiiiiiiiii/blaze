@@ -6,7 +6,7 @@ mod matchers;
 use crate::{
     Options,
     emit::Style,
-    tests::{Mode, ui, ui_core_as},
+    tests::{Mode, library_features, ui, ui_core_as},
 };
 
 /// [`crate::tests::ui_as`] of a fixture of several files: a UI test, its auxiliary crates
@@ -663,7 +663,7 @@ pub struct Bencher;
 
 #[test]
 fn a_builtin_attribute_macro_given_twice_is_linted() {
-    let source = r#"//- /duplicated-attributes.rs crate:other:main edition:2015 deps:std,test cfg:test
+    let source = r#"//- /duplicated-attributes.rs crate:other:main edition:2015 deps:std,test,lib_features cfg:test
 // Test that, if an item is annotated with a builtin attribute more than once, a warning is
 // emitted.
 // Tests https://github.com/rust-lang/rust/issues/90979
@@ -729,5 +729,6 @@ LL | #[cfg_eval]
 warning: 3 warnings emitted
 
 "#;
-    assert_eq!(ui_fixture(Mode::Other, &format!("{TEST_CRATES}{source}"), &Options::default()), expected);
+    let fixture = format!("{TEST_CRATES}{}{source}", library_features(&["cfg_eval"]));
+    assert_eq!(ui_fixture(Mode::Other, &fixture, &Options::default()), expected);
 }

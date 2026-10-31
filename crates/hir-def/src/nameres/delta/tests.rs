@@ -401,6 +401,24 @@ fn an_import_through_a_glob_waits_for_its_modules_expansions() {
     assert!(failures.is_empty(), "{failures}");
 }
 
+/// The crate attributes of the root are the maintained map's crate data with no group's ops
+/// changed: an edit that removes a `#![feature]` removes it from the map, as a fresh run has it
+/// (`random::batched_edits_over_the_fixtures`, the `sanitize` fixture).
+#[test]
+fn removing_a_crate_feature_removes_it_from_the_maintained_map() {
+    let mut loaded = Loaded::new("//- /lib.rs crate:foo crate-attr:no_std\n#![feature(sanitize)]\nfn f() {}\n");
+    let krate = loaded.krate();
+    let root = loaded.file("/lib.rs");
+    let sanitize = Symbol::intern("sanitize");
+    let enabled = |db: &Db| crate_local_def_map(db, krate).def_map(db).features().is_enabled(&sanitize);
+    assert!(enabled(&loaded.db), "loaded: `sanitize` is enabled");
+    loaded.db.set_file_text(root, "fn f() {}\n");
+    assert!(!enabled(&loaded.db), "the feature is gone with its attribute");
+    let mut failures = String::new();
+    check_db(&loaded.db, "a crate feature removed", &Exempt::NONE, false, &mut failures);
+    assert!(failures.is_empty(), "{failures}");
+}
+
 /// A module's id outlives the revisions that never read it: the maintainer publishes each
 /// crate in a write of its own, so a crate maintained early goes unread for as many revisions
 /// as there are crates after it, while their scopes hold its modules' ids. Were
@@ -615,19 +633,27 @@ fn an_edit_in_a_body_of_a_macro_heavy_file_runs_no_resolution_of_again() {
     use crate::test_db::TestDBExt;
     let ran = |log: &[String]| log.iter().filter(|it| *it == "resolution_of").count();
 
-    let (mut db, file, krate) = macro_heavy();
-    let write = db.executed_in_write(|db| db.set_file_text(file, &macro_heavy_text("0")));
-    let read = db.executed_in_read_order(|| _ = crate_local_def_map(&db, krate));
-    let second = db.executed_in_write(|db| db.set_file_text(file, &macro_heavy_text("1")));
-
-    let (mut db, file, krate) = macro_heavy();
-    let within = db.executed_in_write(|db| {
+    // The first write after the load runs the `proc_macros` crate's `resolution_of` once, to
+    // fill its memo; each edit is measured after one such write.
+    let warmed = || {
+        let (mut db, file, krate) = macro_heavy();
         db.set_file_text(file, &macro_heavy_text("0"));
+        _ = crate_local_def_map(&db, krate);
+        (db, file, krate)
+    };
+    let (mut db, file, krate) = warmed();
+    let write = db.executed_in_write(|db| db.set_file_text(file, &macro_heavy_text("1")));
+    let read = db.executed_in_read_order(|| _ = crate_local_def_map(&db, krate));
+    let second = db.executed_in_write(|db| db.set_file_text(file, &macro_heavy_text("2")));
+
+    let (mut db, file, krate) = warmed();
+    let within = db.executed_in_write(|db| {
+        db.set_file_text(file, &macro_heavy_text("1"));
         _ = crate_local_def_map(db, krate);
     });
 
-    let (mut db, file, _) = macro_heavy();
-    let events = db.log_write_in_read_order(|db| db.set_file_text(file, &macro_heavy_text("0")));
+    let (mut db, file, _) = warmed();
+    let events = db.log_write_in_read_order(|db| db.set_file_text(file, &macro_heavy_text("1")));
     let storage = blaze_query::db::Database::storage(&db);
     let of: Vec<String> = events
         .iter()

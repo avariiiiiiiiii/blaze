@@ -214,7 +214,7 @@ error: aborting due to 1 previous error
 
 For more information about this error, try `rustc --explain E0401`.
 "#;
-    assert_eq!(ui_core("enum-definition-with-outer-generic-parameter-5997.rs", "2015", "assert, panic", source), stderr);
+    assert_eq!(ui_core("enum-definition-with-outer-generic-parameter-5997.rs", "2015", "assert, panic, unary_ops", source), stderr);
 }
 
 #[test]

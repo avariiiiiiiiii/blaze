@@ -168,7 +168,7 @@ pub(super) fn written_code<'db>(
     instance: &Instance,
     env: &StoredParamEnvAndCrate,
 ) -> Option<&'db std::result::Result<u128, String>> {
-    let id = cached_closure_of(db, func)?;
+    let id = (*cached_closure_of(db, func))?;
     let closure = Instance {
         def: InstanceDef::Closure(id.as_id()),
         args: instance.args,

@@ -128,6 +128,9 @@ struct PathQuery<'a> {
     mode: ResolveMode,
     shadow: BuiltinShadowMode,
     expected_macro_subns: Option<MacroSubNs>,
+    /// The def map the path resolves in is another crate's, reached by a path: complete, so
+    /// `use Trait::item` lists even its own traits' items through `TraitItems`.
+    collected: bool,
 }
 
 /// The name of blaze's test harness module (`blaze-engine`'s `test_harness::MODULE`).
@@ -220,7 +223,7 @@ impl DefMap {
         // resolving them to. Pass `None` otherwise, e.g. when we're resolving import paths.
         expected_macro_subns: Option<MacroSubNs>,
     ) -> ResolvePathResult {
-        let q = PathQuery { local_def_map, db, mode, shadow, expected_macro_subns };
+        let q = PathQuery { local_def_map, db, mode, shadow, expected_macro_subns, collected: false };
         self.resolve_fp(q, original_module, path.kind, path.segments(), &mut |_| {})
     }
 
@@ -237,7 +240,7 @@ impl DefMap {
         expected_macro_subns: Option<MacroSubNs>,
         reads: &mut impl FnMut(PathRead),
     ) -> ResolvePathResult {
-        let q = PathQuery { local_def_map, db, mode, shadow, expected_macro_subns };
+        let q = PathQuery { local_def_map, db, mode, shadow, expected_macro_subns, collected: false };
         self.resolve_fp(q, original_module, path.kind, path.segments(), reads)
     }
 
@@ -251,7 +254,7 @@ impl DefMap {
         shadow: BuiltinShadowMode,
         expected_macro_subns: Option<MacroSubNs>,
     ) -> ResolvePathResult {
-        let q = PathQuery { local_def_map, db, mode, shadow, expected_macro_subns };
+        let q = PathQuery { local_def_map, db, mode, shadow, expected_macro_subns, collected: false };
         self.resolve_single(q, original_module, path.kind, path.segments(), &mut |_| {})
     }
 
@@ -270,7 +273,7 @@ impl DefMap {
         around: bool,
     ) -> ResolvePathResult {
         let (local_def_map, db, mode) = q;
-        let q = PathQuery { local_def_map, db, mode, shadow, expected_macro_subns };
+        let q = PathQuery { local_def_map, db, mode, shadow, expected_macro_subns, collected: false };
         match around {
             true => self.resolve_fp(q, original_module, kind, segments, &mut |_| {}),
             false => self.resolve_single(q, original_module, kind, segments, &mut |_| {}),
@@ -597,6 +600,7 @@ impl DefMap {
                         let q = PathQuery {
                             local_def_map: LocalDefMap::EMPTY,
                             expected_macro_subns: None,
+                            collected: true,
                             ..q
                         };
                         let resolution =
@@ -675,7 +679,7 @@ impl DefMap {
                     // report. Items the trait's def map cannot list yet bind nothing, and the
                     // importer reports `ItemsFromMacros`.
                     let mut res = PerNs::none();
-                    let listed = self.for_each_trait_item_for_import(db, trait_, |name, item| {
+                    let listed = self.for_each_trait_item_for_import(db, trait_, q.collected, |name, item| {
                         if name == *segment {
                             res = res.or(trait_item_per_ns(item, curr.vis));
                         }

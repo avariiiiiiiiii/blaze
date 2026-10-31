@@ -320,3 +320,19 @@ macro_rules! const_format_args {
     ($fmt:expr) => {{ /* compiler built-in */ }};
     ($fmt:expr, $($args:tt)*) => {{ /* compiler built-in */ }};
 }
+
+pub mod ops {
+    #[lang = "not"]
+    pub trait Not {
+        type Output;
+        fn not(self) -> Self::Output;
+    }
+
+    impl Not for bool {
+        type Output = bool;
+        #[inline]
+        fn not(self) -> bool {
+            !self
+        }
+    }
+}

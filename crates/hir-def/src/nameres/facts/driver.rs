@@ -1515,6 +1515,7 @@ mod a {
 use a::X;
 use a::inner::*;
 pub use self::a::x as renamed;
+use self::renamed as twice;
 use self::missing::Nothing;
 crate::exported!();
 macro_rules! local { () => {} }

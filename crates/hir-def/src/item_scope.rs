@@ -883,7 +883,10 @@ pub struct ItemScope {
     /// Single imports that lost their name to another binding, in the order they came.
     pub(crate) shadowed_imports: ThinVec<ShadowedImport>,
 
-    // the resolutions of the imports of this scope
+    /// The resolutions of the imports of this scope: the binding each import came through, or
+    /// the def, walked by [`Self::fully_resolve_import`]. A glob has no entry: it binds many
+    /// names, so one link per glob would hold whichever name was bound last, an order the old
+    /// collector and the facts engine don't share, and the walk never reads it.
     pub(crate) use_imports_types: Keyed<ImportOrExternCrate, ImportOrDef>,
     pub(crate) use_imports_values: Keyed<ImportOrGlob, ImportOrDef>,
     pub(crate) use_imports_macros: Keyed<ImportOrExternCrate, ImportOrDef>,
@@ -1846,7 +1849,9 @@ impl ItemScope {
                         _ => _ = glob_imports.types.remove(&lookup),
                     }
                     let prev = std::mem::replace(&mut fld.import, import);
-                    if let Some(import) = import {
+                    if let Some(import) = import
+                        && import.glob().is_none()
+                    {
                         self.use_imports_types
                             .insert(import, prev.map_or(ImportOrDef::Def(fld.def), Into::into));
                     }
@@ -1869,7 +1874,9 @@ impl ItemScope {
                                 || self.types.at(pos).is_reresolved_by(&fld, import)
                             {
                                 let prev = std::mem::replace(&mut fld.import, import);
-                                if let Some(import) = import {
+                                if let Some(import) = import
+                                    && import.glob().is_none()
+                                {
                                     self.use_imports_types.insert(
                                         import,
                                         prev.map_or(ImportOrDef::Def(fld.def), Into::into),
@@ -1907,7 +1914,9 @@ impl ItemScope {
                     }
                     let import = import.and_then(ImportOrExternCrate::import_or_glob);
                     let prev = std::mem::replace(&mut fld.import, import);
-                    if let Some(import) = import {
+                    if let Some(import) = import
+                        && import.into_import().is_some()
+                    {
                         self.use_imports_values
                             .insert(import, prev.map_or(ImportOrDef::Def(fld.def), Into::into));
                     }
@@ -1922,7 +1931,9 @@ impl ItemScope {
                         cov_mark::hit!(import_shadowed);
 
                         let prev = std::mem::replace(&mut fld.import, import);
-                        if let Some(import) = import {
+                        if let Some(import) = import
+                            && import.into_import().is_some()
+                        {
                             self.use_imports_values
                                 .insert(import, prev.map_or(ImportOrDef::Def(fld.def), Into::into));
                         }
@@ -1955,7 +1966,9 @@ impl ItemScope {
                         _ => _ = glob_imports.macros.remove(&lookup),
                     }
                     let prev = std::mem::replace(&mut fld.import, import);
-                    if let Some(import) = import {
+                    if let Some(import) = import
+                        && import.glob().is_none()
+                    {
                         self.use_imports_macros.insert(
                             import,
                             prev.map_or_else(|| ImportOrDef::Def(fld.def.into()), Into::into),
@@ -1971,7 +1984,9 @@ impl ItemScope {
                 {
                     cov_mark::hit!(import_shadowed);
                     let prev = std::mem::replace(&mut fld.import, import);
-                    if let Some(import) = import {
+                    if let Some(import) = import
+                        && import.glob().is_none()
+                    {
                         self.use_imports_macros.insert(
                             import,
                             prev.map_or_else(|| ImportOrDef::Def(fld.def.into()), Into::into),
@@ -2215,9 +2230,7 @@ impl ItemScope {
     /// position order binds it, whichever arrived first (docs/v2/plan/design/dbsp.md §6).
     pub(crate) fn rebind_glob_types(&mut self, name: &Name, mut item: TypesItem, glob: GlobId) {
         let pos = self.position(TYPES, name).expect("tried to rebind a non-existent type");
-        let import = ImportOrExternCrate::Glob(glob);
-        let prev = std::mem::replace(&mut item.import, Some(import));
-        self.use_imports_types.insert(import, prev.map_or(ImportOrDef::Def(item.def), Into::into));
+        item.import = Some(ImportOrExternCrate::Glob(glob));
         self.types.entries[pos] = Entry::new(*name, item);
         self.by_def.take();
     }
@@ -2225,9 +2238,7 @@ impl ItemScope {
     /// [`Self::rebind_glob_types`] in the value namespace.
     pub(crate) fn rebind_glob_values(&mut self, name: &Name, mut item: crate::per_ns::ValuesItem, glob: GlobId) {
         let pos = self.position(VALUES, name).expect("tried to rebind a non-existent value");
-        let import = ImportOrGlob::Glob(glob);
-        let prev = std::mem::replace(&mut item.import, Some(import));
-        self.use_imports_values.insert(import, prev.map_or(ImportOrDef::Def(item.def), Into::into));
+        item.import = Some(ImportOrGlob::Glob(glob));
         self.values.entries[pos] = Entry::new(*name, item);
         self.by_def.take();
     }
@@ -2235,9 +2246,7 @@ impl ItemScope {
     /// [`Self::rebind_glob_types`] in the macro namespace.
     pub(crate) fn rebind_glob_macros(&mut self, name: &Name, mut item: crate::per_ns::MacrosItem, glob: GlobId) {
         let pos = self.position(MACROS, name).expect("tried to rebind a non-existent macro");
-        let import = ImportOrExternCrate::Glob(glob);
-        let prev = std::mem::replace(&mut item.import, Some(import));
-        self.use_imports_macros.insert(import, prev.map_or_else(|| ImportOrDef::Def(item.def.into()), Into::into));
+        item.import = Some(ImportOrExternCrate::Glob(glob));
         self.macros.entries[pos] = Entry::new(*name, item);
         self.by_def.take();
     }
@@ -2455,7 +2464,9 @@ mod tests {
                             _ => _ = glob_imports.types.remove(&lookup),
                         }
                         let prev = std::mem::replace(&mut fld.import, import);
-                        if let Some(import) = import {
+                        if let Some(import) = import
+                            && import.glob().is_none()
+                        {
                             self.use_imports_types
                                 .insert(import, prev.map_or(ImportOrDef::Def(fld.def), Into::into));
                         }
@@ -2469,7 +2480,9 @@ mod tests {
                                 || entry.get().is_reresolved_by(&fld, import)
                             {
                                 let prev = std::mem::replace(&mut fld.import, import);
-                                if let Some(import) = import {
+                                if let Some(import) = import
+                                    && import.glob().is_none()
+                                {
                                     self.use_imports_types.insert(
                                         import,
                                         prev.map_or(ImportOrDef::Def(fld.def), Into::into),
@@ -2493,7 +2506,9 @@ mod tests {
                         }
                         let import = import.and_then(ImportOrExternCrate::import_or_glob);
                         let prev = std::mem::replace(&mut fld.import, import);
-                        if let Some(import) = import {
+                        if let Some(import) = import
+                            && import.into_import().is_some()
+                        {
                             self.use_imports_values
                                 .insert(import, prev.map_or(ImportOrDef::Def(fld.def), Into::into));
                         }
@@ -2508,7 +2523,9 @@ mod tests {
                             || entry.get().is_reresolved_by(&fld, import)
                         {
                             let prev = std::mem::replace(&mut fld.import, import);
-                            if let Some(import) = import {
+                            if let Some(import) = import
+                                && import.into_import().is_some()
+                            {
                                 self.use_imports_values.insert(
                                     import,
                                     prev.map_or(ImportOrDef::Def(fld.def), Into::into),
@@ -2531,7 +2548,9 @@ mod tests {
                             _ => _ = glob_imports.macros.remove(&lookup),
                         }
                         let prev = std::mem::replace(&mut fld.import, import);
-                        if let Some(import) = import {
+                        if let Some(import) = import
+                            && import.glob().is_none()
+                        {
                             self.use_imports_macros.insert(
                                 import,
                                 prev.map_or_else(|| ImportOrDef::Def(fld.def.into()), Into::into),
@@ -2546,7 +2565,9 @@ mod tests {
                                 || entry.get().is_reresolved_by(&fld, import)) =>
                     {
                         let prev = std::mem::replace(&mut fld.import, import);
-                        if let Some(import) = import {
+                        if let Some(import) = import
+                            && import.glob().is_none()
+                        {
                             self.use_imports_macros.insert(
                                 import,
                                 prev.map_or_else(|| ImportOrDef::Def(fld.def.into()), Into::into),

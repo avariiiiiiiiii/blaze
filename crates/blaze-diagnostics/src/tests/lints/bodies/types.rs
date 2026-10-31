@@ -25,12 +25,15 @@ pub(crate) struct Ui<'a> {
     pub(crate) std: Option<(&'a str, &'a str)>,
     /// The test's own `//@ compile-flags` of lints: `-D unused-comparisons`.
     pub(crate) flags: &'a [&'a str],
+    /// The library features of std's the test enables that `std` does not define
+    /// ([`crate::tests::library_features`]).
+    pub(crate) library: &'a [&'a str],
     pub(crate) source: &'a str,
 }
 
 impl Default for Ui<'_> {
     fn default() -> Self {
-        Ui { name: "", edition: "2015", mode: Mode::Other, core: "", std: None, flags: &[], source: "" }
+        Ui { name: "", edition: "2015", mode: Mode::Other, core: "", std: None, flags: &[], library: &[], source: "" }
     }
 }
 
@@ -41,7 +44,7 @@ pub(crate) fn ui(ui: Ui<'_>) -> String {
     if !ui.core.is_empty() {
         writeln!(fixture, "//- minicore: {}", ui.core).unwrap();
     }
-    let deps = match ui.std {
+    let mut deps = match ui.std {
         Some((prelude, items)) => {
             assert!(!ui.core.is_empty(), "std's prelude is core's: give minicore's flags");
             fixture.push_str("//- /std.rs crate:std\npub mod prelude {\n");
@@ -53,10 +56,15 @@ pub(crate) fn ui(ui: Ui<'_>) -> String {
                 .unwrap();
             }
             writeln!(fixture, "}}\n#[doc(hidden)]\npub mod __prelude {{\n{prelude}\n}}\n{items}").unwrap();
-            " deps:std"
+            String::from(" deps:std")
         }
-        None => "",
+        None => String::new(),
     };
+    if !ui.library.is_empty() {
+        fixture.push_str(&crate::tests::library_features(ui.library));
+        let sep = if deps.is_empty() { " deps:" } else { "," };
+        write!(deps, "{sep}{}", crate::tests::LIBRARY_FEATURES).unwrap();
+    }
     write!(fixture, "//- /{} crate:other:main edition:{}{deps}\n{}", ui.name, ui.edition, ui.source).unwrap();
     let args: Vec<String> = ui.flags.iter().flat_map(|flag| flag.split(' ')).map(str::to_owned).collect();
     let lints = CommandLine::parse(&args).expect("the test's flags are rustc's");

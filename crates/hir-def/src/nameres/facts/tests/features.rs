@@ -72,7 +72,8 @@ fn reading_the_roots_features_builds_no_def_map() {
 
 #[test]
 fn a_crate_without_features_has_none() {
-    let fx = fixture::db("//- /lib.rs crate:foo\npub struct A;\n");
+    // `no_std` keeps the fixture from gating a `no_core` with `feature(no_core)`.
+    let fx = fixture::db("//- /lib.rs crate:foo crate-attr:no_std\npub struct A;\n");
     let _ = fx.only_file();
     let db = fx.into_db();
     let krate = db.fetch_test_crate();

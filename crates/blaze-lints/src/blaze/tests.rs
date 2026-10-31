@@ -11,7 +11,10 @@
 
 use crate::tests::lint;
 
-const MINICORE: &str = "//- minicore: sized, clone, copy, derive, fn, default, from, deref, builtin_impls\n";
+/// `dispatch_from_dyn` (with `unsize`) makes `&self` methods dispatchable, as with the real
+/// `core`: without its lang items no trait is dyn-compatible and no vtable call resolves.
+const MINICORE: &str =
+    "//- minicore: sized, clone, copy, derive, fn, default, from, deref, builtin_impls, dispatch_from_dyn\n";
 
 const ALLOC_STD: &str = r#"
 //- /std/lib.rs crate:std

@@ -417,7 +417,8 @@ fn publish_crate(
     modules_changed: &mut Vec<ModuleId>,
     work: &mut Work,
 ) -> CrateDelta {
-    let proc_macro = queries::crate_data(db, krate).proc_macro;
+    let attrs = queries::crate_data(db, krate);
+    let proc_macro = attrs.proc_macro;
     let root = cs.root;
     // What the impls maintainer is handed, before: the items of every module the write replaced.
     let mut old_items = Items::default();
@@ -427,8 +428,10 @@ fn publish_crate(
     let mut rows_changed = cold || delta.tree;
     // A cold run keeps the old state's inputs, not what they were made from.
     let mut records_changed = cold || !delta.deleted.is_empty();
-    let mut data_changed =
-        cold || cs.data.is_none() || delta.deleted.iter().any(|(_, it)| !it.out.crate_ops.is_empty());
+    let mut data_changed = cold
+        || cs.data.is_none()
+        || cs.data_of.as_ref() != Some(attrs)
+        || delta.deleted.iter().any(|(_, it)| !it.out.crate_ops.is_empty());
     let mut env_changed = false;
 
     if let Some(Cutoff { out: mut run, old, mut outside, changed: keys, order: ran }) = cutoff {
@@ -501,6 +504,7 @@ fn publish_crate(
         cs.prelude_holder = run.prelude_holder;
         if data_changed {
             cs.data = Some(assemble::data(db, krate, cs));
+            cs.data_of = Some(attrs.clone()); // clone: a count of the crate's attributes
         }
 
         // Each group of the region's share of the records, on the crate as it now is: what it
@@ -537,6 +541,9 @@ fn publish_crate(
         }
         changed = keys;
         order = ran;
+    } else if data_changed {
+        cs.data = Some(assemble::data(db, krate, cs));
+        cs.data_of = Some(attrs.clone()); // clone: a count of the crate's attributes
     }
 
     // The name-free inserts of the groups that did not run.
@@ -665,6 +672,7 @@ fn cold(db: &Db, frame: &Frame, krate: Crate) -> (crate::nameres::DefMap, crate:
     cs.env = out.env;
     cs.prelude = out.prelude;
     cs.data = Some(assemble::data(db, krate, &cs));
+    cs.data_of = Some(queries::crate_data(db, krate).clone()); // clone: a count of the crate's attributes
 
     let local = cs.env.local_def_map();
     let rows = std::mem::replace(&mut cs.rows, ModulesMap::new());

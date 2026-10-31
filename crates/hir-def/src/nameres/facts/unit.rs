@@ -973,6 +973,7 @@ impl<'db, 'f, A: Allocator + Clone> Unit<'db, 'f, A> {
                         let listed = self.def_map.for_each_trait_item_for_import(
                             self.db,
                             it,
+                            false,
                             |name, item| held.push((Some(name), trait_item_per_ns(item, vis))),
                         );
                         if listed.is_err() {

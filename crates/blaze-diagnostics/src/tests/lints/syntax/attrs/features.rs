@@ -4,7 +4,7 @@
 use crate::{
     Options,
     emit::Style,
-    tests::{Mode, checked_with, compiletest, normalized, ui, ui_core_as},
+    tests::{LIBRARY_FEATURES, Mode, checked_with, compiletest, library_features, normalized, ui, ui_core_as},
 };
 
 /// [`crate::tests::ui`] of the revision of a UI test of edition 2015 that compiletest gives
@@ -62,7 +62,13 @@ LL | #![feature(intrinsics, panic_internals)]
 error: aborting due to 2 previous errors
 
 "#;
-    assert_eq!(ui("internal_features.rs", "2015", source), expected);
+    let fixture = format!(
+        "{}//- /internal_features.rs crate:other:main edition:2015 deps:{LIBRARY_FEATURES}\n{source}",
+        library_features(&["panic_internals"])
+    );
+    let options = compiletest(Mode::Other, &Options::default());
+    let stderr = checked_with(&fixture, "$DIR/", &options).stderr_with(Style { ui_testing: true, ..Style::default() });
+    assert_eq!(normalized(&stderr), expected);
 }
 
 #[test]

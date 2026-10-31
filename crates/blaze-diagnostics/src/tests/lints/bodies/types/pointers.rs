@@ -488,9 +488,8 @@ fn dangling_pointers_from_locals() {
 
 #[test]
 fn dangling_pointers_from_temporaries_types() {
-    check(
-        "types.rs",
-        include_str!("pointers/ui/dangling-pointers-from-temporaries/types.rs"),
-        include_str!("pointers/ui/dangling-pointers-from-temporaries/types.stderr"),
-    );
+    let source = include_str!("pointers/ui/dangling-pointers-from-temporaries/types.rs");
+    let library = &["sync_unsafe_cell"];
+    let actual = ui(Ui { name: "types.rs", core: FLAGS, std: Some((PRELUDE, STD)), library, source, ..Ui::default() });
+    assert_eq!(actual, include_str!("pointers/ui/dangling-pointers-from-temporaries/types.stderr"));
 }

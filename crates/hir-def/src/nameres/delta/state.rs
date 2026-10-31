@@ -80,8 +80,12 @@ pub(super) struct CrateState {
     /// round-0 tree.
     pub(super) group_pos: FxHashMap<ModuleId, Pos>,
     /// The crate data with every group's exported derives and proc macro functions, and whether
-    /// a group asked for session macros: made again only when a group's crate-level ops change.
+    /// a group asked for session macros: made again only when a group's crate-level ops change,
+    /// or the root's crate attributes, [`Self::data_of`].
     pub(super) data: Option<(Arc<DefMapCrateData>, bool)>,
+    /// The crate attributes `data` was made from (`queries::crate_data`): an edit of the root's
+    /// `#![feature]` or `#![no_std]` changes them, and no group's ops.
+    pub(super) data_of: Option<Arc<DefMapCrateData>>,
 }
 
 impl CrateState {
@@ -114,6 +118,7 @@ impl CrateState {
             derive_pos: FxHashMap::default(),
             group_pos: FxHashMap::default(),
             data: None,
+            data_of: None,
         }
     }
 

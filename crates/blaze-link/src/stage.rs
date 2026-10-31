@@ -1756,7 +1756,7 @@ mod tests {
     #[test]
     fn the_wasm_header_scan_finds_imports_as_the_decoder_does() {
         let sig = Signature { params: vec![ValType::I32, ValType::I64], results: vec![ValType::F64] };
-        let bare = Code {
+        let bare_code = || Code {
             ty: sig.clone(),
             types: vec![sig.clone(), Signature::default()],
             type_fixups: vec![(3, 0), (300, 1)],
@@ -1764,9 +1764,10 @@ mod tests {
             imports: Vec::new(),
             export: Some("f".to_owned()),
         };
+        let bare = bare_code();
         let with = Code {
             imports: vec![("puts".to_owned(), Import { module: "env".to_owned(), field: "puts".to_owned(), ty: sig })],
-            ..bare.clone()
+            ..bare_code()
         };
         for code in [&bare, &with] {
             let (bytes, _) = code.encode(&[0x0b]);

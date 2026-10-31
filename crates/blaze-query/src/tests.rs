@@ -521,6 +521,49 @@ fn settling_swaps_to_the_mapped_image() {
     db.reclaim();
 }
 
+/// A cold pack still being written (or, `mapping_it`, mapped) when the database settles names the
+/// memos of the store it left (01251): once its I/O is done it is removed, never read into
+/// the image's store, and the image's memos serve.
+fn settle_with_a_cold_pack_in_flight(mapping_it: bool) {
+    let (mut db, tree) = setup();
+    let one = view(&db, &tree, &[("a", "abc")]);
+    double(&db, one, "a");
+    db.close(one);
+    let mut effects = Vec::new();
+    db.collect(&[key::<Double>("a")], &mut effects);
+    let (file, bytes, mut tag) = written(&mut effects);
+    if mapping_it {
+        db.complete(Completion { tag, done: Done::Written }, &mut effects);
+        tag = mapped(&mut effects).1;
+    }
+    let (image, _) = image_of(&db, Builder::new());
+    assert_eq!(db.settle(opened(&image), &mut effects), Ok(()));
+    assert!(effects.is_empty(), "no pack was mapped yet: {effects:?}");
+
+    let done = if mapping_it { Done::Mapped(mapping(&bytes)) } else { Done::Written };
+    db.complete(Completion { tag, done }, &mut effects);
+    assert_eq!(effects.len(), 1, "{effects:?}");
+    let Some(Effect::Remove { file: removed, tag }) = effects.pop() else { panic!("not a remove") };
+    assert_eq!(removed.as_str(), file.as_str());
+    db.complete(Completion { tag, done: Done::Removed }, &mut effects);
+    assert!(effects.is_empty(), "{effects:?}");
+
+    let again = view(&db, &tree, &[("a", "abc")]);
+    assert_eq!(double(&db, again, "a"), 6);
+    assert_eq!((runs("len"), runs("double")), (1, 1), "verified from the image");
+    db.reclaim();
+}
+
+#[test]
+fn a_cold_pack_written_across_a_settle_is_removed() {
+    settle_with_a_cold_pack_in_flight(false);
+}
+
+#[test]
+fn a_cold_pack_mapped_across_a_settle_is_removed() {
+    settle_with_a_cold_pack_in_flight(true);
+}
+
 /// One byte flipped in a group of a database section: each request reading a key whose memos
 /// it held fails naming the section and group, every time, and nothing is computed again; every
 /// other key is used from the image, the group is reported once, and no image is written

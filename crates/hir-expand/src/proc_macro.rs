@@ -182,7 +182,7 @@ pub struct ProcMacros {
 }
 
 impl ProcMacros {
-    pub fn init_default(db: &Db, durability: Durability) {
+    pub fn init_default(db: &mut Db, durability: Durability) {
         _ = Self::builder(Default::default()).durability(durability).new(db);
     }
 }

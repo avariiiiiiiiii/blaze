@@ -104,7 +104,7 @@ pub fn set_served(db: &mut Db, parts: FxHashMap<Crate, ImageBuf>) {
             it.set_parts(db).with_durability(Durability::HIGH).to(served);
         }
         None => {
-            _ = ServedBodies::builder(served).durability(Durability::HIGH).new(&*db);
+            _ = ServedBodies::builder(served).durability(Durability::HIGH).new(db);
         }
     }
 }

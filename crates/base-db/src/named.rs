@@ -172,7 +172,7 @@ impl Named {
                 .collect(); // alloc: as above.
             let table = PathTable(self.table.clone()); // clone: a refcount, once per database.
             self.input =
-                Some(NamedPaths::builder(table, buckets).durability(Durability::HIGH).new(&*db));
+                Some(NamedPaths::builder(table, buckets).durability(Durability::HIGH).new(db));
             return;
         };
         while dirty != 0 {

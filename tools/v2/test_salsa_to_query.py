@@ -134,6 +134,12 @@ class Feature(unittest.TestCase):
         self.assertEqual(out.left, [])
 
 
+class MethodName(unittest.TestCase):
+    def test_a_tracked_impl_method_is_type_and_method(self) -> None:
+        out = s.migrate('expect!["Modules < \'db >::module_", "TraitImpls::for_crate_", "a_"];\n')
+        self.assertEqual(out.text, 'expect!["Modules::module", "TraitImpls::for_crate", "a_"];\n')
+
+
 class Replay(unittest.TestCase):
     def check(self, before: str, after: str) -> None:
         edits = s.hand_edits(before, after)

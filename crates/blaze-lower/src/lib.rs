@@ -305,7 +305,7 @@ pub fn lower_into<T: blaze_query::Tree>(db: Db, lower: Lower<'_, T>) -> Result<L
 
     let tree = files::Mounts { mounts: &config.mounts, view: root, tree: files, read_view: Cell::new(false) };
     let mut db = db;
-    ProcMacros::init_default(&db, Durability::HIGH);
+    ProcMacros::init_default(&mut db, Durability::HIGH);
     for (index, &is_library) in library.iter().enumerate() {
         let source_root = match is_library {
             true => SourceRoot::new_library(FileSet::default()),
@@ -322,8 +322,8 @@ pub fn lower_into<T: blaze_query::Tree>(db: Db, lower: Lower<'_, T>) -> Result<L
             .map(|it| SourceRootId(it as u32))
             .collect()
     };
-    _ = LibraryRoots::builder(roots(true)).durability(Durability::MEDIUM).new(&db);
-    _ = LocalRoots::builder(roots(false)).durability(Durability::MEDIUM).new(&db);
+    _ = LibraryRoots::builder(roots(true)).durability(Durability::MEDIUM).new(&mut db);
+    _ = LocalRoots::builder(roots(false)).durability(Durability::MEDIUM).new(&mut db);
 
     let mut loaded = Vec::new();
     let mut read = Vec::with_capacity(loads.len());

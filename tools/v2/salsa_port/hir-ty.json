@@ -43,6 +43,10 @@
     {
      "old": "//! Every id the record writes goes through a table ([`ids`]), so the bytes name no salsa id.\n",
      "new": "//! Every id the record writes goes through a table ([`ids`]), so the bytes name no database's own id.\n"
+    },
+    {
+     "old": "            _ = ServedBodies::builder(served).durability(Durability::HIGH).new(&*db);\n",
+     "new": "            _ = ServedBodies::builder(served).durability(Durability::HIGH).new(db);\n"
     }
    ]
   },
@@ -211,6 +215,10 @@
     {
      "old": "//! salsa id ([`codec`]). [`cached`] gives `const_eval_query` the kept value before it reads\n",
      "new": "//! database id ([`codec`]). [`cached`] gives `const_eval_query` the kept value before it reads\n"
+    },
+    {
+     "old": "            _ = KeptConsts::builder(kept).durability(Durability::HIGH).new(&*db);\n",
+     "new": "            _ = KeptConsts::builder(kept).durability(Durability::HIGH).new(db);\n"
     }
    ]
   },
@@ -468,6 +476,14 @@
     {
      "old": "//! The published slices (design \u00a77, \u00a78): one salsa input per (crate, trait), per (crate, head)\n",
      "new": "//! The published slices (design \u00a77, \u00a78): one query input per (crate, trait), per (crate, head)\n"
+    },
+    {
+     "old": "        None => _ = ImplIdentities::new(&*db, impl_, def),\n",
+     "new": "        None => _ = ImplIdentities::new(db, impl_, def),\n"
+    },
+    {
+     "old": "            _ = ImplSlices::new(&*db, Arc::new(crates));\n",
+     "new": "            _ = ImplSlices::new(db, Arc::new(crates));\n"
     }
    ]
   },
@@ -475,8 +491,8 @@
    "path": "crates/hir-ty/src/method_resolution/delta/tests/cost.rs",
    "edits": [
     {
-     "old": "/// Whether `query` is among the salsa debug names in `executed`, which end in `_` for a\n",
-     "new": "/// Whether `query` is among the ingredient names in `executed`, which end in `_` for a\n"
+     "old": "/// Whether `query` is among the salsa debug names in `executed`, which end in `_` for a\n/// method of a tracked impl (`TraitImpls < 'db >::for_crate_and_trait_`).\n",
+     "new": "/// Whether `query` is among the ingredient names in `executed`, which name a method of a\n/// tracked impl by its type and method (`TraitImpls::for_crate_and_trait`).\n"
     }
    ]
   },

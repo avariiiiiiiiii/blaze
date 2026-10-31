@@ -153,7 +153,7 @@ pub fn set_process_env(db: &mut Db, vars: Env) {
                 }
             }
             None => {
-                ProcessEnv::new(&*db, vars, content);
+                ProcessEnv::new(db, vars, content);
                 db.note(maintain::Note::Crates);
             }
         }
@@ -514,7 +514,7 @@ pub fn set_all_crates_with_durability(
                 all.set_content(db).with_durability(durability).to(content);
             }
             None => {
-                _ = AllCrates::builder(crates, content).durability(durability).new(&*db);
+                _ = AllCrates::builder(crates, content).durability(durability).new(db);
             }
         }
     })

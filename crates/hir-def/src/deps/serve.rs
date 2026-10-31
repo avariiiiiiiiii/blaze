@@ -320,7 +320,7 @@ fn set_images(db: &mut Db, images: FxHashMap<Crate, Image>) {
             it.set_images(db).with_durability(Durability::HIGH).to(images);
         }
         None => {
-            _ = DepImages::builder(images).durability(Durability::HIGH).new(&*db);
+            _ = DepImages::builder(images).durability(Durability::HIGH).new(db);
         }
     }
 }

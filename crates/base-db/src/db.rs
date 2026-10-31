@@ -138,8 +138,8 @@ impl Db {
     pub fn for_tests() -> Db {
         let log = std::sync::Arc::new(EventLog::default()); // alloc: a test database's setup
         let mut db = Db::with(Run::Here, Some(log));
-        _ = LibraryRoots::builder(Default::default()).durability(Durability::MEDIUM).new(&db);
-        _ = LocalRoots::builder(Default::default()).durability(Durability::MEDIUM).new(&db);
+        _ = LibraryRoots::builder(Default::default()).durability(Durability::MEDIUM).new(&mut db);
+        _ = LocalRoots::builder(Default::default()).durability(Durability::MEDIUM).new(&mut db);
         CrateGraphBuilder::default().set_in_db(&mut db);
         db
     }

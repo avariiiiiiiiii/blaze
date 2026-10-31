@@ -395,6 +395,9 @@ def drop_revisions(text: str) -> str:
 # span's optional engine feature, `salsa` before and `query` now (tt and the proc-macro crates
 # take span without it).
 FEATURE = re.compile(r'\bfeature\s*=\s*"salsa"')
+# A tracked impl method's name in a log: the fork's `"Modules < 'db >::module_"`, the contract's
+# `"Modules::module"`.
+METHOD_NAME = re.compile(r'"([A-Z][A-Za-z0-9]*)(?: < [^"]*? >)?::([a-z_0-9]+?)_"')
 
 
 NESTED_USE = re.compile(r"(?<![\w:])use\s+(?:::)?base_db::\{")
@@ -450,6 +453,7 @@ def migrate(text: str) -> FileResult:
     new = drop_revisions(new)
     new = rewrite_bits(new, salsa_id, had_salsa, left)
     new = FEATURE.sub('feature = "query"', new)
+    new = METHOD_NAME.sub(r'"\1::\2"', new)
     left.extend(scan(new, had_salsa or "blaze_query::db" in new))
     return FileResult(new, left)
 

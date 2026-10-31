@@ -1,6 +1,6 @@
 {
  "crate": "crates/hir-def",
- "base": "fd6947867d60c44cd95f580924a79f2acb08bdae",
+ "base": "9023f3e6d7d8a2d1954423c4ccdd89b220701525",
  "files": [
   {
    "path": "crates/hir-def/src/attrs.rs",
@@ -8,6 +8,15 @@
     {
      "old": "//! if it is not present, we do not call the query, to prevent Salsa from needing to record\n",
      "new": "//! if it is not present, we do not call the query, to keep the query database from needing to record\n"
+    }
+   ]
+  },
+  {
+   "path": "crates/hir-def/src/deps/serve.rs",
+   "edits": [
+    {
+     "old": "            _ = DepImages::builder(images).durability(Durability::HIGH).new(&*db);\n",
+     "new": "            _ = DepImages::builder(images).durability(Durability::HIGH).new(db);\n"
     }
    ]
   },

@@ -1,6 +1,6 @@
 {
  "crate": "crates/blaze-items",
- "base": "b8c752e457596472d86888086afc758ecfcb8f38",
+ "base": "9023f3e6d7d8a2d1954423c4ccdd89b220701525",
  "files": [
   {
    "path": "crates/blaze-items/src/form.rs",
@@ -92,8 +92,8 @@
    "path": "crates/blaze-items/src/tests/narrow.rs",
    "edits": [
     {
-     "old": "/// Whether `query` is among the salsa debug names in `executed`, which end in `_` for a\n",
-     "new": "/// Whether `query` is among the ingredient names in `executed`, which end in `_` for a\n"
+     "old": "/// Whether `query` is among the salsa debug names in `executed`, which end in `_` for a\n/// method of a tracked impl (`TraitImpls < 'db >::for_crate_`).\n",
+     "new": "/// Whether `query` is among the ingredient names in `executed`, which name a method of a\n/// tracked impl by its type and method (`TraitImpls::for_crate`).\n"
     }
    ]
   }

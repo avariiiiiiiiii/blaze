@@ -29,8 +29,8 @@ use hir_expand::fixture;
 
 use super::db::TestDB;
 
-/// Whether `query` is among the ingredient names in `executed`, which end in `_` for a
-/// method of a tracked impl (`TraitImpls < 'db >::for_crate_`).
+/// Whether `query` is among the ingredient names in `executed`, which name a method of a
+/// tracked impl by its type and method (`TraitImpls::for_crate`).
 fn ran(executed: &[String], query: &str) -> bool {
     executed.iter().any(|it| it.trim_end_matches('_').ends_with(query))
 }

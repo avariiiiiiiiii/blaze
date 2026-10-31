@@ -198,7 +198,7 @@ pub fn install_identities(
             it.set_impl_(db).to(impl_);
             it.set_def(db).to(def);
         }
-        None => _ = ImplIdentities::new(&*db, impl_, def),
+        None => _ = ImplIdentities::new(db, impl_, def),
     }
 }
 
@@ -605,7 +605,7 @@ fn register(db: &mut Db, krate: Crate, directory: SliceDirectory) {
             let mut crates = FxHashMap::default();
             crates.insert(krate, directory);
             // alloc: the singleton's map, once per database
-            _ = ImplSlices::new(&*db, Arc::new(crates));
+            _ = ImplSlices::new(db, Arc::new(crates));
         }
     }
 }

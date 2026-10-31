@@ -1,6 +1,6 @@
 {
  "crate": "crates/hir-def",
- "base": "8d2f0ab9ce8d0a115eb24c9cca362953b2e8a1cf",
+ "base": "b8c752e457596472d86888086afc758ecfcb8f38",
  "files": [
   {
    "path": "crates/hir-def/src/attrs.rs",
@@ -75,8 +75,8 @@
    "path": "crates/hir-def/src/expr_store/persist.rs",
    "edits": [
     {
-     "old": "            Code, Column, Node, Placed, Read, Words, WordsRec, blank_segments, names_blank,\n            syntax_context, with_slots,\n",
-     "new": "            Code, Column, Node, Placed, Read, Words, WordsRec, blank_segments, id_of_bits,\n            names_blank, syntax_context, with_slots,\n"
+     "old": "            Code, Column, Node, Placed, Read, Words, WordsRec, blank_segments, lifetime_index,\n            names_blank, syntax_context, with_slots,\n",
+     "new": "            Code, Column, Node, Placed, Read, Words, WordsRec, blank_segments, id_of_bits,\n            lifetime_index, names_blank, syntax_context, with_slots,\n"
     },
     {
      "old": "        /// Each block's salsa id, as its bits.\n",
@@ -199,8 +199,8 @@
    "path": "crates/hir-def/src/expr_store/tests/body/block.rs",
    "edits": [
     {
-     "old": "                [salsa id]: Id(583),\n",
-     "new": "                [id]: Id(583),\n"
+     "old": "                [salsa id]: Id(503),\n",
+     "new": "                [id]: Id(503),\n"
     }
    ]
   },
@@ -402,7 +402,7 @@
      "new": "    /// The sizes the notes give (`docs/v2/plan/lanes/db/speed-hir-nameres-scope.md`), with\n    /// ids of 4 bytes (`blaze_query::db::Id`).\n"
     },
     {
-     "old": "        assert_eq!(size_of::<Entry>(), 40);\n",
+     "old": "        assert_eq!(size_of::<Entry>(), 36);\n",
      "new": "        assert_eq!(size_of::<Entry>(), 24);\n"
     },
     {
@@ -832,6 +832,15 @@
     {
      "old": "    /// Compared by its content, not a hash of it: salsa compares a new value with the old one\n",
      "new": "    /// Compared by its content, not a hash of it: the query database compares a new value with the old one\n"
+    }
+   ]
+  },
+  {
+   "path": "crates/hir-def/src/test_db.rs",
+   "edits": [
+    {
+     "old": "                    salsa::Database::ingredient_debug_name(db, database_key.ingredient_index())\n                        .into_owned(),\n",
+     "new": "                    blaze_query::db::Database::storage(db)\n                        .ingredient_name(database_key.ingredient_index())\n                        .to_owned(),\n"
     }
    ]
   },

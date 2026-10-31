@@ -35,7 +35,7 @@ pub(crate) trait TestDBExt {
     /// database to set inputs on, so the events include what the write-side maintainers ran in
     /// it ([`Db::log_mut`]). Every write ends in them: what a read once ran first, the write
     /// runs now.
-    fn log_write_in_read_order(&mut self, f: impl FnOnce(&mut Db)) -> Vec<salsa::Event>;
+    fn log_write_in_read_order(&mut self, f: impl FnOnce(&mut Db)) -> Vec<blaze_query::db::Event>;
 
     /// The names of the queries `f` executed, in [`TestDBExt::log_write_in_read_order`]'s order.
     fn executed_in_write(&mut self, f: impl FnOnce(&mut Db)) -> Vec<String>;
@@ -103,7 +103,7 @@ impl TestDBExt for Db {
         executed
     }
 
-    fn log_write_in_read_order(&mut self, f: impl FnOnce(&mut Db)) -> Vec<salsa::Event> {
+    fn log_write_in_read_order(&mut self, f: impl FnOnce(&mut Db)) -> Vec<blaze_query::db::Event> {
         let order = set_run_order(RunOrder::LeftToReaders);
         let events = self.log_mut(f);
         set_run_order(order);
@@ -116,9 +116,10 @@ impl TestDBExt for Db {
         events
             .into_iter()
             .filter_map(|event| match event.kind {
-                salsa::EventKind::WillExecute { database_key } => Some(
-                    salsa::Database::ingredient_debug_name(db, database_key.ingredient_index())
-                        .into_owned(),
+                blaze_query::db::EventKind::WillExecute { database_key } => Some(
+                    blaze_query::db::Database::storage(db)
+                        .ingredient_name(database_key.ingredient_index())
+                        .to_owned(),
                 ),
                 _ => None,
             })

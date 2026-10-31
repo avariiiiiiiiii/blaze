@@ -1,6 +1,6 @@
 {
  "crate": "crates/hir-ty-mir",
- "base": "8d2f0ab9ce8d0a115eb24c9cca362953b2e8a1cf",
+ "base": "b8c752e457596472d86888086afc758ecfcb8f38",
  "files": [
   {
    "path": "crates/hir-ty-mir/src/mir/budget.rs",
@@ -19,8 +19,8 @@
    "path": "crates/hir-ty-mir/src/mir/location.rs",
    "edits": [
     {
-     "old": "            db.synthetic_write(blaze_query::db::Durability::LOW);\n",
-     "new": "            db.storage_mut().synthetic_write(blaze_query::db::Durability::LOW);\n"
+     "old": "            db.synthetic_write(blaze_query::db::Durability::HIGH);\n",
+     "new": "            db.storage_mut().synthetic_write(blaze_query::db::Durability::HIGH);\n"
     },
     {
      "old": "        db.report_untracked_read();\n",

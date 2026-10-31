@@ -116,6 +116,17 @@ class StorageCalls(unittest.TestCase):
         self.assertTrue(hand("fn f(db: &mut Db) { salsa::Database::synthetic_write(db, d); db.synthetic_write(d); }\n"))
 
 
+class NestedUse(unittest.TestCase):
+    def test_a_salsa_leaf_of_base_db_gets_its_own_use(self) -> None:
+        out = s.migrate("use base_db::{Db, salsa::Durability};\nfn f(_: Durability) {}\n")
+        self.assertEqual(out.text, "use base_db::Db;\nuse blaze_query::db::Durability;\nfn f(_: Durability) {}\n")
+        self.assertEqual(out.left, [])
+
+    def test_only_salsa_leaves(self) -> None:
+        out = s.migrate("    use base_db::{salsa::Setter as _};\n")
+        self.assertEqual(out.text, "    use blaze_query::db::Setter as _;\n")
+
+
 class Feature(unittest.TestCase):
     def test_spans_feature_is_query(self) -> None:
         out = s.migrate('#[cfg(not(feature = "salsa"))]\nfn f() {}\n')

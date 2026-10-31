@@ -1,6 +1,6 @@
 {
  "crate": "crates/blaze-item-hash",
- "base": "8d2f0ab9ce8d0a115eb24c9cca362953b2e8a1cf",
+ "base": "b8c752e457596472d86888086afc758ecfcb8f38",
  "files": [
   {
    "path": "crates/blaze-item-hash/src/identity/inputs.rs",
@@ -71,6 +71,10 @@
     {
      "old": "        ReadKind::Accumulator => return Classified::Refused,\n        ReadKind::Input | ReadKind::TrackedStruct | ReadKind::Query => {}\n",
      "new": "        ReadKind::Function | ReadKind::InputField(_) | ReadKind::TrackedField(_) => {}\n"
+    },
+    {
+     "old": "/// `name` as [`RULES`] lists it. Salsa names a method of a `#[salsa::tracked] impl` after its\n/// hygienic inner function, the method's name with `_` added (`Body::of_`); a free tracked\n/// function or a field keeps its name.\n",
+     "new": "/// `name` as [`RULES`] lists it. The query engine names a method of a\n/// `#[blaze_query::tracked] impl` after its hygienic inner function, the method's name with `_`\n/// added (`Body::of_`); a free tracked function or a field keeps its name.\n"
     },
     {
      "old": "        let file = *file.get_or_insert_with(|| {\n            db.zalsa().lookup_ingredient(read.ingredient_index()).location().file\n        });\n",

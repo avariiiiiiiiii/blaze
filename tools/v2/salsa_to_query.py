@@ -397,7 +397,45 @@ def drop_revisions(text: str) -> str:
 FEATURE = re.compile(r'\bfeature\s*=\s*"salsa"')
 
 
+NESTED_USE = re.compile(r"(?<![\w:])use\s+(?:::)?base_db::\{")
+
+
+def leaf(path: list[str], alias: str | None) -> str:
+    return "::".join(path) + (f" as {alias}" if alias else "")
+
+
+def split_nested(text: str) -> str:
+    """Moves the `salsa::` leaves of a `use base_db::{..}` tree into a `use salsa::..;` of their
+    own, which `rewrite_uses` then reads: in place, `salsa::X` would become `base_db::blaze_query::..`."""
+    masked, _ = mask(text)
+    edits: list[tuple[int, int, str]] = []
+    for m in NESTED_USE.finditer(masked):
+        brace = m.end() - 1
+        end = masked.index(";", m.end())
+        if masked[brace:end] != text[brace:end]:
+            continue
+        tokens = TOKEN.findall(text[brace:end]) + ["<end>"]
+        leaves: list[tuple[list[str], str | None]] = []
+        if parse_tree(tokens, 0, [], leaves) != len(tokens) - 1:
+            continue
+        ours = [(path[1:], alias) for path, alias in leaves if path[0] == "salsa"]
+        if not ours:
+            continue
+        rest = [leaf(path, alias) for path, alias in leaves if path[0] != "salsa"]
+        use_start = masked.index("use", m.start())
+        indent = text[text.rfind("\n", 0, use_start) + 1:use_start]
+        indent = indent if indent.strip() == "" else ""
+        head = text[use_start:m.end() - 1]
+        salsa = [leaf(path, alias) for path, alias in ours]
+        statements = [f"{head}{rest[0] if len(rest) == 1 else '{' + ', '.join(rest) + '}'}"] if rest else []
+        tail = "salsa::" + (salsa[0] if len(salsa) == 1 else "{" + ", ".join(salsa) + "}")
+        statements.append(f"use {tail}")
+        edits.append((use_start, end, f";\n{indent}".join(statements)))
+    return apply(text, edits)
+
+
 def migrate(text: str) -> FileResult:
+    text = split_nested(text)
     masked, _ = mask(text)
     edits: list[tuple[int, int, str]] = []
     use_spans = [(m.start(), masked.index(";", m.end())) for m in USE.finditer(masked)]

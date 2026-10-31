@@ -24,7 +24,7 @@ la-arena.workspace = true
 triomphe.workspace = true
 inventory.workspace = true
 rustc_apfloat.workspace = true
-salsa.workspace = true
+blaze-query.workspace = true
 
 rustc_abi.workspace = true
 ra-ap-rustc_ast_ir.workspace = true

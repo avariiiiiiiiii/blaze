@@ -1,6 +1,6 @@
 {
  "crate": "crates/blaze-format",
- "base": "8d2f0ab9ce8d0a115eb24c9cca362953b2e8a1cf",
+ "base": "b8c752e457596472d86888086afc758ecfcb8f38",
  "files": [
   {
    "path": "crates/blaze-format/src/lib.rs",

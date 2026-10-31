@@ -1,4 +1,5 @@
-use base_db::{Db, salsa::Durability};
+use base_db::Db;
+use blaze_query::db::Durability;
 use hir_expand::{change::ChangeWithProcMacros, proc_macro::ProcMacros};
 
 use super::*;

@@ -240,7 +240,7 @@ impl<S: Stable> Image<S> {
 
     /// All of `section`, every group checked, as [`Bytes`] that keep the image alive: for an
     /// owner that keeps a section's bytes past a borrow of the image (the library syntax trees,
-    /// the query graph), with no mapping layer of its own. They start 8-aligned, so 8-byte records
+    /// salsa's graph), with no mapping layer of its own. They start 8-aligned, so 8-byte records
     /// read in place; an owner whose bytes don't place them so is refused as `Misaligned`.
     pub fn whole_bytes(self: &Arc<Self>, section: &Section) -> Result<Bytes, Corrupt> {
         let whole = self.whole(section)?;

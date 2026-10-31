@@ -319,8 +319,11 @@ pub(crate) fn failed(unit: &Unit, what: impl std::fmt::Display) -> CodegenError 
     CodegenError { unit: unit.instance.key(), item: unit.item, what: what.to_string() }
 }
 
-/// The error of an instance that is not keyed yet, while it is described.
+/// The error of an instance that is not keyed yet, while it is described. Its `Debug` reads
+/// types through the interner, so it is formatted with `db` attached: describing runs on
+/// threads that have none.
 pub(crate) fn undescribed(
+    db: &Db,
     instance: &impl std::fmt::Debug,
     item: Option<ItemKey>,
     what: impl std::fmt::Display,
@@ -328,6 +331,6 @@ pub(crate) fn undescribed(
     CodegenError {
         unit: InstanceKey(ContentId::default()),
         item: item.unwrap_or(ItemKey(ContentId::default())),
-        what: format!("{instance:?}: {what}"), // alloc: the error's message
+        what: hir_ty::attach_db(db, || format!("{instance:?}: {what}")), // alloc: the error's message
     }
 }

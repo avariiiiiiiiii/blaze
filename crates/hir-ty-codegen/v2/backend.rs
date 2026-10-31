@@ -1220,7 +1220,7 @@ impl<'db> Prepare for Backends<'db> {
         frontend.with(|db, homes| {
             let hashes = &frontend.hashes;
             super::statics::compile(db, homes, hashes, spec.toolchain.arch, value.0, refs)
-                .map_err(|what| super::undescribed(value, None, what))
+                .map_err(|what| super::undescribed(db, value, None, what))
         })
     }
 }

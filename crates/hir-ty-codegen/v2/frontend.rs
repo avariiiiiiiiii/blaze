@@ -312,9 +312,11 @@ impl<'db> HirFrontend<'db> {
     /// The allocator shim of the program of `krate`, with the `#[global_allocator]`'s
     /// functions it calls: roots of a program with a `main`, and of a `cdylib`.
     pub fn allocator_shim(&self, krate: Crate) -> Result<Vec<HirInstance>, CodegenError> {
-        self.with(|db, _| super::allocator::shim(db, krate, |func| self.root(func)))
-            // alloc: the error's message
-            .map_err(|what| undescribed(&krate, None, format!("its allocator shim: {what}")))
+        self.with(|db, _| {
+            super::allocator::shim(db, krate, |func| self.root(func))
+                // alloc: the error's message
+                .map_err(|what| undescribed(db, &krate, None, format!("its allocator shim: {what}")))
+        })
     }
 
     pub(crate) fn with<T>(&self, work: impl FnOnce(&Db, &mut Homes) -> T) -> T {
@@ -334,8 +336,8 @@ impl<'db> HirFrontend<'db> {
             Kind::Allocator(forward) => Ok(super::allocator::item(forward)),
             kind => item_of(db, kind).and_then(|item| hashes.item(db, item)),
         }
-        .map_err(|what| undescribed(instance, None, what))?;
-        let fail = |what: String| undescribed(instance, Some(item), what);
+        .map_err(|what| undescribed(db, instance, None, what))?;
+        let fail = |what: String| undescribed(db, instance, Some(item), what);
         let code = code_of(db, hashes, &instance.0).map_err(fail)?;
         let generic = generic(&instance.0);
         let origin = match crate_of(db, &instance.0) {
@@ -474,9 +476,9 @@ impl<'db> HirFrontend<'db> {
         let hashes = &self.hashes;
         let item = hashes
             .item(db, ItemId::Static(value.0))
-            .map_err(|what| undescribed(value, None, what))?;
+            .map_err(|what| undescribed(db, value, None, what))?;
         let held = super::statics::value(db, homes, hashes, value.0)
-            .map_err(|what| undescribed(value, Some(item), what))?;
+            .map_err(|what| undescribed(db, value, Some(item), what))?;
         Ok(DescribedStatic {
             item,
             instance: ContentId::default(),

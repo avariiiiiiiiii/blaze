@@ -26,6 +26,7 @@ base-db.workspace = true
 hir-def.workspace = true
 hir-ty.workspace = true
 hir-ty-mir.workspace = true
+stdx.workspace = true
 
 blaze-ids.workspace = true
 blaze-items.workspace = true

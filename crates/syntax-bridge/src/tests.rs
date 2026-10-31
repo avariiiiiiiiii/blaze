@@ -558,9 +558,9 @@ fn assert_same_as_reference(
 }
 
 /// Every view a caller can take of `tree`, at every depth: what is left from each token tree
-/// on (all of them at the top level of a small tree, the views that end where the tree does and
-/// are read in place; the last 8 of every other level, whose views end inside the tree and are
-/// copied, as the windows are), and each run of up to 4 token trees, a matcher's window, which
+/// on (all of them at a top level of at most 64 token trees, the views that end where the tree
+/// does and are read in place; the last 8 of every other level, as of a file's long top level,
+/// each such view converted whole by the reference), and each run of up to 4 token trees, a matcher's window, which
 /// ends inside the tree (never inside a lifetime). None starts inside a lifetime either.
 fn every_view(tree: &tt::TopSubtree) -> Vec<tt::TokenTreesView<'_>> {
     fn level<'a>(iter: tt::iter::TtIter<'a>, small: bool, out: &mut Vec<tt::TokenTreesView<'a>>) {
@@ -593,7 +593,7 @@ fn every_view(tree: &tt::TopSubtree) -> Vec<tt::TokenTreesView<'_>> {
             }
         }
     }
-    let small = tree.token_trees().len() <= 2048;
+    let small = tree.iter().count() <= 64;
     let mut out = vec![tree.view().strip_invisible(), tree.token_trees(), tree.as_token_trees()];
     level(tree.iter(), small, &mut out);
     out

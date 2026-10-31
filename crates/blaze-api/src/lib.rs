@@ -143,12 +143,12 @@ pub struct Cargo {
     pub width: Option<u32>,
     /// `build`, `check`, `test`, `bench` or `run`.
     pub command: String,
-    /// How many `-v` were given (cargo's `Verbosity`: 1 is `Verbose`, 2 or more `-vv`); 0 with
-    /// none or with `-q`, which `args` says.
-    pub verbose: u8,
     /// How many of the functions blaze could not compile a build's error names: the first
     /// `n`, or with `None` every one (blaze's own `--refused N|all`; 16 without it).
     pub refused: Option<u32>,
+    /// How many `-v` were given (cargo's `Verbosity`: 1 is `Verbose`, 2 or more `-vv`); 0 with
+    /// none or with `-q`, which `args` says.
+    pub verbose: u8,
 }
 
 /// [`Cargo::files`], each file's bytes one byte string.

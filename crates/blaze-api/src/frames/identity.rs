@@ -217,8 +217,8 @@ impl Gen {
             files: self.many(1, |g| (g.text(), g.bytes())),
             width: self.maybe(Gen::u32),
             command: self.text(),
-            verbose: self.next() as u8,
             refused: self.maybe(Gen::u32),
+            verbose: self.next() as u8,
         }
     }
 

@@ -552,6 +552,33 @@ pub(crate) fn outline_item<'db, N: AstIdNode + syntax::view::Typed>(
     <N::Of<'db> as syntax::view::AstNode<'db>>::cast(syntax::view::to_node(ptr, root))
 }
 
+/// The visibility written on the item at `id`, unresolved: lowered off its file's
+/// [`FileOutline`] with the outline's spans, and so the same after any edit of a body the
+/// outline leaves out. An item the outline doesn't have (in such a body, or written by a
+/// macro) is lowered off its file, as that body is.
+pub(crate) fn written_visibility<N: AstIdNode>(db: &Db, id: AstId<N>) -> RawVisibility {
+    if let HirFileId::FileId(file) = id.file_id {
+        let outline = file_outline(db, file);
+        if let Some(ptr) = outline.ast_id_map.try_get_erased(id.value.erase()) {
+            let node = ast::to_node(ptr, ast::Node::root(&outline.tree));
+            return visibility_of(db, node, &mut |range| outline.span_map.span_for_range(range).ctx);
+        }
+    }
+    let node = ast::to_node(id.file_id.ast_id_map(db).get_erased(id.value.erase()), id.file_id.root(db));
+    let span_map = id.file_id.span_map(db);
+    visibility_of(db, node, &mut |range| span_map.span_for_range(range).ctx)
+}
+
+fn visibility_of(
+    db: &Db,
+    node: ast::Node<'_>,
+    span_for_range: &mut dyn FnMut(TextRange) -> span::SyntaxContext,
+) -> RawVisibility {
+    let item = ast::AnyHasVisibility::cast(node)
+        .unwrap_or_else(|| panic!("a {:?} at {:?} has no visibility", node.kind(), node.text_range()));
+    visibility_from_ast(db, item.visibility(), span_for_range)
+}
+
 /// The root of `file`'s [`FileOutline`]: the file less the bodies it leaves out.
 pub(crate) fn outline_root(db: &Db, file: EditionedFileId) -> syntax::view::SourceFile<'_> {
     syntax::view::root(&file_outline(db, file).tree).expect("an outline's root is a file")

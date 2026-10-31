@@ -285,12 +285,18 @@ pub enum Init {
 }
 
 /// Read-only bytes a function refers to: string literals, constants, vtables of known types.
+/// Or, `writable`, a static's nested mutable allocation ([`Data::owned`]).
 #[derive(Serialize, Deserialize, Clone, PartialEq, Eq, Debug)]
 pub struct Data {
     pub id: ContentId,
     pub align: u32,
     pub bytes: Vec<u8>,
     pub relocs: Relocs,
+    /// Written while the program runs: memory a static's value points to that is mutable,
+    /// as rustc interns it (behind a `&mut` in a `static mut`, or interior mutability behind a
+    /// `&`). rustc emits it as a global of its own, writable and never merged with another;
+    /// so is this, its ID its static's and not its content's alone.
+    pub writable: bool,
 }
 
 /// How the address is written, as the object formats name them.

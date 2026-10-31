@@ -1105,7 +1105,14 @@ impl<'a> Stage<'a> {
             return Ok(());
         }
         let (fixups, weak) = self.fixups(&data.relocs, relocs, function, false, None)?;
-        let (class, rank) = self.own(if fixups.is_empty() { Class::Rodata } else { Class::RelRo });
+        // A static's writable object is written as the program runs, as rustc's global of a
+        // nested mutable allocation is: never read-only, its ID its static's alone.
+        let class = match (data.writable, fixups.is_empty()) {
+            (true, _) => Class::Data,
+            (false, true) => Class::Rodata,
+            (false, false) => Class::RelRo,
+        };
+        let (class, rank) = self.own(class);
         let mut piece =
             Self::piece_in(sym, class, u64::from(data.align), data.bytes.len() as u64, fixups, What::Shared);
         piece.rank = rank;

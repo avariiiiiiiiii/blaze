@@ -160,11 +160,18 @@ pub(in crate::nameres) fn published_records(db: &Db, id: blaze_query::db::Id) ->
     resolution(id).records(db)
 }
 
+/// `krate`'s entry of [`Resolutions`]: what a reader of one crate's resolution depends on, so a
+/// crate that gains or loses its resolution leaves every other crate's readers as they were.
+#[blaze_query::tracked(returns(copy))]
+fn resolution_of(db: &Db, krate: Crate) -> Option<CrateResolution> {
+    Resolutions::try_get(db)?.crates(db).get(&krate).copied()
+}
+
 /// The crate's def map as the maintainer published it, `None` when no maintainer ran for it.
 /// Depends on the crate's resolution minus its modules and records, which its readers read
 /// themselves.
 pub(in crate::nameres) fn published(db: &Db, krate: Crate) -> Option<(DefMap, LocalDefMap)> {
-    let resolution = *Resolutions::try_get(db)?.crates(db).get(&krate)?;
+    let resolution = resolution_of(db, krate)?;
     let id = blaze_query::db::AsId::as_id(&resolution);
     let def_map = DefMap {
         krate,
@@ -193,6 +200,7 @@ pub(in crate::nameres) fn published(db: &Db, krate: Crate) -> Option<(DefMap, Lo
 /// write that changes none of them runs no `crate_local_def_map` of the crate again.
 #[cfg(test)]
 pub(super) struct Slices {
+    resolutions: FxHashMap<Crate, CrateResolution>,
     resolution: CrateResolution,
     root: ModuleId,
     local: LocalDefMap,
@@ -205,8 +213,10 @@ pub(super) struct Slices {
 #[cfg(test)]
 impl Slices {
     pub(super) fn of(db: &Db, krate: Crate) -> Slices {
-        let resolution = *Resolutions::get(db).crates(db).get(&krate).expect("the crate is maintained");
+        let resolutions = Resolutions::get(db).crates(db);
+        let resolution = *resolutions.get(&krate).expect("the crate is maintained");
         Slices {
+            resolutions: resolutions.clone(), // clone: a test's snapshot of the crate -> input map
             resolution,
             root: resolution.root(db),
             local: LocalDefMap { extern_prelude: resolution.local(db).extern_prelude.clone() },
@@ -220,6 +230,7 @@ impl Slices {
     /// The fields that differ between `self` and `other`, by name.
     pub(super) fn differing(&self, other: &Slices) -> Vec<&'static str> {
         let fields = [
+            ("resolutions", self.resolutions == other.resolutions),
             ("resolution", self.resolution == other.resolution),
             ("root", self.root == other.root),
             ("local", self.local == other.local),

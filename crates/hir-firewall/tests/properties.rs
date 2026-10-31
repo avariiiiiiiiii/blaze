@@ -64,7 +64,7 @@ fn run_cases(cases: u64, property: impl FnMut(TestCase)) {
 
 /// `HEGEL_TEST_CASES=<n>` runs it longer.
 #[test]
-#[ignore = "queue 00845: an edit re-executes `body_syntax` for every body of the edited file"]
+#[ignore = "queue 01304: a body edit re-executes `VariantFields::with_source_map` for the module's item checks, which need only its diagnostics"]
 fn an_edit_of_any_body_of_any_program_reaches_only_it() {
     run_cases(16, reaches_only_the_edited_body);
 }

@@ -102,7 +102,7 @@ pub(crate) fn function(
         0
     };
     // alloc: none until it has data of its own, which the result keeps
-    let mut own = OwnData { data: Vec::new(), word: word(arch) };
+    let mut own = OwnData { data: Vec::new(), word: word(arch), owner: None };
     let size = code.bytes.len();
     let names: Relocs<RelocName> = Relocs::try_from_iter_in(
         frame,
@@ -186,7 +186,7 @@ pub(crate) fn names(
     resolve: &impl Resolver,
 ) -> Result<(Vec<Target>, Vec<Data>), String> {
     // alloc: none until it has data of its own, which the caller keeps
-    let mut own = OwnData { data: Vec::new(), word: word(arch) };
+    let mut own = OwnData { data: Vec::new(), word: word(arch), owner: None };
     let declared = func.params.user_named_funcs();
     let named = declared.values().filter(|it| it.namespace == 1).map(|it| it.index as usize);
     let datas = own.requests(frame, requests, resolve, named)?;
@@ -206,10 +206,11 @@ pub(crate) fn value(
     arch: Arch,
     blob: &ConstBlob,
     requests: &Requests,
+    owner: &ContentId,
     resolve: &impl Resolver,
 ) -> Result<(Vec<Data>, Relocs), String> {
     // alloc: none until it has data of its own, which the caller keeps
-    let mut own = OwnData { data: Vec::new(), word: word(arch) };
+    let mut own = OwnData { data: Vec::new(), word: word(arch), owner: Some(*owner) };
     let named = blob.relocs.iter().map(|&(_, data, _)| data.as_u32() as usize);
     let targets = own.requests(frame, requests, resolve, named)?;
     let relocs = own.relocs(blob, requests.datas.len(), &targets, requests, resolve)?;
@@ -238,6 +239,9 @@ pub(crate) fn word(arch: Arch) -> Word {
 struct OwnData {
     data: Vec<Data>,
     word: Word,
+    /// The item key of the static whose value this is, whose writable objects are its own
+    /// ([`Data::owned`]); none for a function, whose data is read-only.
+    owner: Option<ContentId>,
 }
 
 impl OwnData {
@@ -293,8 +297,8 @@ impl OwnData {
             let target = match resolve.data(index as u32, request)? {
                 DataTarget::Target(target) => target,
                 DataTarget::Own => {
-                    let blob = own_blob(request)?;
-                    let data = self.blob(blob, index, &targets, requests, resolve)?;
+                    let (blob, writable) = own_blob(request)?;
+                    let data = self.blob(blob, writable, index, &targets, requests, resolve)?;
                     self.push(data)
                 }
                 DataTarget::Text(text) => self.text(text),
@@ -308,6 +312,7 @@ impl OwnData {
     fn blob(
         &mut self,
         blob: &ConstBlob,
+        writable: bool,
         index: usize,
         before: &[Option<Target>],
         requests: &Requests,
@@ -317,7 +322,14 @@ impl OwnData {
         // alloc: an error
         let align = u32::try_from(blob.align).map_err(|e| e.to_string())?;
         // clone: the data owns its bytes; the request, which the caller keeps, has the blob's
-        Ok(Data::new(align, blob.bytes.clone(), relocs))
+        let bytes = blob.bytes.clone();
+        match (writable, &self.owner) {
+            (false, _) => Ok(Data::new(align, bytes, relocs)),
+            // Its index is where `push` puts it, as `StaticTemplate::instantiate` numbers it.
+            (true, Some(owner)) => Ok(Data::owned(owner, self.data.len() as u32, align, bytes, relocs)),
+            // alloc: an error
+            (true, None) => Err("data a function writes to, which is no constant (`promoted_slot`)".to_owned()),
+        }
     }
 
     /// The relocations of `blob`, the data request `index` (or what comes after them all),
@@ -386,14 +398,12 @@ impl OwnData {
     }
 }
 
-/// The blob of a request that is the function's own data.
-fn own_blob(request: &DataRequest) -> Result<&ConstBlob, String> {
+/// The blob of a request that is the function's or static's own data, and whether it is
+/// written to.
+fn own_blob(request: &DataRequest) -> Result<(&ConstBlob, bool), String> {
     match request {
-        DataRequest::Blob { identity: DataIdentity::Writable, .. } => {
-            // alloc: an error
-            Err("data a function writes to, which is no constant".to_owned())
-        }
-        DataRequest::Blob { blob, .. } | DataRequest::Vtable { blob, .. } => Ok(blob),
+        DataRequest::Blob { blob, identity } => Ok((blob, *identity == DataIdentity::Writable)),
+        DataRequest::Vtable { blob, .. } => Ok((blob, false)),
         // alloc: an error
         _ => Err("a data request that has no blob taken as the function's own".to_owned()),
     }

@@ -4,7 +4,7 @@ use blaze_ids::ContentId;
 use cranelift_codegen::{binemit, ir::Signature, isa::CallConv};
 use cranelift_module::{DataId, FuncId, ModuleReloc, ModuleRelocTarget};
 
-use super::{DataTarget, Resolve, function};
+use super::{DataTarget, Resolve, function, value};
 use crate::{
     ConstBlob, DataIdentity,
     debuginfo::{LineRow, SlotPlaces},
@@ -208,6 +208,40 @@ fn what_v2_has_no_target_for_is_an_error() {
         identity: DataIdentity::Writable,
     };
     assert!(convert(loading(&[0]), &writable).is_err());
+}
+
+/// A static's value that points at a writable object and at an equal read-only one: the
+/// writable one is the static's own, as rustc's global of a nested mutable allocation is,
+/// so two statics' are two objects where their read-only ones are one.
+#[test]
+fn a_statics_writable_data_is_its_own() {
+    let bytes = b"counter\0";
+    let requests = Requests {
+        funcs: Vec::new(),
+        datas: vec![
+            DataRequest::Blob { blob: blob(bytes, Vec::new(), Vec::new()), identity: DataIdentity::Writable },
+            DataRequest::Blob { blob: blob(bytes, Vec::new(), Vec::new()), identity: DataIdentity::Shared },
+        ],
+    };
+    let init = blob(&[0; 16], vec![(0, DataId::from_u32(0), 0), (8, DataId::from_u32(1), 0)], Vec::new());
+    let func = |_: u32, _: &FuncRequest| Ok(callee());
+    let data = |_: u32, _: &DataRequest| Ok(DataTarget::Own);
+    let symbol = |name: &str| Ok(Target::Extern(name.to_owned()));
+    let body = || Ok(Target::Extern("body".to_owned()));
+    let resolve = Resolve { func: &func, data: &data, symbol: &symbol, body: &body };
+    let of = |owner: &[u8]| {
+        let owner = ContentId::of("test", owner);
+        blaze_mem::frame::task(blaze_mem::Tag::Codegen, |frame| {
+            value(frame, Arch::X86_64, &init, &requests, &owner, &resolve)
+        })
+        .expect("converted")
+    };
+    let ((one, one_relocs), (two, _)) = (of(b"one"), of(b"two"));
+    assert_eq!(one.iter().map(|it| it.writable).collect::<Vec<_>>(), [true, false]);
+    assert!(one.iter().all(|it| it.bytes == bytes));
+    assert_ne!(one[0].id, two[0].id, "two statics' writable objects are two");
+    assert_eq!(one[1].id, two[1].id, "equal read-only data is one object");
+    assert_eq!(one_relocs.targets(), [Target::Data(one[0].id), Target::Data(one[1].id)]);
 }
 
 /// A relocation at one of the function's SanitizerCoverage arrays is at its own array, with

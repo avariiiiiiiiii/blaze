@@ -66,10 +66,17 @@ blaze-next salted those with the item's location, which two different edits coul
 ## What a body leaks into an interface
 
 The interface form spells, beyond the signature: hidden types of `impl Trait` returns and
-`async fn`s, with their auto-trait bits; a `const fn`'s body, a const's body and a non-`mut`
+`async fn`s, with their auto-trait bits; a `const fn`'s body, a const's value and a non-`mut`
 static's initializer (whose value users may read at compile time); closures as their
 signature and captures, coroutines with their saved locals (#906). Including a static's
 initializer is coarse: it is in the interface because const eval can read it.
+
+A const without generics (its own or its container's) that evaluates is its value, the
+allocation spelled as a body spells an evaluated constant, in its interface and as its code:
+an edit of a `const fn` it calls that keeps the value changes neither, so it reaches no user
+(E4 of [the firewall notes](../firewall/notes.md)). A generic const, and one whose evaluation
+fails, is its body, from which each use evaluates it. A `const fn` keeps its body in its
+interface for those.
 
 ## Names and positions
 

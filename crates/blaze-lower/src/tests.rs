@@ -981,3 +981,47 @@ fn a_refresh_lists_the_const_macros_again_once_their_file_changes() {
     };
     assert!(error.what.contains("const macros"), "{}", error.what);
 }
+
+/// rustc compiles what a builtin derive expands to, so a build's database expands them: a
+/// derived `Clone` is an impl of the crate whose `clone` has a body, not one only recorded.
+#[test]
+fn a_derived_method_has_a_body() {
+    let tree = MemTree::default();
+    let root = view(&tree);
+    let library = tree.root(&[
+        ("core/Cargo.toml", b"[package]\nname = \"core\"\n"),
+        (
+            "core/src/lib.rs",
+            b"#![feature(no_core, lang_items, rustc_attrs, decl_macro)]\n#![no_core]\n\
+              #[lang = \"pointee_sized\"] pub trait PointeeSized {}\n\
+              #[lang = \"meta_sized\"] pub trait MetaSized: PointeeSized {}\n\
+              #[lang = \"sized\"] pub trait Sized: MetaSized {}\n\
+              #[lang = \"clone\"] pub trait Clone: Sized { fn clone(&self) -> Self; }\n\
+              #[rustc_builtin_macro] pub macro derive($item:item) {}\n\
+              #[rustc_builtin_macro] pub macro Clone($item:item) {}\n\
+              #[derive(Clone)] pub struct Point;\n\
+              #[path = \"../../stdarch/crates/core_arch/src/mod.rs\"] mod core_arch;\n",
+        ),
+        ("stdarch/crates/core_arch/src/mod.rs", b"pub mod arch {}\n"),
+    ]);
+    let config = config(root, library);
+    let units = units();
+    let lowered = lower(Lower { units: &units, config: &config, files: &tree, root, host_cpu: None }).unwrap();
+    let db = lowered.db();
+    let core = lowered.krate(CORE).expect("core is a crate");
+    let def_map = hir_def::nameres::crate_def_map(db, core);
+    let scope = def_map.crate_root(db).scope(db);
+    assert_eq!(scope.builtin_derive_impls().len(), 0, "a derive only recorded");
+    let bodies: Vec<&str> = scope
+        .impls()
+        .flat_map(|impl_| impl_.impl_items(db).items.iter())
+        .filter_map(|&(_, item)| match item {
+            hir_def::AssocItemId::FunctionId(func) => {
+                let signature = hir_def::signatures::FunctionSignature::of(db, func);
+                signature.has_body().then(|| signature.name.as_str())
+            }
+            _ => None,
+        })
+        .collect();
+    assert_eq!(bodies, ["clone"]);
+}

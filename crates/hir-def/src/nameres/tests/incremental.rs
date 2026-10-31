@@ -188,6 +188,7 @@ fn no() {}
         expect![[r#"
             [
                 "crate_local_def_map",
+                "resolution_of",
             ]
         "#]],
         expect![[r#"
@@ -232,6 +233,7 @@ pub struct S {}
         expect![[r#"
             [
                 "crate_local_def_map",
+                "resolution_of",
             ]
         "#]],
         expect![[r#"
@@ -272,6 +274,7 @@ fn f() { foo }
         expect![[r#"
             [
                 "crate_local_def_map",
+                "resolution_of",
             ]
         "#]],
         expect![[r#"
@@ -371,6 +374,7 @@ pub struct S {}
         expect![[r#"
             [
                 "crate_local_def_map",
+                "resolution_of",
             ]
         "#]],
         expect![[r#"
@@ -456,6 +460,7 @@ m!(Z);
         expect![[r#"
             [
                 "crate_local_def_map",
+                "resolution_of",
                 "CrateResolution::module",
             ]
         "#]],

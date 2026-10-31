@@ -39,8 +39,7 @@ use hir_def::{
         StaticSignature, StructSignature, TraitFlags, TraitSignature, TypeAliasSignature,
         UnionSignature, VariantFields,
     },
-    src::HasSource,
-    visibility::{Visibility, visibility_from_ast_view},
+    visibility::{Visibility, written_visibility},
 };
 use hir_expand::proc_macro::ProcMacroKind;
 use hir_ty::{
@@ -76,7 +75,7 @@ use rustc_type_ir::{
     inherent::{GenericArgs as _, IntoKind},
 };
 use smallvec::SmallVec;
-use syntax::view::{self as ast, AstNode as _, HasVisibility as _};
+use syntax::view::{self as ast, AstNode as _};
 
 use crate::{
     ItemId, ItemKey,
@@ -728,7 +727,24 @@ impl<'db> Cx<'db> {
     /// it; `None` for an item with no body.
     pub(crate) fn body(&self, id: ItemId) -> Option<Code> {
         let def = self.body_owner(id)?;
+        if let DefWithBodyId::ConstId(it) = def
+            && let Some(value) = self.const_value(it)
+        {
+            let mut f = Form::new("const value");
+            self.allocation(&mut f, value);
+            return Some(f.code());
+        }
         Some(self.code_form(InferBodyId::DefWithBodyId(def)).code())
+    }
+
+    /// The value of constant `it` when it is one for every use: it has no generics, its own or
+    /// its container's, and evaluates. As [`crate::facts`]' `ConstValue` reads it.
+    fn const_value(&self, it: hir_def::ConstId) -> Option<Allocation<'db>> {
+        let db = self.db;
+        if hir_ty::generics::generics(db, it.into()).iter(true).next().is_some() {
+            return None;
+        }
+        db.const_eval(it, GenericArgs::empty(), None).ok()
     }
 
     /// Why the MIR [`Cx::body`] reads of `id` failed to lower: the first error of its body, or of
@@ -1149,9 +1165,17 @@ impl<'db> Cx<'db> {
         let data = ConstSignature::of(db, it);
         f.u64(u64::from(data.flags.bits()));
         self.attrs(f, it.into());
-        // A constant's value is what its users see: it is in their code.
+        // A constant's value is what its users see: it is in their code. One without generics
+        // that evaluates is its value, so an edit of a `const fn` it calls that keeps the value
+        // reaches no user (E4 in docs/v2/plan/lanes/firewall/notes.md); else its body, from
+        // which each use evaluates it.
         if data.has_body() && self.leak_free {
             f.u8(LEAK);
+        } else if data.has_body()
+            && let Some(value) = self.const_value(it)
+        {
+            f.u8(2);
+            self.allocation(f, value);
         } else if data.has_body() {
             f.u8(1);
             self.nest(f, self.code_form(InferBodyId::DefWithBodyId(it.into())));
@@ -2958,19 +2982,19 @@ fn item_visibility_uncached(db: &Db, id: ItemId) -> Visibility {
         ItemId::Const(it) => AssocItemId::ConstId(it).assoc_visibility(db),
         ItemId::Alias(it) => AssocItemId::TypeAliasId(it).assoc_visibility(db),
         ItemId::Static(it) => {
-            visibility_from_ast_view(db, it, it.lookup(db).source_view(db).map(|it| it.visibility()))
+            written_visibility(db, it, it.lookup(db).id)
         }
         ItemId::Adt(AdtId::StructId(it)) => {
-            visibility_from_ast_view(db, it, it.lookup(db).source_view(db).map(|it| it.visibility()))
+            written_visibility(db, it, it.lookup(db).id)
         }
         ItemId::Adt(AdtId::EnumId(it)) => {
-            visibility_from_ast_view(db, it, it.lookup(db).source_view(db).map(|it| it.visibility()))
+            written_visibility(db, it, it.lookup(db).id)
         }
         ItemId::Adt(AdtId::UnionId(it)) => {
-            visibility_from_ast_view(db, it, it.lookup(db).source_view(db).map(|it| it.visibility()))
+            written_visibility(db, it, it.lookup(db).id)
         }
         ItemId::Trait(it) => {
-            visibility_from_ast_view(db, it, it.lookup(db).source_view(db).map(|it| it.visibility()))
+            written_visibility(db, it, it.lookup(db).id)
         }
         // An impl is wherever its types and trait are.
         ItemId::Impl(_) => Visibility::Public,
@@ -2983,7 +3007,7 @@ fn item_visibility_uncached(db: &Db, id: ItemId) -> Visibility {
             }
         }
         ItemId::Macro(MacroId::Macro2Id(it)) => {
-            visibility_from_ast_view(db, it, it.lookup(db).source_view(db).map(|it| it.visibility()))
+            written_visibility(db, it, it.lookup(db).id)
         }
         ItemId::Macro(MacroId::ProcMacroId(_)) => Visibility::Public,
     }

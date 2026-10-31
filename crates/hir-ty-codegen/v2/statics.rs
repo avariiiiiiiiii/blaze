@@ -150,7 +150,7 @@ pub(crate) fn compile(
         ));
     }
     let (data, mut relocs) = resolve(&value.places, refs, |resolve| {
-        super::convert::value(resolve.frame(), arch, &value.blob, &value.requests, resolve)
+        super::convert::value(resolve.frame(), arch, &value.blob, &value.requests, &item.0, resolve)
     })?;
     if weak_symbol(db, id)?.is_some() {
         // The symbol is data whatever the static's type, as rustc declares it to LLVM: on

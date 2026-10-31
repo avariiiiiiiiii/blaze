@@ -13,7 +13,7 @@ use blaze_items::{CodeHash, ItemKey};
 use crate::{Data, Init, InstanceKey, Static, content, wasm};
 
 pub const FUNCTION_DIGEST_DOMAIN: &str = "blaze v2 function digest 1";
-pub const STATIC_DIGEST_DOMAIN: &str = "blaze v2 static digest 1";
+pub const STATIC_DIGEST_DOMAIN: &str = "blaze v2 static digest 2";
 pub const DEBUG_NAME_DOMAIN: &str = "blaze v2 debug name 1";
 
 /// Of each piece of a build, by what it is, each list sorted and each key once.
@@ -60,9 +60,10 @@ pub fn static_definition(value: &Static) -> ContentId {
         }
     }
     hasher.update(&(data.len() as u64).to_le_bytes());
-    for Data { id, align, bytes, relocs } in data {
+    for Data { id, align, bytes, relocs, writable } in data {
         hasher.id(id).update(&align.to_le_bytes()).part(bytes);
         content::relocs_into(&mut hasher, relocs, content::target_into);
+        hasher.update(&[u8::from(*writable)]);
     }
     hasher.update(&[*mutable as u8, *thread_local as u8]);
     match section {

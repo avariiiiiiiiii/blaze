@@ -34,7 +34,7 @@ fn assert_clean(report: &Report) {
 fn an_edit_of_each_function_reaches_only_it() {
     let report = run(
         r#"
-//- minicore: sized, copy, fn, option, slice
+//- minicore: sized, copy, fn, option, slice, index
 pub struct Point { pub x: u32, pub y: u32 }
 
 impl Point {

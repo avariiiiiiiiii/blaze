@@ -104,6 +104,14 @@ impl K for &'static Q { const V: u32 = 2; }
 impl K for &'static S { const V: u32 = 1; }
 pub fn v<T: K>() -> u32 { T::V }
 
+pub fn plus_zero(x: u32) -> u32 { x }
+pub fn plus_one(x: u32) -> u32 { x + 1 }
+pub trait Pick { const F: fn(u32) -> u32; }
+impl Pick for &'static P { const F: fn(u32) -> u32 = plus_zero; }
+impl Pick for &'static Q { const F: fn(u32) -> u32 = plus_one; }
+impl Pick for &'static S { const F: fn(u32) -> u32 = plus_zero; }
+pub fn pick<T: Pick>(x: u32) -> u32 { (T::F)(x) }
+
 pub fn n<const N: usize>() -> usize { N }
 
 pub trait Show { fn show(&self) -> u32; }
@@ -342,6 +350,15 @@ fn an_associated_const_is_its_value() {
     let db = fixture();
     apart(&db, "v", Ty("RefP"), Ty("RefQ"));
     same(&db, "v", Ty("RefP"), Ty("RefS"));
+}
+
+/// A constant that is a function pointer is the function it points to, by that function's
+/// identity, as the code generator links it.
+#[test]
+fn a_function_pointer_constant_is_its_function() {
+    let db = fixture();
+    apart(&db, "pick", Ty("RefP"), Ty("RefQ"));
+    same(&db, "pick", Ty("RefP"), Ty("RefS"));
 }
 
 #[test]

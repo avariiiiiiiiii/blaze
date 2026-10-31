@@ -31,8 +31,8 @@ use rustc_type_ir::{
 use crate::{
     Span,
     next_solver::{
-        AliasTy, Binder, Const, DbInterner, GenericArgs, Goal, ParamEnv, Predicate, Region,
-        SolverDefId, Ty, TyKind,
+        AliasTy, Binder, Const, DbInterner, GenericArgs, Goal, ParamEnv, Predicate,
+        ProjectionClause, Region, SolverDefId, Ty, TyKind,
         infer::{
             InferCtxt, TypeTrace,
             relate::RelateResult,
@@ -167,13 +167,24 @@ impl<'db> TypeRelation<DbInterner<'db>> for LatticeOp<'_, 'db> {
                 Ok(v)
             }
 
-            (TyKind::Alias(IsRigid::No, _), _) | (_, TyKind::Alias(IsRigid::No, _)) => {
-                // If this turns out to be possible, either the caller should normalize
-                // the alias, or we should normalize the alias here, as the other
-                // relations do.
-                panic!(
-                    "it should not be possible to encounter unnormalized aliases in lattice relation: {a:?}, {b:?}"
-                );
+            // A coercion LUB can meet an alias it has not normalized (a rigid
+            // `<T as Tr>::Item` against the same alias unnormalized), so normalize it
+            // here the way `solver_relating` does.
+            (TyKind::Alias(IsRigid::No, alias), _) => {
+                let v = infcx.next_ty_var(self.span());
+                self.register_predicates([ProjectionClause {
+                    projection_term: alias.into(),
+                    term: v.into(),
+                }]);
+                self.tys(v, b)
+            }
+            (_, TyKind::Alias(IsRigid::No, alias)) => {
+                let v = infcx.next_ty_var(self.span());
+                self.register_predicates([ProjectionClause {
+                    projection_term: alias.into(),
+                    term: v.into(),
+                }]);
+                self.tys(a, v)
             }
 
             (

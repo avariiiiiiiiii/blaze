@@ -308,16 +308,13 @@ impl<'f> Data<'f> {
                 }
                 DataPlace::Nowhere => out.u8(3),
                 DataPlace::Own => {
-                    let blob = match &requests.datas[index] {
-                        DataRequest::Blob { identity: DataIdentity::Writable, .. } => {
-                            // alloc: the error's message
-                            return Err(format!("data {index} is written to"));
-                        }
-                        DataRequest::Blob { blob, .. } | DataRequest::Vtable { blob, .. } => blob,
+                    let (blob, tag) = match &requests.datas[index] {
+                        DataRequest::Blob { blob, identity: DataIdentity::Writable } => (blob, 5),
+                        DataRequest::Blob { blob, .. } | DataRequest::Vtable { blob, .. } => (blob, 4),
                         // alloc: the error's message
                         _ => return Err(format!("data {index} is its own but has no blob")),
                     };
-                    out.u8(4);
+                    out.u8(tag);
                     self.blob(out, blob, places)?;
                 }
             }

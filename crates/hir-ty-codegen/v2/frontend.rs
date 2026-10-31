@@ -48,8 +48,10 @@ impl<'db> Databases<'db> {
         Databases { db }
     }
 
+    /// Runs `work` with the database attached to its thread, which any formatted type or
+    /// constant (an error's message, a panic's) needs, on whichever worker the task is.
     pub(crate) fn with<T>(&self, work: impl FnOnce(&Db, &mut Homes) -> T) -> T {
-        work(self.db, &mut Homes::default())
+        hir_ty::attach_db(self.db, || work(self.db, &mut Homes::default()))
     }
 }
 

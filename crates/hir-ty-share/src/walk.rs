@@ -154,19 +154,23 @@ fn allocation_value(db: &Db, allocation: &AllocationData<'_>) -> Result<ContentI
         MemoryMap::Simple(pointee) => {
             h.update(&[1]).part(pointee);
         }
-        // A static and a vtable's type are named by the database's own ids, which are no
-        // content; the rest of the map is bytes and addresses.
-        MemoryMap::Complex(map) if !map.statics.is_empty() || !map.vtable.is_empty() => {
+        // A static is named by the database's own id, which is no content; the rest of the
+        // map is bytes, addresses and types.
+        MemoryMap::Complex(map) if !map.statics.is_empty() => {
             return Err(Unshared::NoContent(format!( // alloc: error path
-                "a constant of `{:?}` that points to a static or a vtable",
+                "a constant of `{:?}` that points to a static",
                 allocation.ty
             )));
         }
         MemoryMap::Complex(map) => {
-            // The map's own `Hash` reads every field; its `TypeId`s' types are taken out first.
+            // The map's own `Hash` reads every field; the types of its `TypeId`s and of its
+            // function pointers and vtables are taken out first and hashed by their identity.
+            // A function pointer's or vtable's bytes are its id, `FIRST_ID` plus its type's
+            // place in the table, so the table is hashed in that order.
             // clone: once per constant with a `TypeId` or more pieces, on the query's miss
             let mut bare = (**map).clone();
             let types = std::mem::take(&mut bare.type_ids);
+            let pointees = std::mem::take(&mut bare.vtable);
             bare.hash(&mut Fed(h.update(&[2])));
             h.update(&(types.len() as u64).to_le_bytes());
             for ty in types {
@@ -174,6 +178,10 @@ fn allocation_value(db: &Db, allocation: &AllocationData<'_>) -> Result<ContentI
                     Some(ty) => h.update(&[1]).id(&identity::ty(db, ty)?),
                     None => h.update(&[0]),
                 };
+            }
+            h.update(&(pointees.tys().len() as u64).to_le_bytes());
+            for ty in pointees.tys() {
+                h.id(&identity::ty(db, ty)?);
             }
         }
     };
@@ -758,7 +766,9 @@ impl<'a, 'db> Walk<'a, 'db> {
     fn op(&mut self, op: &Op) -> Result<(), Unshared> {
         match op {
             Op::Fact(tag, at) => {
-                let fact = self.cx.fact(self.ty(*at))?;
+                let ty = self.ty(*at);
+                // A fact asks the solver, whose frames below a deep share go past the stack.
+                let fact = stdx::ensure_sufficient_stack(|| self.cx.fact(ty))?;
                 self.record(*tag, fact);
             }
             Op::Value(tag, at) => {
@@ -1012,7 +1022,10 @@ impl<'a, 'db> Walk<'a, 'db> {
             h.update(&[tag::CALLEE_SELF]);
             return Ok(h.finish());
         }
-        match share(db, instance, self.cx.stored.clone(), self.options) { // clone: the query's key, a reference count
+        // A callee's share walks its own callees: the chain is as deep as the call graph,
+        // each level a query's frames, past a codegen thread's stack.
+        let stored = self.cx.stored.clone(); // clone: the query's key, a reference count
+        match stdx::ensure_sufficient_stack(|| share(db, instance, stored, self.options)) {
             Ok(key) => h.update(&[tag::CALLEE_SHARED]).id(&key.0),
             Err(Unshared::Recursive) => return Err(Unshared::Recursive),
             Err(_) => h.update(&[tag::CALLEE_ARGS]).id(&identity::args(db, args)?),

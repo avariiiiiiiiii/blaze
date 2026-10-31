@@ -763,6 +763,22 @@ fn a_leak_changes_the_interface_hash_and_keeps_the_signature_hash() {
     }
 }
 
+/// E4 of docs/v2/plan/lanes/firewall/notes.md: a constant without generics is its value, so an
+/// edit of the `const fn` it calls that keeps the value reaches none of its users.
+#[test]
+fn a_constant_is_its_value() {
+    let common = "const ONE: u32 = one();\nfn uses() -> u32 { ONE }\n";
+    let (mut db, file) = single(&format!("const fn one() -> u32 {{ 1 }}\n{common}"));
+    let (konst, uses) = (of(&db, "ONE"), of(&db, "uses"));
+    edit(&mut db, file, &format!("const fn one() -> u32 {{ let _kept = 0; 1 }}\n{common}"));
+    assert_eq!(of(&db, "ONE").interface, konst.interface, "`one` changed, the value did not");
+    assert_eq!(of(&db, "ONE").code, konst.code);
+    assert_eq!(of(&db, "uses").code, uses.code);
+    edit(&mut db, file, &format!("const fn one() -> u32 {{ 2 }}\n{common}"));
+    assert_ne!(of(&db, "ONE").interface, konst.interface);
+    assert_ne!(of(&db, "uses").code, uses.code);
+}
+
 #[test]
 fn a_signature_change_changes_the_signature_hash() {
     for (before, after, path) in [

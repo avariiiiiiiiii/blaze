@@ -22,8 +22,8 @@ use crate::{
     wasm,
 };
 
-const TEMPLATE_MAGIC: [u8; 4] = *b"BZT5";
-const STATIC_MAGIC: [u8; 4] = *b"BZS3";
+const TEMPLATE_MAGIC: [u8; 4] = *b"BZT6";
+const STATIC_MAGIC: [u8; 4] = *b"BZS4";
 
 /// Why bytes are not a template.
 #[derive(Clone, PartialEq, Eq, Debug)]
@@ -102,6 +102,7 @@ fn put_data(out: &mut Vec<u8>, data: &[TemplateData]) {
         out.put_u32(it.align);
         out.put_bytes_u32(&it.bytes);
         put_relocs(out, &it.relocs);
+        out.put_u8(u8::from(it.writable));
     }
 }
 
@@ -192,7 +193,7 @@ const RELOC_BYTES: usize = 16;
 const REF_BYTES: usize = 1;
 const WIDE_BYTES: usize = 4 + 8;
 const LINE_BYTES: usize = 4 + 32 + 4;
-const DATA_BYTES: usize = 4 + 4 + 4 + 4 + 4;
+const DATA_BYTES: usize = 4 + 4 + 4 + 4 + 4 + 1;
 
 impl<'a> In<'a> {
     fn fail<T>(&self, what: &'static str) -> Result<T, BlobError> {
@@ -309,7 +310,8 @@ impl<'a> In<'a> {
             let align = self.0.u32()?;
             let bytes = self.slice()?;
             let relocs = self.relocs_in(frame)?;
-            data.push(DataView { align, bytes, relocs });
+            let writable = self.bool()?;
+            data.push(DataView { align, bytes, relocs, writable });
         }
         Ok(data.leak())
     }
@@ -321,7 +323,8 @@ impl<'a> In<'a> {
             let align = self.0.u32()?;
             let bytes = self.bytes()?;
             let relocs = self.relocs()?;
-            data.push(TemplateData { align, bytes, relocs });
+            let writable = self.bool()?;
+            data.push(TemplateData { align, bytes, relocs, writable });
         }
         Ok(data)
     }
@@ -466,7 +469,7 @@ fn encoded_len(template: &Template) -> usize {
         }
         Some(TemplateUnwind::Windows { info, handler, lsda }) => 1 + bytes(info) + index(handler) + index(lsda),
     };
-    let data = 4 + template.data.iter().map(|it| 4 + bytes(&it.bytes) + relocs(&it.relocs)).sum::<usize>();
+    let data = 4 + template.data.iter().map(|it| 4 + bytes(&it.bytes) + relocs(&it.relocs) + 1).sum::<usize>();
     let externs = 4 + template.externs.iter().map(|it| bytes(it.as_bytes())).sum::<usize>();
     let coverage = match &template.coverage {
         None => 1,
@@ -747,7 +750,12 @@ mod tests {
                 reloc(Ref::Place(2), 0),
             ]
             .into(),
-            data: vec![TemplateData { align: 8, bytes: vec![9; 8], relocs: vec![reloc(Ref::Place(0), -8)].into() }],
+            data: vec![TemplateData {
+                align: 8,
+                bytes: vec![9; 8],
+                relocs: vec![reloc(Ref::Place(0), -8)].into(),
+                writable: false,
+            }],
             inlined: vec![CodeHash(ContentId([5; 32]))],
             side: Some(ContentId([6; 32])),
             unwind: Some(TemplateUnwind::Dwarf {
@@ -796,7 +804,10 @@ mod tests {
         let template = StaticTemplate {
             align: 16,
             init: TemplateInit::Bytes { bytes: vec![0; 24], relocs: vec![reloc].into() },
-            data: vec![TemplateData { align: 1, bytes: b"hi".to_vec(), relocs: Relocs::new() }],
+            data: vec![
+                TemplateData { align: 1, bytes: b"hi".to_vec(), relocs: Relocs::new(), writable: false },
+                TemplateData { align: 4, bytes: vec![7; 4], relocs: Relocs::new(), writable: true },
+            ],
             mutable: true,
             thread_local: true,
             section: Some("__DATA,__mod_init_func".to_owned()),

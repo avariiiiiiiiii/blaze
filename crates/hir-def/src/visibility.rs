@@ -4,17 +4,17 @@ use std::iter;
 
 use base_db::{Db, Crate};
 use hir_expand::{
-    InFile, Lookup,
+    AstId, InFile, Lookup,
     mod_path::{ModPath, PathKind},
 };
 use la_arena::ArenaMap;
-use span::Edition;
-use syntax::view::{self as ast, HasVisibility};
+use span::{AstIdNode, Edition};
+use syntax::view as ast;
 
 use crate::{
     AssocItemId, BlockIdLt, HasModule, ItemContainerId, LocalFieldId, ModuleDefId, ModuleId,
     ModuleIdLt, TraitId, VariantId, nameres::DefMap, resolver::HasResolver,
-    signatures::VariantFields, src::HasSource,
+    signatures::VariantFields,
 };
 
 pub use crate::item_tree::{RawVisibility, VisibilityExplicitness};
@@ -376,13 +376,28 @@ pub fn visibility_from_ast_view(
     let raw_vis = crate::item_tree::visibility_from_ast(db, ast_vis.value, &mut |range| {
         span_map.get_or_insert_with(|| ast_vis.file_id.span_map(db)).span_for_range(range).ctx
     });
+    resolve_raw(db, has_resolver, &raw_vis)
+}
+
+/// The visibility written on the item at `id`, resolved for `has_resolver`: read off its file's
+/// outline, so an edit of a body the outline leaves out never changes it
+/// ([`crate::signatures::written_visibility`]).
+pub fn written_visibility<N: AstIdNode>(
+    db: &Db,
+    has_resolver: impl HasResolver + HasModule,
+    id: AstId<N>,
+) -> Visibility {
+    resolve_raw(db, has_resolver, &crate::signatures::written_visibility(db, id))
+}
+
+fn resolve_raw(db: &Db, has_resolver: impl HasResolver + HasModule, raw_vis: &RawVisibility) -> Visibility {
     match raw_vis {
-        RawVisibility::PubSelf(explicitness) => {
+        &RawVisibility::PubSelf(explicitness) => {
             Visibility::Module(has_resolver.module(db), explicitness)
         }
         RawVisibility::PubCrate => Visibility::PubCrate(has_resolver.krate(db)),
         RawVisibility::Public => Visibility::Public,
-        RawVisibility::Module(..) => Visibility::resolve(db, &has_resolver.resolver(db), &raw_vis),
+        RawVisibility::Module(..) => Visibility::resolve(db, &has_resolver.resolver(db), raw_vis),
     }
 }
 
@@ -394,24 +409,18 @@ impl AssocItemId {
         match self {
             AssocItemId::FunctionId(function_id) => {
                 let loc = function_id.lookup(db);
-                trait_item_visibility(db, loc.container).unwrap_or_else(|| {
-                    let source = loc.source_view(db);
-                    visibility_from_ast_view(db, function_id, source.map(|src| src.visibility()))
-                })
+                trait_item_visibility(db, loc.container)
+                    .unwrap_or_else(|| written_visibility(db, function_id, loc.id))
             }
             AssocItemId::ConstId(const_id) => {
                 let loc = const_id.lookup(db);
-                trait_item_visibility(db, loc.container).unwrap_or_else(|| {
-                    let source = loc.source_view(db);
-                    visibility_from_ast_view(db, const_id, source.map(|src| src.visibility()))
-                })
+                trait_item_visibility(db, loc.container)
+                    .unwrap_or_else(|| written_visibility(db, const_id, loc.id))
             }
             AssocItemId::TypeAliasId(type_alias_id) => {
                 let loc = type_alias_id.lookup(db);
-                trait_item_visibility(db, loc.container).unwrap_or_else(|| {
-                    let source = loc.source_view(db);
-                    visibility_from_ast_view(db, type_alias_id, source.map(|src| src.visibility()))
-                })
+                trait_item_visibility(db, loc.container)
+                    .unwrap_or_else(|| written_visibility(db, type_alias_id, loc.id))
             }
         }
     }
@@ -428,14 +437,12 @@ fn trait_item_visibility(
 }
 
 fn trait_visibility(db: &Db, def: TraitId) -> Visibility {
-    let loc = def.lookup(db);
-    let source = loc.source_view(db);
-    visibility_from_ast_view(db, def, source.map(|src| src.visibility()))
+    written_visibility(db, def, def.lookup(db).id)
 }
 
 #[cfg(test)]
 mod view_tests {
-    use syntax::view::HasName as _;
+    use syntax::view::{HasName as _, HasVisibility as _};
     use hir_expand::fixture;
 
     use super::*;
@@ -445,6 +452,7 @@ mod view_tests {
             assoc::{ImplItems, TraitItems},
             crate_def_map,
         },
+        src::HasSource as _,
         test_db::{TestDB, TestDBExt},
     };
 

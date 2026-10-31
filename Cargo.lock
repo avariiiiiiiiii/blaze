@@ -2563,6 +2563,7 @@ dependencies = [
  "rustc_abi",
  "rustc_type_ir",
  "smallvec",
+ "stdx",
 ]
 
 [[package]]

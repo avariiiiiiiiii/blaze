@@ -778,7 +778,7 @@ fn a_patch_whose_code_the_loader_slides_is_a_restart() {
 /// `lea rax, [rip + literal]; ret`, the literal its own data, and a call frame entry.
 fn framed(n: u8) -> CompiledFunction {
     let mut it = function(n, &[0x48, 0x8d, 0x05, 0, 0, 0, 0, 0xc3], vec![rel32(3, Target::Data(id(60)))]);
-    it.data = vec![Data { id: id(60), align: 1, bytes: b"literal".to_vec(), relocs: Default::default() }];
+    it.data = vec![Data { id: id(60), align: 1, bytes: b"literal".to_vec(), relocs: Default::default(), writable: false }];
     it.unwind = Some(Unwind::Dwarf {
         code_align: 1,
         data_align: -8,
@@ -1059,6 +1059,59 @@ fn start_and_stop_symbols_bound_a_named_section() {
     };
     let error = image.stage(change).unwrap_err();
     assert!(error.what.contains("section `missing`"), "{error}");
+}
+
+/// A static's writable object (rustc's global of a nested mutable allocation) is placed
+/// writable and is its static's alone: two statics' equal bytes are two objects in `.data`,
+/// where their equal read-only data is one object in `.rodata`.
+#[test]
+fn a_statics_writable_data_is_its_own_and_writable() {
+    let item = |n: u8| {
+        let owned = Data::owned(&id(n), 0, 8, vec![7; 8], Relocs::new());
+        let shared = Data::new(8, vec![9; 8], Relocs::new());
+        let at = |at, data: &Data| blaze_codegen::Relocation { at, kind: RelocKind::Abs64, target: Target::Data(data.id), addend: 0 };
+        Static {
+            item: ItemKey(id(n)),
+            instance: ContentId::default(),
+            align: 8,
+            init: Init::Bytes { bytes: vec![0; 16], relocs: vec![at(0, &owned), at(8, &shared)].into() },
+            data: vec![owned, shared],
+            mutable: false,
+            thread_local: false,
+            section: None,
+            imports: Vec::new(),
+        }
+    };
+    let (one, two) = (item(10), item(11));
+    let static_of = |it: &Static| Target::Static { item: it.item, instance: it.instance };
+    // `lea rax, [rip + one]; lea rcx, [rip + two]; ret`
+    let code = [0x48, 0x8d, 0x05, 0, 0, 0, 0, 0x48, 0x8d, 0x0d, 0, 0, 0, 0, 0xc3];
+    let start = function(1, &code, vec![rel32(3, static_of(&one)), rel32(10, static_of(&two))]);
+    let mut image = Image::new(name(TO), output(false)).unwrap();
+    let mut disk = Disk::default();
+    let change = Change {
+        added: vec![&start],
+        statics: vec![&one, &two],
+        names: vec![("_start".into(), Target::Direct(key(1)))],
+        debug_names: vec![(key(1), "start".into())],
+        ..Change::default()
+    };
+    disk.link(&mut image, change).unwrap();
+    let linked = Linked::of(disk.file(TO));
+    let s = linked.symbol("start");
+    let (one, two) = (linked.rel32(s + 3), linked.rel32(s + 10));
+    let (one_owned, two_owned) = (linked.u64_at(one), linked.u64_at(two));
+    let (one_shared, two_shared) = (linked.u64_at(one + 8), linked.u64_at(two + 8));
+    assert_ne!(one_owned, two_owned, "two statics' writable objects are two");
+    assert_eq!(one_shared, two_shared, "equal read-only data is one object");
+    assert_eq!(linked.at(one_owned, 8), [7; 8]);
+    assert_eq!(linked.at(two_owned, 8), [7; 8]);
+    let within = |name: &str, addr: u64| {
+        let (at, size) = section_of(&linked, name);
+        (at..at + size).contains(&addr)
+    };
+    assert!(within(".data", one_owned) && within(".data", two_owned), "{one_owned:#x} {two_owned:#x}");
+    assert!(within(".rodata", one_shared), "{one_shared:#x}");
 }
 
 /// An x86-64 ELF object defining `c_helper`, which calls `rust_fn`.

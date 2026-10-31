@@ -2,6 +2,7 @@
 
 mod adjusted_ty;
 mod budget;
+mod coercion_lub;
 mod const_args;
 mod const_bounds;
 mod const_param_ty;

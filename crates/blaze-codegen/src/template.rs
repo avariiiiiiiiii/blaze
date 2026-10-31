@@ -63,6 +63,8 @@ pub struct TemplateData {
     pub align: u32,
     pub bytes: Vec<u8>,
     pub relocs: Relocs<Ref>,
+    /// [`Data::writable`]: a static's own, its ID made of the static's and its index here.
+    pub writable: bool,
 }
 
 #[derive(Serialize, Deserialize, Clone, PartialEq, Eq, Hash, Debug)]
@@ -130,6 +132,7 @@ pub struct DataView<'a> {
     pub align: u32,
     pub bytes: &'a [u8],
     pub relocs: RelocsView<'a, Ref>,
+    pub writable: bool,
 }
 
 /// A [`TemplateUnwind`] borrowed.
@@ -149,14 +152,19 @@ pub enum UnwindView<'a> {
 
 impl TemplateData {
     pub fn view(&self) -> DataView<'_> {
-        DataView { align: self.align, bytes: &self.bytes, relocs: self.relocs.view() }
+        DataView { align: self.align, bytes: &self.bytes, relocs: self.relocs.view(), writable: self.writable }
     }
 }
 
 impl DataView<'_> {
     fn owned(self) -> TemplateData {
-        // alloc: a template its caller keeps
-        TemplateData { align: self.align, bytes: self.bytes.to_vec(), relocs: self.relocs.to_relocs() }
+        TemplateData {
+            align: self.align,
+            // alloc: a template its caller keeps
+            bytes: self.bytes.to_vec(),
+            relocs: self.relocs.to_relocs(),
+            writable: self.writable,
+        }
     }
 }
 
@@ -214,7 +222,7 @@ impl TemplateView<'_> {
             return Err(TemplateError::Refs { made: self.refs, given: refs_len(refs) });
         }
         frame::task(Tag::Codegen, |frame| {
-            let data = instantiate_data(self.data, refs, self.externs, frame)?;
+            let data = instantiate_data(self.data, refs, self.externs, None, frame)?;
             Ok(CompiledFunction {
                 key,
                 arch: self.arch,
@@ -307,6 +315,8 @@ pub enum TemplateError {
     ProfileCounters,
     /// Data or a static names a function's own code ([`Ref::Own`]), which only its code can.
     Own,
+    /// A function's data object (its index) is writable, which only a static's can be.
+    Writable(u32),
 }
 
 impl std::fmt::Display for TemplateError {
@@ -347,6 +357,9 @@ impl std::fmt::Display for TemplateError {
             ),
             TemplateError::Own => {
                 write!(f, "data or a static names a function's own code, which only that code can")
+            }
+            TemplateError::Writable(at) => {
+                write!(f, "a function's data object {at} is writable, which only a static's own data can be")
             }
         }
     }
@@ -465,23 +478,31 @@ fn template_data(
             // clone: a static's value, once a static
             bytes: it.bytes.clone(),
             relocs: template_relocs(it.relocs.view(), refs, externs, data, Some(at as u32), None, frame)?,
+            writable: it.writable,
         });
     }
     Ok(made)
 }
 
-/// The data of a template with `refs` in its places, each with its content ID.
+/// The data of a template with `refs` in its places, each with its content ID; a writable
+/// object's is the static `owner`'s ([`Data::owned`]), which a function's data has none of.
 fn instantiate_data<E: AsRef<str>>(
     data: &[DataView<'_>],
     refs: &Refs,
     externs: &[E],
+    owner: Option<&ContentId>,
     frame: &Frame,
 ) -> Result<Vec<Data>, TemplateError> {
     let mut made: Vec<Data> = Vec::with_capacity(data.len());
     for (at, it) in data.iter().enumerate() {
         let relocs = instantiate_relocs(it.relocs, refs, externs, &made, Some(at as u32), None, frame)?;
         // alloc: the instance's data, kept by the build
-        made.push(Data::new(it.align, it.bytes.to_vec(), relocs));
+        let bytes = it.bytes.to_vec();
+        made.push(match (it.writable, owner) {
+            (false, _) => Data::new(it.align, bytes, relocs),
+            (true, Some(owner)) => Data::owned(owner, at as u32, it.align, bytes, relocs),
+            (true, None) => return Err(TemplateError::Writable(at as u32)),
+        });
     }
     Ok(made)
 }
@@ -616,7 +637,7 @@ impl Template {
                 let at = Some(at as u32);
                 let relocs = template_relocs(it.relocs.view(), refs, &externs, &function.data, at, None, frame)?;
                 // alloc: none: the function's bytes move in once every check has passed
-                data.push(TemplateData { align: it.align, bytes: Vec::new(), relocs });
+                data.push(TemplateData { align: it.align, bytes: Vec::new(), relocs, writable: it.writable });
             }
             Ok::<_, TemplateError>((relocs, data))
         })?;
@@ -757,7 +778,7 @@ impl StaticTemplate {
         }
         let (data, init) = frame::task(Tag::Codegen, |frame| {
             let views = frame.alloc_slice_fill_with(self.data.len(), |at| self.data[at].view());
-            let data = instantiate_data(views, refs, NO_EXTERNS, frame)?;
+            let data = instantiate_data(views, refs, NO_EXTERNS, Some(&item.0), frame)?;
             let init = match &self.init {
                 TemplateInit::Bytes { bytes, relocs } => Init::Bytes {
                     // clone: a static's value, kept by the build
@@ -1289,5 +1310,49 @@ mod tests {
         let zeroed = Static { init: Init::Zeroed { size: 1 << 20 }, data: Vec::new(), ..value };
         let template = StaticTemplate::of(&zeroed, &refs).unwrap();
         assert_eq!(template.instantiate(item, zeroed.instance, &refs).unwrap(), zeroed);
+    }
+
+    /// A static's writable object is its own after a template, its ID its static's; another
+    /// static of the same template has another, and a function's data cannot be writable.
+    #[test]
+    fn a_static_keeps_its_writable_data_its_own() {
+        let item = ItemKey(ContentId([3; 32]));
+        let nested = Data::owned(&item.0, 0, 4, vec![7; 4], Relocs::new());
+        let value = Static {
+            item,
+            instance: ContentId([4; 32]),
+            align: 8,
+            init: Init::Bytes {
+                bytes: vec![0; 8],
+                relocs: vec![Relocation { at: 0, kind: RelocKind::Abs64, target: Target::Data(nested.id), addend: 0 }]
+                    .into(),
+            },
+            data: vec![nested],
+            mutable: true,
+            thread_local: false,
+            section: None,
+            imports: Vec::new(),
+        };
+        let template = StaticTemplate::of(&value, &[]).unwrap();
+        assert!(template.data[0].writable);
+        assert_eq!(template.instantiate(item, value.instance, &[]).unwrap(), value);
+        let other = ItemKey(ContentId([5; 32]));
+        let elsewhere = template.instantiate(other, value.instance, &[]).unwrap();
+        assert_ne!(elsewhere.data[0].id, value.data[0].id);
+        assert_eq!(elsewhere.init, Init::Bytes {
+            bytes: vec![0; 8],
+            relocs: vec![Relocation {
+                at: 0,
+                kind: RelocKind::Abs64,
+                target: Target::Data(elsewhere.data[0].id),
+                addend: 0,
+            }]
+            .into(),
+        });
+
+        let (function, refs) = reserve(key(1), key(2), item);
+        let mut function = Template::of(&function, &refs, &[]).unwrap();
+        function.data[0].writable = true;
+        assert_eq!(function.instantiate(key(1), &refs).unwrap_err(), TemplateError::Writable(0));
     }
 }

@@ -539,11 +539,10 @@ pub mod error { pub trait Error {} }
     assert!(failures.is_empty(), "{failures}");
 }
 
-#[test]
-fn an_edit_in_a_body_of_a_macro_heavy_file_sets_nothing_the_def_map_reads() {
-    let text = |body: &str| {
-        format!(
-            "
+/// The text of `foo/bar.rs` in [`macro_heavy`], `body` the body of its first fn.
+fn macro_heavy_text(body: &str) -> String {
+    format!(
+        "
 fn f() {{{body}}}
 
 m!(X);
@@ -560,8 +559,12 @@ m2!(X);
 #[derive(proc_macros::DeriveIdentity)]
 pub struct S {{}}
 "
-        )
-    };
+    )
+}
+
+/// The macro-heavy fixture of `typing_inside_macro_heavy_file_should_not_invalidate_def_map`,
+/// its crate's def map read: the database, `foo/bar.rs` and the crate.
+fn macro_heavy() -> (TestDB, FileId, Crate) {
     let fx = fixture::db(&format!(
         r"
 //- proc_macros: identity, derive_identity
@@ -580,18 +583,52 @@ pub mod bar;
 
 //- /foo/bar.rs
 {}",
-        text("")
+        macro_heavy_text("")
     ));
     let file = fx.files().last().expect("the fixture's files").file_id(fx.db());
-    let mut db = fx.into_db();
+    let db = fx.into_db();
     let krate = crate::test_db::TestDBExt::fetch_test_crate(&db);
     crate_local_def_map(&db, krate);
+    (db, file, krate)
+}
+
+#[test]
+fn an_edit_in_a_body_of_a_macro_heavy_file_sets_nothing_the_def_map_reads() {
+    let (mut db, file, krate) = macro_heavy();
     let before = super::publish::Slices::of(&db, krate);
     let extra = krate.extra_data(&db).clone();
 
-    let work = work_of(&mut db, krate, |db| db.set_file_text(file, &text("0")));
+    let work = work_of(&mut db, krate, |db| db.set_file_text(file, &macro_heavy_text("0")));
     assert_eq!(work.slices, 0, "inputs the maintainer set, though each ends as it was: {work:?}");
     let after = super::publish::Slices::of(&db, krate);
     assert_eq!(before.differing(&after), Vec::<&str>::new(), "fields of the crate's resolution set");
     assert_eq!(*krate.extra_data(&db), extra, "the crate's extra data");
+    let log = crate::test_db::TestDBExt::executed_in_read_order(&db, || _ = crate_local_def_map(&db, krate));
+    assert!(log.iter().all(|it| it != "resolution_of" && it != "crate_local_def_map"), "{log:#?}");
+}
+
+/// Where `resolution_of` runs again after a body edit that sets nothing it reads: in the write
+/// (the maintainer), in a read after it, or in a read made in the write's closure, as
+/// `check_def_map_is_not_recomputed` reads.
+#[test]
+fn an_edit_in_a_body_of_a_macro_heavy_file_runs_no_resolution_of_again() {
+    use crate::test_db::TestDBExt;
+    let ran = |log: &[String]| log.iter().filter(|it| *it == "resolution_of").count();
+
+    let (mut db, file, krate) = macro_heavy();
+    let write = db.executed_in_write(|db| db.set_file_text(file, &macro_heavy_text("0")));
+    let read = db.executed_in_read_order(|| _ = crate_local_def_map(&db, krate));
+
+    let (mut db, file, krate) = macro_heavy();
+    let within = db.executed_in_write(|db| {
+        db.set_file_text(file, &macro_heavy_text("0"));
+        _ = crate_local_def_map(db, krate);
+    });
+
+    assert_eq!(
+        (ran(&write), ran(&read), ran(&within)),
+        (0, 0, 0),
+        "`resolution_of` ran (in the write, in a read after it, in a read in the write)\n\
+         write: {write:#?}\nread: {read:#?}\nwithin: {within:#?}"
+    );
 }

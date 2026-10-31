@@ -317,7 +317,7 @@ fn counter_cells_named_by_another_function_by_data_or_by_another_kind_are_errors
     assert!(error.what.contains("Abs64"), "{error}");
 
     let mut in_data = plain(F, Arch::X86_64);
-    in_data.data.push(Data { id: id(70), align: 8, bytes: vec![0; 8], relocs: vec![counter(0, RelocKind::Abs64, F, 0)].into() });
+    in_data.data.push(Data { id: id(70), align: 8, bytes: vec![0; 8], relocs: vec![counter(0, RelocKind::Abs64, F, 0)].into(), writable: false });
     let error = stage(&in_data);
     assert_eq!(error.function, Some(key(F)), "{error}");
     assert!(error.what.contains("named in data"), "{error}");

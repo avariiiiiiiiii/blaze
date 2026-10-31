@@ -36,7 +36,7 @@ use super::{
     convert::{DataTarget, Resolver},
 };
 use crate::{
-    ConstBlob, DataIdentity, Instance, InstanceDef, erase_regions,
+    ConstBlob, Instance, InstanceDef, erase_regions,
     fragment::{DataRequest, FuncRequest, FuncTarget, Requests, TextPart},
     home::Homes,
     link_name, static_link_name,
@@ -298,10 +298,6 @@ pub(crate) fn place_requests<A: Allocator>(
     let mut datas = Vec::with_capacity(requests.datas.len());
     for request in &mut requests.datas {
         let place = match request {
-            DataRequest::Blob { identity: DataIdentity::Writable, .. } => {
-                return Err("data the code writes to, which is no constant (`promoted_slot`)"
-                    .to_owned()); // alloc: the error's message
-            }
             DataRequest::Blob { blob, .. } | DataRequest::Vtable { blob, .. } => {
                 fill_type_ids(db, hashes, krate, blob)?;
                 DataPlace::Own

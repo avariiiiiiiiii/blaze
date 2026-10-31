@@ -8,6 +8,7 @@ use crate::{Arch, CompiledFunction, Covered, Data, Line, Profiled, RelocKind, Re
 
 pub const DATA_DOMAIN: &str = "blaze v2 data 3";
 pub const CODE_DOMAIN: &str = "blaze v2 code 4";
+pub const OWNED_DATA_DOMAIN: &str = "blaze v2 owned data 1";
 
 /// The content ID of a read-only data object: its alignment, bytes and relocations. Two
 /// objects with one ID are one object.
@@ -21,7 +22,16 @@ pub fn data_id(align: u32, bytes: &[u8], relocs: &Relocs) -> ContentId {
 impl Data {
     /// A data object, its ID made from what it is.
     pub fn new(align: u32, bytes: Vec<u8>, relocs: Relocs) -> Data {
-        Data { id: data_id(align, &bytes, &relocs), align, bytes, relocs }
+        Data { id: data_id(align, &bytes, &relocs), align, bytes, relocs, writable: false }
+    }
+
+    /// The `index`th writable object the static `owner` (its item key) points to: one object
+    /// whatever another static's holds, so two statics' equal bytes are two addresses, and
+    /// another object once its bytes change.
+    pub fn owned(owner: &ContentId, index: u32, align: u32, bytes: Vec<u8>, relocs: Relocs) -> Data {
+        let mut hasher = Hasher::new(OWNED_DATA_DOMAIN);
+        hasher.id(owner).update(&index.to_le_bytes()).id(&data_id(align, &bytes, &relocs));
+        Data { id: hasher.finish(), align, bytes, relocs, writable: true }
     }
 }
 
@@ -451,5 +461,28 @@ mod tests {
         let none = Relocs::new();
         assert_ne!(data_id(1, b"ab", &none), data_id(2, b"ab", &none));
         assert_ne!(data_id(1, b"ab", &none), data_id(1, b"abc", &none));
+    }
+
+    /// A static's writable object is its own: two statics' equal bytes are two objects, as are
+    /// two of one static's, neither is the read-only object of the same bytes, and new bytes
+    /// are a new object.
+    #[test]
+    fn writable_data_is_its_statics_own() {
+        let (one, two) = (ContentId([1; 32]), ContentId([2; 32]));
+        let owned = |owner: &ContentId, index, bytes: &[u8]| Data::owned(owner, index, 4, bytes.to_vec(), Relocs::new());
+        let shared = Data::new(4, vec![0; 4], Relocs::new());
+        assert!(owned(&one, 0, &[0; 4]).writable && !shared.writable);
+        let ids = [
+            owned(&one, 0, &[0; 4]).id,
+            owned(&two, 0, &[0; 4]).id,
+            owned(&one, 1, &[0; 4]).id,
+            owned(&one, 0, &[1; 4]).id,
+            shared.id,
+        ];
+        let mut distinct = ids.to_vec();
+        distinct.sort_unstable();
+        distinct.dedup();
+        assert_eq!(distinct.len(), ids.len(), "{ids:?}");
+        assert_eq!(owned(&one, 0, &[0; 4]), owned(&one, 0, &[0; 4]));
     }
 }

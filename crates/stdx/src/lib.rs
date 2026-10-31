@@ -27,10 +27,14 @@ pub const fn is_ci() -> bool {
 /// as rustc's `ensure_sufficient_stack` does: that of `rustc_type_ir` does nothing outside
 /// rustc. What recurses once per level of what it walks, the trait solver or the lowering of
 /// an expression, goes as deep as the source does, and an unoptimized build overflows a 2 MB
-/// thread long before rustc's 5,204-arm `else if` is through.
+/// thread long before rustc's 5,204-arm `else if` is through. Unoptimized, a query's frames
+/// between two checks (a fetch through blaze-query into the solver) take more than 100 KiB,
+/// so a debug build keeps 1 MiB left and grows by 8 MiB.
 #[cfg(not(target_family = "wasm"))]
 pub fn ensure_sufficient_stack<R>(f: impl FnOnce() -> R) -> R {
-    stacker::maybe_grow(100 * 1024, 1024 * 1024, f)
+    const RED_ZONE: usize = if cfg!(debug_assertions) { 1024 * 1024 } else { 100 * 1024 };
+    const SEGMENT: usize = if cfg!(debug_assertions) { 8 * 1024 * 1024 } else { 1024 * 1024 };
+    stacker::maybe_grow(RED_ZONE, SEGMENT, f)
 }
 
 #[cfg(target_family = "wasm")]

@@ -11,7 +11,7 @@ use crate::{
     AssocItemId, DefWithBodyId, GenericDefId, ModuleDefId,
     expr_store::{Body, scope::ExprScopes},
     hir::generics::GenericParams,
-    nameres::{assoc::ImplItems, crate_def_map},
+    nameres::{assoc::{ImplItems, TraitItems}, crate_def_map},
     signatures::FunctionSignature,
     test_db::{TestDB, TestDBExt},
 };
@@ -301,4 +301,80 @@ fn a_body_lowered_again_on_a_reused_scratch_is_the_same() {
     assert!(!Arc::ptr_eq(&before, &again), "`add` was not lowered again");
     assert_eq!(*before, *again);
     assert_eq!(blaze_format::to_bytes(&*before), blaze_format::to_bytes(&*again));
+}
+
+/// An item's visibility is read off its file's outline, which an edit of a body leaves the
+/// same: growing a body that comes before them resolves no visibility again, a `pub(in path)`
+/// one (whose path needs spans) included, nor the trait's that its items take.
+#[test]
+fn an_edit_in_a_body_resolves_no_visibility_again() {
+    const VISIBILITIES: &str = r#"
+pub fn first(x: u32) -> u32 { x + 1 }
+
+pub(crate) struct S;
+
+impl S {
+    pub(in crate) fn get(&self) -> u32 { 1 }
+    const C: u32 = 0;
+}
+
+pub trait Tr { fn m(&self); }
+"#;
+    let fx = fixture::db(VISIBILITIES);
+    let file = fx.only_file();
+    let mut db = fx.into_db();
+    let items = |db: &TestDB| {
+        let mut items = Vec::new();
+        for (_, module) in crate_def_map(db, db.fetch_test_crate()).modules(db) {
+            let scope = module.scope(db);
+            for imp in scope.impls() {
+                items.extend(ImplItems::of(db, imp).0.items.iter().map(|&(_, it)| it));
+            }
+            for decl in scope.declarations() {
+                if let ModuleDefId::TraitId(it) = decl {
+                    items.extend(TraitItems::query(db, it).items.iter().map(|&(_, it)| it));
+                }
+            }
+        }
+        items
+    };
+    let assoc = items(&db);
+    assert_eq!(assoc.len(), 3, "`get`, `C` and `m`");
+    let before: Vec<_> = assoc.iter().map(|it| it.assoc_visibility(&db)).collect();
+    let outline = |db: &TestDB| {
+        let root = crate::signatures::outline_root(db, file);
+        let (tree, at) = root.syntax().flat();
+        tree.source()[tree.range(at)].to_owned()
+    };
+    let outline_before = outline(&db);
+
+    db.set_file_text(file.file_id(&db), &VISIBILITIES.replace("x + 1", "x + 1 + 2 + 3"));
+    assert_eq!(outline_before, outline(&db), "the outline's text, every body left out");
+    let mut after = Vec::new();
+    let log = db.executed_in_read_order(|| after = assoc.iter().map(|it| it.assoc_visibility(&db)).collect());
+    assert_eq!(before, after);
+    assert_eq!(count(&log, "AssocItemId::assoc_visibility"), 0, "{log:#?}");
+}
+
+/// A fn of an inline module is its own anchor, so it is in its file's outline with its body
+/// left out, an item in that body included: what reads its signature, attributes or
+/// visibility reads them off the outline, not the file.
+#[test]
+fn a_fn_of_an_inline_module_with_an_item_in_its_body_is_in_the_outline() {
+    let fx = fixture::db(
+        r#"
+pub fn first() -> u32 { 1 }
+
+mod inner {
+    pub fn helper(n: u32) -> u32 {
+        fn nested(m: u32) -> u32 { m + 1 }
+        { let k = nested(n); k * 2 }
+    }
+}
+"#,
+    );
+    let db = fx.into_db();
+    let DefWithBodyId::FunctionId(helper) = function_named(&db, "helper") else { panic!("`helper` is a fn") };
+    let id = crate::Lookup::lookup(&helper, &db).id;
+    assert!(crate::signatures::outline_item(&db, id).is_some(), "`helper` is not in the outline");
 }

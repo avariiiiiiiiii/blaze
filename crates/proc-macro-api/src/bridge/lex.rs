@@ -206,6 +206,8 @@ pub fn stream(s: &str, span: Span) -> Result<Vec<Tree>, String> {
             TokenKind::Unknown => return Err(format!("Unknown token: `{text}`")),
             // alloc: the message of text refused.
             TokenKind::UnknownPrefix => return Err(format!("Unknown prefix: `{text}`")),
+            // alloc: the message of text refused.
+            TokenKind::ForcedKeywordIdent => return Err(format!("Forced keyword: `{text}`")),
             TokenKind::UnknownPrefixLifetime => {
                 // alloc: the message of text refused.
                 return Err(format!("Unknown lifetime prefix: `{text}`"));

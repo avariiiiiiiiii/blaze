@@ -14,7 +14,12 @@ const FLAGS: &str = "sized, copy, clone, derive, option, result, fn, from, add, 
                      manually_drop, phantom_data, index, slice, range, unsize, coerce_unsized, \
                      addr_of, todo";
 
-const PRELUDE: &str = "pub use crate::{boxed::Box, string::String, vec::Vec};";
+const PRELUDE: &str = "pub use crate::{boxed::Box, string::String, vec::Vec};
+mod ambiguous_macros_only {
+    mod vec {}
+    pub use crate::*;
+}
+pub use self::ambiguous_macros_only::vec;";
 
 /// The items of std (alloc's and core's, as std re-exports them) the tests use, as std writes
 /// them: their signatures, `#[lang]`s, `#[rustc_diagnostic_item]`s and the attributes the passes

@@ -3,8 +3,11 @@
 use super::types::ui_std;
 use crate::tests::ui;
 
-/// std's `println!` and what it calls, for the tests that write one.
-pub(crate) const PRINTLN: &str = r#"pub mod io {
+/// std's `println!` and what it calls, for the tests that write one: what std's prelude has of
+/// it, and its items.
+pub(crate) const PRINTLN: (&str, &str) = (
+    "pub use crate::println;",
+    r#"pub mod io {
     pub fn _print(_args: core::fmt::Arguments<'_>) {}
 }
 
@@ -14,7 +17,8 @@ macro_rules! println {
         $crate::io::_print(core::format_args_nl!($($arg)*));
     }};
 }
-"#;
+"#,
+);
 
 #[test]
 fn a_return_in_a_return() {

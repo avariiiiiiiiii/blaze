@@ -1,21 +1,19 @@
 {
   "id": "01250",
-  "from_lane": "query-unify-port",
-  "owner": "query-unify-bench",
-  "paths": [
-    "crates/blaze-bench/benches/query_hit.rs"
-  ],
-  "what": "blaze-v2-qu crates/blaze-bench/benches/query_hit.rs:266: `Graph::builder(leaves, nodes).durability(Durability::MEDIUM).new(&db)` must pass `&mut db` since R18 (singleton inputs take &mut; line 580 already does). Every other singleton caller in blaze-v2-qu is on &mut as of checkpoint 9.",
+  "from_lane": "speed",
+  "owner": "core",
+  "paths": [],
+  "what": "Per-step build times for the bench (why newfn takes 16 s). v2 reports only RequestStats::critical_path_ns (blaze-graph/src/plane.rs:538, summed into blaze_api::Worked::critical_path_us at blaze-cargo/src/serve/job.rs:2324); v1 printed timeline-us: name=micros and load workspace/resolve/cold lines that harness/bench.py daemon_steps and cold_steps (:594-614) read, and v2 prints none. Ask: the plane already times each node it runs (plane.rs:1915), so add to RequestStats the run time summed per node kind (a sorted Vec<(kind name, ns)>, deterministic order), carry it into Worked as steps_us, and print it on the existing Worked line. Then the coordinator points bench.py daemon_steps at Worked.steps_us instead of timeline-us (bench.py is the coordinator's, 01158). No new timing source, no wall-clock outside the plane.",
   "state": "open",
-  "created": "2026-10-31T12:17:38Z",
-  "updated": "2026-10-31T12:17:38Z",
+  "created": "2026-10-31T12:08:21Z",
+  "updated": "2026-10-31T12:08:21Z",
   "taken_by": null,
   "why": null,
   "source": null,
   "history": [
     {
-      "at": "2026-10-31T12:17:38Z",
-      "by": "query-unify-port",
+      "at": "2026-10-31T12:08:21Z",
+      "by": "speed",
       "action": "add",
       "note": ""
     }

@@ -424,8 +424,16 @@ impl<'a> Converter<'a> {
                     }
                     IDENT
                 }
-                #[cfg(feature = "in-rust-tree")]
-                rustc_lexer::TokenKind::ForcedKeywordIdent => ERROR,
+                // `k#ident` is the identifier `k` and then `#ident`, as before 2021; from 2021
+                // rustc lexes a forced keyword, gated by `forced_keywords`, which this tree has
+                // no token for.
+                rustc_lexer::TokenKind::ForcedKeywordIdent => {
+                    if self.edition.at_least_2021() {
+                        self.error("forced keywords are experimental");
+                    }
+                    token_text = &token_text[..1];
+                    IDENT
+                }
 
                 rustc_lexer::TokenKind::GuardedStrPrefix if self.edition.at_least_2024() => {
                     // FIXME: rustc does something better for recovery.
@@ -882,6 +890,21 @@ mod tests {
                 (WHITESPACE, " ", None),
                 (IDENT, "r#async", None),
             ]);
+        }
+    }
+
+    /// `k#fn` is `k`, `#` and `fn` in every edition, and from 2021 the error of rustc's
+    /// `forced_keywords` gate on the `k`.
+    #[test]
+    fn forced_keywords_split_and_are_gated_from_2021() {
+        for edition in Edition::iter() {
+            let error = edition.at_least_2021().then(|| "forced keywords are experimental".to_owned());
+            assert_eq!(
+                tokens(edition, "k#fn"),
+                [(IDENT, "k", error), (POUND, "#", None), (FN_KW, "fn", None)],
+                "{edition:?}"
+            );
+            assert_eq!(LexedStr::single_token(edition, "k#fn"), None);
         }
     }
 

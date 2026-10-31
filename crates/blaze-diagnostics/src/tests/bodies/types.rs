@@ -18,6 +18,52 @@ fn ui_core(name: &str, flags: &str, source: &str) -> String {
     normalized(&checked.stderr_with(Style { ui_testing: true, ..Style::default() }))
 }
 
+/// [`ui_core`] of a file that makes an empty `Vec`: std's `Vec`, `Vec::new` and `vec![]` as std
+/// writes them, with its prelude's `Vec` and `vec!`.
+fn ui_vec(name: &str, flags: &str, source: &str) -> String {
+    let fixture = format!(
+        "//- minicore: {flags}\n//- /std.rs crate:std\n{VEC_STD}//- /{name} crate:other:main edition:2015 deps:std\n{source}"
+    );
+    let checked = checked_with(&fixture, "$DIR/", &compiletest(Mode::Other, &Options::default()));
+    normalized(&checked.stderr_with(Style { ui_testing: true, ..Style::default() }))
+}
+
+const VEC_STD: &str = r#"#![feature(rustc_attrs)]
+pub mod prelude {
+    pub mod rust_2015 {
+        pub use core::prelude::rust_2015::*;
+        pub use crate::vec::Vec;
+        mod ambiguous_macros_only {
+            mod vec {}
+            pub use crate::*;
+        }
+        pub use self::ambiguous_macros_only::vec;
+    }
+}
+
+pub mod vec {
+    #[rustc_diagnostic_item = "Vec"]
+    pub struct Vec<T> {
+        ptr: *mut T,
+        len: usize,
+    }
+
+    impl<T> Vec<T> {
+        pub const fn new() -> Vec<T> {
+            loop {}
+        }
+    }
+}
+
+#[macro_export]
+#[rustc_diagnostic_item = "vec_macro"]
+macro_rules! vec {
+    () => {
+        $crate::vec::Vec::new()
+    };
+}
+"#;
+
 #[test]
 fn an_argument_of_another_type_points_at_the_function() {
     // tests/ui/mismatched_types/array-arg-expected-usize.rs
@@ -423,7 +469,7 @@ For more information about this error, try `rustc --explain E0525`.
 "##;
     let fixture = format!(
         "//- minicore: fn\n//- /std.rs crate:std\n\
-         pub mod prelude {{ pub mod rust_2021 {{ pub use core::prelude::rust_2021::*; pub use crate::string::String; }} }}\n\
+         pub mod prelude {{ pub mod rust_2021 {{ pub use core::prelude::rust_2021::*; pub use crate::{{format, string::String}}; }} }}\n\
          pub mod string {{ pub struct String; }}\n\
          #[macro_export]\n\
          macro_rules! format {{ ($($arg:tt)*) => {{ $crate::string::String }}; }}\n\
@@ -612,7 +658,7 @@ error: aborting due to 1 previous error
 
 For more information about this error, try `rustc --explain E0282`.
 ";
-    assert_eq!(ui("vector-no-ann.rs", "2015", source), stderr);
+    assert_eq!(ui_vec("vector-no-ann.rs", "sized", source), stderr);
 }
 
 #[test]
@@ -638,7 +684,7 @@ error: aborting due to 1 previous error
 
 For more information about this error, try `rustc --explain E0282`.
 ";
-    assert_eq!(ui("cannot_infer_local_or_vec.rs", "2015", source), stderr);
+    assert_eq!(ui_vec("cannot_infer_local_or_vec.rs", "sized", source), stderr);
 }
 
 #[test]
@@ -687,7 +733,7 @@ error: aborting due to 2 previous errors
 
 For more information about this error, try `rustc --explain E0282`.
 ";
-    assert_eq!(ui("underscore-placeholder-wording.rs", "2015", source), stderr);
+    assert_eq!(ui_vec("underscore-placeholder-wording.rs", "sized, slice, iterator", source), stderr);
 }
 
 #[test]

@@ -1,7 +1,7 @@
 //! rustc's UI tests of the errors of the crate-level, macro, test, `#[path]`, `#[must_use]` and
 //! `#[non_exhaustive]` attribute parsers, and of `check_attr`'s of the attributes no parser takes.
 
-use crate::tests::ui;
+use crate::tests::{ui, ui_builtins};
 
 #[test]
 fn a_windows_subsystem_is_console_or_windows() {
@@ -950,5 +950,5 @@ LL | #[cfg_accessible(std(value))]
 error: aborting due to 7 previous errors
 
 "#;
-    assert_eq!(ui("cfg_accessible-input-validation.rs", "2015", source), stderr);
+    assert_eq!(ui_builtins("cfg_accessible-input-validation.rs", "2015", source), stderr);
 }

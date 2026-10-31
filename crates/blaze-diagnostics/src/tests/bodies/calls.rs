@@ -21,11 +21,11 @@ fn ui_core(name: &str, flags: &str, source: &str) -> String {
 }
 
 /// [`ui_core`] of a file that uses std: a crate `std` of `std_items` over minicore, with its
-/// prelude.
-fn ui_std(name: &str, flags: &str, std_items: &str, source: &str) -> String {
+/// prelude of core's and `prelude`, what std's adds that the test uses.
+fn ui_std(name: &str, flags: &str, (prelude, std_items): (&str, &str), source: &str) -> String {
     let fixture = format!(
         "//- minicore: {flags}\n//- /std.rs crate:std\n\
-         pub mod prelude {{ pub mod rust_2015 {{ pub use core::prelude::rust_2015::*; }} }}\n\
+         pub mod prelude {{ pub mod rust_2015 {{ pub use core::prelude::rust_2015::*; {prelude} }} }}\n\
          {std_items}\n//- /{name} crate:other:main edition:2015 deps:std\n{source}"
     );
     ui_fixture(&fixture)
@@ -271,7 +271,7 @@ macro_rules! println {
     }};
 }
 "#;
-    assert_eq!(ui_std("enum-drop-cast-error.rs", "sized, drop, fmt", println, source), stderr);
+    assert_eq!(ui_std("enum-drop-cast-error.rs", "sized, drop, fmt", ("pub use crate::println;", println), source), stderr);
 }
 
 #[test]
@@ -292,7 +292,7 @@ impl Default for FieldLessWithNonExhaustiveVariant {
     fn default() -> Self { Self::A }
 }
 //- /std.rs crate:std
-pub mod prelude { pub mod rust_2015 { pub use core::prelude::rust_2015::*; } }
+pub mod prelude { pub mod rust_2015 { pub use core::prelude::rust_2015::*; pub use crate::assert_eq; } }
 #[macro_export]
 macro_rules! assert_eq {
     ($left:expr, $right:expr $(,)?) => {
@@ -509,7 +509,7 @@ error: aborting due to 1 previous error
 For more information about this error, try `rustc --explain E0067`.
 ";
     let std_items = "pub use core::ops;";
-    assert_eq!(ui_std("assign-non-lval-needs-deref.rs", "add", std_items, source), stderr);
+    assert_eq!(ui_std("assign-non-lval-needs-deref.rs", "add", ("", std_items), source), stderr);
 }
 
 #[test]

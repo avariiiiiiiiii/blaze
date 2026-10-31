@@ -1,36 +1,31 @@
 {
   "id": "01247",
-  "from_lane": "query-unify-port",
+  "from_lane": "query-unify-macros",
   "owner": "query-unify",
   "paths": [
-    "crates/blaze-query/src/db/value.rs",
-    "crates/blaze-query/Cargo.toml"
+    "crates/hir-ty/src/providers.rs",
+    "crates/hir-ty-mir/src/mir/lower.rs",
+    "crates/blaze-items/src/index.rs"
   ],
-  "what": "blaze-query/src/db/value.rs: add `container_values!(either::Either<L, R>);` (SAFETY as the other containers: every kept parameter is a Value), and an `either` dep in crates/blaze-query/Cargo.toml if missing. hir-ty mir.rs:2280 stores Either<L, R> in a query value; salsa fork had default_salsa_value!(Either<L, R>). Only hir-ty error left in qu-check4 (query-unify-port-hirty fixed the other 19). Blocks hir-ty and everything above it in blaze-v2-qu.",
+  "what": "qu-check6 (34f763ee6d), 16 errors, none in the macros. (1) hir/src/evict.rs:39-66, 15x E0599 no evict_values: per the contract (query-unify.md:475) evict_values*/set_lru_capacity exist only on functions with `lru = N` (0 too), since only their values are hashed so eviction keeps early cutoff. The 15 queries evict.rs drops (promoted_mir_body, runtime_promoted, optimized_mir_body*, monomorphized_mir_body*, monomorphized_promoted, monomorphized_optimized*) have no lru; mir_body_query has lru = 0 and compiles. Fix: add `lru = 0` to each (their values then need Hash), in hir-ty providers.rs and hir-ty-mir mir/lower.rs. (2) blaze-items index.rs:291 size_of::<AnyImpl>() == 12: blaze_query Id is NonZeroU32 (4 bytes) vs salsa 8 (index+generation), so the two-variant enum is now 8; change the assert to 8.",
   "state": "applied",
-  "created": "2026-10-31T10:05:33Z",
-  "updated": "2026-10-31T12:02:17Z",
-  "taken_by": "query-unify-engine",
+  "created": "2026-10-31T12:04:47Z",
+  "updated": "2026-10-31T12:07:58Z",
+  "taken_by": "query-unify",
   "why": null,
   "source": null,
   "history": [
     {
-      "at": "2026-10-31T10:05:33Z",
-      "by": "query-unify-port",
+      "at": "2026-10-31T12:04:47Z",
+      "by": "query-unify-macros",
       "action": "add",
       "note": ""
     },
     {
-      "at": "2026-10-31T12:02:17Z",
-      "by": "query-unify-engine",
-      "action": "take",
-      "note": ""
-    },
-    {
-      "at": "2026-10-31T12:02:17Z",
-      "by": "query-unify-engine",
+      "at": "2026-10-31T12:07:58Z",
+      "by": "query-unify",
       "action": "done",
-      "note": "applied in blaze-v2-qu and blaze-v2: container_values!(either::Either<L, R>) in db/value.rs, either.workspace = true in crates/blaze-query/Cargo.toml (the root already has either = 1.19.0, so no dedup line), test foreign_containers_of_values_are_values in db/tests.rs; rust-analyzer 0 errors both trees"
+      "note": "(1) hir evict.rs: per contract evict_values/set_lru_capacity exist only with `lru` (an evicted value is cut off by its hash, else it counts as changed); the fork gave every Hash-output query one. Fix is `lru = 0` on the 15 MIR queries: query-unify-port-hirty did the 3 in hir-ty-mir and is doing the 12 in hir-ty providers.rs. (2) blaze-items index.rs:291 size 8 fixed by query-unify-port-blaze."
     }
   ]
 }

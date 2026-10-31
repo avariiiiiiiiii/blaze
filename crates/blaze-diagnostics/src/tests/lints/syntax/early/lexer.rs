@@ -26,7 +26,7 @@ macro_rules! println {
     }};
 }
 "#,
-    "pub use crate::boxed::Box;",
+    "pub use crate::{boxed::Box, println};",
 );
 
 /// What compiletest gives for `fixture`, each file named `$DIR/<path>`: [`ui`] of a UI test

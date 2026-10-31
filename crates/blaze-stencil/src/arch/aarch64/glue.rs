@@ -13,7 +13,7 @@ use super::{
     Ctx,
     abi::{self, Place, Reg},
     frame::{self, Frame},
-    inst::{self, FP, SP, X0, X1, X8, X16, X17, X20, ZR},
+    inst::{self, FP, SP, X0, X1, X8, X16, X17, X20},
 };
 use crate::{
     Error, Target, TlsModel,
@@ -84,7 +84,8 @@ pub(super) fn bound(func: &ir::Function, target: &Target, inst: ir::Inst) -> u32
         Opcode::BrTable => {
             let Data::BranchTable { table, .. } = func.dfg.insts[inst] else { return 0 };
             let entries = func.dfg.jump_tables[table].as_slice().len() as u32;
-            16 + 20 + 6 * 4 + 4 * entries
+            // The index, the compare, the default's index, five instructions, the table.
+            16 + 20 + 16 + 5 * 4 + 4 * (entries + 1)
         }
         Opcode::Trap | Opcode::Debugtrap => 4,
         Opcode::FuncAddr | Opcode::SymbolValue => NAME_MAX + inst::LDST_MAX,
@@ -512,17 +513,17 @@ fn br_table<'f, 'm>(cx: &mut impl Ctx<'f, 'm>, inst: ir::Inst) -> Result<(), Err
             buf.put4(inst::cmp_w(X16, X17));
         }
     }
-    let at = buf.len();
-    buf.fixup(at, Form::A64CondBr19, default, 0);
-    buf.put4(inst::b_cond(inst::HS));
-    buf.put4(inst::csel(X17, ZR, X16, inst::HS));
+    // An index out of bounds is clamped to the default's entry, the table's last, as
+    // Cranelift 0.137 does: no branch to the default, whose range the table could outgrow.
+    inst::mov_imm(buf, X17, entries as u64);
+    buf.put4(inst::csel(X17, X16, X17, inst::LO));
     buf.put4(inst::adr(X16, 16));
     buf.put4(inst::ldrsw_uxtw2(X17, X16, X17));
     buf.put4(inst::add(X16, X16, X17));
     buf.put4(inst::br(X16));
     let start = cx.buf().len();
-    for i in 0..entries {
-        let label = cx.edge(inst, 1 + i);
+    for i in 0..=entries {
+        let label = if i < entries { cx.edge(inst, 1 + i) } else { default };
         let buf = cx.buf();
         let at = buf.len();
         buf.fixup(at, Form::Rel32, label, i64::from(at - start));

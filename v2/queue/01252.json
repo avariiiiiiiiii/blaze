@@ -1,0 +1,24 @@
+{
+  "id": "01252",
+  "from_lane": "dedup-bumps",
+  "owner": "coordinator",
+  "paths": [
+    "vendor/cranelift-object",
+    "vendor/cranelift-codegen"
+  ],
+  "what": "Fetch and unpack the source of cranelift-object 0.137.1 (the newest; 01151 brought cranelift-object 0.137.0 and the rest of the family at 0.137.1). Every other cranelift crate 0.137.1 has the same src as 0.137.0, so the family stays =0.137.0 (vendor/cranelift-codegen, vendor/cranelift-object) until cranelift-object 0.137.1 shows whether the point release changes anything blaze builds.",
+  "state": "open",
+  "created": "2026-10-31T12:09:32Z",
+  "updated": "2026-10-31T12:09:32Z",
+  "taken_by": null,
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-10-31T12:09:32Z",
+      "by": "dedup-bumps",
+      "action": "add",
+      "note": ""
+    }
+  ]
+}

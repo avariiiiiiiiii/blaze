@@ -64,7 +64,11 @@ pub fn main() {
 fn library(variant: Variant) -> Result<Vec<u8>, Vec<String>> {
     let isa = variant.isa();
     let mut shapes: Vec<(u32, Shape)> = Vec::with_capacity(8192);
-    shape::each_on(isa, |shape| shapes.push((shapes.len() as u32, shape)));
+    shape::each_on(isa, |shape| {
+        if variant.has(shape) {
+            shapes.push((shapes.len() as u32, shape));
+        }
+    });
     let machine = llvm::Machine::of(variant);
     let name = format!("{variant:?}");
     let text = ir::module(isa, &shapes);

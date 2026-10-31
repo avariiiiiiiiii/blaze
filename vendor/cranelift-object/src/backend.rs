@@ -630,8 +630,14 @@ impl Module for ObjectModule {
                 .object
                 .add_symbol_data(symbol, section, &contents, align),
         };
-        // blaze: after the symbol is defined, for Mach-O to take its flags as those of a
-        // definition rather than of an undefined symbol.
+        if !relocs.is_empty() {
+            self.relocs.push(SymbolRelocs {
+                section,
+                offset,
+                relocs,
+            });
+        }
+
         if used {
             match self.object.format() {
                 object::BinaryFormat::Elf => match self.object.section_flags_mut(section) {
@@ -645,13 +651,6 @@ impl Module for ObjectModule {
                 },
                 _ => unreachable!(),
             }
-        }
-        if !relocs.is_empty() {
-            self.relocs.push(SymbolRelocs {
-                section,
-                offset,
-                relocs,
-            });
         }
         Ok(())
     }
@@ -892,6 +891,7 @@ impl ObjectModule {
         }
     }
 
+    // blaze: a relocation the object format has no form for is an error naming both.
     fn process_reloc(&self, record: &ModuleReloc) -> ModuleResult<ObjectRelocRecord> {
         let unsupported = |reloc: Reloc| {
             ModuleError::Backend(anyhow!(

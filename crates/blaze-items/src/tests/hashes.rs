@@ -767,8 +767,10 @@ fn a_leak_changes_the_interface_hash_and_keeps_the_signature_hash() {
 fn a_signature_change_changes_the_signature_hash() {
     for (before, after, path) in [
         (
-            "trait A {} trait B {} impl A for u8 {} impl B for u8 {} fn g() -> impl A { 1u8 }",
-            "trait A {} trait B {} impl A for u8 {} impl B for u8 {} fn g() -> impl B { 1u8 }",
+            "trait A {} trait B { fn b(&self) {} } impl A for u8 {} impl B for u8 {}\n\
+             fn g() -> impl A { 1u8 }",
+            "trait A {} trait B { fn b(&self) {} } impl A for u8 {} impl B for u8 {}\n\
+             fn g() -> impl B { 1u8 }",
             "g",
         ),
         ("const fn g() -> u8 { 1 }", "fn g() -> u8 { 1 }", "g"),

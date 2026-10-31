@@ -101,6 +101,7 @@ const FILES: &[(&str, &str)] = files![
     "i128-shifts.clif",
     "select.clif",
     "stack.clif",
+    "stack-widening.clif",
     // Floats.
     "ceil.clif",
     "fcmp.clif",

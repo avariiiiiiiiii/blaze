@@ -866,7 +866,9 @@ const NARROWED: TySet = TySet::of(&[Ty::I8x16, Ty::I16x8, Ty::I32x4]);
 const WIDENED: TySet = TySet::of(&[Ty::I16x8, Ty::I32x4, Ty::I64x2]);
 const SAT_LANES: TySet = TySet::INT_VECTORS;
 const MUL_TYS: TySet = TySet::INTS_WIDE.union(WIDENED);
-const MULHI_TYS: TySet = TySet::INTS.union(ty(Ty::I16x8));
+// Neither backend has a vector rule (x64's `pmulhw` and AArch64's `smull2` lower widening
+// multiplies, not `umulhi`/`smulhi`).
+const MULHI_TYS: TySet = TySet::INTS;
 const FCVT_TO: TySet = TySet::INTS.union(TySet::of(&[Ty::I32x4, Ty::I64x2]));
 const FCVT_FROM: TySet = TySet::INTS.union(TySet::of(&[Ty::I32x4, Ty::I64x2]));
 const FLOAT_SOURCES: TySet = TySet::FLOAT_MATH;
@@ -1230,6 +1232,45 @@ impl Shape {
         }
     }
 
+    /// Whether Cranelift lowers the shape's instruction on `isa` at the baseline the stencil
+    /// backend tiers up to (`tests/host.rs`'s ISA: x86-64 with SSE2, AArch64 with NEON). The
+    /// [`TABLE`]'s type sets are the union of both backends' rules; these are the combinations
+    /// one of them has none for in `isa/{x64,aarch64}/lower.isle` of Cranelift 0.137, which a
+    /// stencil would let run where the function could never be tiered up.
+    fn lowered_on(self, isa: Isa) -> bool {
+        let (ty, x64) = (self.ty, isa == Isa::X86_64);
+        match self.op {
+            // New in 0.137; neither backend has a rule yet.
+            Op::UaddOverflowCin | Op::SaddOverflowCin | Op::UsubOverflowBin | Op::SsubOverflowBin => {
+                false
+            }
+            // x64 has `pavgb`/`pavgw` and the saturating byte and word adds and subtracts only.
+            Op::AvgRound | Op::UaddSat | Op::SaddSat | Op::UsubSat | Op::SsubSat => {
+                !x64 || matches!(ty, Ty::I8x16 | Ty::I16x8)
+            }
+            Op::Fcopysign => !(x64 && ty.is_vector()),
+            // x64 has no rule narrowing `i64x2` operands, and none for `uunarrow`.
+            Op::Snarrow | Op::Unarrow | Op::SqmulRoundSat => !(x64 && ty == Ty::I32x4),
+            Op::Uunarrow => !x64,
+            // x64 converts a float to 32 or 64 bits only, and a vector to `i32x4` only.
+            Op::FcvtToUint | Op::FcvtToSint => !(x64 && matches!(ty, Ty::I8 | Ty::I16)),
+            Op::FcvtToUintSat | Op::FcvtToSintSat => !(x64 && matches!(ty, Ty::I8 | Ty::I16 | Ty::I64x2)),
+            // Of vectors, x64 has no `one` or `ueq`, and AArch64 neither those nor the
+            // unordered orderings.
+            Op::Fcmp if ty.is_vector() => match FloatCc::from_u8(self.aux) {
+                Some(FloatCc::OrderedNotEqual | FloatCc::UnorderedOrEqual) => false,
+                Some(
+                    FloatCc::UnorderedOrLessThan
+                    | FloatCc::UnorderedOrLessThanOrEqual
+                    | FloatCc::UnorderedOrGreaterThan
+                    | FloatCc::UnorderedOrGreaterThanOrEqual,
+                ) => x64,
+                _ => true,
+            },
+            _ => true,
+        }
+    }
+
     /// Whether the shape is one of the set of some instruction set ([`Shape::exists_on`]).
     pub fn exists(self) -> bool {
         Isa::ALL.into_iter().any(|isa| self.exists_on(isa))
@@ -1240,7 +1281,7 @@ impl Shape {
     /// types, at most one source is an accumulator, and it is not pruned.
     pub fn exists_on(self, isa: Isa) -> bool {
         let info = self.op.info();
-        if !self.op.on(isa) || !info.tys.contains(self.ty) || !self.aux_ok() {
+        if !self.op.on(isa) || !info.tys.contains(self.ty) || !self.aux_ok() || !self.lowered_on(isa) {
             return false;
         }
         if let Some((_, disp)) = self.confined()

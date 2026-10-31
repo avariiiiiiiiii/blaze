@@ -883,8 +883,14 @@ macro_rules! vec {
 }
 "#;
 
-/// What std's prelude has of [`STD_VEC`].
-pub(crate) const STD_VEC_PRELUDE: &str = "        pub use crate::vec::Vec;\n";
+/// What std's prelude has of [`STD_VEC`], as `library/std/src/prelude/v1.rs` writes it: `Vec`,
+/// and `vec!` without the module `vec`.
+pub(crate) const STD_VEC_PRELUDE: &str = "        pub use crate::vec::Vec;\n\
+     \x20       mod ambiguous_macros_only {\n\
+     \x20           mod vec {}\n\
+     \x20           pub use crate::*;\n\
+     \x20       }\n\
+     \x20       pub use self::ambiguous_macros_only::vec;\n";
 
 /// The crates a UI test is compiled against.
 #[derive(Default)]

@@ -2,7 +2,7 @@
 
 [package]
 edition = "2024"
-rust-version = "1.96.0"
+rust-version = "1.97.0"
 name = "cranelift-object"
 version = "0.137.0"
 authors = ["The Cranelift Project Developers"]

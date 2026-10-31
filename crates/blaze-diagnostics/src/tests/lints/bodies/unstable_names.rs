@@ -13,6 +13,7 @@ const STD: &str = "//- minicore: sized
 pub mod prelude {
     pub mod rust_2015 {
         pub use core::prelude::rust_2015::*;
+        pub use crate::assert_eq;
     }
 }
 #[macro_export]

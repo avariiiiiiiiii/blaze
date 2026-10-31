@@ -992,8 +992,27 @@ error: aborting due to 4 previous errors; 30 warnings emitted
 
 For more information about this error, try `rustc --explain E0658`.
 "##;
-    assert_eq!(ui("attr-on-mac-call.rs", source, &[]), expected);
+    let fixture = format!("{CORE_UNREACHABLE}//- /attr-on-mac-call.rs crate:other:main edition:2015 deps:core\n{source}");
+    let options = compiletest(Mode::Other, &Options::default());
+    let stderr = checked_with(&fixture, "$DIR/", &options).stderr_with(Style { ui_testing: true, ..Style::default() });
+    assert_eq!(normalized(&stderr), expected);
 }
+
+/// The core `attr-on-mac-call.rs` calls `unreachable!` of, through its prelude as core's
+/// prelude gives it; the expansion is not core's, which these lints do not look into.
+const CORE_UNREACHABLE: &str = "//- /core.rs crate:core edition:2015
+pub mod prelude {
+    pub mod rust_2015 {
+        pub use crate::unreachable;
+    }
+}
+#[macro_export]
+macro_rules! unreachable {
+    () => {
+        loop {}
+    };
+}
+";
 
 /// `tests/ui/rust-2024/unsafe-attributes/in_2024_compatibility.rs`.
 #[test]

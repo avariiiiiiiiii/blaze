@@ -659,7 +659,8 @@ fn kind_name(kind: &TargetKind) -> Option<&'static str> {
 /// them: every unit built for the platform but a build script's run depends on each root,
 /// `noprelude` (named by `--extern noprelude:std=...`), public and not reported unused. blaze
 /// has no sysroot, so a host unit (a build script, a proc macro) is given the host's std the
-/// same way.
+/// same way. std's own units, merged after the build's, are given none: its build scripts are
+/// never compiled, their output blaze's port of each ([`crate::stdlib::scripts`]).
 fn merge_std(
     graph: &mut schema::UnitGraph,
     plans: &mut Vec<Option<UnitPlan>>,

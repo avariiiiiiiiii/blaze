@@ -29,6 +29,9 @@ unsafe extern "C" {
 }
 
 const ARM_THREAD_STATE64: i32 = 6;
+/// What `thread_suspend` says of a port whose thread has exited since `task_threads` listed
+/// it: the port no longer converts to a thread.
+const KERN_INVALID_ARGUMENT: i32 = 4;
 const KERN_TERMINATED: i32 = 37;
 const MACH_SEND_INVALID_DEST: i32 = 0x1000_0003;
 /// What a pointer has of an address, without the bits pointer authentication signs it with.
@@ -119,7 +122,10 @@ impl Threads {
         // SAFETY: `port` names a thread of this task, not this one; it returns once the
         // thread has stopped.
         let suspended = unsafe { thread_suspend(port) };
-        if suspended == KERN_TERMINATED || suspended == MACH_SEND_INVALID_DEST {
+        if suspended == KERN_TERMINATED
+            || suspended == KERN_INVALID_ARGUMENT
+            || suspended == MACH_SEND_INVALID_DEST
+        {
             return Ok(false);
         }
         if suspended != 0 {

@@ -4,6 +4,7 @@
 //! `non_camel_case_types`, the type parameters the early pass checks with the items the
 //! declarations check gives.
 
+use super::ui_std;
 use crate::tests::ui;
 
 const PARSE_ERRORS: &str = r#"//@ check-fail
@@ -624,7 +625,19 @@ fn main() {
     xyz();
 }
 "#;
-    assert_eq!(ui("break-label-with-parens-147542.rs", "2015", source), "");
+    let std_items = r#"pub mod io {
+    pub fn _print(_args: core::fmt::Arguments<'_>) {}
+}
+
+#[macro_export]
+macro_rules! println {
+    ($($arg:tt)*) => {{
+        $crate::io::_print(core::format_args_nl!($($arg)*));
+    }};
+}
+"#;
+    let std = (std_items, "pub use crate::println;");
+    assert_eq!(ui_std("break-label-with-parens-147542.rs", "2015", "sized, fmt, builtin_impls", std, source), "");
 }
 
 #[test]

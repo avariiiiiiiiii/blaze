@@ -114,7 +114,7 @@ macro_rules! test_case {
     };
 }
 
-test_case!(basic, "basic");
+test_case!(basic, "basic", core: "panic");
 test_case!(lint_dead_code_1, "lint-dead-code-1", core: "copy");
 test_case!(lint_dead_code_2, "lint-dead-code-2");
 test_case!(lint_dead_code_3, "lint-dead-code-3", core: "coerce_unsized");
@@ -166,7 +166,7 @@ fn lint_dead_code_6() {
     let ui_ = Ui {
         name: "lint-dead-code-6.rs",
         core: "fmt, builtin_impls",
-        std: Some(("", PRINTLN)),
+        std: Some(("pub use crate::println;", PRINTLN)),
         source,
         ..Ui::default()
     };
@@ -208,7 +208,7 @@ fn passes() {
         name: "with-impl.rs",
         mode: Mode::RunPass,
         core: "fmt, builtin_impls",
-        std: Some(("", PRINTLN)),
+        std: Some(("pub use crate::println;", PRINTLN)),
         source,
         ..Ui::default()
     };

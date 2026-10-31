@@ -1,4 +1,4 @@
-//! Where System V and Windows x64 put each argument and return value: Cranelift 0.136.2's
+//! Where System V and Windows x64 put each argument and return value: Cranelift 0.137's
 //! `X64ABIMachineSpec::compute_arg_locs`, `get_intreg_for_arg`, `get_fltreg_for_arg`,
 //! `get_intreg_for_retval`, `get_fltreg_for_retval` and `get_ext_mode` (`isa/x64/abi.rs`),
 //! with `enable_llvm_abi_extensions` set as `hir-ty-codegen/target.rs` sets it, and
@@ -84,9 +84,9 @@ fn int_ret(win: bool, gpr: usize) -> Option<u8> {
     regs.get(gpr).copied()
 }
 
-fn float_ret(win: bool, vreg: usize) -> Option<u8> {
-    let count = if win { 1 } else { 2 };
-    (vreg < count).then_some(vreg as u8)
+/// `xmm0` and `xmm1` on both: Cranelift returns a Rust float pair in them on Windows too.
+fn float_ret(vreg: usize) -> Option<u8> {
+    (vreg < 2).then_some(vreg as u8)
 }
 
 /// Assigns places in the order of a signature's arguments or of its returns.
@@ -116,7 +116,7 @@ impl Assign {
 
     fn float(&mut self) -> Option<u8> {
         if self.rets {
-            float_ret(self.win, self.vreg)
+            float_ret(self.vreg)
         } else {
             float_arg(self.win, self.vreg, self.idx)
         }

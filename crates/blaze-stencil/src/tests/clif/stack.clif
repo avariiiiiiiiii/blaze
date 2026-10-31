@@ -2,10 +2,11 @@
 ; stack_addr.clif), for the stencil set: explicit slots of 1 to 64 bytes and one of 8192
 ; (more than a page: the prologue probes it), with alignment 16 and 64; stores and loads
 ; through `stack_addr` with slot offsets and access offsets, of every type (integers, `i128`,
-; floats, the six vector types, an unaligned vector); the narrow loads and stores and the
-; vector widening loads, little-endian; several slots live at once; a slot's address passed
-; to a callee that writes through it, and a caller's slot surviving a callee with its own; a
-; value stored in one block and read back in another after a loop. Upstream's `stack_load`
+; floats, the six vector types, an unaligned vector); the narrow loads and stores,
+; little-endian (the vector widening loads are `stack-widening.clif`'s); several slots live
+; at once; a slot's address passed to a callee that writes through it, and a caller's slot
+; surviving a callee with its own; a value stored in one block and read back in another
+; after a loop. Upstream's `stack_load`
 ; and `stack_store` are gone from Cranelift's IR (written here as `stack_addr` and
 ; `load`/`store`); `dynamic_stack_slot` is left out (the IR builder makes none).
 test interpret
@@ -615,78 +616,6 @@ block0(v0: i64, v1: i64):
 }
 ; run: %istore32_i64(-1, 0x0123456789abcdef) == 0x89abcdefffffffff
 ; run: %istore32_i64(0, 0x0123456789abcdef) == 0x89abcdef00000000
-
-function %uload8x8(i64) -> i16x8 {
-    ss0 = explicit_slot 16
-
-block0(v0: i64):
-    v1 = stack_addr.i64 ss0
-    store v0, v1+8
-    v2 = uload8x8 v1+8
-    return v2
-}
-; run: %uload8x8(0x0123456789abcdef) == [239 205 171 137 103 69 35 1]
-; run: %uload8x8(0xfedcba9876543210) == [16 50 84 118 152 186 220 254]
-
-function %sload8x8(i64) -> i16x8 {
-    ss0 = explicit_slot 16
-
-block0(v0: i64):
-    v1 = stack_addr.i64 ss0
-    store v0, v1+8
-    v2 = sload8x8 v1+8
-    return v2
-}
-; run: %sload8x8(0x0123456789abcdef) == [-17 -51 -85 -119 103 69 35 1]
-; run: %sload8x8(0xfedcba9876543210) == [16 50 84 118 -104 -70 -36 -2]
-
-function %uload16x4(i64) -> i32x4 {
-    ss0 = explicit_slot 16
-
-block0(v0: i64):
-    v1 = stack_addr.i64 ss0+4
-    store v0, v1
-    v2 = uload16x4 v1
-    return v2
-}
-; run: %uload16x4(0x0123456789abcdef) == [52719 35243 17767 291]
-; run: %uload16x4(0xfedcba9876543210) == [12816 30292 47768 65244]
-
-function %sload16x4(i64) -> i32x4 {
-    ss0 = explicit_slot 16
-
-block0(v0: i64):
-    v1 = stack_addr.i64 ss0+4
-    store v0, v1
-    v2 = sload16x4 v1
-    return v2
-}
-; run: %sload16x4(0x0123456789abcdef) == [-12817 -30293 17767 291]
-; run: %sload16x4(0xfedcba9876543210) == [12816 30292 -17768 -292]
-
-function %uload32x2(i64) -> i64x2 {
-    ss0 = explicit_slot 16
-
-block0(v0: i64):
-    v1 = stack_addr.i64 ss0
-    store v0, v1
-    v2 = uload32x2 v1
-    return v2
-}
-; run: %uload32x2(0x0123456789abcdef) == [2309737967 19088743]
-; run: %uload32x2(0xfedcba9876543210) == [1985229328 4275878552]
-
-function %sload32x2(i64) -> i64x2 {
-    ss0 = explicit_slot 16
-
-block0(v0: i64):
-    v1 = stack_addr.i64 ss0
-    store v0, v1
-    v2 = sload32x2 v1
-    return v2
-}
-; run: %sload32x2(0x0123456789abcdef) == [-1985229329 19088743]
-; run: %sload32x2(0xfedcba9876543210) == [1985229328 -19088744]
 
 function %write_through(i64, i64) {
 block0(v0: i64, v1: i64):

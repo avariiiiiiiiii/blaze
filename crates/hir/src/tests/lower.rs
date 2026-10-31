@@ -475,19 +475,20 @@ trait G where Self: D + E {}
                 panic!("`{name}` is a trait")
             };
             let interner = DbInterner::new_with(&db, krate);
-            // Elaboration has every trait's implicit `Self: MetaSized` (and `MetaSized`'s
-            // `PointeeSized`), as rustc's; the memo is the written bounds' hierarchy, which method
-            // and associated item lookup read, and has those two only through a written `Sized`.
+            // Elaboration has every trait's implicit `Self: MetaSized`, as rustc's, and never
+            // `PointeeSized`, whose bound lowers to no clause. The memo is the written bounds'
+            // hierarchy, which method and associated item lookup read: `MetaSized` only through
+            // a written `Sized`, and `MetaSized`'s own `PointeeSized`. Neither has items.
             let lang = interner.lang_items();
-            let implicit = [lang.MetaSized, lang.PointeeSized];
             let identity = Binder::dummy(TraitRef::identity(interner, trait_.into()));
             let mut elaborated: Vec<_> = rustc_type_ir::elaborate::supertraits(interner, identity)
                 .map(|it| it.def_id().0)
                 .collect();
             if !elaborated.iter().any(|it| Some(*it) == lang.Sized) {
-                elaborated.retain(|it| !implicit.contains(&Some(*it)));
+                elaborated.retain(|it| Some(*it) != lang.MetaSized);
             }
             let mut memo = hir_ty::all_super_traits(&db, trait_).to_vec();
+            memo.retain(|it| Some(*it) != lang.PointeeSized);
             elaborated.sort();
             elaborated.dedup();
             memo.sort();

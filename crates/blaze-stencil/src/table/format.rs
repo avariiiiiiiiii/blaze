@@ -54,7 +54,10 @@ use std::fmt;
 use blaze_bytes::le::{u16 as u16_at, u32 as u32_at};
 use blaze_ids::bits::BitSet;
 
-use crate::{enc::Form, shape::Shape};
+use crate::{
+    enc::Form,
+    shape::{Op, Shape, Ty},
+};
 
 pub const MAGIC: [u8; 8] = *b"BZSTENC1";
 /// Bumped with any change to this layout.
@@ -106,6 +109,14 @@ impl Variant {
             Variant::X86_64 => crate::shape::Isa::X86_64,
             Variant::Aarch64 | Variant::Aarch64Lse => crate::shape::Isa::Aarch64,
         }
+    }
+
+    /// Whether its library has a stencil of `shape`: its instruction set's set
+    /// ([`Shape::exists_on`]) less an `i128` compare-and-swap without LSE, which Cranelift
+    /// lowers only to `casp` (`isa/aarch64/lower.isle`, `lse_atomic_cas_i128`).
+    pub fn has(self, shape: Shape) -> bool {
+        shape.exists_on(self.isa())
+            && !(self == Variant::Aarch64 && shape.op == Op::AtomicCas && shape.ty == Ty::I128)
     }
 }
 
@@ -319,7 +330,7 @@ pub enum FormatError {
     Bounds(&'static str),
     Form(u8),
     Kind(u8),
-    /// The writer was given a shape twice, or one [`Shape::exists_on`] refuses.
+    /// The writer was given a shape twice, or one [`Variant::has`] refuses.
     Shape(u32),
     /// The writer's index found no pilot for a bucket (it retries with more buckets first).
     Index,
@@ -546,7 +557,7 @@ impl<'a> Reader<'a> {
                 return Err(FormatError::Bounds("a stencil indexed twice"));
             }
             found += 1;
-            if !Shape::from_key(key).is_some_and(|shape| shape.exists_on(self.variant.isa())) {
+            if !Shape::from_key(key).is_some_and(|shape| self.variant.has(shape)) {
                 return Err(FormatError::Shape(key));
             }
             if self.slot_of(key) != slot {
@@ -711,7 +722,7 @@ impl Writer {
         faults: &[u16],
     ) -> Result<u32, FormatError> {
         let key = shape.key();
-        if !shape.exists_on(self.variant.isa()) || self.keys.contains(&key) {
+        if !self.variant.has(shape) || self.keys.contains(&key) {
             return Err(FormatError::Shape(key));
         }
         if code.len() > usize::from(u16::MAX) || usize::from(tail) > code.len() {

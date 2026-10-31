@@ -1385,7 +1385,7 @@ fn a_value_a_format_string_captures() {
 "###;
     let fixture = format!(
         "//- minicore: fmt, panic\n//- /std.rs crate:std\n\
-         pub mod prelude {{ pub mod rust_2015 {{ pub use core::prelude::rust_2015::*; }} }}\n\
+         pub mod prelude {{ pub mod rust_2015 {{ pub use core::prelude::rust_2015::*; pub use crate::{{format, panic}}; }} }}\n\
          #[macro_export]\nmacro_rules! format {{ ($($arg:tt)*) => {{ $crate::fmt::format(::core::format_args!($($arg)*)) }} }}\n\
          #[macro_export]\nmacro_rules! panic {{ ($($arg:tt)*) => {{ ::core::panic!($($arg)*) }} }}\n\
          pub mod fmt {{ pub fn format(_: ::core::fmt::Arguments<'_>) {{}} }}\n\

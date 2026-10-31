@@ -158,14 +158,14 @@ test-utils = { path = "crates/test-utils", version = "0.0.0" }
 tt = { path = "crates/tt", version = "0.0.0" }
 edition = { path = "crates/edition", version = "0.0.0" }
 
-ra-ap-rustc_lexer = { version = "0.166", default-features = false }
-ra-ap-rustc_parse_format = { version = "0.166", default-features = false }
-ra-ap-rustc_index = { version = "0.166", default-features = false }
+ra-ap-rustc_lexer = { version = "0.179", default-features = false }
+ra-ap-rustc_parse_format = { version = "0.179", default-features = false }
+ra-ap-rustc_index = { version = "0.179", default-features = false }
 # rustc's layout code, from the tag of the stable in `harness/toolchain`.
 rustc_abi = { path = "crates/rustc_abi", version = "0.0.0", default-features = false }
 unicode-properties = { version = "0.1.4", default-features = false }
-ra-ap-rustc_pattern_analysis = { version = "0.166", default-features = false }
-ra-ap-rustc_ast_ir = { version = "0.166", default-features = false }
+ra-ap-rustc_pattern_analysis = { version = "0.179", default-features = false }
+ra-ap-rustc_ast_ir = { version = "0.179", default-features = false }
 rustc_apfloat = "0.2.3"
 # The trait solver, with fixes of rustc's backported.
 rustc_type_ir = { path = "vendor/rustc_type_ir", version = "0.0.0", default-features = false }
@@ -328,8 +328,8 @@ proc-macro2 = "1.0.107"
 quote = "1.0.47"
 rustc-demangle = "0.1.28"
 rustc-stable-hash = "0.1.2"
-rustc_hashes = { version = "0.166.0", package = "ra-ap-rustc_hashes" }
-rustc_index = { version = "0.166.0", package = "ra-ap-rustc_index", default-features = false }
+rustc_hashes = { version = "0.179.0", package = "ra-ap-rustc_hashes" }
+rustc_index = { version = "0.179.0", package = "ra-ap-rustc_index", default-features = false }
 rustfmt-unicode-width = { version = "=0.1.14", package = "unicode-width" }
 serde-untagged = "0.1.9"
 sha1 = "0.11.0"

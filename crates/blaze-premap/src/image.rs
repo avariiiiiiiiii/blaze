@@ -520,7 +520,7 @@ impl<'a> View<'a> {
     }
 
     pub fn segments(&self) -> impl Iterator<Item = SegmentRef<'a>> + 'a {
-        let view = *self;
+        let (view, whole) = (*self, self.whole());
         (0..self.directory[SEGMENTS].1 / SEGMENT).map(move |at| {
             let record = view.record(SEGMENTS, SEGMENT, at);
             let (offset, len) = (u64_at(record, 16), u64_at(record, 24));
@@ -528,7 +528,11 @@ impl<'a> View<'a> {
                 addr: u64_at(record, 0),
                 size: u64_at(record, 8),
                 prot: prot_of(record[32]).expect("checked by parse"),
-                bytes: view.bytes.get(offset as usize..(offset + len) as usize).expect("checked by parse"),
+                // The metadata alone holds no segment bytes.
+                bytes: match whole {
+                    true => view.bytes.get(offset as usize..(offset + len) as usize).expect("checked by parse"),
+                    false => &[],
+                },
                 offset,
             }
         })

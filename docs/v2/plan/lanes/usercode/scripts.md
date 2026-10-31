@@ -103,6 +103,65 @@ bytes it is given, and makes the directories and files itself from `run::invoked
 `run::files`. What a failed run shows (`logged`) is found by one `memmem` search for
 `\ncargo:`, so lines that are not directives are never looked at.
 
+## The standard library's own scripts (`blaze_units::stdlib::scripts`)
+
+Decided 2026-10-31 (queue 01244, lane std-scripts for cargo). std's packages with build
+scripts in a hello-world build are `compiler_builtins`, `libc`, `object` and `std`. They
+can't be compiled the way a user's script is: blaze has no sysroot, and the host std a script
+would build against is built from the same `library/`, whose units need these scripts' output
+first. `merge_std` (`crates/blaze-units/src/load/units.rs`) gives std's own units no std edge,
+so each compile failed with `Fn build_script_build::main has no hash: MIR that failed to
+lower`.
+
+What each script calls, read in the pinned nightly's `library/` (nightly-2026-10-27):
+
+| script | reads | starts or touches |
+|---|---|---|
+| `std/build.rs` | `CARGO_CFG_TARGET_{ARCH,OS,VENDOR,ENV}`, `RUSTC_STD_NETBSD10`, `RUSTC_BOOTSTRAP_SYNTHETIC_TARGET`, `WIND_RELEASE_ID` | nothing |
+| `vendor/object-0.39.1/build.rs` | `RUSTC` | `$RUSTC --version` |
+| `vendor/libc-0.2.191/build.rs` | `RUSTC`, `RUSTC_WRAPPER`, `LIBC_*`, `CARGO_CFG_*`, `RUST_LIBC_UNSTABLE_*` | `$RUSTC --version`; `freebsd-version` under `LIBC_CI`; `emcc -dumpversion` for emscripten |
+| `compiler-builtins/compiler-builtins/build.rs` with `libm/configure.rs` | `TARGET`, `OPT_LEVEL`, `CARGO_*`, `LIBM_BUILD_VERBOSE`, `ENSURE_NO_PANIC`, the whole environment (`env::vars()`) | `env::current_dir()`; the `cc` crate under the `c` feature |
+
+Two designs were weighed. In the first, the scripts' units would get an edge to a host std graph
+lowered with no script outputs (as `probe::std_script` reads std), and the pure-scripts
+interpreter would evaluate them. The evidence rules it out. `hir_ty_pure` proves purity; it
+evaluates nothing, and a pure script still compiles and runs on a miss
+([pure-scripts design](../pure-scripts/design.md) section 7). By its own rules all four are
+impure: `object` and `libc` start a process, `compiler_builtins` lists the environment and
+reads the working directory, and `std` reads variables outside `allowed_env`. So every hello
+build would stop at a typed refusal. To make that design work, blaze would first need a MIR
+evaluator for build scripts over a second, host-lowered std, plus models for `Command` and
+`env::vars`, all just to print about 200 constant lines.
+
+The second design is the one taken: each script is ported, pinned by the BLAKE3 hash of every file
+it is made of (`PINNED`, the way `probe::STD_SCRIPT` pins std's). `identify` checks the files
+through the VFS, and `printed` writes what the script prints, line for line and in its order,
+from the run's own environment (`blaze_build_script::env`, as cargo starts it). A script whose
+bytes differ, or a std package whose script has no port, is an error naming the file, its hash
+and the pinned one: never run, never guessed (no-fallback). Where a script starts a program,
+the port answers as blaze's `rustc` stand-in does (`rustc <target::rustc_version>`). A program
+blaze has no answer of (`emcc`, `freebsd-version`, a set `RUSTC_WRAPPER`) and compiling
+compiler-rt's C are errors naming them. Where the script would panic, the port's error says
+why.
+
+In the daemon (`crates/blaze-cargo/src/serve/unit/script.rs`), a script unit that `is_std` is
+`ported`. Its output takes the inert path: the compile builds nothing, the run is not started,
+and its `OUT_DIR` is empty, which is what each of the four leaves. `BLAZE_ELIDE=verify` and
+`BLAZE_PURE=verify` don't apply, since there is nothing to compile. None of the four reads a
+`DEP_*` variable, so the output is known before the runs it depends on end.
+
+The cost is that the ports are a table to keep current. When a nightly bump changes a script,
+the bump fails at `every_pinned_file_is_the_checkouts`
+(`crates/blaze-units/src/stdlib/scripts/tests.rs`) before any build does, and the script is
+ported again. std's vendored scripts change a few times a year.
+
+Request 00710 said std's build-script units are host units with no edge to std roots, and that
+how one links a std is the daemon's. The first part still holds: `merge_std` is unchanged, and
+`std_scripts_are_std_and_need_no_std` checks it. The second part is replaced: no std is linked
+for these scripts, because they are never compiled. The cache keys miss nothing. The output is a
+function of the pinned files, which are checked by hash every job, of the run's environment,
+which is read whole, and of blaze's rustc version, which is in every key through the toolchain.
+
 ## What is not done
 
 - A benchmark: the seeded generators of the differential tests at sizes from real crates

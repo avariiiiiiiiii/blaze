@@ -778,10 +778,16 @@ def measure(name, spec, backend, runs, work, reference_dir, cold_runs=1, setup_n
         linked.update(image for image, _ in links(said))
         return link
 
+    def program():
+        """What blaze's build of the program says, run without `BLAZE_STATS`: its time table
+        on stderr differs from run to run and is not the program's."""
+        quiet = Side(ws, {k: v for k, v in ours.env.items() if k != "BLAZE_STATS"}, True)
+        return quiet.cargo("run", *build, "--", *run)[1]
+
     def runs_right(label):
         if run is None:
             return
-        _, mine = ours.cargo("run", *build, "--", *run)
+        mine = program()
         if program_output(mine) != expected:
             wrong.append(f"{label}: the program says {program_output(mine)!r}")
 
@@ -842,7 +848,7 @@ def measure(name, spec, backend, runs, work, reference_dir, cold_runs=1, setup_n
     ready_mb = round(statistics.median(c["used"]["resident_mb"] for c in colds))
     resident = dict(ready_mb=ready_mb, after=[])
     cold_disk = disk(ws, ours, theirs)
-    expected = program_output(ours.cargo("run", *build, "--", *run)[1]) if run is not None else None
+    expected = program_output(program()) if run is not None else None
     med = lambda key: round(statistics.median(c[key] for c in colds), 3)
     report("cold", dict(wall_s=round(statistics.median(c["build_s"] + c["warm_s"] for c in colds), 3), cargo_s=med("cargo_s"),
                         rss_mb=max(peak, daemon.peak_mb()), built=built, build_s=med("build_s"), warm_s=med("warm_s"),

@@ -18,6 +18,12 @@ const PRELUDE: &str = "\
         pub use crate::boxed::Box;
         pub use crate::iter::{IntoIterator, Iterator};
         pub use crate::vec::Vec;
+        pub use crate::println;
+        mod ambiguous_macros_only {
+            mod vec {}
+            pub use crate::*;
+        }
+        pub use self::ambiguous_macros_only::vec;
 ";
 
 /// std's iterator traits with the `IntoIterator`s of `Option`, `Result`, arrays, slices, boxed

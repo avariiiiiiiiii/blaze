@@ -1241,7 +1241,13 @@ fn inner_rows(db: &Db, inner: Inner, frame: &Frame) -> Box<[Row<Resolved>]> {
         }
         Inner::Store(store) => {
             let exprs = ExpressionStore::of(db, store);
-            for expr in exprs.expr_roots() {
+            let mut roots = exprs.expr_roots();
+            // A body's last root is the body itself, keyed by its item, not an anonymous
+            // constant: its index moves with every edit inside the body.
+            if let ExpressionStoreOwnerId::Body(_) = store {
+                roots.next_back();
+            }
+            for expr in roots {
                 items.add(anon_const_key_of(db, store, expr), Resolved::AnonConst { store, expr });
             }
             let mut nth = 0u32;

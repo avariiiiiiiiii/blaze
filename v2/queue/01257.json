@@ -1,0 +1,24 @@
+{
+  "id": "01257",
+  "from_lane": "std-scripts",
+  "owner": "codegen",
+  "paths": [
+    "crates/blaze-engine/src/as_rustc/probe.rs",
+    "crates/blaze-engine/src/as_rustc/tests.rs"
+  ],
+  "what": "One way per job: crates/blaze-engine/src/as_rustc/probe.rs keeps its own copy of std build.rs rule (STD_SCRIPT, std_restricted, the backtrace_in_libstd and STD_ENV_ARCH lines). blaze_units::stdlib::scripts (crates/blaze-units/src/stdlib/scripts.rs, queue 01244) now ports all four of std own build scripts, pinned by BLAKE3 in PINNED, with pub fn restricted_std(arch, os, vendor, env) and pub fn printed(Script::Std, vars, cwd). Move probe::std_script onto them (e.g. STD_SCRIPT := the PINNED entry for std, std_restricted := scripts::restricted_std) and delete the copies, so a nightly bump re-ports std once. as_rustc/tests.rs std_script_is_the_ported_one and the restricted test move to scripts/tests.rs, which already has both.",
+  "state": "open",
+  "created": "2026-10-31T12:26:41Z",
+  "updated": "2026-10-31T12:26:41Z",
+  "taken_by": null,
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-10-31T12:26:41Z",
+      "by": "std-scripts",
+      "action": "add",
+      "note": ""
+    }
+  ]
+}

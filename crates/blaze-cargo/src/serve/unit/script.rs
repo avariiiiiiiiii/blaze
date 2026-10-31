@@ -36,6 +36,7 @@ use blaze_core::{Command, Completion, Done, Effect, FileName, Sandbox, Tag};
 use blaze_units::{
     query::{UnitPlan, Units},
     schema::{DebugInfo, Mode, Unit},
+    stdlib,
 };
 use blaze_usercode::{
     run::{Begun, OutFile, Run, Value},
@@ -89,25 +90,91 @@ pub(crate) fn compile_of(units: &Units, run: usize) -> Option<usize> {
 }
 
 /// What a script that provably prints only constants prints, read from its source through the
-/// VFS: it is then neither compiled nor run. `unit` is the script's compile or its run. Worked
-/// out once per job and script: its compile and its run both ask.
-pub(crate) fn inert(job: &Job, unit: usize) -> Option<&Value> {
+/// VFS, or what blaze's port of one of std's own scripts says it prints ([`std_printed`]): it
+/// is then neither compiled nor run. `unit` is the script's compile or its run. Worked out once
+/// per job and script: its compile and its run both ask.
+pub(crate) fn inert(job: &Job, unit: usize) -> Result<Option<&Value>, ApiError> {
     let units = job.units();
-    let u = units.graph.units.get(unit)?;
+    let Some(u) = units.graph.units.get(unit) else { return Ok(None) };
     let compile = match u.mode {
-        Mode::RunCustomBuild => compile_of(units, unit)?,
+        Mode::RunCustomBuild => match compile_of(units, unit) {
+            Some(it) => it,
+            None => return Ok(None),
+        },
         _ => unit,
     };
-    job.inert.get(compile)?.get_or_init(|| work_out_inert(job, compile)).as_ref()
+    let Some(slot) = job.inert.get(compile) else { return Ok(None) };
+    match slot.get_or_init(|| work_out_inert(job, compile)) {
+        Ok(value) => Ok(value.as_ref()),
+        // clone: the error the build stops with, once per unit that asks
+        Err(what) => Err(ApiError::new(what.clone(), None)),
+    }
 }
 
-fn work_out_inert(job: &Job, compile: usize) -> Option<Value> {
+/// Whether `unit` is the compile or the run of one of std's own build scripts: never compiled,
+/// so neither `BLAZE_ELIDE=verify` nor `BLAZE_PURE=verify` can run it to check its port.
+pub(crate) fn ported(job: &Job, unit: usize) -> bool {
+    job.units().graph.units.get(unit).is_some_and(|it| it.is_std && it.target.is_custom_build())
+}
+
+fn work_out_inert(job: &Job, compile: usize) -> Result<Option<Value>, String> {
+    if ported(job, compile) {
+        return std_printed(job, compile).map(Some);
+    }
     let units = job.units();
-    let root = units.graph.units.get(compile)?.target.src_path.to_string_lossy().into_owned();
+    let Some(u) = units.graph.units.get(compile) else { return Ok(None) };
+    let root = u.target.src_path.to_string_lossy().into_owned();
     // A root file whose bytes fail their check stopped the job as it was lowered.
-    let (_, _, bytes) = job.mounted.read(&root).ok()??;
+    let Ok(Some((_, _, bytes))) = job.mounted.read(&root) else { return Ok(None) };
+    let Some(plan) = units.plans.get(compile) else { return Ok(None) };
     let files: BTreeMap<PathBuf, Vec<u8>> = [(PathBuf::from(&root), bytes.to_vec())].into();
-    script::inert(Path::new(&root), &files, &units.plans.get(compile)?.rustflags)
+    Ok(script::inert(Path::new(&root), &files, &plan.rustflags))
+}
+
+/// What std's own build script compiled by unit `compile` prints, from blaze's port of it
+/// ([`blaze_units::stdlib::scripts`]), checked to be the script the port is of. A std script
+/// can't be compiled (no host std is there to build it against before these scripts ran), so
+/// its run is this. None of them reads a `DEP_*` variable, so this is known before the runs
+/// it depends on end.
+fn std_printed(job: &Job, compile: usize) -> Result<Value, String> {
+    let units = job.units();
+    let u = units.graph.units.get(compile).ok_or_else(|| format!("the build has no unit {compile}"))?;
+    let package = package_of(units, u).map_err(|it| it.what)?;
+    let failed = |what: String| format!("std's `{}` build script: {what}", package.name);
+    let root = u.target.src_path.to_string_lossy();
+    let read = |path: &str| match job.mounted.read(path) {
+        Ok(Some((_, _, bytes))) => Ok(bytes),
+        Ok(None) => Err(format!("{path} is not among the build's files")),
+        Err(error) => Err(format!("{path}: {error}")),
+    };
+    let which = stdlib::scripts::identify(&package.name, &root, read).map_err(failed)?;
+    let mut runs = (0..units.graph.units.len())
+        .filter(|at| units.graph.units[*at].mode == Mode::RunCustomBuild && compile_of(units, *at) == Some(compile));
+    let (Some(run), None) = (runs.next(), runs.next()) else {
+        return Err(failed(format!("unit {compile} compiles it, and the build does not run it exactly once")));
+    };
+    let (unit, vars) = script_env(job, run).map_err(failed)?;
+    let printed = stdlib::scripts::printed(which, &vars, &unit.package.manifest_dir).map_err(failed)?;
+    Ok(script::elided(printed))
+}
+
+/// Run unit `run` as `blaze_build_script` describes it, its program named and not built, and
+/// the whole environment it is started in, sorted by name.
+fn script_env(job: &Job, run: usize) -> Result<(bs::Unit, Vec<(OsString, OsString)>), String> {
+    let units = job.units();
+    let compile = compile_of(units, run).ok_or_else(|| format!("the run of unit {run} has no build script compiled"))?;
+    let of = Of {
+        units,
+        host: &job.input.config.host,
+        tools: &job.shared.tools,
+        launcher: &job.shared.launcher,
+        program: named_program(units, compile).map_err(|it| it.what)?,
+        scripts: &job.scripts,
+    };
+    let unit = script_unit(&of, run)?;
+    let env = inherited(&job.input.config.invocation.env, job.plan(run).map_err(|it| it.what)?);
+    let vars = blaze_build_script::env(&unit, &env).map_err(|error| error.0)?.vars;
+    Ok((unit, vars))
 }
 
 /// What a run is made from, beside the job: the build, and what the run's dependencies said.
@@ -477,9 +544,9 @@ fn prepare(job: &Job, run: usize) -> Result<Option<Start>, ApiError> {
     let Some(compile) = compile_of(units, run) else {
         return Err(ApiError::new(format!("the run of unit {run} has no build script compiled"), None));
     };
-    let verify = verifies(job)? || pure::verifies(job)?;
+    let verify = !ported(job, run) && (verifies(job)? || pure::verifies(job)?);
     // clone: the run's own, kept with it until it ends; once per run of an inert script.
-    let elided = inert(job, run).or_else(|| pure::hit(job, run)).cloned();
+    let elided = inert(job, run)?.or_else(|| pure::hit(job, run)).cloned();
     let program = match (&elided, verify) {
         // Never compiled: its program is named, not there.
         (Some(_), false) => None,

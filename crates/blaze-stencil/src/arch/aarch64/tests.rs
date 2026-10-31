@@ -687,28 +687,31 @@ fn br_table_is_cranelifts_sequence() {
     let func = switch();
     let clif = cranelift(&func, &LINUX);
     let ours = whole(&func, &LINUX);
-    let is_bhs = |w: &u32| *w & 0xff00_001f == 0x5400_0002;
-    let theirs = clif.words.iter().position(is_bhs).expect("Cranelift's b.hs");
+    // Cranelift 0.137 branches to no default: `csel xN, xIndex, xM, lo` clamps an index out
+    // of bounds to the default's entry, the table's last.
+    let is_csel_lo = |w: &u32| *w & 0xffe0_fc00 == 0x9a80_3000;
+    let theirs = clif.words.iter().position(is_csel_lo).expect("Cranelift's csel");
     let table = ours.span(ir::Opcode::BrTable, &func);
-    let at = table.iter().position(is_bhs).expect("b.hs");
-    // `cmp wN, #3` before; `csel`, `adr #16`, `ldrsw [.., uxtw #2]`, `add`, `br` after, as
-    // Cranelift's but for the registers.
-    assert_eq!(table[at - 1] & 0xffff_fc1f, clif.words[theirs - 1] & 0xffff_fc1f);
-    let masks = [0xffe0_ffe0, 0xffff_ffe0, 0xffe0_fc00, 0xffe0_fc00, 0xffff_fc1f];
+    let at = table.iter().position(is_csel_lo).expect("csel");
+    // `cmp wN, #3` and `movz xM, #3` before; `adr #16`, `ldrsw [.., uxtw #2]`, `add`, `br`
+    // after, as Cranelift's but for the registers.
+    assert_eq!(table[at - 2] & 0xffff_fc1f, clif.words[theirs - 2] & 0xffff_fc1f);
+    assert_eq!(table[at - 1] & 0xffff_ffe0, clif.words[theirs - 1] & 0xffff_ffe0);
+    let masks = [0xffff_ffe0, 0xffe0_fc00, 0xffe0_fc00, 0xffff_fc1f];
     for (k, mask) in masks.into_iter().enumerate() {
         assert_eq!(table[at + 1 + k] & mask, clif.words[theirs + 1 + k] & mask, "{k}");
     }
-    // Three entries, each its target's offset from the table.
-    assert_eq!(table.len(), at + 6 + 3);
+    // Four entries, each its target's offset from the table: the three, then the default.
+    assert_eq!(table.len(), at + 5 + 4);
     let (_, start, _) = ours
         .spans
         .iter()
         .find(|(inst, ..)| func.dfg.insts[*inst].opcode() == ir::Opcode::BrTable)
         .copied()
         .expect("br_table");
-    let base = start + 4 * (at as u32 + 6);
-    for i in 0..3 {
-        assert_eq!(table[at + 6 + i] as i32, ours.edges[1 + i] as i32 - base as i32);
+    let base = start + 4 * (at as u32 + 5);
+    for (i, edge) in [1, 2, 3, 0].into_iter().enumerate() {
+        assert_eq!(table[at + 5 + i] as i32, ours.edges[edge] as i32 - base as i32);
     }
 }
 

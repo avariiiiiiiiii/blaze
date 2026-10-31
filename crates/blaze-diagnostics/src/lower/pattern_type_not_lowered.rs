@@ -21,8 +21,6 @@ pub(crate) fn lower(cx: &Cx<'_, '_>, d: &hir::PatternTypeNotLowered) -> Vec<Foun
     let span = cx.span(ty.with_value(ty.value.syntax().text_range()));
     let message = match d.reason {
         PatternTypeUnsupported::Pattern => "pattern not supported in pattern types",
-        PatternTypeUnsupported::ExclusiveEnd => "blaze cannot lower a pattern type's exclusive range end (`a..b`) yet",
-        PatternTypeUnsupported::OpenEnd => "blaze cannot lower a pattern type's open range end (`a..` or `..=b`) yet",
     };
     // alloc: one error, for an error hir found
     vec![Found::new(Diag::error(None, message, span), Phase::Items)]

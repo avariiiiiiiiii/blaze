@@ -148,7 +148,10 @@ fn protector_forbids_foreign_write() {
     s.call();
     let a = s.arg_mut(x, 1).unwrap();
     let e = expect_ub(s.write(x, 1), AliasErrorKind::ProtectedDisabled, "write access through");
-    assert_eq!(e.title(), "write access through <1> at alloc1[0x0] is forbidden");
+    assert_eq!(
+        e.title(),
+        "write access through <1> (root of the allocation) at alloc1[0x0] is forbidden"
+    );
     assert_eq!(
         e.details(),
         &[

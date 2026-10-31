@@ -526,9 +526,10 @@ pub fn token_to_literal(text: &str, span: Span) -> Literal {
     let lit = &lit[start_offset..lit.len() - end_offset];
     match suffix {
         "" | "_" => Literal::new_no_suffix(lit, span, kind),
-        // ill-suffixed literals
-        _ if !matches!(kind, LitKind::Integer | LitKind::Float | LitKind::Err(_)) => {
-            Literal::new_no_suffix(text, span, LitKind::Err(()))
+        // A quoted literal keeps its kind and suffix, as rustc's lexer does: a suffix where
+        // none is allowed is an error of the literal's use (`LitKind::from_token_lit`).
+        suffix if !matches!(kind, LitKind::Integer | LitKind::Float) => {
+            Literal::new(lit, span, kind, suffix)
         }
         // A number has no quotes, so its text and suffix are the token's text.
         suffix => Literal {

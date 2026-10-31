@@ -91,7 +91,7 @@
 //!     cfg:
 
 #![rustc_coherence_is_core]
-#![feature(lang_items)]
+#![feature(lang_items, staged_api)]
 
 pub mod marker {
     // region:sized

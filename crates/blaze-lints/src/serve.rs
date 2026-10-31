@@ -236,7 +236,7 @@ fn setup(package: &Package) -> Result<Setup, String> {
 /// The diagnostics of one build, as rustc writes them: what is said once a build is said with
 /// the first diagnostic that has it, and a diagnostic said again is not. The files they point
 /// into that `sources` has not read yet are read by `read`.
-fn written<'a>(
+pub(crate) fn written<'a>(
     found: impl Iterator<Item = &'a Found>,
     sources: &mut Sources,
     read: impl Fn(&str) -> Option<String>,

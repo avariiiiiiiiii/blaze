@@ -3,8 +3,12 @@
 use std::iter;
 
 use base_db::{Db, Crate};
-use hir_expand::{InFile, Lookup};
+use hir_expand::{
+    InFile, Lookup,
+    mod_path::{ModPath, PathKind},
+};
 use la_arena::ArenaMap;
+use span::Edition;
 use syntax::view::{self as ast, HasVisibility};
 
 use crate::{
@@ -40,6 +44,38 @@ pub enum VisibilityError {
     /// The path names `module`, which is not the item's module or one above it (rustc's E0742,
     /// "visibilities can only be restricted to ancestor modules").
     NotAncestor { module: ModuleId },
+    /// The path starts with a name in Rust 2018 or later (rustc's "relative paths are not
+    /// supported in visibilities in 2018 edition or later").
+    Relative2018,
+}
+
+/// The path rustc resolves for `pub(in path)` (`try_resolve_visibility`): one that starts with a
+/// name is from the crate root in Rust 2015 and an error after it.
+pub(crate) fn visibility_path(path: &ModPath, edition: Edition) -> Result<ModPath, VisibilityError> {
+    match path.kind {
+        PathKind::Plain if edition == Edition::Edition2015 => {
+            Ok(ModPath::from_segments(PathKind::Abs, path.segments().iter().copied()))
+        }
+        PathKind::Plain => Err(VisibilityError::Relative2018),
+        _ => Ok(*path),
+    }
+}
+
+/// rustc's error for `ast_vis`, the visibility written on an item in `scope`: what
+/// [`visibility_from_ast_view`] and the def collectors recover from.
+pub fn visibility_error_from_ast_view(
+    db: &Db,
+    scope: impl HasResolver,
+    ast_vis: InFile<Option<ast::Visibility<'_>>>,
+) -> Option<VisibilityError> {
+    let mut span_map = None;
+    let raw_vis = crate::item_tree::visibility_from_ast(db, ast_vis.value, &mut |range| {
+        span_map.get_or_insert_with(|| ast_vis.file_id.span_map(db)).span_for_range(range).ctx
+    });
+    match raw_vis {
+        RawVisibility::Module(..) => Visibility::try_resolve(db, &scope.resolver(db), &raw_vis).err(),
+        RawVisibility::PubSelf(_) | RawVisibility::PubCrate | RawVisibility::Public => None,
+    }
 }
 
 impl VisibilityError {
@@ -531,12 +567,43 @@ pub mod m {
     pub(in crate::nope) fn unresolved() {}
     pub(in crate::S) fn not_a_module() {}
     pub(in crate::n) fn not_ancestor() {}
+    pub(in m) fn relative() {}
 }
 pub mod n {}
 pub struct S;
 pub(super) fn too_far() {}
 "#,
         );
+        assert_eq!(restricted_visibilities(fx), [
+            "not_a_module E0577",
+            "not_ancestor E0742",
+            "ok ok",
+            "relative 2018",
+            "too_far E0433",
+            "unresolved E0433",
+        ]);
+    }
+
+    /// In Rust 2015 a `pub(in path)` that starts with a name is from the crate root, as rustc
+    /// resolves it.
+    #[test]
+    fn restricted_visibility_2015_is_from_the_root() {
+        let fx = fixture::db(
+            r#"
+//- /main.rs edition:2015
+pub mod m {
+    pub mod k {
+        pub(in m) fn ok() {}
+        pub(in k) fn not_from_here() {}
+    }
+}
+"#,
+        );
+        assert_eq!(restricted_visibilities(fx), ["not_from_here E0433", "ok ok"]);
+    }
+
+    /// `Visibility::try_resolve` of each function's visibility of `fx`, by name.
+    fn restricted_visibilities(fx: fixture::Fixture) -> Vec<String> {
         let _ = fx.only_file();
         let db = fx.into_db();
         let mut seen = Vec::new();
@@ -545,29 +612,18 @@ pub(super) fn too_far() {}
                 let ModuleDefId::FunctionId(f) = decl else { continue };
                 let source = f.lookup(&db).source_view(&db);
                 let name = source.value.name().map_or("", |it| it.text()).to_owned();
-                let mut span_map = None;
-                let raw = crate::item_tree::visibility_from_ast(
-                    &db,
-                    source.value.visibility(),
-                    &mut |range| {
-                        span_map
-                            .get_or_insert_with(|| source.file_id.span_map(&db))
-                            .span_for_range(range)
-                            .ctx
-                    },
-                );
-                let code = match Visibility::try_resolve(&db, &f.resolver(&db), &raw) {
-                    Ok(_) => "ok",
-                    Err(VisibilityError::Unresolved) => "E0433",
-                    Err(VisibilityError::NotAModule { .. }) => "E0577",
-                    Err(VisibilityError::NotAncestor { .. }) => "E0742",
+                let vis = source.map(|it| it.visibility());
+                let code = match visibility_error_from_ast_view(&db, f, vis) {
+                    None => "ok",
+                    Some(VisibilityError::Unresolved) => "E0433",
+                    Some(VisibilityError::NotAModule { .. }) => "E0577",
+                    Some(VisibilityError::NotAncestor { .. }) => "E0742",
+                    Some(VisibilityError::Relative2018) => "2018",
                 };
                 seen.push(format!("{name} {code}"));
             }
         }
         seen.sort();
-        let want =
-            ["not_a_module E0577", "not_ancestor E0742", "ok ok", "too_far E0433", "unresolved E0433"];
-        assert_eq!(seen, want);
+        seen
     }
 }

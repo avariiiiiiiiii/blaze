@@ -75,6 +75,8 @@ salsa-macro-rules = { path = "vendor/salsa-macro-rules" }
 llvm-sys = { path = "vendor/llvm-sys" }
 # Statics that name one section share it, as in LLVM's objects (vendor/cranelift-object/SOURCE.md).
 cranelift-object = { path = "vendor/cranelift-object" }
+# The unwind instructions hir-ty-codegen makes `.eh_frame` rows from (vendor/cranelift-codegen/SOURCE.md).
+cranelift-codegen = { path = "vendor/cranelift-codegen" }
 
 [workspace.dependencies]
 # local crates
@@ -201,11 +203,12 @@ blake3 = { version = "1.8", default-features = false, features = ["std", "neon"]
 blake3-servil = { git = "https://github.com/johnservil/BLAKE3", rev = "c6bd679a0911cc233cb28297f2b25875381215a1", default-features = false, features = ["std"] }
 camino = "1.2.6"
 # The Cranelift hir-ty-codegen compiles with.
-cranelift-codegen = "0.136"
-cranelift-frontend = "0.136"
+# `=`: the version of vendor/cranelift-codegen, which every crate here that needs it must match.
+cranelift-codegen = "=0.137.0"
+cranelift-frontend = "=0.137.0"
 # The reference interpreter and CLIF reader blaze-stencil's tests check each stencil with.
-cranelift-interpreter = "0.136"
-cranelift-reader = "0.136"
+cranelift-interpreter = "=0.137.0"
+cranelift-reader = "=0.137.0"
 # `vendor/llvm-sys` by the patch above.
 llvm-sys = "231"
 crossbeam-channel = "0.5.17"
@@ -222,7 +225,8 @@ zerocopy = { version = "0.8.63", default-features = false, features = ["derive"]
 lz4_flex = { version = "0.14", default-features = false, features = ["std", "safe-decode"] }
 # rustc renders its diagnostics with exactly this version; another lays some snippets out differently.
 annotate-snippets = "=0.12.16"
-object = { version = "0.37", default-features = false, features = ["read_core", "std", "archive", "elf", "macho", "coff", "pe", "wasm", "unaligned"] }
+# No `wasm`: it pulls a second wasmparser, and nothing here reads Wasm through `object`.
+object = { version = "0.40", default-features = false, features = ["read_core", "std", "archive", "elf", "macho", "coff", "pe"] }
 gimli = { version = "0.33", default-features = false, features = ["read", "write", "std"] }
 either = "1.19.0"
 expect-test = "1.5.1"
@@ -323,8 +327,8 @@ blaze-registry = { path = "crates/blaze-registry" }
 cargo-platform = "0.3.3"
 cargo-util-schemas = "=0.14.3"
 cov-mark = "2.2.0"
-cranelift-module = "0.136.2"
-cranelift-object = "0.136.2"
+cranelift-module = "=0.137.0"
+cranelift-object = "=0.137.0"
 diff = "=0.1.13"
 dissimilar = "1.0.11"
 drop_bomb = "0.1.5"
@@ -342,7 +346,6 @@ im-rc = "15.1.0"
 inkwell = { version = "0.11.0", default-features = false }
 jobserver = "0.1.35"
 lzma-rust2 = { version = "0.24.0", default-features = false }
-oorandom = "11.1.5"
 pathdiff = "0.2.3"
 percent-encoding = "2.3.2"
 proc-macro2 = "1.0.107"

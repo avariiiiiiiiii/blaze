@@ -144,7 +144,7 @@ const SOLVER_DOMAIN: &str = "blaze v2 goal 1 solver";
 /// nightly, the vendored solver's patch series (each crate's series file and every patch), and
 /// the front end's code ([`install`]'s `build`). A patch added to a series is added here too;
 /// `the_solver_version_covers_every_patch` checks it.
-const SOLVER_FILES: [(&str, &[u8]); 13] = [
+const SOLVER_FILES: [(&str, &[u8]); 17] = [
     ("harness/toolchain", include_bytes!("../../../../harness/toolchain")),
     (
         "vendor/rustc_next_trait_solver/PATCHES.md",
@@ -172,6 +172,14 @@ const SOLVER_FILES: [(&str, &[u8]); 13] = [
             "../../../../vendor/rustc_next_trait_solver/patches/0004-solver-temporaries-recycled.patch"
         ),
     ),
+    (
+        "vendor/rustc_next_trait_solver/patches/0005-fast-path-depth.patch",
+        include_bytes!("../../../../vendor/rustc_next_trait_solver/patches/0005-fast-path-depth.patch"),
+    ),
+    (
+        "vendor/rustc_next_trait_solver/patches/0006-def-id-is-local.patch",
+        include_bytes!("../../../../vendor/rustc_next_trait_solver/patches/0006-def-id-is-local.patch"),
+    ),
     ("vendor/rustc_type_ir/PATCHES.md", include_bytes!("../../../../vendor/rustc_type_ir/PATCHES.md")),
     (
         "vendor/rustc_type_ir/patches/0001-from-checked-parts.patch",
@@ -196,6 +204,14 @@ const SOLVER_FILES: [(&str, &[u8]); 13] = [
     (
         "vendor/rustc_type_ir/patches/0006-solver-storage-recycled.patch",
         include_bytes!("../../../../vendor/rustc_type_ir/patches/0006-solver-storage-recycled.patch"),
+    ),
+    (
+        "vendor/rustc_type_ir/patches/0007-fast-path-depth.patch",
+        include_bytes!("../../../../vendor/rustc_type_ir/patches/0007-fast-path-depth.patch"),
+    ),
+    (
+        "vendor/rustc_type_ir/patches/0008-def-id-is-local.patch",
+        include_bytes!("../../../../vendor/rustc_type_ir/patches/0008-def-id-is-local.patch"),
     ),
 ];
 

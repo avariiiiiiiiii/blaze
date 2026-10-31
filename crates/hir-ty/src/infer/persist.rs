@@ -36,12 +36,14 @@ use rustc_type_ir::{ClausePolarity, ClosureKind};
 
 use crate::{
     Span,
+    consteval::CreateConstError,
     db::{AnonConstId, InternedOpaqueTyId},
     infer::{
         Adjust, Adjustment, AllowTwoPhase, AutoBorrow, AutoBorrowMutability, CallArguments, CaptureInfo,
         CaptureSourceStack, CapturedPlace, ClosureData, ExplicitDropMethodUseKind,
         InferenceDiagnostic, InferenceResult, MinCaptures, OverloadedDeref, PatAdjust,
-        PatAdjustment, PointerCast, ReturnKind, Unreachable, UnreachableAt, UpvarCapture,
+        PatAdjustment, PointerCast, ReturnKind, StructPathDef, StructPathFound, Unreachable,
+        UnreachableAt, UpvarCapture,
         cast::{CastError, CastPointerKind, CastPointers},
         closure::analysis::{
             BorrowKind,
@@ -55,7 +57,7 @@ use crate::{
     },
     lower::{
         diagnostics::IncorrectGenericsLenKind,
-        persist::{Words, put_diagnostic, put_path_diagnostic},
+        persist::{Words, const_error_of, const_error_word, put_diagnostic, put_path_diagnostic},
     },
     method_resolution::CandidateId,
     next_solver::{
@@ -364,6 +366,33 @@ fn builtin_of(word: u32) -> Option<BuiltinType> {
         15..19 => BuiltinType::Float(BUILTIN_FLOATS[word - 15]),
         _ => return None,
     })
+}
+
+/// Every `StructPathDef`, its word being its index here.
+const STRUCT_PATH_DEFS: [StructPathDef; 14] = [
+    StructPathDef::Enum,
+    StructPathDef::Struct,
+    StructPathDef::Union,
+    StructPathDef::Variant,
+    StructPathDef::TypeAlias,
+    StructPathDef::BuiltinType,
+    StructPathDef::Module,
+    StructPathDef::Trait,
+    StructPathDef::TypeParam,
+    StructPathDef::Function,
+    StructPathDef::Const,
+    StructPathDef::Static,
+    StructPathDef::ConstParam,
+    StructPathDef::Local,
+];
+
+fn struct_path_def_word(def: StructPathDef) -> u32 {
+    STRUCT_PATH_DEFS.iter().position(|&it| it == def).expect("every struct path def is listed")
+        as u32
+}
+
+fn struct_path_def_of(word: u32) -> Option<StructPathDef> {
+    STRUCT_PATH_DEFS.get(usize::try_from(word).ok()?).copied()
 }
 
 fn candidate_key(candidate: CandidateId) -> (u8, u64) {
@@ -953,7 +982,7 @@ impl InferenceRecord {
 impl Persist for InferenceRecord {
     const SCHEMA: SchemaHash = schema_of(&[
         Part::Str("InferenceRecord"),
-        Part::U64(18),
+        Part::U64(21),
         Part::Schema(<InferRoot as Record>::SCHEMA),
     ]);
     type Ref<'a> = InferenceRecordRef<'a>;
@@ -2269,6 +2298,26 @@ impl Sink {
                 self.len(missed_fields.len());
                 missed_fields.iter().for_each(|&it| self.local(it));
             }
+            D::InvalidConstArg { site, reason } => {
+                self.word(46);
+                self.span(*site);
+                self.word(const_error_word(reason));
+                if let CreateConstError::TypeMismatch { actual } = reason {
+                    self.ty(tys, actual);
+                }
+            }
+            D::NotAStructPath { node, found, ty } => {
+                self.word(47);
+                self.node(*node);
+                match *found {
+                    StructPathFound::Ty => self.word(0),
+                    StructPathFound::Def(def) => self.words.extend([1, struct_path_def_word(def)]),
+                    StructPathFound::NoVariant { segment } => self.words.extend([2, segment]),
+                    StructPathFound::AssocType { segment } => self.words.extend([3, segment]),
+                    StructPathFound::AfterVariant { segment } => self.words.extend([4, segment]),
+                }
+                self.opt_ty(tys, ty.as_ref());
+            }
         }
     }
 
@@ -3198,6 +3247,35 @@ impl Source<'_> {
                 let missed_fields = exact(len, (0..len).map(|_| self.local()))?;
                 D::RecordMissingFields { record, variant, missed_fields }
             }
+            46 => D::InvalidConstArg {
+                site: self.span()?,
+                reason: match self.word()? {
+                    9 => CreateConstError::TypeMismatch { actual: self.ty(tys)? },
+                    word => match const_error_of(word) {
+                        Some(reason) => reason,
+                        None => return Err(self.invalid("an invalid const argument of no reason")),
+                    },
+                },
+            },
+            47 => {
+                let node = self.node()?;
+                let found = match self.word()? {
+                    0 => StructPathFound::Ty,
+                    1 => match struct_path_def_of(self.word()?) {
+                        Some(def) => StructPathFound::Def(def),
+                        None => return Err(self.invalid("a struct path naming no kind of item")),
+                    },
+                    2 => StructPathFound::NoVariant { segment: self.word()? },
+                    3 => StructPathFound::AssocType { segment: self.word()? },
+                    4 => StructPathFound::AfterVariant { segment: self.word()? },
+                    _ => return Err(self.invalid("a struct path that found nothing")),
+                };
+                let ty = self.opt_ty(tys)?;
+                if ty.is_some() != (found == StructPathFound::Ty) {
+                    return Err(self.invalid("a struct path's type without a type found"));
+                }
+                D::NotAStructPath { node, found, ty }
+            }
             _ => return Err(self.invalid("an inference diagnostic of no kind")),
         })
     }
@@ -3551,6 +3629,21 @@ mod tests {
             D::UnresolvedIdent { id: expr(7).into() },
             D::UnresolvedPath { id: expr(7).into(), segment: 0 },
             D::UnresolvedPath { id: pat(6).into(), segment: 2 },
+            D::NotAStructPath {
+                node: expr(7).into(),
+                found: StructPathFound::Ty,
+                ty: Some(ty(types.never)),
+            },
+            D::NotAStructPath {
+                node: pat(6).into(),
+                found: StructPathFound::Def(StructPathDef::Local),
+                ty: None,
+            },
+            D::NotAStructPath {
+                node: pat(5).into(),
+                found: StructPathFound::AfterVariant { segment: 2 },
+                ty: None,
+            },
             D::BreakOutsideOfLoop { expr: expr(8), is_break: false, bad_value_break: true },
             D::UnlabeledJumpInLabeledBlock { expr: expr(8), is_break: true },
             D::UnlabeledJumpInLabeledBlock { expr: expr(9), is_break: false },
@@ -3854,6 +3947,23 @@ mod tests {
                 missed_fields: vec![local_of(0), local_of(2)],
             },
         ];
+        let reasons = [
+            CreateConstError::UsedForbiddenParam,
+            CreateConstError::LocalBinding,
+            CreateConstError::Static,
+            CreateConstError::ImplSelf,
+            CreateConstError::NeedsAnonConst,
+            CreateConstError::DoesNotResolve,
+            CreateConstError::ConstHasGenerics,
+            CreateConstError::UnderscoreExpr,
+            CreateConstError::AnonConstInterningDisabled,
+            CreateConstError::TypeMismatch { actual: ty(types.bool) },
+            CreateConstError::TargetLayoutNotAvailable,
+        ];
+        all.extend(reasons.into_iter().enumerate().map(|(n, reason)| D::InvalidConstArg {
+            site: if n % 2 == 0 { Span::ExprId(expr(34)) } else { Span::TypeRefId(local_of(6)) },
+            reason,
+        }));
         let unary = [UnaryOp::Deref, UnaryOp::Not, UnaryOp::Neg];
         all.extend(unary.into_iter().enumerate().map(|(n, op)| D::UnaryOperatorCannotBeApplied {
             expr: expr(26),

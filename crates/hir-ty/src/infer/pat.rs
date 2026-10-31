@@ -28,7 +28,7 @@ use crate::{
     BindingMode, InferenceDiagnostic, Span,
     infer::{
         AllowTwoPhase, ByRef, Expectation, InferenceContext, InferenceTables, PatAdjust,
-        PatAdjustment,
+        PatAdjustment, StructPathDef, StructPathFound,
         expr::ExprIsRead,
     },
     next_solver::{
@@ -1047,9 +1047,23 @@ impl<'db, 'f> InferenceContext<'db, 'f> {
         match res {
             ValueNs::FunctionId(_)
             | ValueNs::GenericParam(_)
-            | ValueNs::ImplSelf(_)
             | ValueNs::LocalBinding(_)
             | ValueNs::StaticId(_) => {
+                let def = match res {
+                    ValueNs::FunctionId(_) => StructPathDef::Function,
+                    ValueNs::GenericParam(_) => StructPathDef::ConstParam,
+                    ValueNs::LocalBinding(_) => StructPathDef::Local,
+                    _ => StructPathDef::Static,
+                };
+                self.push_diagnostic(InferenceDiagnostic::NotAStructPath {
+                    node: pat.into(),
+                    found: StructPathFound::Def(def),
+                    ty: None,
+                });
+                return Err(());
+            }
+            // `infer_path` makes a `Self` of a struct the struct.
+            ValueNs::ImplSelf(_) => {
                 // FIXME: Emit an error.
                 return Err(());
             }

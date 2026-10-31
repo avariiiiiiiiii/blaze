@@ -1,0 +1,23 @@
+{
+  "id": "01201",
+  "from_lane": "tests-misc-front1",
+  "owner": "db",
+  "paths": [
+    "crates/hir-expand/src/proc_macro.rs"
+  ],
+  "what": "hir-expand proc_macro.rs:195 unwraps None in a blaze-items narrow test whose fixture calls a proc macro (round2-test.log, blaze-items section).",
+  "state": "open",
+  "created": "2026-10-31T00:51:36Z",
+  "updated": "2026-10-31T00:51:36Z",
+  "taken_by": null,
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-10-31T00:51:36Z",
+      "by": "tests-misc-front1",
+      "action": "add",
+      "note": ""
+    }
+  ]
+}

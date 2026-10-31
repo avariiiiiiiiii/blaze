@@ -999,6 +999,7 @@ pub(crate) fn copy_diagnostic(diagnostic: &DefDiagnostic) -> DefDiagnostic {
         K::MacroDefError { ast, message } => K::MacroDefError { ast: *ast, message: message.clone() },
         // clone: see above.
         K::MacroError { ast, path, err } => K::MacroError { ast: *ast, path: *path, err: err.clone() },
+        K::Prelude { krate, error } => K::Prelude { krate: *krate, error: *error },
     };
     DefDiagnostic { in_module: diagnostic.in_module, kind }
 }

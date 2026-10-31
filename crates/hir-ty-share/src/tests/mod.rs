@@ -227,7 +227,10 @@ fn reflection_intrinsics_read_identity() {
         let intrinsic = Intrinsic::from_index(index).expect("an intrinsic at each index");
         let name = intrinsic.to_string();
         let class = classify(intrinsic);
-        if name.starts_with("type_id") || name.starts_with("type_name") {
+        // `type_id_eq(a: TypeId, b: TypeId)` has no generic argument: it compares two values
+        // whose identity the `type_id` calls that made them read.
+        if (name.starts_with("type_id") && name != "type_id_eq") || name.starts_with("type_name")
+        {
             assert_eq!(class, Class::Identity, "`{name}` tells types apart");
         }
         if name.starts_with("atomic_") || name.starts_with("simd_") {

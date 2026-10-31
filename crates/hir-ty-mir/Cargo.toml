@@ -24,7 +24,6 @@ la-arena.workspace = true
 triomphe.workspace = true
 inventory.workspace = true
 rustc_apfloat.workspace = true
-oorandom.workspace = true
 salsa.workspace = true
 
 rustc_abi.workspace = true
@@ -36,6 +35,7 @@ rustc_next_trait_solver.workspace = true
 blaze-hashcons.workspace = true
 blaze-ids.workspace = true
 blaze-mem.workspace = true
+blaze-rng.workspace = true
 stdx.workspace = true
 macros.workspace = true
 intern.workspace = true

@@ -1868,7 +1868,12 @@ impl<'db> Cx<'db> {
                 bound_region(f, placeholder.bound);
             }
             RegionKind::ReErased => f.u8(6),
-            RegionKind::ReError(_) => f.error(Missed::ErrorType),
+            // hir-ty's lowering gives each lifetime a signature leaves out (`fn f(&self)`, `&S`)
+            // an error region, bound only where the fn is reified (`bind_elided_lifetimes`);
+            // which lifetime it is follows from where it is, which the form spells. A lifetime
+            // that is an error of the program (an undeclared `'b`) is a lowering diagnostic,
+            // which fails the check.
+            RegionKind::ReError(_) => f.u8(7),
         }
     }
 

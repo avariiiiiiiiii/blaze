@@ -47,8 +47,8 @@ pub(in super::super) const RELEASE: &str = "blaze.seh.release";
 pub(in super::super) const PERSONALITY: &str = "blaze.seh.personality";
 
 /// The bit of a source location that marks a call that has a landing pad, for [`function`]
-/// to find them. The rest is the statement the call is of, as without it. Bit 31 is
-/// Cranelift's (`MaybeRelSourceLoc`), which drops it from every location it keeps.
+/// to find them. The rest is the statement the call is of, as without it. Bit 31 is left
+/// to Cranelift, whose 0.137 drops it from every location it keeps.
 const GUARDED: u32 = 1 << 30;
 
 /// The source location of a call of the statement at `loc` that has a landing pad.
@@ -150,7 +150,7 @@ pub(super) fn function(
     let mut ranges = Ranges { ranges: code.buffer.get_srclocs_sorted(), at: 0, last: 0 };
     for call_site in code.buffer.call_sites() {
         // The call ends where it returns to, which may be where the next thing starts.
-        if ranges.of(call_site.ret_addr - 1).is_some_and(|it| is_guarded(it.loc.as_abs())) {
+        if ranges.of(call_site.ret_addr - 1).is_some_and(|it| is_guarded(it.loc)) {
             calls.returning(call_site.ret_addr);
         }
     }
@@ -167,7 +167,7 @@ struct Ranges<'a> {
     last: u32,
 }
 
-type SrcLoc = cranelift_codegen::MachSrcLoc;
+type SrcLoc = cranelift_codegen::MachSrcLoc<cranelift_codegen::Final>;
 
 impl<'a> Ranges<'a> {
     fn of(&mut self, offset: u32) -> Option<&'a SrcLoc> {
@@ -542,8 +542,7 @@ fn ranges_find_what_a_search_of_all_of_them_finds() {
         for line in 0..next(40) {
             let start = at + next(4);
             let end = start + next(12);
-            let loc = ir::MaybeRelSourceLoc::abs(ir::SourceLoc::new(line));
-            ranges.push(SrcLoc { start, end, loc });
+            ranges.push(SrcLoc { start, end, loc: ir::SourceLoc::new(line) });
             at = end;
         }
         let mut found = Ranges { ranges: &ranges, at: 0, last: 0 };

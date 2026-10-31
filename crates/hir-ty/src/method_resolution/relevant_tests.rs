@@ -150,18 +150,22 @@ fn traits_and_self_tys(db: &Db) -> Vec<(TraitId, Vec<SimplifiedType<'_>>)> {
 #[test]
 fn the_relevant_impls_are_those_the_table_walk_finds_in_its_order() {
     let db = fixture::db(FIXTURE).into_db();
-    let (main, dep) = (crate_named(&db, "main"), crate_named(&db, "dep"));
+    crate::next_solver::attach_db(&db, || the_relevant_impls_in(&db));
+}
+
+fn the_relevant_impls_in(db: &Db) {
+    let (main, dep) = (crate_named(db, "main"), crate_named(db, "dep"));
     let (mut from_dep, mut in_block, mut negative, mut derived, mut blanket) =
         (false, false, false, false, false);
     let mut compared = 0;
-    for (trait_, self_tys) in traits_and_self_tys(&db) {
+    for (trait_, self_tys) in traits_and_self_tys(db) {
         let unused = Simplified::Int(IntTy::I128);
         let asked = self_tys.iter().copied().chain([unused]).map(Some).chain([None]);
         for self_ty in asked {
-            for &krate in all_crates(&db).iter() {
-                let key = RelevantImplsKey::new(&db, krate, trait_, self_ty.map(SelfTyKey));
-                let relevant = relevant_impls(&db, key);
-                let expected = walked(&db, krate, trait_, self_ty);
+            for &krate in all_crates(db).iter() {
+                let key = RelevantImplsKey::new(db, krate, trait_, self_ty.map(SelfTyKey));
+                let relevant = relevant_impls(db, key);
+                let expected = walked(db, krate, trait_, self_ty);
                 let what = format!("{trait_:?} for {self_ty:?} in {krate:?}");
                 match self_ty {
                     Some(_) => assert_eq!(relevant.all(), &expected[..], "{what}"),
@@ -173,12 +177,12 @@ fn the_relevant_impls_are_those_the_table_walk_finds_in_its_order() {
                 assert_eq!([relevant.for_self_ty(), relevant.blanket()].concat(), relevant.all());
                 compared += 1;
                 blanket |= !relevant.blanket().is_empty();
-                in_block |= trait_.loc(&db).container.block(&db).is_some() && !expected.is_empty();
+                in_block |= trait_.loc(db).container.block(db).is_some() && !expected.is_empty();
                 for &impl_ in relevant.all() {
                     match impl_ {
                         AnyImplId::ImplId(it) => {
-                            from_dep |= krate == main && it.krate(&db) == dep;
-                            negative |= ImplSignature::of(&db, it).is_negative();
+                            from_dep |= krate == main && it.krate(db) == dep;
+                            negative |= ImplSignature::of(db, it).is_negative();
                         }
                         AnyImplId::BuiltinDeriveImplId(_) => derived = true,
                     }

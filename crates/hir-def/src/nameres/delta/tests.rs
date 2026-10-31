@@ -400,3 +400,77 @@ fn an_import_through_a_glob_waits_for_its_modules_expansions() {
     check_db(&loaded.db, "an import through a glob", &Exempt::NONE, false, &mut failures);
     assert!(failures.is_empty(), "{failures}");
 }
+
+/// A module's id outlives the revisions that never read it: the maintainer publishes each
+/// crate in a write of its own, so a crate maintained early goes unread for as many revisions
+/// as there are crates after it, while their scopes hold its modules' ids. Were
+/// `child_module`'s interned arguments collected, the module would be deleted and its id given
+/// to a module of a later crate (hello's std build: `alloc`'s `string`, read through
+/// `rustc_std_workspace_alloc`, became a module of `gimli`, whose own maintenance then asked
+/// for its unpublished map).
+#[test]
+fn a_dependencys_module_ids_outlive_the_crates_maintained_after_it() {
+    let mut fixture = String::from("//- /lib.rs crate:lib\npub mod string { pub struct S; }\n");
+    for krate in 0..8 {
+        _ = writeln!(fixture, "//- /c{krate}.rs crate:c{krate}");
+        for module in 0..64 {
+            _ = writeln!(fixture, "pub mod m{module} {{ pub struct T; }}");
+        }
+    }
+    fixture.push_str("//- /main.rs crate:main deps:lib\npub use lib::string::S;\n");
+    let loaded = Loaded::new(&fixture);
+    let db = &loaded.db;
+    let crate_of = |root: &str| {
+        let file = loaded.file(root);
+        *all_crates(db).iter().find(|it| it.data(db).root_file_id == file).expect("a crate of the root")
+    };
+    let (lib, main) = (crate_of("/lib.rs"), crate_of("/main.rs"));
+    let string = module_at(db, lib, &["string"]);
+    assert_eq!(string.krate(db), lib, "`lib::string`'s id names a module of another crate");
+    assert_eq!(module_path(db, string), "crate::string");
+    let map = crate_local_def_map(db, main).def_map(db);
+    let (def, _) = map.module(db, map.root).scope(db).type_(&name("S")).expect("`S` is imported");
+    let crate::ModuleDefId::AdtId(crate::AdtId::StructId(it)) = def else { panic!("`S` is {def:?}") };
+    assert_eq!(crate::Lookup::lookup(&it, db).container, string, "`S` is `lib::string::S`");
+    let mut failures = String::new();
+    check_db(db, "a dependency's module ids", &Exempt::NONE, false, &mut failures);
+    assert!(failures.is_empty(), "{failures}");
+}
+
+/// A `std` cargo passes `noprelude` (build-std's `--extern noprelude:std`) is in no extern
+/// prelude until the `extern crate std;` rustc injects puts it there, in every edition; the
+/// std prelude is then `std`'s, as for any crate that depends on `std`.
+#[test]
+fn a_noprelude_std_is_put_in_the_extern_prelude_by_its_injected_extern_crate() {
+    let loaded = Loaded::new(
+        r#"
+//- /main.rs crate:main edition:2021 deps:std extern-prelude:
+use std::process::Command;
+//- /std.rs crate:std
+pub mod process { pub struct Command; }
+pub mod prelude {
+    pub mod v1 { pub enum Option<T> { None, Some(T) } }
+    pub mod rust_2015 { pub use super::v1::*; }
+    pub mod rust_2018 { pub use super::v1::*; }
+    pub mod rust_2021 { pub use super::v1::*; }
+    pub mod rust_2024 { pub use super::v1::*; }
+}
+"#,
+    );
+    let main = loaded.krate();
+    let db = &loaded.db;
+    let std = *all_crates(db).iter().find(|it| **it != main).expect("the crate `std`");
+    let pair = crate_local_def_map(db, main);
+    assert!(
+        pair.local(db).extern_prelude().any(|(it, _)| *it == name("std")),
+        "`std` is not in the extern prelude"
+    );
+    let map = pair.def_map(db);
+    let (prelude, _) = map.prelude().expect("the std prelude is injected");
+    assert_eq!(prelude.krate(db), std);
+    assert_eq!(module_path(db, prelude), "crate::prelude::rust_2021");
+    assert!(map.module(db, map.root).scope(db).type_(&name("Command")).is_some(), "`Command` is imported");
+    let mut failures = String::new();
+    check_db(db, "a noprelude std", &Exempt::NONE, false, &mut failures);
+    assert!(failures.is_empty(), "{failures}");
+}

@@ -2,7 +2,9 @@
 
 - Upstream: https://github.com/bytecodealliance/wasmtime (`cranelift/object`), crates.io
   `cranelift-object` 0.136.2 (sha256 7e1d0b304a1a852087669b13a26f341c1984c15ba0f4f2d9b3182e67e69782c4,
-  git 3c8a3e79aa).
+  git 3c8a3e79aa), moved to Cranelift 0.137.0 (the version in Cargo.toml) by upstream 0.137's one
+  change to it: `res.buffer.alignment` is `min_alignment` (src/backend.rs). The 0.137.0 crate
+  itself was not on this machine (queue 01151); re-vendor from it when it is.
 - Licence: Apache-2.0 WITH LLVM-exception (LICENSE).
 - Left out: tests/ (and the dev-dependencies and `[[test]]` they need), Cargo.lock.
 

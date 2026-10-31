@@ -8,6 +8,7 @@ use crate::tests::lint;
 /// lang item or diagnostic item rustc's `std` gives it.
 const STD: &str = r#"
 //- /std/lib.rs crate:std
+#![feature(lang_items)]
 pub mod prelude {
     pub mod v1 {
         pub use crate::{dbg, eprint, eprintln, print, println, todo};
@@ -73,6 +74,10 @@ pub mod sync {
 pub mod collections {
     #[rustc_diagnostic_item = "HashMap"]
     pub struct HashMap<K, V> { k: *const K, v: *const V }
+}
+pub mod ops {
+    #[rustc_diagnostic_item = "RangeBounds"]
+    pub trait RangeBounds<T: ?Sized> {}
 }
 "#;
 
@@ -410,7 +415,7 @@ fn callable<F: Fn()>(f: F) {
 #[test]
 fn needless_pass_by_value_local_type() {
     let fixture = fixture(
-        "sized, copy, clone",
+        "sized, copy, clone, fn",
         "struct S {
     x: u32,
 }
@@ -430,7 +435,7 @@ fn f(s: S) -> u32 {
 #[test]
 fn needless_pass_by_value_clones() {
     let fixture = fixture(
-        "sized, copy, clone",
+        "sized, copy, clone, fn",
         "fn f(s: String) -> usize {
     let t = s.clone();
     t.len()

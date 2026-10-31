@@ -91,7 +91,7 @@ fn equal_fields_intern_to_one_id_by_any_borrowed_form() {
     assert_eq!(a.depth_of(&db), 1);
 
     let s = Symbol::new(&db, "s");
-    assert_eq!(s, Symbol::new(&db, Box::<str>::from("s")));
+    assert!(s == Symbol::new(&db, Box::<str>::from("s")), "one id by any borrowed form");
     let text: &str = s.text(&db);
     assert_eq!(text, "s");
 

@@ -134,7 +134,8 @@ pub fn name_sources(
             _ = SourceNames::builder(rule).durability(salsa::Durability::HIGH).new(db);
             // Reading a singleton that does not exist yet is not tracked: what read it before
             // reported an untracked read (`file_source_path`), which a new revision makes stale.
-            db.synthetic_write(salsa::Durability::LOW);
+            // The read may be under a memo of any durability, so the write is of the highest.
+            db.synthetic_write(salsa::Durability::HIGH);
         }
     }
 }

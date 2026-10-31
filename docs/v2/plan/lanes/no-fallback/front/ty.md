@@ -76,8 +76,8 @@ builds or tests.
 | `hir-ty/src/layout/adt.rs:115` `repr_discr(..).unwrap_or((I8, false))` | error | a `#[repr]` too small for the (truncated) values became `u8` | `Integer::repr_discr`: `bug!("Integer::repr_discr: #[repr] hint too small")` | **done**: panic naming the enum |
 | `hir-ty/src/infer.rs:3135` `demand_coerce` | error | a refused coercion became an error type with no diagnostic | `FnCtxt::demand_coerce` → `demand_coerce_diag`: E0308 | **done**: `emit_type_mismatch` (E0308), then the error type |
 | `hir-ty-matchck/src/cx.rs:206` field types: `deeply_normalize(ty).unwrap_or(ty)` | error | a field type that did not normalize was checked as the alias | `ctor_sub_tys`: `normalize_erasing_regions` (panics) | **done**: panic naming the field; bodies with errors are skipped before (`lib.rs:291`) |
-| `hir-ty/src/lower.rs:936,944` `lower_expr_as_const` / `lower_path_as_const` `unwrap_or(consts.error)` | error | a const argument in a type that does not lower (unresolved, a static or local, a forbidden generic, a literal of the wrong type) is an error const with no diagnostic | E0425 / E0435 / "generic parameters may not be used in const operations" / E0308 | queued (diagnostic plumbing) |
-| `hir-ty/src/infer.rs:2928,2935` `create_anon_const` / `make_path_as_const` `unwrap_or_else(next_const_var(Span::Dummy))` | error | in a body the same failure becomes a **fresh inference var**, which other constraints can solve: a program rustc rejects can type-check. `Span::Dummy` also hides it from E0282 | as above; only `_` (`UnderscoreExpr`) is a var in rustc | queued (diagnostic plumbing); worst of the set |
+| `hir-ty/src/lower.rs:936,944` `lower_expr_as_const` / `lower_path_as_const` `unwrap_or(consts.error)` | error | a const argument in a type that does not lower (unresolved, a static or local, a forbidden generic, a literal of the wrong type) is an error const with no diagnostic | E0412 / E0435 / E0013 / "generic parameters may not be used in const operations" / E0308 | **done**: `TyLoweringDiagnostic::InvalidConstArg { site, reason: CreateConstError }` (lowering words tag 3), a `_` where no inference is E0121 (`InferVarsNotAllowed`), and a literal of another type is an anon const whose own type check gives E0308, as rustc's; test `tests/const_args.rs`. Emitter: queue 01188 |
+| `hir-ty/src/infer.rs:2928,2935` `create_anon_const` / `make_path_as_const` `unwrap_or_else(next_const_var(Span::Dummy))` | error | in a body the same failure becomes a **fresh inference var**, which other constraints can solve: a program rustc rejects can type-check. `Span::Dummy` also hides it from E0282 | as above; only `_` (`UnderscoreExpr`) is a var in rustc | **done**: `InferenceDiagnostic::InvalidConstArg { site, reason }` (persist tag 46) and an error const; a literal of another type is E0308 (`emit_type_mismatch`); `TypeLikeConst::Infer` gets its type ref as span; `CreateConstError` lost its lifetime, splits `ResolveToNonConst` into `LocalBinding`/`Static`/`ImplSelf`, gains `TargetLayoutNotAvailable`; integer literals truncate as rustc's `lit_to_const`. hir: `AnyDiagnostic::InvalidConstArg`. Emitter: queue 01188 |
 | `hir-ty/src/infer/unify.rs` `err_on_span` returns on a dummy span; const var with no span | error | an unresolved var made with `Span::Dummy` becomes an error type with no E0282 | `Resolver::report_error` always reports | after the const-arg fix removes the `Span::Dummy` vars, report or `unreachable!` |
 | `hir-ty/src/mir.rs:2142` place projection: `structurally_normalize` `Err(_) => error` | error | a place type that does not normalize becomes an error type | `PlaceTy::projection_ty`: `normalize_erasing_regions` (panics) | open: callers in borrowck and MIR lowering decide; owner hir-ty-mir side |
 | `hir-ty/src/mir.rs:2177,2183` Deref/Index of a non-pointer: error type | error | "lowering a deref pattern on a smart pointer gets here": an unsupported feature becomes an error type | `bug!("deref projection of non-dereferenceable ty")`; deref patterns are lowered differently | open: MIR lowering should refuse deref patterns with a typed error (hir-ty-mir) |
@@ -107,19 +107,19 @@ request (see the report).
 
 | site | rustc |
 |---|---|
-| `lower/path.rs:243` assoc type not found on a trait path | E0220 `complain_about_assoc_item_not_found` |
-| `lower/path.rs:179,254` ambiguous associated type (`Trait::Assoc`, more than one segment) | E0223 `report_ambiguous_assoc_item` |
-| `lower/path.rs:534,555` `Self::Name` / `T::Name` with no such assoc type | E0220 |
+| `lower/path.rs:243` assoc type not found on a trait path | E0220 `complain_about_assoc_item_not_found`. **Done**: `PathLoweringDiagnostic::AssocTypeNotResolved { qself: Trait }` |
+| `lower/path.rs:179,254` ambiguous associated type (`Trait::Assoc`, more than one segment) | E0223 `report_ambiguous_assoc_item`. **Done**: `PathLoweringDiagnostic::AmbiguousAssocType`, also for `<u8>::X` and an inherent one not found; not of a self type that is an error |
+| `lower/path.rs:534,555` `Self::Name` / `T::Name` with no such assoc type | E0220, E0221 ambiguous, E0391 cycle. **Done**: `AssocTypeNotResolved { qself: Param, failure }` |
 | `lower/path.rs:274` an enum variant or module as a type | E0573 / E0433 (`expected type, found variant`) |
 | `lower/path.rs:1386` `<T as Struct>::X` | E0404 |
 | `lower.rs:960,974,996` a forbidden generic parameter (a default naming a later one) | E0128 (blaze-diagnostics `checks/defs/generics.rs` reports it from names; to confirm it covers every case here) |
-| `lower.rs:1188` `impl Trait` where not allowed | E0562 |
-| `lower.rs:1649` a second non-auto trait in `dyn` | E0225 |
-| `lower.rs:1660` a second lifetime bound in `dyn` | E0226 (blaze-diagnostics `ast_validation/types.rs` reports it) |
-| `lower.rs:1710` conflicting assoc bindings | E0719 |
-| `lower.rs:1829` `Self` in a `dyn` default | E0393 |
-| `lower.rs:1885` `dyn` with no principal resolved | E0224 |
-| `infer.rs:3251,3262,3372,3434,3472,3485,3525` struct path that resolves to a non-struct, or with extra segments | E0071 / E0109 / E0223 |
+| `lower.rs:1188` `impl Trait` where not allowed | E0562. **Done**: `TyLoweringDiagnostic::ImplTraitNotAllowed` (the emitter reads the position from the syntax, and says blaze does not support it under `impl_trait_in_bindings`/TAIT) |
+| `lower.rs:1649` a second non-auto trait in `dyn` | E0225. **Done**: `AdditionalNonAutoTraits { first, additional }` |
+| `lower.rs:1660` a second lifetime bound in `dyn` | rule: E0226, which blaze-diagnostics `ast_validation/types.rs` reports |
+| `lower.rs:1710` conflicting assoc bindings (no error type: the later value was kept silently) | E0719. **Done**: `ConflictingAssocTypeBindings { source, assoc: AssocItemId }` |
+| `lower.rs:1829` `Self` in a `dyn` default | E0393. **Done**: `MissingSelfDefaultParams { source, trait_, params }`; projections that name `Self` stay rustc's `delayed_bug` (another error is reported) |
+| `lower.rs:1885` `dyn` with no principal resolved | E0224. **Done** for bounds that are all relaxed (`dyn ?Sized`): `ObjectWithoutTrait`; no trait written is the parser's E0224, an unresolved path is reported where it is resolved |
+| `infer.rs` `resolve_variant`, `resolve_variant_on_alias`: struct path that resolves to a non-struct, or with extra segments | E0574 / E0532 for an item of another kind, E0071 for a type, E0599 no such variant, E0223, E0433 after a variant. **Done**: `InferenceDiagnostic::NotAStructPath { node, found: StructPathFound, ty }`. Two cases went unreported before and were wrongly accepted: `Self::A::B { .. }` and `Trait::A::B { .. }` gave `A`'s struct. Open: E0109 generics on a variant reached through a type anchor; in a tuple struct pattern, a segment after a type (`S::new(x)`, rustc's E0164); `T::Assoc { .. }` on a type parameter, which rustc accepts and blaze does not resolve yet |
 | `infer/path.rs:98,189` invalid `Self` reference, first segment unresolved | E0411 / E0433 |
 | `infer/closure.rs:512` closure signature deduction obligations dropped | rule: rustc drops them too (`deduce_sig_from_projection` "may discard the goal") |
 | `method_resolution.rs:219` a private method picked | rule: E0624 is reported by blaze-diagnostics `lower/private_assoc_item.rs` from the pick |
@@ -128,7 +128,7 @@ request (see the report).
 | `method_resolution/probe.rs:451` self type still a var | rule: E0282 is reported at writeback for a var still unresolved (`TypeMustBeKnown`); rustc reports it here, earlier |
 | `method_resolution/confirm.rs:619` | rule: the allow-by-default `supertrait_item_shadowing_usage` lint; no program meaning |
 | `infer/pat.rs:594` deref pattern past the recursion limit | E0055 |
-| `infer/pat.rs:1053` a path pattern naming a function, static, local or generic | E0532 / E0530 (emitted nowhere) |
+| `infer/pat.rs:1053` a path pattern naming a function, static, local or generic | E0532 / E0530 / E0158. **Done**: `NotAStructPath` with `StructPathFound::Def`. Open: a `Self` that is not a struct (`infer/path.rs:98`) |
 | `infer/pat.rs:1426,1464,1501` `&mut` pattern on an inherited shared ref (`ref_pat_eat_one_layer_2024*` only) | E0308 |
 | `infer/expr.rs:1259,1351` missing fields | rule: E0063 is reported by blaze-diagnostics `lower/missing_fields.rs` |
 | `infer/expr.rs:2319` `Fn*` call whose `Args` is not a tuple (`unboxed_closures` only) | E0059 |

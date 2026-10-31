@@ -9,7 +9,7 @@
 use std::sync::OnceLock;
 
 use cranelift_codegen::{
-    Context, RegClass, RelocTarget,
+    Context, FinalizedRelocTarget, RegClass,
     binemit::Reloc,
     control::ControlPlane,
     ir::{
@@ -123,8 +123,8 @@ fn cranelift(func: &ir::Function, target: &Target) -> Clif {
             at: reloc.offset,
             kind: reloc.kind,
             name: match &reloc.target {
-                RelocTarget::ExternalName(name) => name_of(func, name),
-                RelocTarget::Label(at) => Name::Own(at.as_offset()),
+                FinalizedRelocTarget::ExternalName(name) => name_of(func, name),
+                FinalizedRelocTarget::Func(at) => Name::Own(*at),
             },
             addend: reloc.addend,
         })

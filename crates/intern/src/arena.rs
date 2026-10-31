@@ -163,7 +163,7 @@ impl Store {
     pub(crate) fn new() -> Store {
         let bits = shard_bits();
         let shards = 1usize << bits;
-        Store {
+        let store = Store {
             // alloc: the shard array, once a store
             tables: (0..shards).map(|_| Published::new()).collect(),
             writers: (0..shards)
@@ -171,7 +171,15 @@ impl Store {
                 // alloc: as the tables
                 .collect(),
             bits,
+        };
+        // Where std's `Mutex` is a pthread mutex (Apple targets), its first lock boxes it:
+        // taken once here, so no insert allocates.
+        #[cfg(not(blaze_check))]
+        for writer in &store.writers {
+            // alloc: a shard lock's pthread mutex, once a store, on Apple targets
+            drop(writer.lock());
         }
+        store
     }
 
     #[inline]

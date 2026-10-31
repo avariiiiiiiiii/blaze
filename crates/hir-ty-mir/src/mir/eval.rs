@@ -426,7 +426,7 @@ pub struct Evaluator<'db, M: Machine<'db> = Plain> {
     /// time of use.
     vtable_map: VTableMap<'db>,
     thread_local_storage: shim::TlsData,
-    random_state: oorandom::Rand64,
+    random_state: blaze_rng::SplitMix64,
     stdout: Vec<u8>,
     stderr: Vec<u8>,
     layout_cache: RefCell<FxHashMap<Ty<'db>, Interned<'static, InternedLayout>>>,
@@ -948,7 +948,7 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
             missing_static: Cell::new(None),
             in_static: matches!(owner, InferBodyId::DefWithBodyId(DefWithBodyId::StaticId(_))),
             db,
-            random_state: oorandom::Rand64::new(0),
+            random_state: blaze_rng::SplitMix64::new(0),
             param_env: trait_env.unwrap_or_else(|| ParamEnvAndCrate {
                 param_env: db.trait_environment(owner.generic_def(db)),
                 krate: crate_id,

@@ -14,7 +14,7 @@ use std::{
 
 use base_db::{Db, FileId};
 use cranelift_codegen::{
-    MachReloc, RelocTarget, binemit,
+    FinalizedMachReloc, FinalizedRelocTarget, binemit,
     ir::{self, Signature},
     isa::TargetIsa,
 };
@@ -324,26 +324,26 @@ impl Relocs {
     /// v2 ([`crate::spare::relocs`]).
     pub(super) fn extend_mach(
         &mut self,
-        relocs: &[MachReloc],
+        relocs: &[FinalizedMachReloc],
         func: &ir::Function,
     ) -> std::result::Result<(), RelocError> {
         self.rows.reserve_exact(relocs.len());
         for reloc in relocs {
             let name = match &reloc.target {
-                RelocTarget::ExternalName(ir::ExternalName::User(name)) => {
+                FinalizedRelocTarget::ExternalName(ir::ExternalName::User(name)) => {
                     let name = &func.params.user_named_funcs()[*name];
                     RelocName::user(name.namespace, name.index)
                 }
-                RelocTarget::ExternalName(ir::ExternalName::LibCall(call)) => {
+                FinalizedRelocTarget::ExternalName(ir::ExternalName::LibCall(call)) => {
                     RelocName::LibCall(*call)
                 }
-                RelocTarget::ExternalName(ir::ExternalName::KnownSymbol(symbol)) => {
+                FinalizedRelocTarget::ExternalName(ir::ExternalName::KnownSymbol(symbol)) => {
                     RelocName::Known(*symbol)
                 }
-                RelocTarget::ExternalName(ir::ExternalName::TestCase(_)) => {
+                FinalizedRelocTarget::ExternalName(ir::ExternalName::TestCase(_)) => {
                     return Err(RelocError::TestCase);
                 }
-                RelocTarget::Label(offset) => RelocName::Own(offset.as_offset()),
+                FinalizedRelocTarget::Func(offset) => RelocName::Own(*offset),
             };
             let (offset, kind, addend) = (reloc.offset, reloc.kind, reloc.addend);
             self.push(Reloc { offset, kind, name, addend, elf_type: None })?;

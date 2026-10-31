@@ -423,12 +423,14 @@ mod termination {
         fn new() -> Alphabet {
             let kinds: Vec<SyntaxKind> = (SyntaxKind::EOF as u16 + 1..=SyntaxKind::SHEBANG as u16)
                 .map(SyntaxKind::from)
-                .chain([SyntaxKind::UNWRAP_BINDER_KW, SyntaxKind::WRAP_BINDER_KW])
                 .filter(|&kind| !kind.is_trivia())
                 .collect();
+            // The binder keywords are numbered after the nodes and are contextual only: the
+            // lexer hands them to the parser as an identifier's contextual kind, never as a kind.
             let mut contextual: Vec<SyntaxKind> = kinds
                 .iter()
                 .copied()
+                .chain([SyntaxKind::UNWRAP_BINDER_KW, SyntaxKind::WRAP_BINDER_KW])
                 .filter(|&kind| Edition::iter().any(|edition| kind.is_contextual_keyword(edition)))
                 .collect();
             contextual.push(SyntaxKind::IDENT);

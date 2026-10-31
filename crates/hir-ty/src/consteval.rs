@@ -28,7 +28,7 @@ use crate::{
         AliasConst, AliasConstKind, Allocation, AllocationData, AnonConstIdWrapper, Const, ConstExt,
         ConstKind, Consts, DbInterner, DefaultAny, FreeConstAliasId, GenericArgs,
         InherentAssocConstId, IsRigid, ParamConst, ScalarInt, StoredAllocation, StoredEarlyBinder,
-        StoredGenericArgs, TraitAssocConstId, Ty, TyKind, ValTreeKind, default_types,
+        StoredGenericArgs, StoredTy, TraitAssocConstId, Ty, TyKind, ValTreeKind, default_types,
         persist::{TyTableReader, TyTableWriter},
     },
     traits::StoredParamEnvAndCrate,
@@ -64,32 +64,28 @@ fn intern_const_ref<'db>(
     interner: DbInterner<'db>,
     value: &Literal,
     ty: Ty<'db>,
-) -> Option<Result<Const<'db>, CreateConstError<'db>>> {
+) -> Option<Result<Const<'db>, CreateConstError>> {
     let Ok(data_layout) = interner.db.target_data_layout(interner.expect_crate()) else {
-        return Some(Ok(Const::error(interner)));
+        return Some(Err(CreateConstError::TargetLayoutNotAvailable));
+    };
+    // As rustc's `lit_to_const`: an integer literal is truncated to its type's width (the
+    // `overflowing_literals` lint is what refuses one too large).
+    let trunc = |size: Size, bits: u128| {
+        ScalarInt::try_from_uint(size.truncate(bits), size).expect("a truncated value fits its size")
     };
     let valtree = match (ty.kind(), value) {
         (TyKind::Uint(uint), Literal::Uint(value, _)) => {
             let size = uint.bit_width().map(Size::from_bits).unwrap_or(data_layout.pointer_size());
-            let Some(scalar) = ScalarInt::try_from_uint(*value, size) else {
-                return Some(Ok(Const::error(interner)));
-            };
-            ValTreeKind::Leaf(scalar)
+            ValTreeKind::Leaf(trunc(size, *value))
         }
         (TyKind::Uint(uint), Literal::Int(value, _)) => {
             // `Literal::Int` is the default, so we also need to account for the type being uint.
             let size = uint.bit_width().map(Size::from_bits).unwrap_or(data_layout.pointer_size());
-            let Some(scalar) = ScalarInt::try_from_uint(*value as u128, size) else {
-                return Some(Ok(Const::error(interner)));
-            };
-            ValTreeKind::Leaf(scalar)
+            ValTreeKind::Leaf(trunc(size, *value as u128))
         }
         (TyKind::Int(int), Literal::Int(value, _)) => {
             let size = int.bit_width().map(Size::from_bits).unwrap_or(data_layout.pointer_size());
-            let Some(scalar) = ScalarInt::try_from_int(*value, size) else {
-                return Some(Ok(Const::error(interner)));
-            };
-            ValTreeKind::Leaf(scalar)
+            ValTreeKind::Leaf(trunc(size, *value as u128))
         }
         (TyKind::Bool, Literal::Bool(value)) => ValTreeKind::Leaf(ScalarInt::from(*value)),
         (TyKind::Char, Literal::Char(value)) => ValTreeKind::Leaf(ScalarInt::from(*value)),
@@ -125,7 +121,7 @@ fn intern_const_ref<'db>(
                 |types| types.types.u32,
                 |types| types.types.f64,
             );
-            return Some(Err(CreateConstError::TypeMismatch { actual }));
+            return Some(Err(CreateConstError::TypeMismatch { actual: actual.store() }));
         }
     };
     Some(Ok(Const::new_valtree(interner, ty, valtree)))
@@ -299,19 +295,33 @@ pub fn try_const_isize<'db>(db: &'db Db, c: Const<'db>) -> Option<i128> {
     }
 }
 
-#[derive(Debug)]
-pub(crate) enum CreateConstError<'db> {
+/// Why a const argument is not a constant: the reason of
+/// [`crate::InferenceDiagnostic::InvalidConstArg`].
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum CreateConstError {
+    /// A generic parameter where none may be used: rustc's "generic parameters may not be used
+    /// in const operations".
     UsedForbiddenParam,
-    ResolveToNonConst,
+    /// A local binding: E0435.
+    LocalBinding,
+    /// A static: E0013.
+    Static,
+    /// The `Self` constructor of an impl.
+    ImplSelf,
+    /// A function or constructor named by a bare path, which only an anon const holds.
     NeedsAnonConst,
+    /// A path that names no value: E0425.
     DoesNotResolve,
+    /// A bare path to a constant with generic parameters of its own.
     ConstHasGenerics,
+    /// `_` where no inference variable may stand.
     UnderscoreExpr,
+    /// An expression that needs an anon const where the lowering mode makes none.
     AnonConstInterningDisabled,
-    TypeMismatch {
-        #[expect(unused, reason = "will need this for diagnostics")]
-        actual: Ty<'db>,
-    },
+    /// A literal of `actual`, another type than the parameter's: E0308.
+    TypeMismatch { actual: StoredTy },
+    /// No target data layout to size an integer literal by.
+    TargetLayoutNotAvailable,
 }
 
 pub(crate) fn path_to_const<'a, 'db: 'a>(
@@ -320,7 +330,7 @@ pub(crate) fn path_to_const<'a, 'db: 'a>(
     generics: &impl Fn() -> &'a Generics<'db>,
     forbid_params_after: Option<u32>,
     path: Path<'_>,
-) -> Result<Const<'db>, CreateConstError<'db>> {
+) -> Result<Const<'db>, CreateConstError> {
     let interner = DbInterner::new_no_crate(db);
     let resolution = resolver
         .resolve_path_in_value_ns_fully(db, path, HygieneId::ROOT)
@@ -336,11 +346,9 @@ pub(crate) fn path_to_const<'a, 'db: 'a>(
             }
             return Ok(Const::new_param(interner, ParamConst { id: param, index }));
         }
-        // These are not valid as consts; a static is a place, not a const argument.
-        // FIXME: Report an error?
-        ValueNs::ImplSelf(_) | ValueNs::LocalBinding(_) | ValueNs::StaticId(_) => {
-            return Err(CreateConstError::ResolveToNonConst);
-        }
+        ValueNs::LocalBinding(_) => return Err(CreateConstError::LocalBinding),
+        ValueNs::StaticId(_) => return Err(CreateConstError::Static),
+        ValueNs::ImplSelf(_) => return Err(CreateConstError::ImplSelf),
         // A function or a constructor is a value, but only an anon const can hold it.
         ValueNs::FunctionId(_) | ValueNs::StructId(_) | ValueNs::EnumVariantId(_) => {
             return Err(CreateConstError::NeedsAnonConst);
@@ -373,7 +381,8 @@ pub(crate) fn create_anon_const<'a, 'db: 'a>(
     lowering_mode: LoweringMode,
     forbid_params_after: Option<u32>,
     allow_anon_const_using_generic_params: bool,
-) -> Result<Const<'db>, CreateConstError<'db>> {
+    mismatched_literal_as_anon_const: bool,
+) -> Result<Const<'db>, CreateConstError> {
     let mut expr = store.expr(expr_id);
     if let Expr::Block { statements, tail: Some(tail), .. } = expr
         && statements.is_empty()
@@ -384,8 +393,12 @@ pub(crate) fn create_anon_const<'a, 'db: 'a>(
         expr = store.expr(tail);
     }
     match expr {
+        // A literal of another type is, as in rustc, an anon const whose own type check gives
+        // E0308, when `mismatched_literal_as_anon_const`.
         Expr::Literal(literal)
-            if let Some(literal) = intern_const_ref(interner, literal, expected_ty) =>
+            if let Some(literal) = intern_const_ref(interner, literal, expected_ty)
+                && !(mismatched_literal_as_anon_const
+                    && matches!(literal, Err(CreateConstError::TypeMismatch { .. }))) =>
         {
             literal
         }

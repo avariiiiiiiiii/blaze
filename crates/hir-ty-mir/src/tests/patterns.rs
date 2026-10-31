@@ -48,10 +48,6 @@ fn infer_pattern() {
             83..84 '1': i32
             86..93 '"hello"': &'static str
             101..150 'for (e...     }': !
-            101..150 'for (e...     }': IntoIter<(i32, i32), 1>
-            101..150 'for (e...     }': &'? mut IntoIter<(i32, i32), 1>
-            101..150 'for (e...     }': fn next<IntoIter<(i32, i32), 1>>(&'? mut IntoIter<(i32, i32), 1>) -> Option<<IntoIter<(i32, i32), 1> as Iterator>::Item>
-            101..150 'for (e...     }': Option<(i32, i32)>
             101..150 'for (e...     }': ()
             101..150 'for (e...     }': ()
             101..150 'for (e...     }': ()
@@ -62,6 +58,10 @@ fn infer_pattern() {
             115..123 '[(0, 1)]': [(i32, i32); 1]
             115..123 '[(0, 1)]': fn into_iter<[(i32, i32); 1]>([(i32, i32); 1]) -> <[(i32, i32); 1] as IntoIterator>::IntoIter
             115..123 '[(0, 1)]': IntoIter<(i32, i32), 1>
+            115..123 '[(0, 1)]': IntoIter<(i32, i32), 1>
+            115..123 '[(0, 1)]': &'? mut IntoIter<(i32, i32), 1>
+            115..123 '[(0, 1)]': fn next<IntoIter<(i32, i32), 1>>(&'? mut IntoIter<(i32, i32), 1>) -> Option<<IntoIter<(i32, i32), 1> as Iterator>::Item>
+            115..123 '[(0, 1)]': Option<(i32, i32)>
             116..122 '(0, 1)': (i32, i32)
             117..118 '0': i32
             120..121 '1': i32
@@ -922,14 +922,14 @@ fn foo(tuple: Tuple) {
             145..146 'a': u8
             148..149 'b': i16
             158..160 '{}': ()
-            170..181 'Tuple(a, b)': Tuple
-            176..177 'a': u8
-            179..180 'b': i16
+            170..181 'Tuple(a, b)': {unknown}
+            176..177 'a': {unknown}
+            179..180 'b': {unknown}
             185..200 '{/*too short*/}': ()
-            209..226 'Tuple(... c, d)': Tuple
-            215..216 'a': u8
-            218..219 'b': i16
-            221..222 'c': f32
+            209..226 'Tuple(... c, d)': {unknown}
+            215..216 'a': {unknown}
+            218..219 'b': {unknown}
+            221..222 'c': {unknown}
             224..225 'd': {unknown}
             230..244 '{/*too long*/}': ()
             253..254 '_': Tuple

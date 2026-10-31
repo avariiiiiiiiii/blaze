@@ -82,7 +82,7 @@ fn futex_wake(word: *const u32) -> i64 {
 macro_rules! program {
     ($body:literal) => {
         concat!(
-            "//- minicore: sized, option\n",
+            "//- minicore: sized, option, index, slice\n",
             "//- /main.rs cfg:target_os=linux,target_arch=x86_64\n",
             prelude!(),
             $body

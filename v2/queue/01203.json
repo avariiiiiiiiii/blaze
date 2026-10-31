@@ -1,0 +1,30 @@
+{
+  "id": "01203",
+  "from_lane": "no-fallback-front-ty",
+  "owner": "no-fallback-tools",
+  "paths": [
+    "crates/blaze-diagnostics/src/lower/mod.rs",
+    "crates/blaze-diagnostics/src/lower/assoc_type_not_resolved.rs",
+    "crates/blaze-diagnostics/src/lower/ambiguous_assoc_type.rs",
+    "crates/blaze-diagnostics/src/lower/impl_trait_not_allowed.rs",
+    "crates/blaze-diagnostics/src/lower/additional_non_auto_traits.rs",
+    "crates/blaze-diagnostics/src/lower/conflicting_assoc_type_bindings.rs",
+    "crates/blaze-diagnostics/src/lower/missing_self_default_params.rs",
+    "crates/blaze-diagnostics/src/lower/object_without_trait.rs"
+  ],
+  "what": "01168 batch 3 emitters: hir has 7 new AnyDiagnostic variants (AssocTypeNotResolved E0220/E0221/E0391, AmbiguousAssocType E0223, ImplTraitNotAllowed E0562, AdditionalNonAutoTraits E0225, ConflictingAssocTypeBindings E0719, MissingSelfDefaultParams E0393, ObjectWithoutTrait E0224), from type lowering that gave silent error types. blaze-diagnostics lower() is exhaustive, so it needs these to compile. Exact code: /tmp/blaze-lanes/no-fallback-front-ty-01168-lowering-emitters.rs",
+  "state": "open",
+  "created": "2026-10-31T01:00:12Z",
+  "updated": "2026-10-31T01:00:12Z",
+  "taken_by": null,
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-10-31T01:00:12Z",
+      "by": "no-fallback-front-ty",
+      "action": "add",
+      "note": ""
+    }
+  ]
+}

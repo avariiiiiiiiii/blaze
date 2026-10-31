@@ -5,8 +5,7 @@
 ; simd-fadd.clif, simd-fsub.clif, simd-fmul.clif, simd-fdiv.clif, simd-sqrt.clif,
 ; simd-fneg.clif, simd-fabs.clif), for the stencil set: integer, bitwise, shift and float
 ; lane arithmetic of the 128-bit vectors, all lowered with SSE2 alone on x86-64. Left out:
-; `avg_round` (cranelift-interpreter 0.136 adds whole vectors with its scalar `add` and
-; panics), `imul.i8x16` (not in the stencil set), shifts by an `i128` amount (the stencil
+; `avg_round` (simd-avg-round.clif), `imul.i8x16` (not in the stencil set), shifts by an `i128` amount (the stencil
 ; set's amounts are up to 64 bits).
 test interpret
 test run

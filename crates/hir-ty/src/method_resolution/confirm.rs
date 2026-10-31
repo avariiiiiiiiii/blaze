@@ -421,13 +421,13 @@ impl<'a, 'db, 'f> ConfirmContext<'a, 'db, 'f> {
 
             fn provided_type_like_const(
                 &mut self,
-                _type_ref: TypeRefId,
+                type_ref: TypeRefId,
                 _const_ty: Ty<'db>,
                 arg: TypeLikeConst<'_>,
             ) -> Const<'db> {
                 match arg {
-                    TypeLikeConst::Path(path) => self.ctx.make_path_as_const(path),
-                    TypeLikeConst::Infer => self.ctx.table.next_const_var(Span::Dummy),
+                    TypeLikeConst::Path(path) => self.ctx.make_path_as_const(path, type_ref),
+                    TypeLikeConst::Infer => self.ctx.table.next_const_var(type_ref.into()),
                 }
             }
 

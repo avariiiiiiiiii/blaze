@@ -1403,8 +1403,10 @@ impl AstIdMap {
                     it = tree.end(it);
                     continue;
                 }
-                let may_have_id =
-                    ast::BlockExpr::can_cast(kind) || ErasedFileAstId::should_alloc(kind).is_some();
+                // `node` itself first, a file's root too, whose id no kind allocates.
+                let may_have_id = it == at
+                    || ast::BlockExpr::can_cast(kind)
+                    || ErasedFileAstId::should_alloc(kind).is_some();
                 if may_have_id && let Some(id) = self.id_at(key_of(kind, range)) {
                     entries.push(entry(kind, moved(range), id));
                 }

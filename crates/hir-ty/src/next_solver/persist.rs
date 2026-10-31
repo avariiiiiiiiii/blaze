@@ -2508,7 +2508,7 @@ mod tests {
         let kind = |n: u32| {
             let leaf = Ty::intern(TyKind::Infer(InferTy::FreshTy(n % 64)));
             match n % 3 {
-                0 => TyKind::Slice(leaf),
+                0 => TyKind::Slice(Ty::intern(TyKind::Infer(InferTy::FreshTy(n)))),
                 1 => TyKind::Tuple(Tys::new_from_slice(&[leaf, Ty::intern(TyKind::Infer(InferTy::FreshIntTy(n)))])),
                 _ => TyKind::Array(leaf, konst(ConstKind::Infer(InferConst::Fresh(n)))),
             }

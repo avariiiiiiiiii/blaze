@@ -823,13 +823,15 @@ impl Tree {
                         // alloc: none, the same element type collects into the same buffer.
                         .collect(),
                 };
+                // `from` goes first: a directory it leaves empty is gone, so its last file may
+                // take the directory's path (`d/b` to `d`).
+                self.delete(base, pending, from)?;
                 match file_at(pending, to) {
                     Ok(None) => {}
                     // clone: the error's path
                     _ => return Err(OpError::Exists(to.clone())),
                 }
                 no_file_above(pending, to)?;
-                self.delete(base, pending, from)?;
                 for (path, blob) in moved {
                     pending.insert(path, Some(blob));
                 }

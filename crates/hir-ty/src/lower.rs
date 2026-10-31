@@ -64,7 +64,7 @@ pub(crate) use hir_def::TrackedStructToken;
 use crate::{
     ElidedLifetimeSite, ImplTraitId, InferenceResult, MissingLifetimeKind,
     PathLoweringDiagnostic, Span, TyLoweringDiagnostic,
-    consteval::{create_anon_const, path_to_const},
+    consteval::{CreateConstError, create_anon_const, path_to_const},
     db::{AnonConstId, HirDatabase, InternedOpaqueTyId},
     generics::{Generics, SingleGenerics, generics},
     infer::unify::InferenceTable,
@@ -75,7 +75,7 @@ use crate::{
         FnSigKind, GenericArg, GenericArgKind, GenericArgs, IsRigid, ParamConst,
         ParamEnv, PatList, Pattern, PolyFnSig, Predicate, Region, RegionExt, RegionKind,
         StoredClauses, StoredConst, StoredEarlyBinder, StoredGenericArg, StoredGenericArgs,
-        StoredPolyFnSig, StoredTraitRef, StoredTy, Symbol, TraitClause, TraitRef, Ty, Tys,
+        StoredPolyFnSig, StoredTraitRef, StoredTy, Symbol, TermId, TraitClause, TraitRef, Ty, Tys,
         Unnormalized, abi::Safety, default_types, infer::InferCtxt, mk_param,
         util::BottomUpFolder,
     },
@@ -924,6 +924,7 @@ impl<'db, 'a> TyLoweringContext<'db, 'a> {
             self.interning_mode,
             self.forbid_params_after,
             allow_anon_const_using_generic_params,
+            true,
         );
 
         if let Ok(konst) = konst
@@ -933,18 +934,25 @@ impl<'db, 'a> TyLoweringContext<'db, 'a> {
             self.defined_anon_consts.push(konst);
         }
 
-        konst.unwrap_or({
-            // FIXME: Report an error.
-            self.types.consts.error
-        })
+        konst.unwrap_or_else(|reason| self.invalid_const_arg(expr_id.into(), reason))
     }
 
-    pub(crate) fn lower_path_as_const(&mut self, path: Path<'_>, _const_type: Ty<'db>) -> Const<'db> {
+    /// `path`, written at `site` where a type or a const could stand, as the const argument it
+    /// is.
+    pub(crate) fn lower_path_as_const(&mut self, path: Path<'_>, site: TypeRefId) -> Const<'db> {
         path_to_const(self.db, self.resolver, &|| self.generics(), self.forbid_params_after, path)
-            .unwrap_or({
-                // FIXME: Report an error.
-                self.types.consts.error
-            })
+            .unwrap_or_else(|reason| self.invalid_const_arg(site.into(), reason))
+    }
+
+    /// The error const of a const argument at `site` that is none, reported for `reason`, as
+    /// rustc's `lower_const_arg` gives `ty::Const::new_error` after its error. A `_` where no
+    /// inference is, as each other placeholder there, is E0121.
+    fn invalid_const_arg(&mut self, site: Span, reason: CreateConstError) -> Const<'db> {
+        match reason {
+            CreateConstError::UnderscoreExpr => self.push_infer_vars_not_allowed(site),
+            reason => self.push_diagnostic(TyLoweringDiagnostic::InvalidConstArg { site, reason }),
+        }
+        self.types.consts.error
     }
 
     fn generics(&self) -> &Generics<'db> {
@@ -1185,7 +1193,9 @@ impl<'db, 'a> TyLoweringContext<'db, 'a> {
                         )
                     }
                     ImplTraitLoweringMode::Disallowed => {
-                        // FIXME: report error
+                        self.push_diagnostic(TyLoweringDiagnostic::ImplTraitNotAllowed {
+                            source: type_ref_id,
+                        });
                         self.types.types.error
                     }
                 }
@@ -1618,9 +1628,18 @@ impl<'db, 'a> TyLoweringContext<'db, 'a> {
             let mut auto_traits = SmallVec::<[_; 3]>::new();
             let mut projections = Vec::new_in(frame);
             let mut had_error = false;
+            let mut principal_source = None;
+            // alloc: an error's sites, empty but for one
+            let mut additional = Vec::new();
 
             for b in bounds {
                 let db = self.db;
+                let source = match b {
+                    TypeBound::Path(path, _) | TypeBound::ForLifetime(_, path) => {
+                        Some(path.type_ref())
+                    }
+                    TypeBound::Lifetime(_) | TypeBound::Use(_) | TypeBound::Error => None,
+                };
                 match b {
                     TypeBound::Path(
                         _,
@@ -1645,19 +1664,23 @@ impl<'db, 'a> TyLoweringContext<'db, 'a> {
                             if is_auto {
                                 auto_traits.push(t.def_id().0);
                             } else {
+                                let source = source.expect("a trait bound has a path");
                                 if principal.is_some() {
-                                    // FIXME: Report an error.
+                                    additional.push(source);
                                     had_error = true;
+                                } else {
+                                    principal_source = Some(source);
                                 }
                                 principal = Some(b.kind().rebind(t.trait_ref));
                             }
                         }
                         rustc_type_ir::ClauseKind::Projection(p) => {
-                            projections.push(b.kind().rebind(p));
+                            let source = source.expect("a projection bound has a path");
+                            projections.push((b.kind().rebind(p), source));
                         }
                         rustc_type_ir::ClauseKind::TypeOutlives(outlives_predicate) => {
+                            // E0226, which AST validation reports.
                             if region.is_some() {
-                                // FIXME: Report an error.
                                 had_error = true;
                             }
                             region = Some(outlives_predicate.1);
@@ -1672,12 +1695,34 @@ impl<'db, 'a> TyLoweringContext<'db, 'a> {
                 })
             }
 
+            if !additional.is_empty() {
+                let first = principal_source.expect("a second non-auto trait has a first");
+                // alloc: an error's sites
+                let additional = additional.into_boxed_slice();
+                self.push_diagnostic(TyLoweringDiagnostic::AdditionalNonAutoTraits { first, additional });
+            }
+
             if had_error {
                 break 'bounds None;
             }
 
             if principal.is_none() && auto_traits.is_empty() {
-                // No traits is not allowed.
+                // No traits is not allowed. With no trait written the parser reports it, and a
+                // path that does not name a trait is reported where it is resolved; bounds
+                // that are all relaxed (`dyn ?Sized`) are reported here.
+                let relaxed = bounds.iter().find_map(|b| match b {
+                    TypeBound::Path(path, TraitBoundModifier::Maybe) => Some(path.type_ref()),
+                    _ => None,
+                });
+                let only_relaxed = bounds.iter().all(|b| {
+                    !matches!(b, TypeBound::ForLifetime(..))
+                        && !matches!(b, TypeBound::Path(_, modifier) if *modifier != TraitBoundModifier::Maybe)
+                });
+                if let Some(source) = relaxed
+                    && only_relaxed
+                {
+                    self.push_diagnostic(TyLoweringDiagnostic::ObjectWithoutTrait { source });
+                }
                 break 'bounds None;
             }
 
@@ -1696,9 +1741,10 @@ impl<'db, 'a> TyLoweringContext<'db, 'a> {
             // let _: &dyn Alias<Assoc = u32> = /* ... */;
             // ```
             let mut projection_bounds = frame_map(frame);
-            for proj in projections {
+            for (proj, source) in projections {
+                let term = proj.skip_binder().def_id().0;
                 let key = (
-                    proj.skip_binder().def_id().0,
+                    term,
                     interner.anonymize_bound_vars(
                         proj.map_bound(|proj| proj.projection_term.trait_ref(interner)),
                     ),
@@ -1707,7 +1753,14 @@ impl<'db, 'a> TyLoweringContext<'db, 'a> {
                     && interner.anonymize_bound_vars(proj)
                         != interner.anonymize_bound_vars(old_proj)
                 {
-                    // FIXME: Report "conflicting associated type" error.
+                    let assoc = match term {
+                        TermId::TypeAliasId(it) => AssocItemId::TypeAliasId(it),
+                        TermId::ConstId(it) => AssocItemId::ConstId(it),
+                    };
+                    self.push_diagnostic(TyLoweringDiagnostic::ConflictingAssocTypeBindings {
+                        source,
+                        assoc,
+                    });
                 }
             }
 
@@ -1820,13 +1873,16 @@ impl<'db, 'a> TyLoweringContext<'db, 'a> {
 
             projection_bounds.sort_unstable_by_key(|proj| proj.skip_binder().def_id().0);
 
+            let principal_trait = principal.map(|it| it.skip_binder().def_id.0);
+            // alloc: an error's parameters, empty but on an error
+            let mut missing = Vec::new();
             let principal = principal.map(|principal| {
                 principal.map_bound(|principal| {
                     // Verify that `dummy_self` did not leak inside default type parameters.
                     // Skip `Self`
-                    let args = principal.args.iter().skip(1).map(|arg| {
+                    let args = principal.args.iter().enumerate().skip(1).map(|(index, arg)| {
                         if arg.walk().any(|arg| arg == dummy_self_ty.into()) {
-                            // FIXME: Report an error.
+                            missing.push(index as u32);
                             self.types.types.error.into()
                         } else {
                             arg
@@ -1840,6 +1896,34 @@ impl<'db, 'a> TyLoweringContext<'db, 'a> {
                     ))
                 })
             });
+            if !missing.is_empty() {
+                let trait_ = principal_trait.expect("a principal's arguments have its trait");
+                let source = principal_source.expect("a principal has its bound");
+                let trait_generics = generics(self.db, trait_.into());
+                let params = missing
+                    .iter()
+                    .map(|&index| {
+                        trait_generics
+                            .iter_id(false)
+                            .find_map(|id| match id {
+                                GenericParamId::TypeParamId(param)
+                                    if trait_generics.type_or_const_param_idx(param.into())
+                                        == index =>
+                                {
+                                    Some(param)
+                                }
+                                _ => None,
+                            })
+                            .expect("an argument naming `Self` is of a type parameter")
+                    })
+                    // alloc: an error's parameters
+                    .collect();
+                self.push_diagnostic(TyLoweringDiagnostic::MissingSelfDefaultParams {
+                    source,
+                    trait_,
+                    params,
+                });
+            }
 
             let projections = projection_bounds.into_iter().map(|proj| {
                 proj.map_bound(|mut proj| {

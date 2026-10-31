@@ -1,0 +1,23 @@
+{
+  "id": "01199",
+  "from_lane": "tests-misc-front1",
+  "owner": "db",
+  "paths": [
+    "crates/base-db/src/reparse.rs"
+  ],
+  "what": "base-db reparse.rs:269 assert_whole panics 'a reparse whose tree is not the whole parse's' in every blaze-items edit test (round2-test.log ~19577-23290: tests::hashes::a_body_edit_keeps_the_interface_and_callers_code, whitespace_inside_a_literal_is_code, form::a_no_mangle_fn_s_name_is_its_interface, facts::a_capture_edit_changes_captures and ~10 more). The incremental reparse of an edit gives a different tree than a whole parse; the cause may be syntax's reparse (format).",
+  "state": "open",
+  "created": "2026-10-31T00:51:36Z",
+  "updated": "2026-10-31T00:51:36Z",
+  "taken_by": null,
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-10-31T00:51:36Z",
+      "by": "tests-misc-front1",
+      "action": "add",
+      "note": ""
+    }
+  ]
+}

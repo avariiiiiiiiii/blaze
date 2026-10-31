@@ -242,7 +242,7 @@ fn e0596_suggests_mut_at_the_binding() {
 }
 
 #[test]
-fn e0597_points_at_the_drop_and_the_later_call() {
+fn e0597_points_at_the_drop_and_the_later_use() {
     error_of(
         "e0597",
         "E0597",
@@ -250,7 +250,9 @@ fn e0597_points_at_the_drop_and_the_later_call() {
             ("s", "binding `s` declared here"),
             ("&s", "borrowed value does not live long enough"),
             ("}", "`s` dropped here while still borrowed"),
-            ("read", "borrow later used by call"),
+            // A call's argument is read into a temporary first (`as_call_operand`), so the
+            // later use is that read, as in rustc's tests/ui/variance/variance-issue-20533.
+            ("r", "borrow later used here"),
         ],
         |_, _, error| {
             assert!(error.children.is_empty() && error.suggestions.is_empty(), "{error:?}")
@@ -370,7 +372,11 @@ fn a_body_with_no_error_takes_nothing_from_the_global_allocator() {
                         // the types it interns.
                         let first = borrowck_in_mode(&db, it.into(), mode);
                         assert!(first.skipped.is_none(), "{it:?}: {:?}", first.skipped);
-                        assert!(first.not_checked.is_none(), "{it:?}");
+                        assert!(
+                            first.not_checked.is_none(),
+                            "{}: {first:?}",
+                            FunctionSignature::of(&db, it).name.as_str()
+                        );
                         assert!(first.diagnostics.is_empty(), "{:?}", first.diagnostics);
                         GLOBAL.with(|it| it.set(0));
                         let _ = borrowck_in_mode(&db, it.into(), mode);

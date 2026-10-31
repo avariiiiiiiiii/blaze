@@ -22,13 +22,14 @@ use hir_def::{
 };
 use hir_expand::name::Name;
 use rustc_type_ir::{
-    AliasTerm, AliasTy, AliasTyKind,
+    AliasTerm, AliasTy, AliasTyKind, TypeVisitableExt as _,
     inherent::{GenericArgs as _, Ty as _},
 };
 
 use crate::{
     GenericArgsProhibitedReason, IncorrectGenericsLenKind, PathGenericsSource,
     PathLoweringDiagnostic, Span, TyDefId, ValueTyDefId,
+    lower::diagnostics::{AssocTypeFailure, AssocTypeQself},
     db::HirDatabase,
     generics::{Generics, ObjectLifetimeDefault, generics},
     infer::unify::InferenceTable,
@@ -38,7 +39,8 @@ use crate::{
     },
     next_solver::{
         AliasTermKind, Binder, Clause, Const, DbInterner, EarlyBinder, ErrorGuaranteed, GenericArg,
-        GenericArgs, IsRigid, Predicate, ProjectionClause, Region, TraitRef, Ty,
+        GenericArgs, IsRigid, Predicate, ProjectionClause, Region, StoredEarlyBinder,
+        StoredGenericArgs, TraitRef, Ty,
     },
 };
 
@@ -175,11 +177,41 @@ impl<'a, 'b, 'db> PathLoweringContext<'a, 'b, 'db> {
                 // resolve unselected assoc types
                 (self.select_associated_type(ty, res, infer_args, span), None)
             }
-            _ => {
-                // FIXME report error (ambiguous associated type)
-                (self.ctx.types.types.error, None)
-            }
+            // `<ty>::A::B`: `<ty>::A` is a projection, which no bound gives `B` of. Not
+            // reported of a `ty` that is itself an error, as rustc's `lower_assoc_path`.
+            _ if ty.references_error() => (self.ctx.types.types.error, None),
+            _ => (self.ambiguous_assoc_type(self.current_segment_u32()), None),
         }
+    }
+
+    /// The error type of an associated type `segment` no bound gives: E0223.
+    fn ambiguous_assoc_type(&mut self, segment: u32) -> Ty<'db> {
+        self.on_diagnostic(PathLoweringDiagnostic::AmbiguousAssocType { segment });
+        self.ctx.types.types.error
+    }
+
+    /// The error type of the associated type of the current segment that `qself` does not
+    /// resolve for `failure`.
+    fn assoc_type_not_resolved(&mut self, qself: AssocTypeQself, failure: AssocTypeFailure) -> Ty<'db> {
+        let segment = self.current_segment_u32();
+        self.on_diagnostic(PathLoweringDiagnostic::AssocTypeNotResolved { segment, qself, failure });
+        self.ctx.types.types.error
+    }
+
+    /// The associated type the shorthand `resolution` of the current segment in `qself`'s
+    /// bounds gives, or the error type it is reported as.
+    fn resolved_shorthand(
+        &mut self,
+        qself: AssocTypeQself,
+        resolution: AssocTypeShorthandResolution,
+    ) -> Result<StoredEarlyBinder<(TypeAliasId, StoredGenericArgs)>, Ty<'db>> {
+        let failure = match resolution {
+            AssocTypeShorthandResolution::Resolved(it) => return Ok(it),
+            AssocTypeShorthandResolution::NotFound => AssocTypeFailure::NotFound,
+            AssocTypeShorthandResolution::Ambiguous { .. } => AssocTypeFailure::Ambiguous,
+            AssocTypeShorthandResolution::Cycle => AssocTypeFailure::Cycle,
+        };
+        Err(self.assoc_type_not_resolved(qself, failure))
     }
 
     // When calling this, the current segment is the resolved segment (we don't advance it yet).
@@ -239,10 +271,10 @@ impl<'a, 'b, 'db> PathLoweringContext<'a, 'b, 'db> {
                                     ),
                                 )
                             }
-                            None => {
-                                // FIXME: report error (associated type not found)
-                                self.ctx.types.types.error
-                            }
+                            None => self.assoc_type_not_resolved(
+                                AssocTypeQself::Trait(trait_id),
+                                AssocTypeFailure::NotFound,
+                            ),
                         }
                     }
                     0 => {
@@ -250,10 +282,8 @@ impl<'a, 'b, 'db> PathLoweringContext<'a, 'b, 'db> {
                         // `lower_path()`.
                         unreachable!("unexpected fully resolved trait path")
                     }
-                    _ => {
-                        // FIXME report error (ambiguous associated type)
-                        self.ctx.types.types.error
-                    }
+                    // `Trait::A::B`: `Trait::A` has no self type to look `B` up on.
+                    _ => self.ambiguous_assoc_type(self.current_segment_u32() + 1),
                 };
                 return (ty, None);
             }
@@ -516,23 +546,22 @@ impl<'a, 'b, 'db> PathLoweringContext<'a, 'b, 'db> {
             Some(TypeNs::AdtId(_) | TypeNs::AdtSelfType(_) | TypeNs::TypeAliasId(_)) => true,
             _ => false,
         };
+        // An associated type of a type that is itself an error is not reported, as rustc's
+        // `lower_assoc_path`.
         if inherent {
-            return self
-                .inherent_associated_type(ty, assoc_name)
-                .unwrap_or(self.ctx.types.types.error);
+            return match self.inherent_associated_type(ty, assoc_name) {
+                Some(ty) => ty,
+                None if ty.references_error() => self.ctx.types.types.error,
+                None => self.ambiguous_assoc_type(self.current_segment_u32()),
+            };
         }
         let (assoc_type, trait_args) = match res {
             Some(TypeNs::GenericParam(param)) => {
-                let AssocTypeShorthandResolution::Resolved(assoc_type) =
-                    super::resolve_type_param_assoc_type_shorthand(
-                        db,
-                        def,
-                        param,
-                        *assoc_name,
-                    )
-                else {
-                    // FIXME: Emit an error.
-                    return self.ctx.types.types.error;
+                let resolution =
+                    super::resolve_type_param_assoc_type_shorthand(db, def, param, *assoc_name);
+                let assoc_type = match self.resolved_shorthand(AssocTypeQself::Param(param), resolution) {
+                    Ok(it) => it,
+                    Err(error) => return error,
                 };
                 assoc_type
                     .get_with(|(assoc_type, trait_args)| (*assoc_type, trait_args.as_ref()))
@@ -544,17 +573,18 @@ impl<'a, 'b, 'db> PathLoweringContext<'a, 'b, 'db> {
                 };
                 let impl_trait = impl_trait.instantiate_identity().skip_norm_wip();
                 // Searching for `Self::Assoc` in `impl Trait for Type` is like searching for `Self::Assoc` in `Trait`.
-                let AssocTypeShorthandResolution::Resolved(assoc_type) =
-                    super::resolve_type_param_assoc_type_shorthand(
-                        db,
-                        impl_trait.def_id.0.into(),
-                        TypeParamId::trait_self(impl_trait.def_id.0),
-                        *assoc_name,
-                    )
-                else {
-                    // FIXME: Emit an error.
-                    return self.ctx.types.types.error;
-                };
+                let self_param = TypeParamId::trait_self(impl_trait.def_id.0);
+                let resolution = super::resolve_type_param_assoc_type_shorthand(
+                    db,
+                    impl_trait.def_id.0.into(),
+                    self_param,
+                    *assoc_name,
+                );
+                let assoc_type =
+                    match self.resolved_shorthand(AssocTypeQself::Param(self_param), resolution) {
+                        Ok(it) => it,
+                        Err(error) => return error,
+                    };
                 let (assoc_type, trait_args) = assoc_type
                     .get_with(|(assoc_type, trait_args)| (*assoc_type, trait_args.as_ref()))
                     .skip_binder();
@@ -576,7 +606,9 @@ impl<'a, 'b, 'db> PathLoweringContext<'a, 'b, 'db> {
                         .skip_norm_wip(),
                 )
             }
-            _ => return self.ctx.types.types.error,
+            // `<[u8]>::Name`, `<dyn Trait>::Name`: no bound gives the type an associated type.
+            _ if ty.references_error() => return self.ctx.types.types.error,
+            _ => return self.ambiguous_assoc_type(self.current_segment_u32()),
         };
 
         // FIXME: `substs_from_path_segment()` pushes `TyKind::Error` for every parent
@@ -822,11 +854,11 @@ impl<'a, 'b, 'db> PathLoweringContext<'a, 'b, 'db> {
             fn provided_type_like_const(
                 &mut self,
                 type_ref: TypeRefId,
-                const_ty: Ty<'db>,
+                _const_ty: Ty<'db>,
                 arg: TypeLikeConst<'_>,
             ) -> Const<'db> {
                 match arg {
-                    TypeLikeConst::Path(path) => self.ctx.ctx.lower_path_as_const(path, const_ty),
+                    TypeLikeConst::Path(path) => self.ctx.ctx.lower_path_as_const(path, type_ref),
                     TypeLikeConst::Infer => self.ctx.ctx.next_const_var(type_ref.into()),
                 }
             }

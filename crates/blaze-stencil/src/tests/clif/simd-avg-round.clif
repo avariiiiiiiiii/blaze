@@ -1,8 +1,9 @@
 ; Follows upstream's runtests/simd-avg-round.clif: `avg_round`, the unsigned average rounded
 ; up (`(a + b + 1) >> 1` in the double width), of `i8x16` and `i16x8` (wasm's `avgr_u`,
 ; x86's `pavgb`/`pavgw`), plus `i32x4`, which x86-64 Cranelift does not lower (so on x86-64
-; hosts that function runs as AArch64 code only). No `test interpret`: the interpreter
-; applies its scalar add to the whole vector and panics, so these lines hold as code only.
+; hosts that function runs as AArch64 code only). The interpreter applies its scalar add to
+; the whole vector and panics, so the tests interpret `avg_round` as `(a | b) - ((a ^ b) >> 1)`.
+test interpret
 test run
 target x86_64
 target aarch64

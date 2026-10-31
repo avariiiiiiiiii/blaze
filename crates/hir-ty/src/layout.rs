@@ -1030,6 +1030,8 @@ mod tests {
             let kinds: &[StructKind] = match case % 3 {
                 // A closure: every field free to move.
                 0 => &[StructKind::AlwaysSized],
+                // `()`, which rustc lays out `AlwaysSized`.
+                1 if fields.is_empty() => &[StructKind::AlwaysSized],
                 // A tuple: the last field stays last.
                 1 => &[StructKind::MaybeUnsized, StructKind::AlwaysSized],
                 // A tuple with an unsized tail.

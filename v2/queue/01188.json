@@ -1,0 +1,24 @@
+{
+  "id": "01188",
+  "from_lane": "no-fallback-front-ty",
+  "owner": "no-fallback-tools",
+  "paths": [
+    "crates/blaze-diagnostics/src/lower/mod.rs",
+    "crates/blaze-diagnostics/src/lower/invalid_const_arg.rs"
+  ],
+  "what": "01168 emitter: hir now has AnyDiagnostic::InvalidConstArg { site: SpanSyntax, reason: hir::CreateConstError } (hir-ty InferenceDiagnostic::InvalidConstArg replaces the fresh const var infer.rs gave for an invalid const arg). blaze-diagnostics lower() match is exhaustive, so it does not compile until this lands. Exact code (new module + 2 lines in lower/mod.rs) in /tmp/blaze-lanes/no-fallback-front-ty-01168-invalid_const_arg.rs.",
+  "state": "open",
+  "created": "2026-10-30T23:58:06Z",
+  "updated": "2026-10-30T23:58:06Z",
+  "taken_by": null,
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-10-30T23:58:06Z",
+      "by": "no-fallback-front-ty",
+      "action": "add",
+      "note": ""
+    }
+  ]
+}

@@ -153,8 +153,8 @@ pub fn cranelift(func: &ir::Function, isa: &dyn isa::TargetIsa) -> Result<Compil
     let mut relocs = Vec::with_capacity(compiled.buffer.relocs().len());
     for reloc in compiled.buffer.relocs() {
         let name = match &reloc.target {
-            cranelift_codegen::RelocTarget::ExternalName(name) => name_of(func, name)?,
-            cranelift_codegen::RelocTarget::Label(at) => code::Name::Own(at.as_offset()),
+            cranelift_codegen::FinalizedRelocTarget::ExternalName(name) => name_of(func, name)?,
+            cranelift_codegen::FinalizedRelocTarget::Func(at) => code::Name::Own(*at),
         };
         relocs.push(code::Reloc { at: reloc.offset, kind: reloc.kind, name, addend: reloc.addend });
     }
@@ -165,15 +165,14 @@ pub fn cranelift(func: &ir::Function, isa: &dyn isa::TargetIsa) -> Result<Compil
         let first = handlers.len() as u32;
         for handler in site.exception_handlers {
             match *handler {
-                cranelift_codegen::MachExceptionHandler::Tag(tag, landing) => {
-                    let landing = landing.as_offset();
+                cranelift_codegen::FinalizedMachExceptionHandler::Tag(tag, landing) => {
                     handlers.push(code::Handler::Tag { tag: tag.as_u32(), landing });
                 }
-                cranelift_codegen::MachExceptionHandler::Default(landing) => {
-                    handlers.push(code::Handler::Default { landing: landing.as_offset() });
+                cranelift_codegen::FinalizedMachExceptionHandler::Default(landing) => {
+                    handlers.push(code::Handler::Default { landing });
                 }
                 // The IR builder never sets a dynamic context, and neither do the tests.
-                cranelift_codegen::MachExceptionHandler::Context(_) => {
+                cranelift_codegen::FinalizedMachExceptionHandler::Context(_) => {
                     return Err("an exception handler with a dynamic context".to_owned());
                 }
             }
@@ -181,7 +180,7 @@ pub fn cranelift(func: &ir::Function, isa: &dyn isa::TargetIsa) -> Result<Compil
         calls.push(code::CallSite { ret: site.ret_addr, handlers: first..handlers.len() as u32 });
     }
     let unwind = compiled.create_unwind_info(isa).map_err(|e| format!("{e:?}"))?;
-    Ok(Compiled { bytes, align: compiled.buffer.min_alignment, relocs, traps, calls, handlers, unwind })
+    Ok(Compiled { bytes, align: compiled.buffer.alignment, relocs, traps, calls, handlers, unwind })
 }
 
 /// The relocation name of `name` in `func`, as the stencil backend's glue names it

@@ -1178,8 +1178,8 @@ fn node(db: &TestDb, at: usize) -> Node {
 
 fn combine(op: Op, values: &[u64]) -> u64 {
     match op {
-        Op::Sum => values.iter().fold(0, |acc, it| acc.wrapping_add(*it)),
-        Op::Mod3 => values.iter().fold(0, |acc, it| acc.wrapping_add(*it)) % 3,
+        Op::Sum => values.iter().fold(0u64, |acc, it| acc.wrapping_add(*it)),
+        Op::Mod3 => values.iter().fold(0u64, |acc, it| acc.wrapping_add(*it)) % 3,
         Op::Max => values.iter().copied().max().unwrap_or(0),
     }
 }

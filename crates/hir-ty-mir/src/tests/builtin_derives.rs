@@ -149,55 +149,55 @@ struct WithGenerics<'a, T: Trait, const N: usize>(&'a [T; N], T::Assoc);
 
 
 
-                Clause(Binder { value: TraitClause(#1: Trait, polarity:Positive), bound_vars: [] })
-                Clause(Binder { value: ConstArgHasType(#2, usize), bound_vars: [] })
-                Clause(Binder { value: TraitClause(#1: Sized, polarity:Positive), bound_vars: [] })
-                Clause(Binder { value: TraitClause(#1: Debug, polarity:Positive), bound_vars: [] })
-                Clause(Binder { value: TraitClause(Alias(AliasTy { args: [#1], kind: Projection { def_id: TypeAliasId("Assoc") }, .. }): Debug, polarity:Positive), bound_vars: [] })
+            Clause(Binder { value: TraitClause(#1: Trait, polarity:Positive), bound_vars: [] })
+            Clause(Binder { value: ConstArgHasType(#2, usize), bound_vars: [] })
+            Clause(Binder { value: TraitClause(#1: Sized, polarity:Positive), bound_vars: [] })
+            Clause(Binder { value: TraitClause(#1: Debug, polarity:Positive), bound_vars: [] })
+            Clause(Binder { value: TraitClause(Alias(No, Alias { kind: Projection { def_id: TypeAliasId("Assoc") }, args: [#1], .. }): Debug, polarity:Positive), bound_vars: [] })
 
-                Clause(Binder { value: TraitClause(#1: Trait, polarity:Positive), bound_vars: [] })
-                Clause(Binder { value: ConstArgHasType(#2, usize), bound_vars: [] })
-                Clause(Binder { value: TraitClause(#1: Sized, polarity:Positive), bound_vars: [] })
-                Clause(Binder { value: TraitClause(#1: Clone, polarity:Positive), bound_vars: [] })
-                Clause(Binder { value: TraitClause(Alias(AliasTy { args: [#1], kind: Projection { def_id: TypeAliasId("Assoc") }, .. }): Clone, polarity:Positive), bound_vars: [] })
+            Clause(Binder { value: TraitClause(#1: Trait, polarity:Positive), bound_vars: [] })
+            Clause(Binder { value: ConstArgHasType(#2, usize), bound_vars: [] })
+            Clause(Binder { value: TraitClause(#1: Sized, polarity:Positive), bound_vars: [] })
+            Clause(Binder { value: TraitClause(#1: Clone, polarity:Positive), bound_vars: [] })
+            Clause(Binder { value: TraitClause(Alias(No, Alias { kind: Projection { def_id: TypeAliasId("Assoc") }, args: [#1], .. }): Clone, polarity:Positive), bound_vars: [] })
 
-                Clause(Binder { value: TraitClause(#1: Trait, polarity:Positive), bound_vars: [] })
-                Clause(Binder { value: ConstArgHasType(#2, usize), bound_vars: [] })
-                Clause(Binder { value: TraitClause(#1: Sized, polarity:Positive), bound_vars: [] })
-                Clause(Binder { value: TraitClause(#1: Copy, polarity:Positive), bound_vars: [] })
-                Clause(Binder { value: TraitClause(Alias(AliasTy { args: [#1], kind: Projection { def_id: TypeAliasId("Assoc") }, .. }): Copy, polarity:Positive), bound_vars: [] })
+            Clause(Binder { value: TraitClause(#1: Trait, polarity:Positive), bound_vars: [] })
+            Clause(Binder { value: ConstArgHasType(#2, usize), bound_vars: [] })
+            Clause(Binder { value: TraitClause(#1: Sized, polarity:Positive), bound_vars: [] })
+            Clause(Binder { value: TraitClause(#1: Copy, polarity:Positive), bound_vars: [] })
+            Clause(Binder { value: TraitClause(Alias(No, Alias { kind: Projection { def_id: TypeAliasId("Assoc") }, args: [#1], .. }): Copy, polarity:Positive), bound_vars: [] })
 
-                Clause(Binder { value: TraitClause(#1: Trait, polarity:Positive), bound_vars: [] })
-                Clause(Binder { value: ConstArgHasType(#2, usize), bound_vars: [] })
-                Clause(Binder { value: TraitClause(#1: Sized, polarity:Positive), bound_vars: [] })
-                Clause(Binder { value: TraitClause(#1: PartialEq<[#1]>, polarity:Positive), bound_vars: [] })
-                Clause(Binder { value: TraitClause(Alias(AliasTy { args: [#1], kind: Projection { def_id: TypeAliasId("Assoc") }, .. }): PartialEq<[Alias(AliasTy { args: [#1], kind: Projection { def_id: TypeAliasId("Assoc") }, .. })]>, polarity:Positive), bound_vars: [] })
+            Clause(Binder { value: TraitClause(#1: Trait, polarity:Positive), bound_vars: [] })
+            Clause(Binder { value: ConstArgHasType(#2, usize), bound_vars: [] })
+            Clause(Binder { value: TraitClause(#1: Sized, polarity:Positive), bound_vars: [] })
+            Clause(Binder { value: TraitClause(#1: PartialEq<[#1]>, polarity:Positive), bound_vars: [] })
+            Clause(Binder { value: TraitClause(Alias(No, Alias { kind: Projection { def_id: TypeAliasId("Assoc") }, args: [#1], .. }): PartialEq<[Alias(No, Alias { kind: Projection { def_id: TypeAliasId("Assoc") }, args: [#1], .. })]>, polarity:Positive), bound_vars: [] })
 
-                Clause(Binder { value: TraitClause(#1: Trait, polarity:Positive), bound_vars: [] })
-                Clause(Binder { value: ConstArgHasType(#2, usize), bound_vars: [] })
-                Clause(Binder { value: TraitClause(#1: Sized, polarity:Positive), bound_vars: [] })
-                Clause(Binder { value: TraitClause(#1: Eq, polarity:Positive), bound_vars: [] })
-                Clause(Binder { value: TraitClause(Alias(AliasTy { args: [#1], kind: Projection { def_id: TypeAliasId("Assoc") }, .. }): Eq, polarity:Positive), bound_vars: [] })
+            Clause(Binder { value: TraitClause(#1: Trait, polarity:Positive), bound_vars: [] })
+            Clause(Binder { value: ConstArgHasType(#2, usize), bound_vars: [] })
+            Clause(Binder { value: TraitClause(#1: Sized, polarity:Positive), bound_vars: [] })
+            Clause(Binder { value: TraitClause(#1: Eq, polarity:Positive), bound_vars: [] })
+            Clause(Binder { value: TraitClause(Alias(No, Alias { kind: Projection { def_id: TypeAliasId("Assoc") }, args: [#1], .. }): Eq, polarity:Positive), bound_vars: [] })
 
-                Clause(Binder { value: TraitClause(#1: Trait, polarity:Positive), bound_vars: [] })
-                Clause(Binder { value: ConstArgHasType(#2, usize), bound_vars: [] })
-                Clause(Binder { value: TraitClause(#1: Sized, polarity:Positive), bound_vars: [] })
-                Clause(Binder { value: TraitClause(#1: PartialOrd<[#1]>, polarity:Positive), bound_vars: [] })
-                Clause(Binder { value: TraitClause(Alias(AliasTy { args: [#1], kind: Projection { def_id: TypeAliasId("Assoc") }, .. }): PartialOrd<[Alias(AliasTy { args: [#1], kind: Projection { def_id: TypeAliasId("Assoc") }, .. })]>, polarity:Positive), bound_vars: [] })
+            Clause(Binder { value: TraitClause(#1: Trait, polarity:Positive), bound_vars: [] })
+            Clause(Binder { value: ConstArgHasType(#2, usize), bound_vars: [] })
+            Clause(Binder { value: TraitClause(#1: Sized, polarity:Positive), bound_vars: [] })
+            Clause(Binder { value: TraitClause(#1: PartialOrd<[#1]>, polarity:Positive), bound_vars: [] })
+            Clause(Binder { value: TraitClause(Alias(No, Alias { kind: Projection { def_id: TypeAliasId("Assoc") }, args: [#1], .. }): PartialOrd<[Alias(No, Alias { kind: Projection { def_id: TypeAliasId("Assoc") }, args: [#1], .. })]>, polarity:Positive), bound_vars: [] })
 
-                Clause(Binder { value: TraitClause(#1: Trait, polarity:Positive), bound_vars: [] })
-                Clause(Binder { value: ConstArgHasType(#2, usize), bound_vars: [] })
-                Clause(Binder { value: TraitClause(#1: Sized, polarity:Positive), bound_vars: [] })
-                Clause(Binder { value: TraitClause(#1: Ord, polarity:Positive), bound_vars: [] })
-                Clause(Binder { value: TraitClause(Alias(AliasTy { args: [#1], kind: Projection { def_id: TypeAliasId("Assoc") }, .. }): Ord, polarity:Positive), bound_vars: [] })
+            Clause(Binder { value: TraitClause(#1: Trait, polarity:Positive), bound_vars: [] })
+            Clause(Binder { value: ConstArgHasType(#2, usize), bound_vars: [] })
+            Clause(Binder { value: TraitClause(#1: Sized, polarity:Positive), bound_vars: [] })
+            Clause(Binder { value: TraitClause(#1: Ord, polarity:Positive), bound_vars: [] })
+            Clause(Binder { value: TraitClause(Alias(No, Alias { kind: Projection { def_id: TypeAliasId("Assoc") }, args: [#1], .. }): Ord, polarity:Positive), bound_vars: [] })
 
-                Clause(Binder { value: TraitClause(#1: Trait, polarity:Positive), bound_vars: [] })
-                Clause(Binder { value: ConstArgHasType(#2, usize), bound_vars: [] })
-                Clause(Binder { value: TraitClause(#1: Sized, polarity:Positive), bound_vars: [] })
-                Clause(Binder { value: TraitClause(#1: Hash, polarity:Positive), bound_vars: [] })
-                Clause(Binder { value: TraitClause(Alias(AliasTy { args: [#1], kind: Projection { def_id: TypeAliasId("Assoc") }, .. }): Hash, polarity:Positive), bound_vars: [] })
+            Clause(Binder { value: TraitClause(#1: Trait, polarity:Positive), bound_vars: [] })
+            Clause(Binder { value: ConstArgHasType(#2, usize), bound_vars: [] })
+            Clause(Binder { value: TraitClause(#1: Sized, polarity:Positive), bound_vars: [] })
+            Clause(Binder { value: TraitClause(#1: Hash, polarity:Positive), bound_vars: [] })
+            Clause(Binder { value: TraitClause(Alias(No, Alias { kind: Projection { def_id: TypeAliasId("Assoc") }, args: [#1], .. }): Hash, polarity:Positive), bound_vars: [] })
 
-            "#]],
+        "#]],
     );
 }
 
@@ -241,26 +241,34 @@ where
     U: Trait<U>;
         "#,
         expect![[r#"
-                Clause(Binder { value: TraitClause(#0: Unsize<[#1]>, polarity:Positive), bound_vars: [] })
+            Clause(Binder { value: TraitClause(#0: MetaSized, polarity:Positive), bound_vars: [] })
+            Clause(Binder { value: TraitClause(#1: MetaSized, polarity:Positive), bound_vars: [] })
+            Clause(Binder { value: TraitClause(#0: Unsize<[#1]>, polarity:Positive), bound_vars: [] })
 
-                Clause(Binder { value: TraitClause(#0: Unsize<[#1]>, polarity:Positive), bound_vars: [] })
+            Clause(Binder { value: TraitClause(#0: MetaSized, polarity:Positive), bound_vars: [] })
+            Clause(Binder { value: TraitClause(#1: MetaSized, polarity:Positive), bound_vars: [] })
+            Clause(Binder { value: TraitClause(#0: Unsize<[#1]>, polarity:Positive), bound_vars: [] })
 
-                Clause(Binder { value: TraitClause(#1: Trait<[#2]>, polarity:Positive), bound_vars: [] })
-                Clause(Binder { value: TraitClause(#2: Trait<[#2]>, polarity:Positive), bound_vars: [] })
-                Clause(Binder { value: ConstArgHasType(#3, usize), bound_vars: [] })
-                Clause(Binder { value: TraitClause(#1: Sized, polarity:Positive), bound_vars: [] })
-                Clause(Binder { value: TraitClause(#1: Trait<[#4]>, polarity:Positive), bound_vars: [] })
-                Clause(Binder { value: TraitClause(#4: Trait<[#4]>, polarity:Positive), bound_vars: [] })
-                Clause(Binder { value: TraitClause(#2: Unsize<[#4]>, polarity:Positive), bound_vars: [] })
+            Clause(Binder { value: TraitClause(#1: Trait<[#2]>, polarity:Positive), bound_vars: [] })
+            Clause(Binder { value: TraitClause(#2: Trait<[#2]>, polarity:Positive), bound_vars: [] })
+            Clause(Binder { value: ConstArgHasType(#3, usize), bound_vars: [] })
+            Clause(Binder { value: TraitClause(#1: Sized, polarity:Positive), bound_vars: [] })
+            Clause(Binder { value: TraitClause(#2: MetaSized, polarity:Positive), bound_vars: [] })
+            Clause(Binder { value: TraitClause(#1: Trait<[#4]>, polarity:Positive), bound_vars: [] })
+            Clause(Binder { value: TraitClause(#4: Trait<[#4]>, polarity:Positive), bound_vars: [] })
+            Clause(Binder { value: TraitClause(#4: MetaSized, polarity:Positive), bound_vars: [] })
+            Clause(Binder { value: TraitClause(#2: Unsize<[#4]>, polarity:Positive), bound_vars: [] })
 
-                Clause(Binder { value: TraitClause(#1: Trait<[#2]>, polarity:Positive), bound_vars: [] })
-                Clause(Binder { value: TraitClause(#2: Trait<[#2]>, polarity:Positive), bound_vars: [] })
-                Clause(Binder { value: ConstArgHasType(#3, usize), bound_vars: [] })
-                Clause(Binder { value: TraitClause(#1: Sized, polarity:Positive), bound_vars: [] })
-                Clause(Binder { value: TraitClause(#1: Trait<[#4]>, polarity:Positive), bound_vars: [] })
-                Clause(Binder { value: TraitClause(#4: Trait<[#4]>, polarity:Positive), bound_vars: [] })
-                Clause(Binder { value: TraitClause(#2: Unsize<[#4]>, polarity:Positive), bound_vars: [] })
+            Clause(Binder { value: TraitClause(#1: Trait<[#2]>, polarity:Positive), bound_vars: [] })
+            Clause(Binder { value: TraitClause(#2: Trait<[#2]>, polarity:Positive), bound_vars: [] })
+            Clause(Binder { value: ConstArgHasType(#3, usize), bound_vars: [] })
+            Clause(Binder { value: TraitClause(#1: Sized, polarity:Positive), bound_vars: [] })
+            Clause(Binder { value: TraitClause(#2: MetaSized, polarity:Positive), bound_vars: [] })
+            Clause(Binder { value: TraitClause(#1: Trait<[#4]>, polarity:Positive), bound_vars: [] })
+            Clause(Binder { value: TraitClause(#4: Trait<[#4]>, polarity:Positive), bound_vars: [] })
+            Clause(Binder { value: TraitClause(#4: MetaSized, polarity:Positive), bound_vars: [] })
+            Clause(Binder { value: TraitClause(#2: Unsize<[#4]>, polarity:Positive), bound_vars: [] })
 
-            "#]],
+        "#]],
     );
 }

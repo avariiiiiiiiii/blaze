@@ -197,10 +197,6 @@ fn expr_macro_def_expanded_in_various_places() {
             39..442 '{     ...!(); }': !
             73..94 'spam!(...am!())': {unknown}
             100..119 'for _ ...!() {}': !
-            100..119 'for _ ...!() {}': {unknown}
-            100..119 'for _ ...!() {}': &'? mut {unknown}
-            100..119 'for _ ...!() {}': fn next<{unknown}>(&'? mut {unknown}) -> Option<<{unknown} as Iterator>::Item>
-            100..119 'for _ ...!() {}': Option<<{unknown} as Iterator>::Item>
             100..119 'for _ ...!() {}': ()
             100..119 'for _ ...!() {}': ()
             100..119 'for _ ...!() {}': ()
@@ -208,6 +204,10 @@ fn expr_macro_def_expanded_in_various_places() {
             104..105 '_': {unknown}
             109..116 'spam!()': fn into_iter<isize>(isize) -> <isize as IntoIterator>::IntoIter
             109..116 'spam!()': <isize as IntoIterator>::IntoIter
+            109..116 'spam!()': {unknown}
+            109..116 'spam!()': &'? mut {unknown}
+            109..116 'spam!()': fn next<{unknown}>(&'? mut {unknown}) -> Option<<{unknown} as Iterator>::Item>
+            109..116 'spam!()': Option<<{unknown} as Iterator>::Item>
             117..119 '{}': ()
             124..134 '|| spam!()': impl Fn() -> isize
             140..156 'while ...!() {}': !
@@ -291,10 +291,6 @@ fn expr_macro_rules_expanded_in_various_places() {
             53..456 '{     ...!(); }': !
             87..108 'spam!(...am!())': {unknown}
             114..133 'for _ ...!() {}': !
-            114..133 'for _ ...!() {}': {unknown}
-            114..133 'for _ ...!() {}': &'? mut {unknown}
-            114..133 'for _ ...!() {}': fn next<{unknown}>(&'? mut {unknown}) -> Option<<{unknown} as Iterator>::Item>
-            114..133 'for _ ...!() {}': Option<<{unknown} as Iterator>::Item>
             114..133 'for _ ...!() {}': ()
             114..133 'for _ ...!() {}': ()
             114..133 'for _ ...!() {}': ()
@@ -302,6 +298,10 @@ fn expr_macro_rules_expanded_in_various_places() {
             118..119 '_': {unknown}
             123..130 'spam!()': fn into_iter<isize>(isize) -> <isize as IntoIterator>::IntoIter
             123..130 'spam!()': <isize as IntoIterator>::IntoIter
+            123..130 'spam!()': {unknown}
+            123..130 'spam!()': &'? mut {unknown}
+            123..130 'spam!()': fn next<{unknown}>(&'? mut {unknown}) -> Option<<{unknown} as Iterator>::Item>
+            123..130 'spam!()': Option<<{unknown} as Iterator>::Item>
             131..133 '{}': ()
             138..148 '|| spam!()': impl Fn() -> isize
             154..170 'while ...!() {}': !
@@ -686,7 +686,7 @@ fn infer_builtin_macros_line() {
         }
         "#,
         expect![[r#"
-            !0..4 '0u32': u32
+            !0..4 '5u32': u32
             63..87 '{     ...!(); }': ()
             73..74 'x': u32
         "#]],
@@ -724,7 +724,7 @@ fn infer_builtin_macros_column() {
         }
         "#,
         expect![[r#"
-            !0..4 '0u32': u32
+            !0..5 '13u32': u32
             65..91 '{     ...!(); }': ()
             75..76 'x': u32
         "#]],

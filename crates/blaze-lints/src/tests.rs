@@ -2,7 +2,7 @@
 //! diagnostics compared with what clippy writes of the same source.
 
 use base_db::{Db, FileId};
-use blaze_diagnostics::emit::{self, Sources, Style};
+use blaze_diagnostics::emit::{Sources, Style};
 use rustc_hash::FxHashMap;
 use hir_expand::fixture;
 
@@ -108,10 +108,10 @@ fn lint_once(fixture: &str, flags: &str, conf: Conf) -> String {
         let setup = Setup { command_line: CommandLine::parse(&flags).expect("the flags read"), conf };
         let name_of = |file: FileId| names.get(&file).cloned();
         let found = check(&db, krate, &setup, &name_of).expect("every file of the crates is named");
-        let sources = Sources::of(texts);
-        found
-            .iter()
-            .map(|it| emit::written(&it.diagnostic, &sources, Style::default()))
+        let mut sources = Sources::of(texts);
+        crate::serve::written(found.iter(), &mut sources, |_| None, Style::default())
+            .into_iter()
+            .map(|it| it.rendered)
             .collect()
     })
 }
@@ -191,7 +191,6 @@ fn f() {{
           |     ^^^^^^^^^^^^^^^^^^^^^^^^
           |
           = help: for further information visit https://rust-lang.github.io/rust-clippy/main/index.html#bool_assert_comparison
-          = note: `#[warn(clippy::bool_assert_comparison)]` on by default
         help: replace it with `assert!(..)`
           |
         3 -     assert_ne!(1 > 0, false);
@@ -233,7 +232,6 @@ fn f(s: &str, n: i32, m: &mut i32) {{
           |                           ^^^ help: remove the redundant `&`: `n`
           |
           = help: for further information visit https://rust-lang.github.io/rust-clippy/main/index.html#useless_borrows_in_formatting
-          = note: `#[warn(clippy::useless_borrows_in_formatting)]` on by default
 
         warning: redundant reference in `print!` argument
          --> src/lib.rs:3:22
@@ -242,7 +240,6 @@ fn f(s: &str, n: i32, m: &mut i32) {{
           |                      ^^ help: remove the redundant `&`: `n`
           |
           = help: for further information visit https://rust-lang.github.io/rust-clippy/main/index.html#useless_borrows_in_formatting
-          = note: `#[warn(clippy::useless_borrows_in_formatting)]` on by default
 
         warning: redundant reference in `print!` argument
          --> src/lib.rs:3:26
@@ -251,7 +248,6 @@ fn f(s: &str, n: i32, m: &mut i32) {{
           |                          ^^^^^^^ help: remove the redundant `&`: `5usize`
           |
           = help: for further information visit https://rust-lang.github.io/rust-clippy/main/index.html#useless_borrows_in_formatting
-          = note: `#[warn(clippy::useless_borrows_in_formatting)]` on by default
 
         warning: redundant reference in `print!` argument
          --> src/lib.rs:4:18
@@ -260,7 +256,6 @@ fn f(s: &str, n: i32, m: &mut i32) {{
           |                  ^^^^^^^ help: remove the redundant `&mut`: `*m`
           |
           = help: for further information visit https://rust-lang.github.io/rust-clippy/main/index.html#useless_borrows_in_formatting
-          = note: `#[warn(clippy::useless_borrows_in_formatting)]` on by default
 
         warning: redundant reference in `print!` argument
          --> src/lib.rs:6:27
@@ -269,7 +264,6 @@ fn f(s: &str, n: i32, m: &mut i32) {{
           |                           ^^^^ help: remove the redundant `&`: `(n)`
           |
           = help: for further information visit https://rust-lang.github.io/rust-clippy/main/index.html#useless_borrows_in_formatting
-          = note: `#[warn(clippy::useless_borrows_in_formatting)]` on by default
 
     "#]].assert_eq(&lint(&fixture, ""));
 }
@@ -311,7 +305,6 @@ fn f(a: I<'_>, b: I<'_>, c: I<'_>) {{
            |             ^^^^^^^^^^^^^ help: consider calling the dedicated `copied` method: `b.copied()`
            |
            = help: for further information visit https://rust-lang.github.io/rust-clippy/main/index.html#map_clone
-           = note: `#[warn(clippy::map_clone)]` on by default
 
         warning: you are using an explicit closure for copying elements
           --> src/lib.rs:11:13
@@ -320,7 +313,6 @@ fn f(a: I<'_>, b: I<'_>, c: I<'_>) {{
            |             ^^^^^^^^^^^^^^^^^^^^ help: consider calling the dedicated `copied` method: `c.copied()`
            |
            = help: for further information visit https://rust-lang.github.io/rust-clippy/main/index.html#map_clone
-           = note: `#[warn(clippy::map_clone)]` on by default
 
         warning: using `clone` on type `u8` which implements the `Copy` trait
           --> src/lib.rs:11:23
@@ -383,7 +375,6 @@ fn f(x: Option<u8>) -> (bool, bool, bool) {{
           |             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
           |
           = help: for further information visit https://rust-lang.github.io/rust-clippy/main/index.html#match_like_matches_macro
-          = note: `#[warn(clippy::match_like_matches_macro)]` on by default
         help: use `matches!` directly
           |
         6 -     let b = if let Some(1) = x { false } else { true };
@@ -508,7 +499,6 @@ fn f(x: bool) -> u8 {{
           |         ^^^^^^^^
           |
           = help: for further information visit https://rust-lang.github.io/rust-clippy/main/index.html#needless_return
-          = note: `#[warn(clippy::needless_return)]` on by default
         help: remove `return`
           |
         5 -         return 2;

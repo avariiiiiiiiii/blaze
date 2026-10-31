@@ -529,16 +529,17 @@ def migrate_manifest(text: str) -> tuple[str, list[Left]]:
 
 
 def ported(rel: str) -> bool:
-    """Whether the port reads `rel` (relative to its crate): its manifest, its Rust sources and
-    the parser's expected trees of them."""
+    """Whether the port reads `rel` (relative to its crate): its manifest, its Rust sources, the
+    parser's expected trees of them and the tests' expected files (`expect_file!`), which print
+    query ids."""
     parts = rel.split("/")
-    return "target" not in parts and (rel == "Cargo.toml" or rel.endswith((".rs", ".rast")))
+    return "target" not in parts and (rel == "Cargo.toml" or rel.endswith((".rs", ".rast", ".txt")))
 
 
 def mechanical(rel: str, text: str) -> tuple[str, list[Left]]:
     if rel.endswith("Cargo.toml"):
         return migrate_manifest(text)
-    if rel.endswith(".rast"):
+    if rel.endswith((".rast", ".txt")):
         return text, []
     result = migrate(text)
     return result.text, result.left

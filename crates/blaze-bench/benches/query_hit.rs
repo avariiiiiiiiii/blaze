@@ -1,6 +1,6 @@
 //! The front end's query database, `blaze_query::db`, on its hot paths (`db/*`;
-//! docs/v2/plan/lanes/db/query-unify.md, "How it is measured"; the numbers are in
-//! docs/v2/plan/lanes/db/speed-of-light.md):
+//! docs/v2/plan/lanes/db/query-unify.md, "How it is measured"). The numbers, and those of the
+//! fork it replaced on the same shapes, are in docs/v2/plan/lanes/db/speed-of-light.md:
 //!
 //! - `hit/*`: a warm hit of a function of one interned ID returning `u64`, over [`KEYS`] keys,
 //!   in order and scattered, one hit an iteration;
@@ -35,10 +35,6 @@ const LAYERS: usize = 64;
 const WIDTH: usize = 1024;
 const FAN: usize = EDGES;
 const LEAVES: usize = 4;
-/// Writes a database takes before `verify/deep_unrelated` builds it again: each write opens a
-/// view, and `blaze_query::db` has 2^28 of them, which a run of tens of ns an iteration spends
-/// in seconds.
-const REBUILD: u32 = 1 << 24;
 
 const _: () = assert!(LAYERS * WIDTH * FAN == 1 << 20);
 
@@ -257,7 +253,6 @@ mod engine {
         top: Node,
         other: Other,
         tick: u32,
-        runs: u32,
         pub(crate) expected: u64,
     }
 
@@ -275,14 +270,10 @@ mod engine {
             let _ = Graph::builder(leaves, nodes).durability(Durability::MEDIUM).new(&mut db);
             let other = Other::builder(0).durability(Durability::MEDIUM).new(&db);
             let expected = node(&db, top);
-            Deep { db, top, other, tick: 0, runs: 0, expected }
+            Deep { db, top, other, tick: 0, expected }
         }
 
         pub(crate) fn run(&mut self) -> u64 {
-            if self.runs == super::REBUILD {
-                *self = Deep::new();
-            }
-            self.runs += 1;
             self.tick ^= 1;
             self.other.set_value(&mut self.db).with_durability(Durability::MEDIUM).to(self.tick);
             node(&self.db, self.top)

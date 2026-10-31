@@ -140,6 +140,14 @@ class MethodName(unittest.TestCase):
         self.assertEqual(out.text, 'expect!["Modules::module", "TraitImpls::for_crate", "a_"];\n')
 
 
+class Files(unittest.TestCase):
+    def test_expected_files_are_hand_edits_only(self) -> None:
+        self.assertTrue(s.ported("src/view_tests/walks.txt"))
+        self.assertFalse(s.ported("target/debug/x.txt"))
+        text = 'use salsa::Id;\n"Modules < \'db >::module_"\n'
+        self.assertEqual(s.mechanical("src/tests/x.txt", text), (text, []))
+
+
 class Replay(unittest.TestCase):
     def check(self, before: str, after: str) -> None:
         edits = s.hand_edits(before, after)

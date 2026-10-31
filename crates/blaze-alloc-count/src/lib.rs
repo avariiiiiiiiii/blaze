@@ -17,10 +17,16 @@
 //!
 //! Counts are per thread, so tests running in parallel don't see each other's allocations.
 //! Work a closure hands to other threads is not counted; measure on the thread that does it.
+//!
+//! With `BLAZE_ALLOC_TRACE=1`, each counted allocation also keeps a backtrace, and a failing
+//! [`assert_at_most`] prints where every one of them came from.
 
 use std::{
     alloc::{GlobalAlloc, Layout, System},
-    cell::Cell,
+    backtrace::Backtrace,
+    cell::{Cell, RefCell},
+    fmt::Write as _,
+    sync::OnceLock,
 };
 
 /// The system allocator, counting each thread's allocations while [`measure`] runs on it.
@@ -42,15 +48,47 @@ thread_local! {
     static ALLOCATIONS: Cell<u64> = const { Cell::new(0) };
     static BYTES: Cell<u64> = const { Cell::new(0) };
     static LARGEST: Cell<u64> = const { Cell::new(0) };
+    static TRACING: Cell<bool> = const { Cell::new(false) };
+    // Set while this crate allocates for itself (a backtrace, the trace list, reading the
+    // environment): those allocations are neither counted nor traced.
+    static OWN: Cell<bool> = const { Cell::new(false) };
+    static TRACES: RefCell<Vec<(usize, Backtrace)>> = const { RefCell::new(Vec::new()) };
+}
+
+static TRACE: OnceLock<bool> = OnceLock::new();
+
+#[cfg(test)]
+fn forced() -> bool {
+    tests::FORCE_TRACE.with(Cell::get)
+}
+
+#[cfg(not(test))]
+fn forced() -> bool {
+    false
+}
+
+/// Runs `f` with [`OWN`] set, so what it allocates is this crate's and not the measured code's.
+fn own<R>(f: impl FnOnce() -> R) -> R {
+    let was = OWN.with(|own| own.replace(true));
+    let result = f();
+    OWN.with(|own| own.set(was));
+    result
 }
 
 #[inline]
 fn record(size: usize) {
     // `try_with`: a thread being torn down may allocate after its locals are gone.
-    if ON.try_with(Cell::get).unwrap_or(false) {
-        let _ = ALLOCATIONS.try_with(|c| c.set(c.get() + 1));
-        let _ = BYTES.try_with(|c| c.set(c.get() + size as u64));
-        let _ = LARGEST.try_with(|c| c.set(c.get().max(size as u64)));
+    if OWN.try_with(Cell::get).unwrap_or(true) || !ON.try_with(Cell::get).unwrap_or(false) {
+        return;
+    }
+    let _ = ALLOCATIONS.try_with(|c| c.set(c.get() + 1));
+    let _ = BYTES.try_with(|c| c.set(c.get() + size as u64));
+    let _ = LARGEST.try_with(|c| c.set(c.get().max(size as u64)));
+    if TRACING.try_with(Cell::get).unwrap_or(false) {
+        own(|| {
+            let trace = Backtrace::force_capture();
+            let _ = TRACES.try_with(|traces| traces.borrow_mut().push((size, trace)));
+        });
     }
 }
 
@@ -89,14 +127,53 @@ unsafe impl GlobalAlloc for Counting {
 /// Runs `f` and returns what it allocated on this thread. Measurements nest: an inner one
 /// counts only its own closure, and the outer one includes it.
 pub fn measure<R>(f: impl FnOnce() -> R) -> (R, Used) {
-    let was_on = ON.with(|on| on.replace(true));
+    let (result, used, _) = measure_traced(f);
+    (result, used)
+}
+
+/// [`measure`], and where this measurement's traces start in [`TRACES`].
+fn measure_traced<R>(f: impl FnOnce() -> R) -> (R, Used, usize) {
+    let tracing = own(|| {
+        *TRACE.get_or_init(|| std::env::var_os("BLAZE_ALLOC_TRACE").is_some_and(|v| v == "1"))
+    }) || forced();
+    let was_on = ON.with(|on| on.get());
+    let start = own(|| {
+        TRACES.with(|traces| {
+            let mut traces = traces.borrow_mut();
+            // An outermost measurement drops the traces the last one kept.
+            if !was_on {
+                traces.clear();
+            }
+            traces.len()
+        })
+    });
+    let was_tracing = TRACING.with(|t| t.replace(tracing));
+    ON.with(|on| on.set(true));
     let outer_largest = LARGEST.with(|c| c.replace(0));
     let before = (ALLOCATIONS.with(Cell::get), BYTES.with(Cell::get));
     let result = f();
     let after = (ALLOCATIONS.with(Cell::get), BYTES.with(Cell::get));
     let largest = LARGEST.with(|c| c.replace(outer_largest.max(c.get())));
     ON.with(|on| on.set(was_on));
-    (result, Used { allocations: after.0 - before.0, bytes: after.1 - before.1, largest })
+    TRACING.with(|t| t.set(was_tracing));
+    (result, Used { allocations: after.0 - before.0, bytes: after.1 - before.1, largest }, start)
+}
+
+/// Where each allocation traced since `start` came from, or how to see it.
+fn traces_since(start: usize) -> String {
+    own(|| {
+        TRACES.with(|traces| {
+            let traces = traces.borrow();
+            if traces.len() <= start {
+                return "\n(set BLAZE_ALLOC_TRACE=1 for a backtrace of each allocation)".to_owned();
+            }
+            let mut out = String::new();
+            for (n, (size, trace)) in traces[start..].iter().enumerate() {
+                let _ = write!(out, "\nallocation {} ({size} bytes):\n{trace}", n + 1);
+            }
+            out
+        })
+    })
 }
 
 /// Whether this binary's global allocator is [`Counting`]: without it every measurement is
@@ -109,13 +186,15 @@ pub fn installed() -> bool {
 /// Asserts `f` makes at most `max` allocations on this thread, naming `what` when it doesn't.
 #[track_caller]
 pub fn assert_at_most<R>(max: u64, what: &str, f: impl FnOnce() -> R) -> R {
-    let (result, used) = measure(f);
-    assert!(
-        used.allocations <= max,
-        "{what}: {} allocations ({} bytes), budget {max}",
-        used.allocations,
-        used.bytes
-    );
+    let (result, used, start) = measure_traced(f);
+    if used.allocations > max {
+        panic!(
+            "{what}: {} allocations ({} bytes), budget {max}{}",
+            used.allocations,
+            used.bytes,
+            traces_since(start)
+        );
+    }
     result
 }
 
@@ -125,6 +204,51 @@ mod tests {
 
     #[global_allocator]
     static ALLOC: Counting = Counting;
+
+    thread_local! {
+        // `BLAZE_ALLOC_TRACE` for this thread alone: setting the variable would reach every test.
+        pub(super) static FORCE_TRACE: Cell<bool> = const { Cell::new(false) };
+    }
+
+    #[test]
+    fn a_traced_failure_names_where_each_allocation_came_from() {
+        FORCE_TRACE.with(|f| f.set(true));
+        let failed = std::panic::catch_unwind(|| {
+            assert_at_most(0, "two boxes", || (Box::new(1u8), Box::new([0u8; 40])));
+        });
+        FORCE_TRACE.with(|f| f.set(false));
+        let message =
+            *failed.expect_err("over budget").downcast::<String>().expect("a formatted panic");
+        assert!(message.starts_with("two boxes: 2 allocations (41 bytes), budget 0"), "{message}");
+        assert!(message.contains("allocation 1 (1 bytes):\n"), "{message}");
+        assert!(message.contains("allocation 2 (40 bytes):\n"), "{message}");
+        assert!(
+            message.contains("a_traced_failure_names_where_each_allocation_came_from"),
+            "{message}"
+        );
+    }
+
+    #[test]
+    fn tracing_counts_only_what_is_measured() {
+        FORCE_TRACE.with(|f| f.set(true));
+        let (_, used) = measure(|| Box::new(7u32));
+        FORCE_TRACE.with(|f| f.set(false));
+        assert_eq!(used.allocations, 1, "the backtrace and the trace list are not counted");
+    }
+
+    #[test]
+    fn an_untraced_failure_says_how_to_trace() {
+        let failed = std::panic::catch_unwind(|| assert_at_most(0, "a box", || Box::new(1u8)));
+        if TRACE.get() == Some(&true) {
+            return;
+        }
+        let message =
+            *failed.expect_err("over budget").downcast::<String>().expect("a formatted panic");
+        assert!(
+            message.ends_with("(set BLAZE_ALLOC_TRACE=1 for a backtrace of each allocation)"),
+            "{message}"
+        );
+    }
 
     #[test]
     fn counts_only_inside_measure() {

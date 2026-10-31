@@ -266,7 +266,12 @@ fn lower_file(
 
     for error in parser_errors {
         // alloc: the error's text, for an error hir found
-        let (diag, recovered) = f.parser_error(&error.to_string(), error.range().start());
+        let message = error.to_string();
+        if let Some(missing) = f.missing_item_type(&message, error.range().start()) {
+            found.extend(missing);
+            continue;
+        }
+        let (diag, recovered) = f.parser_error(&message, error.range().start());
         found.push(Found::new(diag, Phase::Parse));
         if !recovered {
             return Outcome::GaveUp;
@@ -730,6 +735,46 @@ impl<'a, 'c, 'db> File<'a, 'c, 'db> {
                 (Diag::error(None, msg, self.at(at)), false)
             }
         }
+    }
+
+    /// rustc's `recover_missing_global_item_type`, which recovers: its error is stashed and
+    /// written as item collection takes it back (`infer_placeholder_type`). An item with no
+    /// body keeps the parser's suggestion, its type being an error; of one with a body rustc
+    /// suggests the type it infers, which blaze does not give here, and says so.
+    fn missing_item_type(&self, msg: &str, pos: TextSize) -> Option<Vec<Found>> {
+        let keyword = match msg {
+            "missing type for `const`" => "const",
+            "missing type for `static`" => "static",
+            _ => return None,
+        };
+        let (prev, next) = self.around(pos);
+        let prev = prev.expect("the parser reports a missing type after the item's name");
+        let before = &self.toks[..self.toks.partition_point(|it| it.range.end() <= pos)];
+        let at = before
+            .iter()
+            .rposition(|&it| self.is_ident_named(Some(it), keyword))
+            .expect("the parser reports a missing type in a `const` or `static` item");
+        let mutable =
+            keyword == "static" && self.is_ident_named(before.get(at + 1).copied(), "mut");
+        let kind = if mutable { "static mut" } else { keyword };
+        let span = self.at(TextRange::empty(prev.range.end()));
+        // alloc: the error's text, for an error hir found
+        let mut diag = Diag::error(None, format!("missing type for `{kind}` item"), span.clone());
+        if next.is_some_and(|it| self.src(it) == "=") {
+            // alloc: the error's text, for an error hir found
+            let message = format!(
+                "blaze: rustc suggests the type it infers for this `{kind}` item, which blaze does not infer here"
+            );
+            // alloc: the errors found
+            return Some(vec![
+                Found::new(diag, Phase::Items),
+                Found::new(Diag::error(None, message, span), Phase::Items),
+            ]);
+        }
+        let placeholders = Applicability::HasPlaceholders;
+        diag.suggestion_verbose(span, "provide a type for the item", ": <type>", placeholders);
+        // alloc: the error found
+        Some(vec![Found::new(diag, Phase::Items)])
     }
 
     /// rustc's `expected_one_of_not_found` of one expected token, with its recovery of a

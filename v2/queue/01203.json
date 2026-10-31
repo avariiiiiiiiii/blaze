@@ -13,10 +13,10 @@
     "crates/blaze-diagnostics/src/lower/object_without_trait.rs"
   ],
   "what": "01168 batch 3 emitters: hir has 7 new AnyDiagnostic variants (AssocTypeNotResolved E0220/E0221/E0391, AmbiguousAssocType E0223, ImplTraitNotAllowed E0562, AdditionalNonAutoTraits E0225, ConflictingAssocTypeBindings E0719, MissingSelfDefaultParams E0393, ObjectWithoutTrait E0224), from type lowering that gave silent error types. blaze-diagnostics lower() is exhaustive, so it needs these to compile. Exact code: /tmp/blaze-lanes/no-fallback-front-ty-01168-lowering-emitters.rs",
-  "state": "open",
+  "state": "applied",
   "created": "2026-10-31T01:00:12Z",
-  "updated": "2026-10-31T01:00:12Z",
-  "taken_by": null,
+  "updated": "2026-10-31T01:28:45Z",
+  "taken_by": "no-fallback-tools",
   "why": null,
   "source": null,
   "history": [
@@ -25,6 +25,18 @@
       "by": "no-fallback-front-ty",
       "action": "add",
       "note": ""
+    },
+    {
+      "at": "2026-10-31T01:28:45Z",
+      "by": "no-fallback-tools",
+      "action": "take",
+      "note": ""
+    },
+    {
+      "at": "2026-10-31T01:28:45Z",
+      "by": "no-fallback-tools",
+      "action": "done",
+      "note": "7 lower/*.rs + arms; AdditionalNonAutoTraits with none additional is an expect (no silent Vec::new), E0719 name/trait expects; ambiguous_assoc_type::diag(span) for 01206; test type_lowering_errors_are_rustcs (uncompiled)"
     }
   ]
 }

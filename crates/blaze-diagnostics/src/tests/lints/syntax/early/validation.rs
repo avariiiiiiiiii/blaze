@@ -395,7 +395,7 @@ LL | unsafe extern "C" {
 error: aborting due to 2 previous errors
 
 "#;
-    assert_eq!(ui("safe-unsafe-on-unadorned-extern-block.rs", "2021", source), stderr);
+    assert_eq!(crate::tests::items::ui_core("safe-unsafe-on-unadorned-extern-block.rs", "2021", "copy", source), stderr);
 }
 
 #[test]

@@ -3,6 +3,7 @@
 //! rustdoc's layout: a path shows its last segment, bounds on a parameter stay by it, other
 //! predicates go to a `where` clause, a long parameter list breaks one parameter to a line.
 
+use base_db::Db;
 use hir::{HasVisibility, ModuleDef};
 use hir_def::{
     AdtId, ExpressionStoreOwnerId, FunctionId, GenericDefId, ImplId, ItemContainerId, TraitId,
@@ -32,7 +33,6 @@ use hir_def::{
     },
     visibility::Visibility,
 };
-use base_db::Db;
 use syntax::view::{self as ast, AstNode, HasName};
 
 use crate::{
@@ -1186,12 +1186,7 @@ fn attributes(db: &Db, out: &mut Code, adt: AdtId) {
     }
 }
 
-pub(crate) fn trait_header(
-    db: &Db,
-    places: Linking<'_>,
-    it: hir::Trait,
-    out: &mut Code,
-) -> Code {
+pub(crate) fn trait_header(db: &Db, places: Linking<'_>, it: hir::Trait, out: &mut Code) -> Code {
     let id: TraitId = it.into();
     let data = TraitSignature::of(db, id);
     visibility(db, out, it.visibility(db), it.module(db));
@@ -1276,11 +1271,7 @@ pub(crate) struct Aliased {
     where_clause: Code,
 }
 
-pub(crate) fn aliased(
-    db: &Db,
-    places: Linking<'_>,
-    it: hir::TypeAlias,
-) -> Option<Aliased> {
+pub(crate) fn aliased(db: &Db, places: Linking<'_>, it: hir::TypeAlias) -> Option<Aliased> {
     let id: TypeAliasId = it.into();
     let data = TypeAliasSignature::of(db, id);
     let TypeRef::Path(path) = data.store.type_ref(data.ty?) else { return None };
@@ -1361,11 +1352,7 @@ fn head(
 }
 
 /// The type an alias stands for: `[u8]` of `type Target = [u8];`.
-pub(crate) fn alias_type(
-    db: &Db,
-    places: Linking<'_>,
-    it: hir::TypeAlias,
-) -> Option<Code> {
+pub(crate) fn alias_type(db: &Db, places: Linking<'_>, it: hir::TypeAlias) -> Option<Code> {
     let id: TypeAliasId = it.into();
     let data = TypeAliasSignature::of(db, id);
     let mut out = Code::default();

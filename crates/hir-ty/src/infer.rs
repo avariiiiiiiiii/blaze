@@ -803,7 +803,7 @@ pub enum StructPathFound {
 }
 
 /// The kind of item `StructPathFound::Def` names, as rustc's `Res::descr` words it.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum StructPathDef {
     Enum,
     Struct,

@@ -32,7 +32,8 @@ pub(crate) fn lower<'db>(cx: &Cx<'_, 'db>, d: &hir::CannotIndexInto<'db>) -> Vec
         Some(at(TextRange::new(open, close)))
     });
     let brackets = brackets.unwrap_or_else(|| cx.span_of_ptr(d.expr));
-    let ty = cx.ty(&d.found);
+    // clone: the type as rustc prints it, for an error hir found
+    let ty = d.at_error.clone().unwrap_or_else(|| cx.ty(&d.found));
     let message = format!("cannot index into a value of type `{ty}`"); // alloc: the error's message
     let mut diag = Diag::error(Some("E0608"), message, brackets.clone()); // clone: the error's span
 

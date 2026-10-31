@@ -49,8 +49,11 @@ pub(crate) fn lower<'db>(
         .map_or_else(|| whole.clone(), |it| at(it.text_range())); // clone: the error's span
     let lhs_span = lhs_expr.map(|it| at(it.syntax().text_range()));
     let rhs_span = rhs_expr.map(|it| at(it.syntax().text_range()));
-    let lhs = cx.ty(&d.lhs);
-    let rhs = cx.ty(&d.rhs);
+    // clone: the types as rustc prints them as it reports, before integer fallback
+    let (lhs, rhs) = match &d.at_error {
+        Some((lhs, rhs)) => (lhs.clone(), rhs.clone()),
+        None => (cx.ty(&d.lhs), cx.ty(&d.rhs)),
+    };
     let op_str = d.op.to_string(); // alloc: the operator, for the error's message
     let trait_ = lang_item(d.op).and_then(|it| hir::Trait::lang(cx.db, cx.krate, it));
     let assign = matches!(d.op, BinaryOp::Assignment { .. });

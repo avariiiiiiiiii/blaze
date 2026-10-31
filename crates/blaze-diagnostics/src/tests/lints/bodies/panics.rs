@@ -9,7 +9,7 @@ fn ui(name: &str, source: &str) -> String {
 /// [`ui`] with core's indexing, unsizing and negation, which rustc's type check reaches only
 /// through their lang items, as the UI test has them from std.
 fn ui_core(name: &str, source: &str) -> String {
-    const FLAGS: &str = "sized, unsize, coerce_unsized, index, slice, unary_ops, builtin_impls";
+    const FLAGS: &str = "sized, copy, unsize, coerce_unsized, index, slice, unary_ops, builtin_impls";
     crate::tests::items::ui_core(name, "2015", FLAGS, source)
 }
 

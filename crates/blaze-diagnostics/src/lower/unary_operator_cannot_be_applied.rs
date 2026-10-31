@@ -31,7 +31,8 @@ pub(crate) fn lower<'db>(
         ast::UnaryOp::Deref => ("*", None),
     };
     let span = cx.span_of_ptr(d.expr);
-    let ty = cx.ty(&d.found);
+    // clone: the type as rustc prints it, for an error hir found
+    let ty = d.at_error.clone().unwrap_or_else(|| cx.ty(&d.found));
     let mut diag = Diag::error(
         Some("E0600"),
         // alloc: the error's text, for an error hir found

@@ -129,8 +129,25 @@ pub(crate) enum Mode {
 }
 
 pub(crate) fn ui_as(mode: Mode, name: &str, edition: &str, source: &str, options: &Options) -> String {
-    let fixture = format!("//- /{name} crate:other:main edition:{edition}\n{source}");
-    let stderr = checked_with(&fixture, "$DIR/", &compiletest(mode, options))
+    ui_fixture_as(mode, &format!("//- /{name} crate:other:main edition:{edition}\n{source}"), options)
+}
+
+/// [`ui_as`] beside core, minicore with `flags` (`crates/test-utils/src/minicore.rs`): what of
+/// rustc's core the test reaches, `copy` for a value of a primitive used twice.
+pub(crate) fn ui_core_as(
+    mode: Mode,
+    name: &str,
+    edition: &str,
+    flags: &str,
+    source: &str,
+    options: &Options,
+) -> String {
+    let fixture = format!("//- minicore: {flags}\n//- /{name} crate:other:main edition:{edition}\n{source}");
+    ui_fixture_as(mode, &fixture, options)
+}
+
+fn ui_fixture_as(mode: Mode, fixture: &str, options: &Options) -> String {
+    let stderr = checked_with(fixture, "$DIR/", &compiletest(mode, options))
         .stderr_with(Style { ui_testing: true, ..Style::default() });
     normalized(&stderr)
 }

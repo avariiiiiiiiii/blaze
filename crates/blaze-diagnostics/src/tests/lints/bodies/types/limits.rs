@@ -4,8 +4,11 @@
 
 use super::{Ui, ui};
 
+/// rustc's core as far as the tests reach it: primitives that are `Copy`, and `-` of a signed
+/// integer or a float through `Neg`.
 fn check(name: &str, flags: &[&str], source: &str, stderr: &str) {
-    let actual = ui(Ui { name, flags, source, ..Ui::default() });
+    const CORE: &str = "copy, unary_ops, builtin_impls";
+    let actual = ui(Ui { name, core: CORE, flags, source, ..Ui::default() });
     assert_eq!(actual, stderr, "{name}");
 }
 

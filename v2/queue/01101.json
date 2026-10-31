@@ -6,10 +6,10 @@
     "crates/blaze-graph/"
   ],
   "what": "Main #1539/#1568 (a worker admits its program builds by the memory budget; one not yet measured runs alone) had its home in the deleted blaze-engine admit.rs; v2 home is blaze-graph plane admission (admission::Estimates). Check v2 admits program builds (codegen + link of a program) against the budget the same way, so cold builds on CI runners do not OOM.",
-  "state": "open",
+  "state": "taken",
   "created": "2026-10-30T16:46:07Z",
-  "updated": "2026-10-31T14:42:53Z",
-  "taken_by": null,
+  "updated": "2026-10-31T14:43:14Z",
+  "taken_by": "compile-time-sched",
   "why": null,
   "source": null,
   "history": [
@@ -24,6 +24,12 @@
       "by": "coordinator",
       "action": "add",
       "note": "Reassigned from core (no live window) to compile-time-sched, which works in the same paths (Andrew 05:08: an item whose owner has no live window goes to a live lane within the hour)."
+    },
+    {
+      "at": "2026-10-31T14:43:14Z",
+      "by": "compile-time-sched",
+      "action": "take",
+      "note": ""
     }
   ]
 }

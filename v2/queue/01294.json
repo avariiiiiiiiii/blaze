@@ -1,0 +1,29 @@
+{
+  "id": "01294",
+  "from_lane": "query-unify-port",
+  "owner": "query-unify",
+  "paths": [
+    "crates/blaze-query-macros/src/query.rs"
+  ],
+  "what": "FYI, contract question, nothing blocks: blaze-query-macros query.rs:245 requires Hash of the value of every lru query, also with no_eq, where a recomputed value is never compared, so the hash looks unused. qu-check8 hit it on hir-ty-codegen mod.rs inlinable/always_inlinable (no_eq, lru = 0, Option<Inlinable> not Hash). The port dropped their lru = 0 (fork meaning: no cap; nothing evicts them), so this is only a question: should no_eq + lru skip the hash, or should the macro refuse that combination with an error naming it?",
+  "state": "open",
+  "created": "2026-10-31T12:19:48Z",
+  "updated": "2026-10-31T14:49:36Z",
+  "taken_by": null,
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-10-31T12:19:48Z",
+      "by": "query-unify-port",
+      "action": "add",
+      "note": ""
+    },
+    {
+      "at": "2026-10-31T14:49:36Z",
+      "by": "coordinator",
+      "action": "add",
+      "note": "Re-filed from the query-unify-port tree, where it was 01251; blaze-v2 has a different 01251, which the merge kept."
+    }
+  ]
+}

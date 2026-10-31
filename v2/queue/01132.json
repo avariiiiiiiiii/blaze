@@ -9,10 +9,10 @@
     "crates/mbe"
   ],
   "what": "From dedup (one lexer, the modern one): blaze has two copies of rustc's lexer. `crates/rustc_lexer` is compiler/rustc_lexer/src at the pinned nightly's commit (16d1ffac1), re-vendored on every bump by harness/toolchain_bump.py; crates.io `ra-ap-rustc_lexer` 0.166 is an older snapshot. Its only difference (diff -r of the two src/ trees): the nightly lexes `k#ident` as one token, `TokenKind::ForcedKeywordIdent`. The pinned one is the one to keep (superset-of-rust: lex as the pinned nightly). Ask: move the nine users onto `rustc_lexer.workspace = true` (the root line exists) and delete `ra-ap-rustc_lexer` from their manifests: parser (lib.rs `extern crate ra_ap_rustc_lexer as rustc_lexer`, cook.rs, cook/tests.rs, lexed_str.rs, frontmatter.rs), syntax, tt, mbe (yours), and blaze-fmt, blaze-macro-eval (lex.rs, lex/cook.rs), blaze-diagnostics, proc-macro-api (bridge/lex.rs), which dedup will do once your crates have the ForcedKeywordIdent rule (tell dedup). The new variant needs rustc's rule (compiler/rustc_parse/src/lexer/mod.rs at 16d1ffac1, line 243): in edition 2021+ it is an identifier of kind ForcedKeyword named by the text after `k#`, gated by `forced_keywords`; before 2021 the lexer backs up so only `k` was consumed (then `#`, then the identifier) and buffers RUST_2021_PREFIXES_INCOMPATIBLE_SYNTAX. Programs without `#![feature(forced_keywords)]` lex the same either way (2021+ was an unknown prefix error before, a gate error now). `ra-ap-rustc_lexer` stays in the build through `ra-ap-rustc_parse_format` until that is vendored at the nightly too.",
-  "state": "open",
+  "state": "taken",
   "created": "2026-10-30T22:03:17Z",
-  "updated": "2026-10-31T14:42:53Z",
-  "taken_by": null,
+  "updated": "2026-10-31T14:45:40Z",
+  "taken_by": "dedup",
   "why": null,
   "source": null,
   "history": [
@@ -27,6 +27,12 @@
       "by": "coordinator",
       "action": "add",
       "note": "Reassigned from format (no live window) to dedup-next3, which works in the same paths (Andrew 05:08: an item whose owner has no live window goes to a live lane within the hour)."
+    },
+    {
+      "at": "2026-10-31T14:45:40Z",
+      "by": "dedup",
+      "action": "take",
+      "note": ""
     }
   ]
 }

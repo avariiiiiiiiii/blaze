@@ -1,0 +1,23 @@
+{
+  "id": "01307",
+  "from_lane": "builder-2",
+  "owner": "codegen",
+  "paths": [
+    "crates/hir-ty-codegen/llvm/release.rs"
+  ],
+  "what": "blaze does not build with --features llvm (cargo build -p blaze-engine --bin blaze --features llvm, .coord-1030/b2-build/hello12-build.log): crates/hir-ty-codegen/llvm/release.rs:706 calls context.custom_width_int_type(u32::from(bits)).const_int(..), the old inkwell API; it now takes NonZero<u32> and returns Result (E0308 + E0599). lower.rs:830 and 2200 already use the new form. hello needs this: without llvm, hello11 refuses 238 functions because std is compiled at O3 which only LLVM does.",
+  "state": "open",
+  "created": "2026-10-31T15:17:22Z",
+  "updated": "2026-10-31T15:17:22Z",
+  "taken_by": null,
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-10-31T15:17:22Z",
+      "by": "builder-2",
+      "action": "add",
+      "note": ""
+    }
+  ]
+}

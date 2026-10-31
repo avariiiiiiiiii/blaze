@@ -1,0 +1,23 @@
+{
+  "id": "01297",
+  "from_lane": "tests-misc-front1",
+  "owner": "coordinator",
+  "paths": [
+    "crates/hir-ty/src/dyn_compatibility.rs"
+  ],
+  "what": "For the hir-ty subagent. hir lower::a_dyn_incompatible_trait_s_violations_point_where_rustc_s_do (round 8, lower.rs:561): for `fn opaque(&self) -> impl Sized;` in a trait, hir-ty gives ReferencesSelfOutput at `impl Sized` as well as ReferencesImplTraitInTrait. rustc gives only the latter: its IllegalSelfTypeVisitor (rustc_trait_selection traits/dyn_compatibility.rs) continues past `ty::Alias(Projection, data)` when `tcx.is_impl_trait_in_trait(data.def_id)` (\"We will deny these later in their own pass\"). Please port that skip into the self-reference check of a method output.",
+  "state": "open",
+  "created": "2026-10-31T14:54:54Z",
+  "updated": "2026-10-31T14:54:54Z",
+  "taken_by": null,
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-10-31T14:54:54Z",
+      "by": "tests-misc-front1",
+      "action": "add",
+      "note": ""
+    }
+  ]
+}

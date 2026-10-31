@@ -1,0 +1,32 @@
+{
+  "id": "01300",
+  "from_lane": "tests-misc-stencil",
+  "owner": "tests-misc-stencil",
+  "paths": [
+    "crates/blaze-stencil/src/arch/x64",
+    "crates/blaze-stencil/src/arch/aarch64",
+    "crates/blaze-stencil/src/arch.rs",
+    "crates/blaze-stencil/src/patch"
+  ],
+  "what": "blaze-stencil: the `tail` calling convention in the glue on x86-64 and AArch64, as Cranelift 0.137 lowers it (isa/{x64,aarch64}/abi.rs, machinst/abi.rs): its argument registers, callee-popped stack arguments (`ret imm16` on x86-64), every register clobbered across a call, the prologue growing the incoming argument area to tail_args_size, and `return_call`/`return_call_indirect` moving the arguments into that area, restoring the frame and jumping; calls between `tail` and native functions both ways. Until it lands, frame.rs (x86-64) and glue.rs (AArch64) stop naming the `tail` function and the instruction (no fallback). Tests: tests::func::calls::run::return_calls_cross_both_ways and return_calls_grow_and_shrink_stack_arguments, arch::x64::tests::refuses_what_cranelift_refuses (its `tail` case moves to a passing one). Needed by explicit_tail_calls / `become` (superset-of-rust).",
+  "state": "taken",
+  "created": "2026-10-31T14:57:01Z",
+  "updated": "2026-10-31T14:57:30Z",
+  "taken_by": "tests-misc-stencil",
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-10-31T14:57:01Z",
+      "by": "tests-misc-stencil",
+      "action": "add",
+      "note": ""
+    },
+    {
+      "at": "2026-10-31T14:57:30Z",
+      "by": "tests-misc-stencil",
+      "action": "take",
+      "note": ""
+    }
+  ]
+}

@@ -1,0 +1,23 @@
+{
+  "id": "01296",
+  "from_lane": "tests-misc-front1",
+  "owner": "coordinator",
+  "paths": [
+    "crates/hir-def/src/nameres/frozen.rs"
+  ],
+  "what": "Enc::file_name (nameres/frozen.rs) names a file from the crate that owns its source root, taking the first crate of the closure for a source root shared by several (owners.entry(root).or_insert). A build script and its package lib share one source root (so do all fixture crates), so a crate's own root is named from another crate's directory: hir-ty-pure scripts::a_moved_or_reformatted_script_has_the_same_identity (round 8) fails on the `entries` part of main's identity when build.rs moves to tools/gen/build.rs (`build.rs` vs `tools/gen/build.rs`, named from alloc's `/`). Please name the encoded crate's own files from its own root first (krate before the rest of the closure for its source root), as the encode and decode both carry the owner index. For the hir-def lane (query-unify-port-hirdef?).",
+  "state": "open",
+  "created": "2026-10-31T14:54:30Z",
+  "updated": "2026-10-31T14:54:30Z",
+  "taken_by": null,
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-10-31T14:54:30Z",
+      "by": "tests-misc-front1",
+      "action": "add",
+      "note": ""
+    }
+  ]
+}

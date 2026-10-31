@@ -2034,7 +2034,8 @@ A "line" is as in the salsa section: a dependent load, 4.5 cycles from L1, 110 n
 `crates/blaze-bench/benches/query_hit.rs` runs the same query shapes on both engines
 ([query-unify.md](query-unify.md), "How it is measured"); one database type each, functions take
 it concretely (`&Db`), as the front end's do. Run with `cargo bench -p blaze-bench --bench
-query_hit -- solo -t 8` (tango, solo mode). The cases:
+query_hit -- solo -t 8` (blaze-bench's paired runner, which replaced tango with the same
+CLI, in solo mode). The cases:
 
 - **hit**: a tracked function of one interned key (`unsafe(no_lifetime), revisions =
   usize::MAX`, the front end's form) returning `u64`, 64K keys, warm; one hit an iteration, the
@@ -2105,6 +2106,27 @@ says the scattered mean is mostly the load); verify is 9.8 ns a reader by durabi
 
 The run stopped at `db/verify/deep_unrelated`: the engine spent all 2^28 views (one a write)
 within tango's 8 s, about 30 ns an iteration, and `Storage::next_view` panicked, so the last
-three rows are missing on both sides. The view limit is queued to query-unify-engine (01215);
-until it is fixed the case builds its database again every 2^24 writes (`REBUILD`), on both
-engines, so the rebuild lands in one sample and leaves the minimum alone.
+three rows are missing on both sides. The bench then rebuilt the case's database every 2^24
+writes until the engine renumbered its views at the last one (`Storage::next_view`, 01215);
+with that in, the bench asks the engine as it is.
+
+**All nine cases**, the port's run (`qu-bench1`, worktree blaze-v2-qu at `b7c951d585`,
+2026-10-31, the same Mac, loaded): the engine is faster than the fork on every case, by
+minimum and by mean.
+
+| case | salsa min | salsa mean | db min | db mean | db / salsa (min) |
+|---|---|---|---|---|---|
+| hit, sequential | 13.3 ns | 29.4 ns | 3.8 ns | 8.6 ns | 0.29 |
+| hit, scattered | 18.5 ns | 39.9 ns | 4.4 ns | 12.6 ns | 0.24 |
+| hit in query, sequential (64K hits) | 1.5 ms | 4.0 ms | 830 µs | 2.0 ms | 0.55 |
+| hit in query, scattered (64K hits) | 2.1 ms | 5.4 ms | 967 µs | 4.8 ms | 0.46 |
+| verify, other durability | 511 µs | 1.2 ms | 176 µs | 374 µs | 0.34 |
+| verify, same durability | 1.2 ms | 2.0 ms | 628 µs | 808 µs | 0.52 |
+| deep unrelated (1M edges) | 500 ns | 1.3 µs | 28.9 ns | 43.7 ns | 0.06 |
+| interned hit | 10.3 ns | 63.6 ns | 6.1 ns | 16.2 ns | 0.59 |
+| cycle of 8 to fixpoint | 7.4 µs | 18.1 µs | 2.0 µs | 7.0 µs | 0.27 |
+
+The deep case is the transitive-input summary at work: the engine answers a memo over 1M
+edges in 29 ns, one summary test against the view's mask, where the fork's 62-bit closure
+filter takes 500 ns. The fork's half of the bench and its `salsa` dev-dependency are gone
+(2026-10-31, before `vendor/salsa` is deleted); these tables are its record.

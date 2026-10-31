@@ -168,6 +168,18 @@ impl<'src> Lexer<'src> {
                     }
                     token::Ident(sym, IdentKind::Raw)
                 }
+                rustc_lexer::TokenKind::ForcedKeywordIdent if self.edition.at_least_rust_2021() => {
+                    token::Ident(
+                        Symbol::intern(self.str_from(start + BytePos(2))),
+                        IdentKind::ForcedKeyword,
+                    )
+                }
+                // Before 2021 `k#fn` is the identifier `k` followed by `#fn`.
+                rustc_lexer::TokenKind::ForcedKeywordIdent => {
+                    self.pos = start + BytePos(1);
+                    self.cursor = Cursor::new(&str_before[1..], FrontmatterAllowed::No);
+                    self.ident(start)
+                }
                 rustc_lexer::TokenKind::UnknownPrefix => {
                     let prefix = self.str_from(start);
                     if self.edition.at_least_rust_2021() {

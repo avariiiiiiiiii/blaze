@@ -188,13 +188,19 @@ impl<'s, 'e> Lexer<'s, 'e> {
                     }
                     Kind::Ident(sym, IdentKind::Raw)
                 }
-                rustc_lexer::TokenKind::UnknownPrefix => match self.forced_keyword(start) {
-                    Some(kind) => kind,
-                    None => {
-                        self.report_unknown_prefix(start);
-                        self.ident(start)
-                    }
-                },
+                rustc_lexer::TokenKind::ForcedKeywordIdent if self.edition >= Edition::Edition2021 => {
+                    self.emitted.forced_keywords += 1;
+                    Kind::Ident(nfc_normalize(self.str_from(start + 2)), IdentKind::ForcedKeyword)
+                }
+                // Only the `k` is an identifier before 2021.
+                rustc_lexer::TokenKind::ForcedKeywordIdent => {
+                    self.reset_to(start + 1);
+                    self.ident(start)
+                }
+                rustc_lexer::TokenKind::UnknownPrefix => {
+                    self.report_unknown_prefix(start);
+                    self.ident(start)
+                }
                 rustc_lexer::TokenKind::UnknownPrefixLifetime => {
                     self.report_unknown_prefix(start);
                     Kind::Lifetime(Symbol::intern(self.str_from(start)), IdentKind::Normal)
@@ -339,23 +345,6 @@ impl<'s, 'e> Lexer<'s, 'e> {
     fn is_one_confusable(&self, start: u32) -> bool {
         let mut chars = self.str_from(start).chars();
         matches!((chars.next(), chars.next()), (Some(c), None) if is_confusable(c))
-    }
-
-    /// `k#ident`: the pinned `rustc_lexer`'s `ForcedKeywordIdent`, which the lexer crate
-    /// blaze links lexes as the unknown prefix `k`. From 2021 it is a forced keyword; before,
-    /// rustc takes back all but the `k`, which is then an identifier as here.
-    fn forced_keyword(&mut self, start: u32) -> Option<Kind> {
-        if self.str_from(start) != "k" || self.edition < Edition::Edition2021 {
-            return None;
-        }
-        let rest = self.cursor.as_str().strip_prefix('#')?;
-        let mut chars = rest.chars();
-        let first = chars.next().filter(|&c| rustc_lexer::is_id_start(c))?;
-        let ident_len = first.len_utf8()
-            + chars.take_while(|&c| rustc_lexer::is_id_continue(c)).map(char::len_utf8).sum::<usize>();
-        self.reset_to(self.pos + 1 + ident_len as u32);
-        self.emitted.forced_keywords += 1;
-        Some(Kind::Ident(nfc_normalize(self.str_from(start + 2)), IdentKind::ForcedKeyword))
     }
 
     /// `report_unknown_prefix`: an error from 2021, a lint (allowed by default) before.

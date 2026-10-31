@@ -106,6 +106,7 @@ pub trait Spec: 'static {
     const QUERY: &'static str;
     const CAP: usize = 0;
     const EVICT: bool = false;
+    const UNEQUAL: bool = false;
     const CYCLES: CycleKind = CycleKind::Panic;
     fn cache() -> &'static Ingredient;
     fn compute(db: &TestDb, key: Self::Key) -> Self::Value;
@@ -137,7 +138,7 @@ impl<S: Spec> Function for S {
     const FILE: &'static str = file!();
     const LRU: usize = S::CAP;
     const EVICTABLE: bool = S::EVICT;
-    const NO_EQ: bool = false;
+    const NO_EQ: bool = S::UNEQUAL;
     const CYCLE: CycleKind = S::CYCLES;
     const TAG: Tag = Tag::Query;
 
@@ -169,7 +170,7 @@ impl<S: Spec> Function for S {
     }
 
     fn equal(old: &S::Value, new: &S::Value) -> bool {
-        old == new
+        !S::UNEQUAL && old == new
     }
 
     fn hash(value: &S::Value) -> u64 {
@@ -1015,6 +1016,39 @@ fn an_evictable_function_hashes_its_value_only_when_evicted() {
         "the rerun of an evicted row hashes its new value"
     );
     assert_eq!((db.runs("Hashed"), db.runs("HashedReader")), (3, 1));
+}
+
+static UNEQUAL_HASHES: AtomicUsize = AtomicUsize::new(0);
+
+query!(
+    UnequalHashed,
+    u64,
+    |db, key| key.a(db) / 10;
+    const EVICT: bool = true;
+    const UNEQUAL: bool = true;
+    fn hash_value(value: &u64) -> u64 {
+        UNEQUAL_HASHES.fetch_add(1, Ordering::SeqCst);
+        value_hash(value)
+    }
+);
+query!(UnequalReader, u64, |db, key| get::<UnequalHashed>(db, key) + 1);
+
+#[test]
+fn an_evictable_no_eq_function_never_hashes_and_every_rerun_changes() {
+    let mut db = TestDb::new();
+    let cell = Cell::new(&db, 11, 0);
+    assert_eq!(*get::<UnequalReader>(&db, cell), 2);
+    cell.set_a(&mut db, 15);
+    assert_eq!(*get::<UnequalReader>(&db, cell), 2);
+    assert_eq!(evict_values::<UnequalHashed>(&mut db), 1);
+    cell.set_a(&mut db, 12);
+    assert_eq!(*get::<UnequalReader>(&db, cell), 2);
+    assert_eq!(UNEQUAL_HASHES.load(Ordering::SeqCst), 0, "`no_eq`: nothing is hashed");
+    assert_eq!(
+        (db.runs("UnequalHashed"), db.runs("UnequalReader")),
+        (3, 3),
+        "an equal rerun is still a change, evicted or not"
+    );
 }
 
 query!(

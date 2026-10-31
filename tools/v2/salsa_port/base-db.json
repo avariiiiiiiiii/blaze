@@ -1,6 +1,6 @@
 {
  "crate": "crates/base-db",
- "base": "b8c752e457596472d86888086afc758ecfcb8f38",
+ "base": "9023f3e6d7d8a2d1954423c4ccdd89b220701525",
  "files": [
   {
    "path": "crates/base-db/src/db.rs",
@@ -32,6 +32,10 @@
     {
      "old": "    /// [`RunOrder`], it keeps salsa's events while [`Db::log`] runs, and it has empty library\n",
      "new": "    /// [`RunOrder`], it keeps the query engine's events while [`Db::log`] runs, and it has empty library\n"
+    },
+    {
+     "old": "        _ = LibraryRoots::builder(Default::default()).durability(Durability::MEDIUM).new(&db);\n        _ = LocalRoots::builder(Default::default()).durability(Durability::MEDIUM).new(&db);\n",
+     "new": "        _ = LibraryRoots::builder(Default::default()).durability(Durability::MEDIUM).new(&mut db);\n        _ = LocalRoots::builder(Default::default()).durability(Durability::MEDIUM).new(&mut db);\n"
     },
     {
      "old": "            // alloc: setup, once per database: salsa's event hook\n            Box::new(move |event: blaze_query::db::Event| {\n",
@@ -248,6 +252,14 @@
     {
      "old": "                    .field(&format_args!(\"{:04x}\", self.0.index()))\n",
      "new": "                    .field(&format_args!(\"{:04x}\", self.0.as_u32()))\n"
+    },
+    {
+     "old": "                ProcessEnv::new(&*db, vars, content);\n",
+     "new": "                ProcessEnv::new(db, vars, content);\n"
+    },
+    {
+     "old": "                _ = AllCrates::builder(crates, content).durability(durability).new(&*db);\n",
+     "new": "                _ = AllCrates::builder(crates, content).durability(durability).new(db);\n"
     }
    ]
   },
@@ -257,6 +269,15 @@
     {
      "old": "//! its state by that delta and sets the salsa inputs whose slice changed. Queries never read a\n",
      "new": "//! its state by that delta and sets the query inputs whose slice changed. Queries never read a\n"
+    }
+   ]
+  },
+  {
+   "path": "crates/base-db/src/named.rs",
+   "edits": [
+    {
+     "old": "                Some(NamedPaths::builder(table, buckets).durability(Durability::HIGH).new(&*db));\n",
+     "new": "                Some(NamedPaths::builder(table, buckets).durability(Durability::HIGH).new(db));\n"
     }
    ]
   },

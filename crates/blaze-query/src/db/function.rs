@@ -65,7 +65,7 @@ pub trait Function: 'static {
     const FILE: &'static str;
     /// The value cap: past it, the oldest-verified values are evicted at a new view. 0: none.
     const LRU: usize;
-    /// `lru = N` given (0 too): `hash` is real and the values may be evicted.
+    /// `lru = N` given (0 too): the values may be evicted, and without `NO_EQ` `hash` is real.
     const EVICTABLE: bool;
     const NO_EQ: bool;
     const CYCLE: CycleKind;
@@ -752,6 +752,7 @@ fn finish<F: Function>(
             // SAFETY: the old value is this view's flight holder's to read (rule 1).
             || (!F::NO_EQ && final_old && F::equal(unsafe { row.value() }, &new))
             || (F::EVICTABLE
+                && !F::NO_EQ
                 && !had
                 && old_meta & HASHED != 0
                 && F::hash(&new) == header.extra.load(Ordering::Relaxed)));
@@ -1097,17 +1098,20 @@ fn rows<'t, F: Function>(
 }
 
 /// Drops the value of `row` (with `&mut`), keeping its stamp and edges and, for a run that
-/// computes it again, its hash: hashed here, once per eviction, never on a run that keeps it.
+/// computes it again, its hash: hashed here, once per eviction, never on a run that keeps it,
+/// and never for `NO_EQ`, whose every run is a change.
 fn evict<F: Function>(row: &RowOf<F>) -> bool {
     let header = &row.header;
     let word = header.verified.load(Ordering::Relaxed);
     if word & VALUE == 0 || word & PROVISIONAL != 0 {
         return false;
     }
-    // SAFETY: with `&mut` of the storage no reference to the value lives (rule 3), and it is
-    // whole (`VALUE`, not provisional).
-    header.extra.store(F::hash(unsafe { row.value() }), Ordering::Relaxed);
-    header.meta.store(header.meta.load(Ordering::Relaxed) | HASHED, Ordering::Relaxed);
+    if !F::NO_EQ {
+        // SAFETY: with `&mut` of the storage no reference to the value lives (rule 3), and it
+        // is whole (`VALUE`, not provisional).
+        header.extra.store(F::hash(unsafe { row.value() }), Ordering::Relaxed);
+        header.meta.store(header.meta.load(Ordering::Relaxed) | HASHED, Ordering::Relaxed);
+    }
     // SAFETY: as above.
     unsafe { row.drop_value() };
     row.header.verified.store(word & !VALUE, Ordering::Relaxed);

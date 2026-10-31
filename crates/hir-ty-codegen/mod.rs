@@ -2261,7 +2261,7 @@ fn build<'db>(
 }
 
 /// The body of a small function, built to be put where the function is called.
-#[blaze_query::tracked(returns(ref), no_eq, cycle_result = inlinable_cycle, lru = 0)]
+#[blaze_query::tracked(returns(ref), no_eq, cycle_result = inlinable_cycle)]
 fn inlinable(
     db: &Db,
     instance: Instance,
@@ -2288,7 +2288,7 @@ fn inlinable(
 /// is called, as LLVM's always-inliner puts it at every level rustc compiles at. `unit` is the
 /// v2 unit's settings it is built under (debug assertions, panic strategy, MIR options), part
 /// of the key; `None` in v1.
-#[blaze_query::tracked(returns(ref), no_eq, cycle_result = always_inlinable_cycle, lru = 0)]
+#[blaze_query::tracked(returns(ref), no_eq, cycle_result = always_inlinable_cycle)]
 fn always_inlinable(
     db: &Db,
     instance: Instance,

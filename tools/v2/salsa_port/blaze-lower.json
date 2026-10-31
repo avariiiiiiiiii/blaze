@@ -1,6 +1,6 @@
 {
  "crate": "crates/blaze-lower",
- "base": "b8c752e457596472d86888086afc758ecfcb8f38",
+ "base": "9023f3e6d7d8a2d1954423c4ccdd89b220701525",
  "files": [
   {
    "path": "crates/blaze-lower/src/lib.rs",
@@ -8,6 +8,14 @@
     {
      "old": "use blaze_query::db::{Durability, Setter};\n",
      "new": "use blaze_query::db::{Database as _, Durability, Setter};\n"
+    },
+    {
+     "old": "    ProcMacros::init_default(&db, Durability::HIGH);\n",
+     "new": "    ProcMacros::init_default(&mut db, Durability::HIGH);\n"
+    },
+    {
+     "old": "    _ = LibraryRoots::builder(roots(true)).durability(Durability::MEDIUM).new(&db);\n    _ = LocalRoots::builder(roots(false)).durability(Durability::MEDIUM).new(&db);\n",
+     "new": "    _ = LibraryRoots::builder(roots(true)).durability(Durability::MEDIUM).new(&mut db);\n    _ = LocalRoots::builder(roots(false)).durability(Durability::MEDIUM).new(&mut db);\n"
     },
     {
      "old": "    /// salsa counts them. It takes `&mut self`, as a write does: salsa measures its storage\n    /// only with no reader.\n",

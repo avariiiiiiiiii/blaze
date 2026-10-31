@@ -25,6 +25,14 @@
     {
      "old": "// Nothing in its arguments is collected by salsa (no tracked struct, no interned value with\n// fewer revisions), so they stay interned and are never verified.\n",
      "new": "// Nothing in its arguments is ever collected (the query database frees no interned value),\n// so they stay interned and are never verified.\n"
+    },
+    {
+     "old": "#[blaze_query::tracked(returns(ref), no_eq, cycle_result = inlinable_cycle, lru = 0)]\n",
+     "new": "#[blaze_query::tracked(returns(ref), no_eq, cycle_result = inlinable_cycle)]\n"
+    },
+    {
+     "old": "#[blaze_query::tracked(returns(ref), no_eq, cycle_result = always_inlinable_cycle, lru = 0)]\n",
+     "new": "#[blaze_query::tracked(returns(ref), no_eq, cycle_result = always_inlinable_cycle)]\n"
     }
    ]
   },

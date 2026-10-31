@@ -1,6 +1,6 @@
 {
  "crate": "crates/hir-expand",
- "base": "50e11331df9ea34eb60fe68fe783db82d49f1d44",
+ "base": "9023f3e6d7d8a2d1954423c4ccdd89b220701525",
  "files": [
   {
    "path": "crates/hir-expand/src/files.rs",
@@ -8,6 +8,15 @@
     {
      "old": "/// It is stable across reparses, and can be used as salsa key/value.\n",
      "new": "/// It is stable across reparses, and can be used as a query key or value.\n"
+    }
+   ]
+  },
+  {
+   "path": "crates/hir-expand/src/fixture.rs",
+   "edits": [
+    {
+     "old": "    ProcMacros::init_default(&db, Durability::HIGH);\n",
+     "new": "    ProcMacros::init_default(&mut db, Durability::HIGH);\n"
     }
    ]
   },
@@ -59,6 +68,15 @@
     {
      "old": "    /// salsa though, so we punt on that bit for a moment.\n",
      "new": "    /// the query engine though, so we punt on that bit for a moment.\n"
+    }
+   ]
+  },
+  {
+   "path": "crates/hir-expand/src/proc_macro.rs",
+   "edits": [
+    {
+     "old": "    pub fn init_default(db: &Db, durability: Durability) {\n",
+     "new": "    pub fn init_default(db: &mut Db, durability: Durability) {\n"
     }
    ]
   },

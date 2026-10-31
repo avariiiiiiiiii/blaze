@@ -1,0 +1,23 @@
+{
+  "id": "01250",
+  "from_lane": "query-unify-port",
+  "owner": "query-unify-bench",
+  "paths": [
+    "crates/blaze-bench/benches/query_hit.rs"
+  ],
+  "what": "blaze-v2-qu crates/blaze-bench/benches/query_hit.rs:266: `Graph::builder(leaves, nodes).durability(Durability::MEDIUM).new(&db)` must pass `&mut db` since R18 (singleton inputs take &mut; line 580 already does). Every other singleton caller in blaze-v2-qu is on &mut as of checkpoint 9.",
+  "state": "open",
+  "created": "2026-10-31T12:17:38Z",
+  "updated": "2026-10-31T12:17:38Z",
+  "taken_by": null,
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-10-31T12:17:38Z",
+      "by": "query-unify-port",
+      "action": "add",
+      "note": ""
+    }
+  ]
+}

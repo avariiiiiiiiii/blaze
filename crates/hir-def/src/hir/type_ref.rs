@@ -694,7 +694,7 @@ mod tests {
     use hir_expand::mod_path::{ModPath, PathKind};
     use intern::Symbol;
     use la_arena::RawIdx;
-    use salsa::plumbing::FromId;
+    use blaze_query::db::FromId;
 
     use super::*;
     use crate::{FunctionId, GenericDefId, TypeOrConstParamId};
@@ -716,8 +716,8 @@ mod tests {
 
     fn type_param(local: u32) -> TypeParamId {
         TypeParamId::from_unchecked(TypeOrConstParamId {
-            parent: GenericDefId::FunctionId(FunctionId::from_id(salsa::Id::from_bits(
-                5 | (1 << 32),
+            parent: GenericDefId::FunctionId(FunctionId::from_id(blaze_query::db::Id::from_u32(
+                5 + (1 << 20),
             ))),
             local_id: Idx::from_raw(RawIdx::from_u32(local)),
         })

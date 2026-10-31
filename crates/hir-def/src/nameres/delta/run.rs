@@ -170,7 +170,7 @@ fn run_in<'db>(
     let mut eager_with_errors = false;
     'resolve_attr: loop {
         'resolve_macros: loop {
-            salsa::Database::unwind_if_revision_cancelled(db);
+            blaze_query::db::unwind_if_cancelled(db);
             sink.unit.set_unexpanded(pending.iter().any(|it| !it.is_empty()));
             sink.unit.resolve_imports();
             let (mut progress, mut deferred_eager) = (false, false);

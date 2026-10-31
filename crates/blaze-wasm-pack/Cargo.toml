@@ -18,6 +18,7 @@ serde = { workspace = true, features = ["derive"] }
 triomphe.workspace = true
 
 base-db.workspace = true
+blaze-query.workspace = true
 cfg.workspace = true
 hir.workspace = true
 hir-expand.workspace = true

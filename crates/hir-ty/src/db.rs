@@ -16,7 +16,6 @@ use hir_def::{
     resolver::{HasResolver, Resolver},
     signatures::{ConstSignature, StaticSignature},
 };
-use salsa::SalsaValue;
 use span::Edition;
 use stdx::impl_from;
 
@@ -945,14 +944,14 @@ impl HirDatabase for Db {
     }
 }
 
-#[salsa::interned(debug, revisions = usize::MAX)]
+#[blaze_query::interned(debug)]
 #[derive(PartialOrd, Ord)]
 pub struct InternedOpaqueTyId {
     #[returns(copy)]
     pub loc: ImplTraitId,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, SalsaValue)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, blaze_query::Value)]
 pub struct InternedClosure<'db> {
     pub owner: InferBodyId<'db>,
     pub expr: ExprId,
@@ -962,7 +961,7 @@ pub struct InternedClosure<'db> {
 /// What a closure is interned by: its place among the closures of its body. Its expression
 /// moves with every edit of the body before it, and a closure that moved would be another
 /// type, with everything generic over it instantiated again.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, SalsaValue)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, blaze_query::Value)]
 pub struct ClosureKey<'db> {
     owner: InferBodyId<'db>,
     nth: u32,
@@ -992,9 +991,10 @@ impl<'db> ClosureKey<'db> {
 }
 
 /// The closures, `async` blocks and coroutines of a body, in the order of their expressions.
-// The unit makes the arguments something salsa interns: the owner alone is no salsa struct.
-#[salsa::tracked(returns(deref), mem_tag = Infer)]
-fn closure_exprs(db: &Db, owner: ExpressionStoreOwnerId, _: ()) -> Box<[ExprId]> {
+// The unit makes this a function of several arguments, whose key `closure_exprs::arguments`
+// gives back (blaze-item-hash reads it).
+#[blaze_query::tracked(returns(deref), mem_tag = Infer)]
+pub fn closure_exprs(db: &Db, owner: ExpressionStoreOwnerId, _: ()) -> Box<[ExprId]> {
     ExpressionStore::of(db, owner)
         .exprs()
         .filter(|(_, expr)| matches!(expr, hir_def::hir::Expr::Closure { .. }))
@@ -1002,7 +1002,7 @@ fn closure_exprs(db: &Db, owner: ExpressionStoreOwnerId, _: ()) -> Box<[ExprId]>
         .collect() // alloc: the memo's stored list, once per body
 }
 
-#[salsa::interned(constructor = new_impl, debug, revisions = usize::MAX)]
+#[blaze_query::interned(constructor = new_impl, debug)]
 #[derive(PartialOrd, Ord)]
 pub struct InternedClosureId<'db> {
     #[returns(copy)]
@@ -1036,7 +1036,7 @@ impl<'db> InternedClosureId<'db> {
     }
 }
 
-#[salsa::interned(constructor = new_impl, debug, revisions = usize::MAX)]
+#[blaze_query::interned(constructor = new_impl, debug)]
 #[derive(PartialOrd, Ord)]
 pub struct InternedCoroutineId<'db> {
     #[returns(copy)]
@@ -1070,7 +1070,7 @@ impl<'db> InternedCoroutineId<'db> {
     }
 }
 
-#[salsa::interned(constructor = new_impl, debug, revisions = usize::MAX)]
+#[blaze_query::interned(constructor = new_impl, debug)]
 #[derive(PartialOrd, Ord)]
 pub struct InternedCoroutineClosureId<'db> {
     #[returns(copy)]
@@ -1124,7 +1124,7 @@ pub struct AnonConstLoc {
     pub allow_using_generic_params: bool,
 }
 
-#[salsa::interned(debug, revisions = usize::MAX, constructor = new_)]
+#[blaze_query::interned(debug, constructor = new_)]
 #[derive(PartialOrd, Ord)]
 pub struct AnonConstId {
     #[returns(ref)]
@@ -1219,7 +1219,7 @@ impl<'db> AnonConstId<'db> {
 
 /// A constant, which might appears as a const item, an anonymous const block in expressions
 /// or patterns, or as a constant in types with const generics.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, salsa::Supertype)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, blaze_query::Supertype)]
 pub enum GeneralConstId<'db> {
     ConstId(ConstId),
     StaticId(StaticId),
@@ -1496,10 +1496,10 @@ pub mod kinds {
             found
         }
 
-        /// What follows each salsa attribute of `text`: a function, a method of a tracked
+        /// What follows each query attribute of `text`: a function, a method of a tracked
         /// `impl`, or an interned or input struct.
         fn scan(text: &str, found: &mut Vec<String>) {
-            let attribute = concat!("#[", "salsa::");
+            let attribute = concat!("#[", "blaze_query::");
             let mut in_impl: Option<String> = None;
             let mut lines = text.lines();
             while let Some(line) = lines.next() {

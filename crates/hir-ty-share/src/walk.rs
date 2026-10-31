@@ -62,7 +62,7 @@ use rustc_type_ir::{
     GenericArgKind, TypeFlags, TypeVisitableExt,
     inherent::{GenericArgs as _, IntoKind},
 };
-use salsa::plumbing::{AsId, FromId};
+use blaze_query::db::{AsId, FromId};
 use smallvec::SmallVec;
 
 use crate::{
@@ -157,7 +157,7 @@ fn allocation_value(allocation: &AllocationData<'_>) -> Result<ContentId, Unshar
     Ok(h.finish())
 }
 
-#[salsa::tracked(returns(ref), cycle_result = share_cycle)]
+#[blaze_query::tracked(returns(ref), cycle_result = share_cycle)]
 pub(crate) fn share(
     db: &Db,
     instance: ShareInstance,
@@ -191,7 +191,7 @@ pub(crate) fn share(
 
 fn share_cycle(
     _: &Db,
-    _: salsa::Id,
+    _: blaze_query::db::Id,
     _: ShareInstance,
     _: StoredParamEnvAndCrate,
     _: BodyOptions,
@@ -327,7 +327,7 @@ enum Op {
 
 /// The sites of `def`'s generic body under `options`. It reads no argument, so every instance
 /// of the body shares one.
-#[salsa::tracked(returns(ref))]
+#[blaze_query::tracked(returns(ref))]
 pub(crate) fn sites(db: &Db, def: ShareDef, options: MirOptions) -> Result<Sites, Unshared> {
     let body = body_of(db, def, options)?;
     let mut collect = Collect {

@@ -7,7 +7,7 @@
 use std::{fmt::Write as _, time::Instant};
 
 use hir_firewall::Harness;
-use salsa::{Database as _, Durability};
+use blaze_query::db::{Database as _, Durability};
 use hir_expand::fixture;
 
 const MODULES: usize = 10;
@@ -44,7 +44,7 @@ fn main() {
     let mut harness = Harness::new(&mut db, krate, None).expect("the harness sets up");
     let setup = started.elapsed();
 
-    db.synthetic_write(Durability::LOW);
+    db.storage_mut().synthetic_write(Durability::LOW);
     let started = Instant::now();
     let executed = harness.ask_all(&db).expect("a pass");
     let warm = started.elapsed();

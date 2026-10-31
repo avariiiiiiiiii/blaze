@@ -88,7 +88,6 @@ use rustc_type_ir::{
     BoundVarIndexKind, TypeSuperVisitable, TypeVisitableExt,
     inherent::{IntoKind, Ty as _},
 };
-use salsa::SalsaValue;
 use stdx::impl_from;
 use traits::FnTrait;
 
@@ -658,7 +657,7 @@ mod memory_map_tests {
         with_static.statics.push(StaticMemory {
             start: 8,
             size: 4,
-            id: salsa::plumbing::FromId::from_id(salsa::Id::from_bits(1)),
+            id: blaze_query::db::FromId::from_id(blaze_query::db::Id::from_u32(1)),
         });
         let empty = MemoryMap::Complex(Box::default());
         let with_static = MemoryMap::Complex(Box::new(with_static));
@@ -1034,7 +1033,7 @@ impl Span {
 
 /// A [`DefWithBodyId`], or an anon const.
 #[derive(
-    Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, salsa::Supertype, SalsaValue,
+    Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, blaze_query::Supertype, blaze_query::Value,
 )]
 pub enum InferBodyId<'db> {
     DefWithBodyId(DefWithBodyId),

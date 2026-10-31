@@ -81,7 +81,7 @@ pub(crate) fn included(db: &Db, krate: Crate, out: &mut Vec<PathBuf>) {
 /// closure's files are hashed once a revision.
 #[derive(Default)]
 pub(crate) struct Memo {
-    last: std::sync::Mutex<Option<((Nonce, salsa::Revision), ContentId)>>,
+    last: std::sync::Mutex<Option<((Nonce, blaze_query::db::View), ContentId)>>,
 }
 
 impl Memo {

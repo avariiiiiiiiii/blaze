@@ -25,7 +25,7 @@
 //! an item's normalized form; [`hash`] fills the forms' slots and gives the four hashes
 //! ([`hashes`]); [`facts`] gives each [`Fact`] its value; `index` holds the negative-fact
 //! indexes; [`table`] holds hashes and facts as columns ([`HashColumns`], [`FactSet`]);
-//! [`goals`] gives the persistent goal cache its keys and facts. Each is computed by `#[salsa::tracked]` queries over the front end's database, so
+//! [`goals`] gives the persistent goal cache its keys and facts. Each is computed by `#[blaze_query::tracked]` queries over the front end's database, so
 //! an edit recomputes only the forms it touched and stops where a hash comes out equal.
 //!
 //! Memory (docs/v2/plan/design/memory.md): a crate's tables (its key index, its hash columns)
@@ -75,7 +75,7 @@ pub use table::{FactSet, HashColumns, crate_hashes};
 
 /// Which item, in one database: its dense ids, never hashed, never kept past the database.
 /// [`ItemKey`] is what is kept.
-#[derive(Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Debug, salsa::Supertype)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Debug, blaze_query::Supertype)]
 pub enum ItemId {
     Function(FunctionId),
     Adt(AdtId),

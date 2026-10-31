@@ -1176,7 +1176,7 @@ impl<K: DenseKey + fmt::Debug> fmt::Debug for ModeColumn<K> {
 }
 
 /// A side table of the few keys that have a value, sorted by key.
-#[derive(Clone, PartialEq, Eq, Hash, salsa::SalsaValue)]
+#[derive(Clone, PartialEq, Eq, Hash, blaze_query::Value)]
 pub struct SortedMap<K, V> {
     entries: Box<[(K, V)]>,
 }
@@ -1513,8 +1513,8 @@ mod tests {
 
     #[test]
     fn field_column_takes_back_its_parts_and_refuses_others() {
-        use salsa::plumbing::FromId;
-        let id = |index: u32| salsa::Id::from_bits(u64::from(index) | (2 << 32));
+        use blaze_query::db::FromId;
+        let id = |index: u32| blaze_query::db::Id::from_u32(index + (2 << 20));
         let field = |local: u32| FieldId {
             parent: hir_def::StructId::from_id(id(3)).into(),
             local_id: Idx::from_raw(RawIdx::from_u32(local)),

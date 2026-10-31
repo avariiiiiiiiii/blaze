@@ -19,9 +19,9 @@
 //! word even in a vector that doubles; the allowance's megabyte is for the interner's first
 //! tables.
 //!
-//! A decoded value holds `SyntaxContext`s and salsa ids from the bytes, which only the
+//! A decoded value holds `SyntaxContext`s and query IDs from the bytes, which only the
 //! database that wrote them may look up. The targets compare and drop them and never hand one
-//! to a database, nor format one (`Debug` of a salsa id asks the attached database).
+//! to a database, nor format one (`Debug` of a query ID asks the attached database).
 //!
 //! The valid buffers are laid out by [`Build`] in the order the crate's writers lay theirs out,
 //! through the same `blaze_format::Writer`: the crate keeps its root records to itself, and its

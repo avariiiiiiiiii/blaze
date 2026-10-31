@@ -24,7 +24,7 @@ use std::{
 
 use blaze_ids::{ContentId, Hasher};
 use blaze_mem::{Frame, scratch};
-use salsa::{Durability, Setter};
+use blaze_query::db::{Durability, Setter};
 use crate::{FileId, VfsPath};
 
 use crate::{
@@ -43,7 +43,7 @@ pub const NAMED_PATHS_DOMAIN: &str = "blaze v2 named paths bucket 2";
 
 /// The index's handles, set once when the first source root is set and never again: what it
 /// holds is in its buckets' content IDs.
-#[salsa::input(singleton, debug)]
+#[blaze_query::input(singleton, debug)]
 pub(crate) struct NamedPaths {
     #[returns(ref)]
     table: PathTable,
@@ -52,7 +52,7 @@ pub(crate) struct NamedPaths {
 }
 
 /// The paths of one of [`BUCKETS`], by their [`hash_of`]: see [`NAMED_PATHS_DOMAIN`].
-#[salsa::input(debug)]
+#[blaze_query::input(debug)]
 pub(crate) struct PathBucket {
     #[returns(copy)]
     content: InputId,
@@ -172,7 +172,7 @@ impl Named {
                 .collect(); // alloc: as above.
             let table = PathTable(self.table.clone()); // clone: a refcount, once per database.
             self.input =
-                Some(NamedPaths::builder(table, buckets).durability(Durability::HIGH).new(&*db));
+                Some(NamedPaths::builder(table, buckets).durability(Durability::HIGH).new(db));
             return;
         };
         while dirty != 0 {

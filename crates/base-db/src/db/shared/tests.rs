@@ -4,13 +4,13 @@ use std::{
     time::{Duration, Instant},
 };
 
-use salsa::{Cancelled, Database as _};
+use blaze_query::db::{Cancelled, Database as _};
 use span::FileId;
 
 use super::Shared;
 use crate::{Db, FileText};
 
-#[salsa::tracked(returns(copy))]
+#[blaze_query::tracked(returns(copy))]
 fn text_len(db: &Db, text: FileText) -> u32 {
     text.text(db).len() as u32
 }
@@ -33,7 +33,7 @@ fn a_write_stops_a_held_reader_and_waits_for_it_to_let_go() {
         let ran = Cancelled::catch(AssertUnwindSafe(|| {
             started.send(()).unwrap();
             while Instant::now() < deadline {
-                reader.unwind_if_revision_cancelled();
+                blaze_query::db::unwind_if_cancelled(&*reader);
                 assert_eq!(text_len(&reader, text), 13);
                 std::thread::yield_now();
             }
@@ -44,7 +44,7 @@ fn a_write_stops_a_held_reader_and_waits_for_it_to_let_go() {
     has_started.recv().unwrap();
     shared.write().set_file_text(file, "fn other() {}\n");
     assert!(matches!(thread.join().unwrap(), Err(Cancelled::PendingWrite)));
-    assert!(!shared.readers_stopped(), "the write clears the stop");
+    assert!(!shared.storage().readers_stopped(), "the write clears the stop");
     assert_eq!(text_len(&shared, shared.file_text(file)), 14);
 }
 
@@ -53,7 +53,7 @@ fn a_write_with_no_reader_left_neither_waits_nor_stops() {
     let (mut shared, file) = shared_with("fn main() {}\n");
     drop(shared.reader());
     shared.write().set_file_text(file, "fn other() {}\n");
-    assert!(!shared.readers_stopped());
+    assert!(!shared.storage().readers_stopped());
     assert_eq!(text_len(&shared, shared.file_text(file)), 14);
 }
 
@@ -63,7 +63,7 @@ fn idle_is_the_database_only_while_no_reader_holds_it_and_stops_none() {
     let text = shared.file_text(file);
     let reader = shared.reader();
     assert!(shared.idle().is_none());
-    assert!(!shared.readers_stopped(), "a reader goes on");
+    assert!(!shared.storage().readers_stopped(), "a reader goes on");
     assert_eq!(text_len(&reader, text), 13);
     drop(reader);
     shared.idle().expect("no reader is left").set_file_text(file, "fn other() {}\n");
@@ -75,7 +75,7 @@ fn a_stop_holds_until_the_next_write() {
     let (mut shared, file) = shared_with("fn main() {}\n");
     let text = shared.file_text(file);
     shared.stop_readers();
-    assert!(shared.readers_stopped());
+    assert!(shared.storage().readers_stopped());
     let stopped = Cancelled::catch(AssertUnwindSafe(|| text_len(&shared, text)));
     assert!(matches!(stopped, Err(Cancelled::PendingWrite)));
     let reader = shared.reader();
@@ -83,14 +83,14 @@ fn a_stop_holds_until_the_next_write() {
     assert!(matches!(stopped, Err(Cancelled::PendingWrite)), "a reader made after the stop");
     drop(reader);
     let db = shared.into_inner();
-    assert!(!db.readers_stopped());
+    assert!(!db.storage().readers_stopped());
     assert_eq!(text_len(&db, text), 13);
 }
 
 mod stopped_mid_query {
     use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
-    use salsa::Database as _;
+    use blaze_query::db::Database as _;
 
     use super::*;
 
@@ -98,23 +98,23 @@ mod stopped_mid_query {
     static OUTER_RUNS: AtomicU32 = AtomicU32::new(0);
     static OUTER_READ: AtomicBool = AtomicBool::new(false);
 
-    #[salsa::tracked(returns(copy))]
+    #[blaze_query::tracked(returns(copy))]
     fn counted_len(db: &Db, text: FileText) -> u32 {
         INNER_RUNS.fetch_add(1, Ordering::Relaxed);
         text.text(db).len() as u32
     }
 
     /// Reads [`counted_len`], and on its first run waits to be stopped before it returns.
-    #[salsa::tracked(returns(copy))]
+    #[blaze_query::tracked(returns(copy))]
     fn len_once_stopped(db: &Db, text: FileText) -> u32 {
         let first = OUTER_RUNS.fetch_add(1, Ordering::Relaxed) == 0;
         let len = counted_len(db, text);
         if first {
             OUTER_READ.store(true, Ordering::Release);
-            while !db.readers_stopped() {
+            while !db.storage().readers_stopped() {
                 std::thread::yield_now();
             }
-            db.unwind_if_revision_cancelled();
+            blaze_query::db::unwind_if_cancelled(db);
             unreachable!("a stopped reader unwinds at its next check");
         }
         len

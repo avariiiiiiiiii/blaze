@@ -80,17 +80,17 @@ impl fmt::Display for Unhashable {
 
 impl std::error::Error for Unhashable {}
 
-#[salsa::tracked(returns(ref))]
+#[blaze_query::tracked(returns(ref))]
 pub(crate) fn interface_form(db: &Db, id: ItemId) -> form::Sub {
     form::Cx::new(db).interface(id)
 }
 
-#[salsa::tracked(returns(ref))]
+#[blaze_query::tracked(returns(ref))]
 pub(crate) fn signature_form(db: &Db, id: ItemId) -> form::Sub {
     form::Cx::leak_free(db).signature(id)
 }
 
-#[salsa::tracked(returns(ref))]
+#[blaze_query::tracked(returns(ref))]
 pub(crate) fn body_form(db: &Db, id: ItemId) -> Option<form::Sub> {
     form::Cx::new(db).body(id).map(|code| code.sub)
 }
@@ -207,27 +207,27 @@ fn missed(sub: &form::Sub, item: ItemId) -> Result<(), Unhashable> {
     }
 }
 
-#[salsa::tracked(returns(copy))]
+#[blaze_query::tracked(returns(copy))]
 fn interface_of(db: &Db, id: ItemId) -> Result<ContentId, Unhashable> {
     component_hash(db, Graph::Interface, id)
 }
 
-#[salsa::tracked(returns(copy))]
+#[blaze_query::tracked(returns(copy))]
 fn layout_of(db: &Db, id: ItemId) -> Result<ContentId, Unhashable> {
     component_hash(db, Graph::Layout, id)
 }
 
-#[salsa::tracked(returns(copy))]
+#[blaze_query::tracked(returns(copy))]
 fn deep_of(db: &Db, id: ItemId) -> Result<ContentId, Unhashable> {
     component_hash(db, Graph::Deep, id)
 }
 
-#[salsa::tracked(returns(copy))]
+#[blaze_query::tracked(returns(copy))]
 fn signature_of(db: &Db, id: ItemId) -> Result<ContentId, Unhashable> {
     component_hash(db, Graph::Signature, id)
 }
 
-#[salsa::tracked(returns(copy))]
+#[blaze_query::tracked(returns(copy))]
 fn code_of(db: &Db, id: ItemId) -> Result<Option<ContentId>, Unhashable> {
     let Some(body) = body_form(db, id) else { return Ok(None) };
     let interface = interface_of(db, id)?;
@@ -368,22 +368,22 @@ pub(crate) struct Unit {
 
 /// The unit of the component whose first member (by id) is `first`: asked once per component,
 /// not once per member.
-#[salsa::tracked(returns(ref))]
+#[blaze_query::tracked(returns(ref))]
 fn interface_unit(db: &Db, first: ItemId) -> Result<Unit, Unhashable> {
     unit(db, Graph::Interface, first)
 }
 
-#[salsa::tracked(returns(ref))]
+#[blaze_query::tracked(returns(ref))]
 fn layout_unit(db: &Db, first: ItemId) -> Result<Unit, Unhashable> {
     unit(db, Graph::Layout, first)
 }
 
-#[salsa::tracked(returns(ref))]
+#[blaze_query::tracked(returns(ref))]
 fn deep_unit(db: &Db, first: ItemId) -> Result<Unit, Unhashable> {
     unit(db, Graph::Deep, first)
 }
 
-#[salsa::tracked(returns(ref))]
+#[blaze_query::tracked(returns(ref))]
 fn signature_unit(db: &Db, first: ItemId) -> Result<Unit, Unhashable> {
     unit(db, Graph::Signature, first)
 }
@@ -629,14 +629,14 @@ fn components(db: &Db, graph: Graph, krate: base_db::Crate) -> &Components {
     }
 }
 
-#[salsa::tracked(returns(ref))]
+#[blaze_query::tracked(returns(ref))]
 fn deep_components(db: &Db, krate: base_db::Crate) -> Components {
     find_components(db, Graph::Deep, krate)
 }
 
 /// The refs of an item in the deep graph that stay in its crate: a body edit that calls
 /// nothing new gives the same list, and leaves [`deep_components`] as it was.
-#[salsa::tracked(returns(deref))]
+#[blaze_query::tracked(returns(deref))]
 fn deep_refs(db: &Db, id: ItemId) -> Box<[ItemId]> {
     let krate = id.krate(db);
     // alloc: a memo's list, at its final length.
@@ -866,7 +866,7 @@ pub fn closure_code<'db>(
     closure_code_of(db, closure).map(CodeHash)
 }
 
-#[salsa::tracked(returns(copy))]
+#[blaze_query::tracked(returns(copy))]
 fn closure_code_of<'db>(
     db: &'db Db,
     closure: InternedClosureId<'db>,
@@ -884,7 +884,7 @@ pub fn coroutine_code<'db>(
     coroutine_code_of(db, coroutine).map(CodeHash)
 }
 
-#[salsa::tracked(returns(copy))]
+#[blaze_query::tracked(returns(copy))]
 fn coroutine_code_of<'db>(
     db: &'db Db,
     coroutine: InternedCoroutineId<'db>,

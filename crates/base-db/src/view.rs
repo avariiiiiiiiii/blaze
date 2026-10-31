@@ -1,6 +1,6 @@
 //! One view's files as the front end's inputs (docs/v2/plan/lanes/vfs.md section 2): a view is a root of
 //! blaze-vfs, a map of every file to its content ID, and setting one writes only the inputs
-//! whose content changed, so salsa sees no change where there is none.
+//! whose content changed, so the query engine sees no change where there is none.
 //!
 //! A view's path maps to a file and a source root through what the database has already: a
 //! path a source root has named keeps its [`FileId`] for good, and a
@@ -23,7 +23,7 @@ use std::{borrow::Cow, cell::RefCell, fmt};
 use blaze_ids::{ContentId, radix};
 use blaze_mem::{Frame, Tag, frame, scratch::Scratch};
 use rustc_hash::{FxBuildHasher, FxHashMap};
-use salsa::{Durability, Setter};
+use blaze_query::db::{Durability, Setter};
 use triomphe::Arc;
 use crate::{AbsPath, AbsPathBuf, FileId, FileSet, FileSetConfig, VfsPath};
 

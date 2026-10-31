@@ -2,7 +2,7 @@
 //! (docs/v2/plan/design/concurrency.md): a read is acquire loads of data that never moves once
 //! published, and only writers write.
 //!
-//! - [`Column`]: a salsa input per dense `u32` ID (a file, a source root), in a
+//! - [`Column`]: a query input per dense `u32` ID (a file, a source root), in a
 //!   `blaze_mem::AppendVec` reserved for every ID. A read is two acquire loads.
 //! - [`Log`]: an append-only list whose values never move, a `blaze_mem::Column`.
 //! - [`Table`]: values found by a hash the caller computed once, in a `blaze_mem::swiss::Index`
@@ -14,22 +14,22 @@ use std::{
     marker::PhantomData,
     sync::{
         Mutex, OnceLock, PoisonError,
-        atomic::{AtomicU64, Ordering},
+        atomic::{AtomicU32, Ordering},
     },
 };
 
 use blaze_mem::{AppendVec, Tag};
 use intern::swiss::Index;
-use salsa::plumbing::{AsId, FromId, Id};
+use blaze_query::db::{AsId, FromId, Id};
 
-/// A salsa input per ID up to [`Column::MAX`]: a word of the input's ID bits per ID, 0 for none
-/// (an input's index is never 0), in one region reserved for `MAX + 1` words and committed as
+/// A query input per ID up to [`Column::MAX`]: a word of the input's ID per ID, 0 for none
+/// (no ID is 0), in one region reserved for `MAX + 1` words and committed as
 /// IDs are used.
 ///
 /// A read is one acquire load of the length, a bounds compare and the word's acquire load, and
 /// writes nothing.
 pub(crate) struct Column<T> {
-    words: AppendVec<AtomicU64>,
+    words: AppendVec<AtomicU32>,
     of: PhantomData<fn() -> T>,
 }
 
@@ -48,7 +48,7 @@ impl<T: AsId + FromId + Copy> Column<T> {
     pub(crate) fn get(&self, raw: u32) -> Option<T> {
         match self.words.get(raw)?.load(Ordering::Acquire) {
             0 => None,
-            bits => Some(T::from_id(Id::from_bits(bits))),
+            bits => Some(T::from_id(Id::from_u32(bits))),
         }
     }
 
@@ -61,13 +61,13 @@ impl<T: AsId + FromId + Copy> Column<T> {
             "ID {raw} is past {}, the largest file ID the front end takes",
             Self::MAX
         );
-        let bits = value.map_or(0, |it| it.as_id().as_bits());
+        let bits = value.map_or(0, |it| it.as_id().as_u32());
         if bits == 0 && raw >= self.words.len() {
             return;
         }
         let len = self.words.len();
         if len <= raw {
-            self.words.writer().extend_with((raw - len + 1) as usize, |_| AtomicU64::new(0));
+            self.words.writer().extend_with((raw - len + 1) as usize, |_| AtomicU32::new(0));
         }
         self.words.as_slice()[raw as usize].store(bits, Ordering::Release);
     }
@@ -76,7 +76,7 @@ impl<T: AsId + FromId + Copy> Column<T> {
     pub(crate) fn iter(&self) -> impl Iterator<Item = (u32, T)> + '_ {
         self.words.iter().enumerate().filter_map(|(raw, word)| match word.load(Ordering::Acquire) {
             0 => None,
-            bits => Some((raw as u32, T::from_id(Id::from_bits(bits)))),
+            bits => Some((raw as u32, T::from_id(Id::from_u32(bits)))),
         })
     }
 }

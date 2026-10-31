@@ -3,7 +3,7 @@
 //! A probe's answer is a function of the inputs [`PickKey`] names, its reads aside. For a
 //! receiver with no inference variables those are known before the probe, so the answer is
 //! stored once per database, crate and revision and shared by every body: a body that takes it
-//! replays the reads the probe made (`salsa::replay_reads`), so it is checked again when any of
+//! replays the reads the probe made (`blaze_query::db::replay_reads`), so it is checked again when any of
 //! them changes, as the solver's shared cache does (`next_solver/interner/tls_cache.rs`).
 //!
 //! The autoderef steps of a canonical receiver are stored the same way, by what
@@ -25,7 +25,7 @@ use rustc_hash::FxHasher;
 use rustc_type_ir::{
     RegionKind, TypeFoldable, TypeFolder, TypeSuperFoldable, TypeVisitableExt, inherent::IntoKind,
 };
-use salsa::{Reads, Revision, plumbing::AsId};
+use blaze_query::db::{AsId, Reads, View};
 
 use self::table::{Key, Table};
 use super::{
@@ -52,10 +52,10 @@ pub(super) struct ProbeFacts {
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 struct PickKey {
     nonce: Nonce,
-    solver_crate: u64,
-    resolver_crate: u64,
+    solver_crate: u32,
+    resolver_crate: u32,
     /// 0, or the module of the call when the answer depends on it.
-    module: u64,
+    module: u32,
     /// The receiver with its free regions erased.
     self_ty: u32,
     name: u32,
@@ -82,12 +82,11 @@ impl Key for PickKey {
     fn hint(&self) -> u64 {
         let mut hasher = FxHasher::default();
         self.nonce.hash(&mut hasher);
-        hasher.write_u64(self.solver_crate);
-        hasher.write_u64(self.resolver_crate);
-        hasher.write_u64(self.module);
-        hasher.write_u64(pair(self.self_ty, self.name));
-        hasher.write_u64(pair(self.scope, self.param_env));
-        hasher.write_u64(pair(self.typing_defs, self.bits));
+        hasher.write_u64(pair(self.solver_crate, self.resolver_crate));
+        hasher.write_u64(pair(self.module, self.self_ty));
+        hasher.write_u64(pair(self.name, self.scope));
+        hasher.write_u64(pair(self.param_env, self.typing_defs));
+        hasher.write_u32(self.bits);
         hasher.finish() | 1
     }
 }
@@ -117,7 +116,7 @@ enum Answer {
 /// scope) triples checked in one revision, across every crate being checked.
 const PICK_BITS: u32 = 16;
 
-static PICKS: LazyLock<Table<PickKey, Revision, Cached>> =
+static PICKS: LazyLock<Table<PickKey, View, Cached>> =
     LazyLock::new(|| Table::new(PICK_BITS));
 
 /// The answer of the probe for `name` on `self_ty` in `ctx`: from the table when it holds it,
@@ -141,11 +140,11 @@ pub(super) fn pick<'db>(
         let guard = blaze_reclaim::enter();
         let mut found = PICKS.get(&guard, &key, revision);
         if let Some(Cached::ByModule) = found {
-            key.module = ctx.resolver.module().as_id().as_bits();
+            key.module = ctx.resolver.module().as_id().as_u32();
             found = PICKS.get(&guard, &key, revision);
         }
         if let Some(Cached::Answer(answer, reads)) = found {
-            salsa::replay_reads(db, *reads);
+            blaze_query::db::replay_reads(db, *reads);
             let result = answer.to_result();
             #[cfg(test)]
             tests::on_hit(answer, &result, || probe(&mut ProbeFacts::default()));
@@ -153,7 +152,7 @@ pub(super) fn pick<'db>(
         }
     }
     let mut facts = ProbeFacts::default();
-    let (result, reads) = salsa::capture_reads(db, || probe(&mut facts));
+    let (result, reads) = blaze_query::db::capture_reads(db, || probe(&mut facts));
     if let Some(reads) = reads
         && facts.cacheable
         && let Some(answer) = Answer::of(&result)
@@ -161,7 +160,7 @@ pub(super) fn pick<'db>(
         let guard = blaze_reclaim::enter();
         if facts.module_dependent && key.module == 0 {
             PICKS.insert(&guard, key, revision, Cached::ByModule);
-            key.module = ctx.resolver.module().as_id().as_bits();
+            key.module = ctx.resolver.module().as_id().as_u32();
         }
         PICKS.insert(&guard, key, revision, Cached::Answer(answer, reads));
     }
@@ -212,8 +211,8 @@ impl PickKey {
             | flag(features.supertrait_item_shadowing, FLAG_SUPERTRAIT_ITEM_SHADOWING);
         Some(PickKey {
             nonce,
-            solver_crate: interner.expect_crate().as_id().as_bits(),
-            resolver_crate: ctx.resolver.krate().as_id().as_bits(),
+            solver_crate: interner.expect_crate().as_id().as_u32(),
+            resolver_crate: ctx.resolver.krate().as_id().as_u32(),
             module: 0,
             self_ty: erase_free_regions(interner, self_ty).index(),
             name: name.symbol().id(),
@@ -345,7 +344,7 @@ impl<'db> TypeFolder<DbInterner<'db>> for EraseFreeRegions<'db> {
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 struct StepsKey {
     nonce: Nonce,
-    solver_crate: u64,
+    solver_crate: u32,
     self_ty: u32,
     opaques: u32,
     var_kinds: u32,
@@ -362,7 +361,7 @@ impl Key for StepsKey {
     fn hint(&self) -> u64 {
         let mut hasher = FxHasher::default();
         self.nonce.hash(&mut hasher);
-        hasher.write_u64(self.solver_crate);
+        hasher.write_u32(self.solver_crate);
         hasher.write_u64(pair(self.self_ty, self.opaques));
         hasher.write_u64(pair(self.var_kinds, self.max_universe));
         hasher.write_u64(pair(self.param_env, self.typing_defs));
@@ -380,7 +379,7 @@ struct CachedSteps {
 /// probed in a revision.
 const STEPS_BITS: u32 = 14;
 
-static STEPS: LazyLock<Table<StepsKey, Revision, CachedSteps>> =
+static STEPS: LazyLock<Table<StepsKey, View, CachedSteps>> =
     LazyLock::new(|| Table::new(STEPS_BITS));
 
 /// Runs `f` on the autoderef steps of `input`: the table's, borrowed in place, when it holds
@@ -403,7 +402,7 @@ pub(super) fn with_steps<'db, R>(
     let (self_ty, opaques) = input.value;
     let key = StepsKey {
         nonce,
-        solver_crate: interner.expect_crate().as_id().as_bits(),
+        solver_crate: interner.expect_crate().as_id().as_u32(),
         self_ty: self_ty.index(),
         opaques: opaques.index(),
         var_kinds: input.var_kinds.index(),
@@ -420,10 +419,10 @@ pub(super) fn with_steps<'db, R>(
     };
     let guard = blaze_reclaim::enter();
     if let Some(cached) = STEPS.get(&guard, &key, revision) {
-        salsa::replay_reads(db, cached.reads);
+        blaze_query::db::replay_reads(db, cached.reads);
         return f(erase::unerase_steps(&cached.steps));
     }
-    let (steps, reads) = salsa::capture_reads(db, compute);
+    let (steps, reads) = blaze_query::db::capture_reads(db, compute);
     match reads {
         Some(reads) => {
             let cached =
@@ -438,7 +437,7 @@ pub(super) fn with_steps<'db, R>(
 ///
 /// The `'db` of these types marks interned handles (types, generic argument lists, bound
 /// variable lists: an index into a process-wide table that is never freed, and a
-/// `PhantomData<&'db ()>`) and salsa ids; none is a reference into the database. A table entry
+/// `PhantomData<&'db ()>`) and `blaze_query::db::Id`s; none is a reference into the database. A table entry
 /// is handed out only to a probe of the database its key's nonce names, in the revision its
 /// state names, so every handle in it was made by that database as it still is.
 ///

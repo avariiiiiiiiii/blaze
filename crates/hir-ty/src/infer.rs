@@ -76,7 +76,6 @@ use rustc_type_ir::{
     AliasTyKind, TypeFoldable, TypeVisitableExt,
     inherent::{GenericArgs as _, IntoKind, Ty as _},
 };
-use salsa::SalsaValue;
 use span::Edition;
 use thin_vec::ThinVec;
 
@@ -218,7 +217,7 @@ pub(crate) fn infer_body_in<'db>(
 
 fn infer_cycle_result<'db>(
     db: &'db Db,
-    _: salsa::Id,
+    _: blaze_query::db::Id,
     _: DefWithBodyId,
 ) -> InferenceResult<'db> {
     InferenceResult {
@@ -264,7 +263,7 @@ fn infer_anon_const_query<'db>(
 
 fn infer_anon_const_cycle_result<'db>(
     db: &'db Db,
-    _: salsa::Id,
+    _: blaze_query::db::Id,
     _: AnonConstId<'db>,
 ) -> InferenceResult<'db> {
     InferenceResult {
@@ -1221,7 +1220,7 @@ pub enum PatAdjust {
 /// When you add a field that stores types (including `Substitution` and the like), don't forget
 /// `resolve_completely()`'ing  them in `InferenceContext::resolve_all()`. Inference variables must
 /// not appear in the final inference result.
-#[derive(Clone, PartialEq, Eq, Hash, Debug, SalsaValue)]
+#[derive(Clone, PartialEq, Eq, Hash, Debug, blaze_query::Value)]
 pub struct InferenceResult<'db> {
     /// For each method call expr, records the function it resolves to.
     pub(crate) method_resolutions: IndexColumn<ExprId, (FunctionId, StoredGenericArgs)>,
@@ -1928,7 +1927,7 @@ impl PartialOrd for UpvarCapture {
 
 /// The inference of a body. Free functions rather than methods of a tracked impl, so that
 /// [`crate::evict`] can name them to drop their values.
-#[salsa::tracked(returns(ref), cycle_result = infer_cycle_result, lru = 0, mem_tag = Infer)]
+#[blaze_query::tracked(returns(ref), cycle_result = infer_cycle_result, lru = 0, mem_tag = Infer)]
 pub(crate) fn infer_body_query<'db>(
     db: &'db Db,
     def: DefWithBodyId,
@@ -1944,7 +1943,7 @@ pub(crate) fn infer_body_query<'db>(
 /// Returns an `InferenceResult` containing type information for array lengths,
 /// const generic arguments, and other const expressions appearing in type
 /// positions within the item's signature.
-#[salsa::tracked(
+#[blaze_query::tracked(
     returns(ref),
     cycle_result = infer_anon_const_cycle_result,
     lru = 0,

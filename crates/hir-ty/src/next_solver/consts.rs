@@ -197,7 +197,7 @@ impl<'db> ConstExt<'db> for Const<'db> {
 
 /// A constant as kept in a query result: its row, which stays valid in every revision, as an
 /// interned value is never freed.
-#[derive(Clone, Copy, PartialEq, Eq, Hash, salsa::SalsaValue)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash, blaze_query::Value)]
 pub struct StoredConst {
     index: NonZeroU32,
 }
@@ -314,7 +314,7 @@ mod tests {
     use crate::next_solver::{ErrorGuaranteed, FreeConstAliasId, TyKind};
 
     fn free_const_alias(is_rigid: IsRigid) -> ConstKind<'static> {
-        let def_id = FreeConstAliasId(salsa::plumbing::FromId::from_id(salsa::Id::from_bits(1)));
+        let def_id = FreeConstAliasId(blaze_query::db::FromId::from_id(blaze_query::db::Id::from_u32(1)));
         ConstKind::Alias(
             is_rigid,
             AliasConst::from_checked_parts(AliasConstKind::Free { def_id }, GenericArgs::empty()),

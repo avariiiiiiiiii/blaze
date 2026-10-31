@@ -2,7 +2,7 @@
 //! simplified self type, and what a name is in a scope, each answering its question both ways
 //! ("no impl", "nothing by that name" are answers too).
 //!
-//! Each is built from salsa queries in layers, so an edit reruns only the groupings it touches
+//! Each is built from tracked queries in layers, so an edit reruns only the groupings it touches
 //! and every layer above backdates where its answer stayed the same:
 //!
 //! - impls: one crate's impls of one trait ([`trait_impls_in`], from hir-ty's per-module
@@ -288,7 +288,7 @@ pub(crate) enum AnyImpl {
     BuiltinDerive(BuiltinDeriveImplId),
 }
 
-const _: () = assert!(size_of::<AnyImpl>() == 12);
+const _: () = assert!(size_of::<AnyImpl>() == 8);
 
 /// An impl's signature hash: an impl fact's value is computed inside a body's inference, which
 /// an interface hash, holding what bodies leak, may reach. A built-in derive impl has no item
@@ -336,7 +336,7 @@ pub(crate) fn implements_value(
 
 /// The values of the impls of `trait_` for `self_ty` and of its blanket impls, hashed once
 /// for every fact that reads them.
-#[salsa::tracked(returns(copy))]
+#[blaze_query::tracked(returns(copy))]
 fn implements_entries(
     db: &Db,
     trait_: TraitId,
@@ -349,7 +349,7 @@ fn implements_entries(
 
 /// The value of every impl of `trait_`, in the order of [`trait_impls`]: what a blanket impl's
 /// coherence reads, hashed once per trait rather than once per blanket impl.
-#[salsa::tracked(returns(copy))]
+#[blaze_query::tracked(returns(copy))]
 pub(crate) fn all_impls_value(
     db: &Db,
     trait_: TraitId,
@@ -493,7 +493,7 @@ impl<T: Copy> Keyed<T> {
 }
 
 /// The impls of `trait_` in `krate`, as [`trait_impls`] holds them.
-#[salsa::tracked(returns(ref))]
+#[blaze_query::tracked(returns(ref))]
 fn trait_impls_in(
     db: &Db,
     krate: Crate,
@@ -520,7 +520,7 @@ fn trait_impls_in(
 
 /// The impls of `trait_` in every crate, by simplified self type (the blanket ones as their
 /// own run, first), then key.
-#[salsa::tracked(returns(ref))]
+#[blaze_query::tracked(returns(ref))]
 pub(crate) fn trait_impls(db: &Db, trait_: TraitId) -> Runs<SimplifiedType, AnyImpl> {
     frame::task(Tag::Other, |frame| {
         let mut rows: Vec<_, &Frame> = Vec::new_in(frame);
@@ -534,7 +534,7 @@ pub(crate) fn trait_impls(db: &Db, trait_: TraitId) -> Runs<SimplifiedType, AnyI
 }
 
 /// The impls of `trait_` whose simplified self type is `self_ty`, sorted by key.
-#[salsa::tracked(returns(ref))]
+#[blaze_query::tracked(returns(ref))]
 pub(crate) fn impls_of(
     db: &Db,
     trait_: TraitId,
@@ -544,14 +544,14 @@ pub(crate) fn impls_of(
 }
 
 /// The blanket impls of `trait_`, sorted by key.
-#[salsa::tracked(returns(ref))]
+#[blaze_query::tracked(returns(ref))]
 pub(crate) fn blanket_impls_of(db: &Db, trait_: TraitId) -> Keyed<AnyImpl> {
     Keyed::of(trait_impls(db, trait_).run(None).iter())
 }
 
 /// The inherent impls of a frozen `krate`, from its one frozen table, by the hash of their
 /// simplified self type, then key.
-#[salsa::tracked(returns(ref))]
+#[blaze_query::tracked(returns(ref))]
 fn inherent_impls_in(db: &Db, krate: Crate) -> Runs<SimplifiedType, ImplId> {
     inherent_rows(db, InherentImpls::for_crate(db, krate))
 }
@@ -559,7 +559,7 @@ fn inherent_impls_in(db: &Db, krate: Crate) -> Runs<SimplifiedType, ImplId> {
 /// The inherent impls of `module` and of the blocks in the bodies it holds, by the hash of
 /// their simplified self type, then key: equal unless one of them is added, removed or
 /// changes its self type.
-#[salsa::tracked(returns(ref))]
+#[blaze_query::tracked(returns(ref))]
 fn inherent_impls_in_module(db: &Db, module: ModuleId) -> Runs<SimplifiedType, ImplId> {
     inherent_rows(db, InherentImpls::for_module(db, module))
 }
@@ -580,7 +580,7 @@ fn inherent_rows(db: &Db, impls: &InherentImpls<'_>) -> Runs<SimplifiedType, Imp
 /// The modules of `krate` with an inherent impl for each simplified self type, by its hash,
 /// then the module's key: equal unless a module gains its first impl for a type or loses its
 /// last.
-#[salsa::tracked(returns(ref))]
+#[blaze_query::tracked(returns(ref))]
 fn inherent_impl_modules(db: &Db, krate: Crate) -> Runs<SimplifiedType, ModuleId> {
     frame::task(Tag::Other, |frame| {
         let mut rows: Vec<_, &Frame> = Vec::new_in(frame);
@@ -598,7 +598,7 @@ fn inherent_impl_modules(db: &Db, krate: Crate) -> Runs<SimplifiedType, ModuleId
 
 /// The modules of `krate` with an inherent impl for `self_ty`: equal unless that list changes,
 /// whatever other types gain.
-#[salsa::tracked(returns(deref))]
+#[blaze_query::tracked(returns(deref))]
 fn inherent_modules_of(db: &Db, krate: Crate, self_ty: SimplifiedType) -> Box<[ModuleId]> {
     let modules = inherent_impl_modules(db, krate).run(Some(self_ty));
     column(modules.iter().map(|(_, module)| module))
@@ -606,7 +606,7 @@ fn inherent_modules_of(db: &Db, krate: Crate, self_ty: SimplifiedType) -> Box<[M
 
 /// The inherent impls of `module` for `self_ty`, sorted by key: equal unless one for that
 /// type is added there or removed.
-#[salsa::tracked(returns(ref))]
+#[blaze_query::tracked(returns(ref))]
 fn module_inherent_impls_of(
     db: &Db,
     module: ModuleId,
@@ -617,7 +617,7 @@ fn module_inherent_impls_of(
 
 /// The inherent impls of every crate for `self_ty`, sorted by key. Reads, in each crate, only
 /// the modules with impls for that type.
-#[salsa::tracked(returns(ref))]
+#[blaze_query::tracked(returns(ref))]
 pub(crate) fn inherent_impls_of(
     db: &Db,
     self_ty: SimplifiedType,
@@ -641,7 +641,7 @@ pub(crate) fn inherent_impls_of(
 /// The traits declared in `module` of a frozen crate, by the hash of each name one of their
 /// items has, then key, each pair once: equal unless such a trait or the names of its items
 /// change. A maintained crate's are its candidate slices ([`traits_named`]).
-#[salsa::tracked(returns(deref))]
+#[blaze_query::tracked(returns(deref))]
 fn traits_in_module(db: &Db, module: ModuleId) -> Box<[(NameHash, ItemKey, TraitId)]> {
     frame::task(Tag::Other, |frame| {
         let mut names: Vec<&str, &Frame> = Vec::new_in(frame);
@@ -670,7 +670,7 @@ fn traits_in_module(db: &Db, module: ModuleId) -> Box<[(NameHash, ItemKey, Trait
 /// The traits declared in `krate`'s modules, by the hash of each name one of their items
 /// has, then key: reruns only when some module's [`traits_in_module`] changes. A trait is
 /// declared in one module, so the modules' rows never repeat one another.
-#[salsa::tracked(returns(ref))]
+#[blaze_query::tracked(returns(ref))]
 fn traits_in(db: &Db, krate: Crate) -> Runs<NameHash, TraitId> {
     frame::task(Tag::Other, |frame| {
         let mut found: Vec<_, &Frame> = Vec::new_in(frame);
@@ -684,7 +684,7 @@ fn traits_in(db: &Db, krate: Crate) -> Runs<NameHash, TraitId> {
 
 /// Every name a trait item of maintained `krate` has (hir-ty's candidate directory), by hash,
 /// then name: reruns only when the crate's traits gain a name never seen in it.
-#[salsa::tracked(returns(deref))]
+#[blaze_query::tracked(returns(deref))]
 fn candidate_names(db: &Db, krate: Crate) -> Box<[(NameHash, Name)]> {
     frame::task(Tag::Other, |frame| {
         let mut names: Vec<Name, &Frame> = Vec::new_in(frame);
@@ -700,7 +700,7 @@ fn candidate_names(db: &Db, krate: Crate) -> Box<[(NameHash, Name)]> {
 /// The traits declared in maintained `krate`'s modules with an item whose name hashes to
 /// `name`, sorted by key: the candidate slice of that name alone, so a trait gaining an item of
 /// another name leaves this as it was.
-#[salsa::tracked(returns(ref))]
+#[blaze_query::tracked(returns(ref))]
 fn traits_named(db: &Db, krate: Crate, name: NameHash) -> Keyed<TraitId> {
     frame::task(Tag::Other, |frame| {
         let names = candidate_names(db, krate);
@@ -720,7 +720,7 @@ fn traits_named(db: &Db, krate: Crate, name: NameHash) -> Keyed<TraitId> {
 }
 
 /// The traits of every crate with an item whose name hashes to `name`, sorted by key.
-#[salsa::tracked(returns(ref))]
+#[blaze_query::tracked(returns(ref))]
 pub(crate) fn traits_with(db: &Db, name: NameHash, _: ()) -> Keyed<TraitId> {
     frame::task(Tag::Other, |frame| {
         let mut rows: Vec<_, &Frame> = Vec::new_in(frame);
@@ -810,7 +810,7 @@ impl ScopeNames {
 }
 
 /// Every name of `owner` with what it is there, sorted by the name's hash.
-#[salsa::tracked(returns(ref))]
+#[blaze_query::tracked(returns(ref))]
 fn scope_names(db: &Db, owner: ScopeOwner, _: ()) -> ScopeNames {
     frame::task(Tag::Nameres, |frame| scope_names_in(db, owner, frame))
 }

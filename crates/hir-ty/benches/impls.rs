@@ -16,7 +16,7 @@ use hir_ty::{
     next_solver::{SimplifiedType, SolverDefId},
 };
 use rustc_type_ir::{UintTy, fast_reject::SimplifiedType as Simplified};
-use salsa::{Database as _, Durability};
+use blaze_query::db::{Database as _, Durability};
 
 const LEAVES: usize = 200;
 
@@ -117,7 +117,7 @@ fn main() {
     });
     assert_eq!(new_found, old_found, "both walks find the same impls");
 
-    db.synthetic_write(Durability::LOW);
+    db.storage_mut().synthetic_write(Durability::LOW);
     let warm = hir_ty::attach_db(&db, || {
         let (main, asks) = asks(&db);
         let started = Instant::now();

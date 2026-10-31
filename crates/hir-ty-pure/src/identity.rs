@@ -21,7 +21,7 @@ use hir_ty::{
 use hir_ty_mir::mir::{MirBody, Operand, OperandKind};
 use hir_ty_share::identity as share;
 use rustc_hash::{FxHashMap, FxHashSet};
-use salsa::plumbing::FromId;
+use blaze_query::db::FromId;
 
 use crate::{
     models::tag,
@@ -62,7 +62,7 @@ pub(crate) fn of(
 /// What the code of `instance` in `env` is: its body's identity, its arguments' identity, and
 /// the facts its monomorphized body reads past its body's identity: each local's type, and
 /// each constant's and static's value.
-#[salsa::tracked(returns(ref))]
+#[blaze_query::tracked(returns(ref))]
 pub(crate) fn content(
     db: &Db,
     env: StoredParamEnvAndCrate,

@@ -5,7 +5,7 @@
 //! script's result is then a function of its [`Proof::identity`], the variables of
 //! [`Proof::env`] and the files it read, which `blaze_usercode::pure` keys it by.
 //!
-//! - [`walk`](script_purity): the instances from `main`, each summarized bottom-up as a salsa
+//! - [`walk`](script_purity): the instances from `main`, each summarized bottom-up as a
 //!   query over its monomorphized runtime MIR: what it does, the first thing on the way that is
 //!   not pure, and the calls leading to it. Function pointers and `dyn` calls are closed over
 //!   every function the graph makes a pointer of and every vtable it makes (design section 3).

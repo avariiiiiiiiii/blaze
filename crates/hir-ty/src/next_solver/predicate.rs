@@ -1030,13 +1030,13 @@ impl<'db> rustc_type_ir::inherent::Clause<DbInterner<'db>> for Clause<'db> {
 #[cfg(test)]
 mod tests {
     use rustc_type_ir::inherent::Clause as _;
-    use salsa::plumbing::FromId;
+    use blaze_query::db::FromId;
 
     use super::*;
     use crate::next_solver::{AliasTermKind, GenericArgs, TraitAssocTyId};
 
     fn id<T: FromId>(index: u32) -> T {
-        T::from_id(salsa::Id::from_bits(u64::from(index)))
+        T::from_id(blaze_query::db::Id::from_u32(index))
     }
 
     fn clause<'db>(kind: ClauseKind<'db>) -> Clause<'db> {

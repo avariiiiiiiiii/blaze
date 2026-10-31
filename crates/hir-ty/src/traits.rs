@@ -83,7 +83,7 @@ pub fn structurally_normalize_ty<'db>(
     ty.replace_infer_with_error(infcx.interner)
 }
 
-#[derive(Debug, Copy, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, salsa::SalsaValue)]
+#[derive(Debug, Copy, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, blaze_query::Value)]
 pub enum FnTrait {
     // Warning: Order is important. If something implements `x` it should also implement
     // `y` if `y <= x`.
@@ -436,7 +436,7 @@ pub fn is_inherent_impl_coherent(db: &Db, def_map: &DefMap, impl_id: ImplId) -> 
     inherent_impl_coherent(db, impl_id, def_map.krate(), def_map.is_rustc_coherence_is_core())
 }
 
-#[salsa::tracked(returns(copy), mem_tag = Infer)]
+#[blaze_query::tracked(returns(copy), mem_tag = Infer)]
 fn inherent_impl_coherent(
     db: &Db,
     impl_id: ImplId,
@@ -530,7 +530,7 @@ pub fn check_orphan_rules<'db>(db: &'db Db, impl_: ImplId) -> bool {
     orphan_rules_hold(db, impl_)
 }
 
-#[salsa::tracked(returns(copy), mem_tag = Infer)]
+#[blaze_query::tracked(returns(copy), mem_tag = Infer)]
 fn orphan_rules_hold(db: &Db, impl_: ImplId) -> bool {
     check_orphan_rules_uncached(db, impl_)
 }

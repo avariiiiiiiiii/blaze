@@ -61,7 +61,7 @@ use cfg::CfgOptions;
 use intern::{Symbol, sym};
 use itertools::Itertools;
 use rustc_hash::FxHashSet;
-use salsa::{Durability, Setter};
+use blaze_query::db::{Durability, Setter};
 use span::Edition;
 use test_utils::{
     CURSOR_MARKER, ESCAPED_CURSOR_MARKER, Fixture as FixtureFile, FixtureWithProjectMeta,
@@ -394,7 +394,7 @@ fn build(fixture: &str, mut extra: Vec<(String, ProcMacro)>) -> Fixture {
     let mut db = Db::for_tests();
     // Setting the crate graph maintains every crate's def map, which reads the proc macros: the
     // input is there first, as `load-cargo` makes it, and `build_in` gives it the fixture's.
-    ProcMacros::init_default(&db, Durability::HIGH);
+    ProcMacros::init_default(&mut db, Durability::HIGH);
     let ids = set_files(&mut db, &base, &planned, &roots);
     let sysroot_files = ids[own_files..].to_vec();
     let core_file = has_core.then(|| ids[own_files]);

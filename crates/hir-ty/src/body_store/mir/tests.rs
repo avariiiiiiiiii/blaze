@@ -24,7 +24,7 @@ use hir_expand::name::Name;
 use la_arena::{Arena, ArenaMap, Idx, RawIdx};
 use rustc_hash::FxHashMap;
 use rustc_type_ir::inherent::Ty as _;
-use salsa::Setter;
+use blaze_query::db::Setter;
 
 use super::{RAN, built, decode, encode, lookup_mir, place};
 use crate::{
@@ -45,7 +45,7 @@ use crate::{
 
 /// What a test asks the store for: the MIR of `closures` or of its closure, or a lowering that
 /// fails.
-#[salsa::input]
+#[blaze_query::input]
 struct Ask {
     #[returns(copy)]
     def: DefWithBodyId,
@@ -64,7 +64,7 @@ fn owner_of<'db>(db: &'db Db, ask: Ask) -> MirOwner<'db> {
 }
 
 /// What a built-MIR query does with the store: `providers::compute` at `MirStage::Built`.
-#[salsa::tracked(returns(ref))]
+#[blaze_query::tracked(returns(ref))]
 fn built_mir<'db>(db: &'db Db, ask: Ask) -> Result<MirBody<'db>, MirLowerError<'db>> {
     let owner = owner_of(db, ask);
     built(db, owner, || match ask.fails(db) {

@@ -68,11 +68,12 @@ impl ScopeLevels {
 /// item and of what is around it, through the macro calls it is made by and the `mod`s it is
 /// in, as the HIR has them: the innermost wins, and a `forbid` does not hold against one.
 ///
-/// The `()` is there because salsa needs it: a tracked function of one argument takes only a
-/// salsa struct or a `salsa::Supertype`, and `ExpressionStoreOwnerId` can be neither (its
-/// variants overlap: `Body(FunctionId)` and `Signature(FunctionId)` are one id). With two
-/// arguments salsa interns the pair (as hir-ty's `closure_exprs`).
-#[salsa::tracked(returns(ref))]
+/// The `()` is there because the query engine needs it: a tracked function of one argument is
+/// keyed by that argument, an interned or input struct or a `blaze_query::Supertype` enum, and
+/// `ExpressionStoreOwnerId` can be neither (its variants overlap: `Body(FunctionId)` and
+/// `Signature(FunctionId)` are one id). With two arguments the engine interns the pair into the
+/// function's hidden key (as hir-ty's `closure_exprs`).
+#[blaze_query::tracked(returns(ref))]
 pub fn lint_levels_on(db: &Db, owner: ExpressionStoreOwnerId, _: ()) -> ScopeLevels {
     let krate = owner.krate(db);
     let mut cx = LevelCx::new(db, krate, krate.lint_options(db));
@@ -83,7 +84,7 @@ pub fn lint_levels_on(db: &Db, owner: ExpressionStoreOwnerId, _: ()) -> ScopeLev
 
 /// The levels at `krate`'s root: what is in force where no item of the crate is, as rustc's
 /// `CRATE_HIR_ID` has them.
-#[salsa::tracked(returns(ref))]
+#[blaze_query::tracked(returns(ref))]
 pub fn crate_lint_levels(db: &Db, krate: Crate) -> ScopeLevels {
     let mut cx = LevelCx::new(db, krate, krate.lint_options(db));
     let mut levels = Levels::new(&mut cx, &mut (), false, false);

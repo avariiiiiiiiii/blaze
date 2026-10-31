@@ -118,13 +118,13 @@ impl SelfAndAssocBounds {
 
 /// The associated types of an impl, in order: what a body in it reads of its items for the
 /// opaque types it may define. A function or constant added to the impl leaves this equal.
-#[salsa::tracked(returns(deref), mem_tag = Infer)]
+#[blaze_query::tracked(returns(deref), mem_tag = Infer)]
 fn impl_type_aliases(db: &Db, impl_id: ImplId) -> Box<[TypeAliasId]> {
     blaze_mem::frame::current(|frame| type_aliases_of(frame, &impl_id.impl_items(db).items))
 }
 
 /// As [`impl_type_aliases`], of a trait.
-#[salsa::tracked(returns(deref), mem_tag = Infer)]
+#[blaze_query::tracked(returns(deref), mem_tag = Infer)]
 fn trait_type_aliases(db: &Db, trait_id: TraitId) -> Box<[TypeAliasId]> {
     blaze_mem::frame::current(|frame| type_aliases_of(frame, &trait_id.trait_items(db).items))
 }
@@ -141,7 +141,7 @@ fn type_aliases_of(frame: &Frame, items: &[(Name, AssocItemId)]) -> Box<[TypeAli
 
 // These are firewall queries to prevent drawing dependencies between infers:
 
-#[salsa::tracked(returns(ref), mem_tag = Infer)]
+#[blaze_query::tracked(returns(ref), mem_tag = Infer)]
 pub fn rpit_hidden_types(
     db: &Db,
     function: FunctionId,
@@ -162,7 +162,7 @@ pub fn rpit_hidden_types(
     result
 }
 
-#[salsa::tracked(returns(ref), mem_tag = Infer)]
+#[blaze_query::tracked(returns(ref), mem_tag = Infer)]
 pub fn tait_hidden_types(
     db: &Db,
     type_alias: TypeAliasId,
@@ -274,7 +274,7 @@ fn for_each_defining_body(
 /// The functions of the type alias's crate whose `#[define_opaque(..)]` names it: what its
 /// hidden types read of [`define_opaque_functions`], so another type alias's defining
 /// function added or removed leaves them as they were.
-#[salsa::tracked(returns(deref), mem_tag = Infer)]
+#[blaze_query::tracked(returns(deref), mem_tag = Infer)]
 fn defining_functions(db: &Db, type_alias: TypeAliasId) -> Box<[FunctionId]> {
     blaze_mem::frame::current(|frame| {
         let mut found = Vec::new_in(frame);
@@ -309,7 +309,7 @@ fn defined_type_aliases(
 /// defines `SplitPathsRef` inside it. Of a crate that is not local, a body is lowered for its
 /// blocks when its text says `define_opaque` or may have it written by a macro or an attribute
 /// ([`may_hold`]), and always when a macro wrote the body itself.
-#[salsa::tracked(returns(deref), mem_tag = Infer)]
+#[blaze_query::tracked(returns(deref), mem_tag = Infer)]
 fn define_opaque_functions(db: &Db, krate: Crate) -> Box<[FunctionId]> {
     let local = krate.data(db).origin.is_local();
     return blaze_mem::frame::current(|frame| {
@@ -396,7 +396,7 @@ fn text_may_define_opaque<N: syntax::AstNode>(
 }
 
 /// Where the text of `file` says `define_opaque`.
-#[salsa::tracked(returns(deref), mem_tag = Infer)]
+#[blaze_query::tracked(returns(deref), mem_tag = Infer)]
 fn define_opaque_at(db: &Db, file: base_db::EditionedFileId) -> Box<[TextSize]> {
     let text = db.file_text(file.file_id(db)).text(db);
     blaze_mem::frame::current(|frame| {

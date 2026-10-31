@@ -15,7 +15,7 @@ doctest = false
 
 [dependencies]
 rustc-hash.workspace = true
-salsa.workspace = true
+blaze-query.workspace = true
 
 base-db.workspace = true
 blaze-codegen.workspace = true

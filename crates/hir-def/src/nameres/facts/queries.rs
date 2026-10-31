@@ -1,4 +1,4 @@
-//! The salsa queries of the per-module resolver (`docs/v2/plan/lanes/frontend/nameres.md` §3,
+//! The queries of the per-module resolver (`docs/v2/plan/lanes/frontend/nameres.md` §3,
 //! `nameres-core.md` §3). Every key is content (crate, round, module, anchor module), never a
 //! dense index, and every key's `Debug` names its module. Each query here is a thin entry; the
 //! work is in `collect`, `unit`, `macros` and `driver`.
@@ -58,26 +58,26 @@ pub(crate) struct Decl {
     pub(crate) env: EnvKey,
 }
 
-#[salsa::interned(debug, unsafe(no_lifetime), revisions = usize::MAX)]
+#[blaze_query::interned(debug, unsafe(no_lifetime))]
 pub(crate) struct DeclKey {
     #[returns(ref)]
     pub(crate) decl: Decl,
 }
 
-#[salsa::interned(debug, unsafe(no_lifetime), revisions = usize::MAX)]
+#[blaze_query::interned(debug, unsafe(no_lifetime))]
 pub(crate) struct EnvKey {
     #[returns(ref)]
     pub(crate) env: CollectEnv,
 }
 
-#[salsa::interned(debug, unsafe(no_lifetime), revisions = usize::MAX)]
+#[blaze_query::interned(debug, unsafe(no_lifetime))]
 pub(crate) struct CrateEnvKey {
     #[returns(ref)]
     pub(crate) env: CrateEnv,
 }
 
 /// A round of a crate's collection.
-#[salsa::interned(debug, unsafe(no_lifetime), revisions = usize::MAX)]
+#[blaze_query::interned(debug, unsafe(no_lifetime))]
 pub(crate) struct RoundKey {
     #[returns(copy)]
     pub(crate) krate: Crate,
@@ -88,7 +88,7 @@ pub(crate) struct RoundKey {
 /// A module at a round: `fact_handle`, `module_round`, `macro_step`, `unresolved_named`. Only
 /// a round that can change the module makes one: readers name an idle module's facts by the
 /// round they last changed at (`fact_key`).
-#[salsa::interned(debug, unsafe(no_lifetime), revisions = usize::MAX)]
+#[blaze_query::interned(debug, unsafe(no_lifetime))]
 pub(crate) struct FactKey {
     #[returns(copy)]
     pub(crate) module: ModuleId,
@@ -100,7 +100,7 @@ pub(crate) struct FactKey {
 
 /// A component of a round's import graph, by the smallest module index of its members (its
 /// anchor, `Partition::anchor`), named by the module.
-#[salsa::interned(debug, unsafe(no_lifetime), revisions = usize::MAX)]
+#[blaze_query::interned(debug, unsafe(no_lifetime))]
 pub(crate) struct SccKey {
     #[returns(copy)]
     pub(crate) anchor: ModuleId,
@@ -120,7 +120,7 @@ pub(crate) enum Rows {
     Decl(DeclKey),
 }
 
-#[salsa::interned(debug, unsafe(no_lifetime), revisions = usize::MAX)]
+#[blaze_query::interned(debug, unsafe(no_lifetime))]
 pub(crate) struct RowsKey {
     #[returns(copy)]
     pub(crate) rows: Rows,
@@ -135,7 +135,7 @@ pub(crate) enum Scope {
     Decl(DeclKey),
 }
 
-#[salsa::interned(debug, unsafe(no_lifetime), revisions = usize::MAX)]
+#[blaze_query::interned(debug, unsafe(no_lifetime))]
 pub(crate) struct ScopeRef {
     #[returns(copy)]
     pub(crate) scope: Scope,
@@ -310,8 +310,8 @@ pub(crate) struct SccState {
     pub(crate) round: u32,
     /// Members, ascending by module index of the round.
     pub(crate) members: Box<[ModuleId]>,
-    /// Each member's `ModuleScope` (as `salsa::Id`), in `members` order.
-    pub(crate) handles: Box<[salsa::Id]>,
+    /// Each member's `ModuleScope` (as `blaze_query::db::Id`), in `members` order.
+    pub(crate) handles: Box<[blaze_query::db::Id]>,
     /// The `#[prelude_import]` this component resolved, if it holds it.
     pub(crate) prelude: Option<(ModuleId, Option<UseId>)>,
     /// Every module of another component the state read (a path's `PathRead::Slot`, a glob's
@@ -319,7 +319,7 @@ pub(crate) struct SccState {
     /// component runs at keeps this state when its members gain no op and each of these is
     /// still the module's `fact_handle` (`fact_key`); a round at which none of these modules'
     /// components runs and no member gains an op does not run the component (`round_active`).
-    pub(crate) upstream: Box<[(ModuleId, salsa::Id)]>,
+    pub(crate) upstream: Box<[(ModuleId, blaze_query::db::Id)]>,
     /// At a `RoundKind::Final` round, every import of the members in import order with what it
     /// resolved to (`PartialResolvedImport::namespaces`; `None` while still unresolved), for
     /// `finish`'s diagnostics and `NameRecords`; empty at any other round.
@@ -366,7 +366,7 @@ pub(crate) struct RoundOutcome {
 // Queries.
 
 /// The crate's root module id. Created here so every query of the crate shares it.
-#[salsa::tracked(returns(copy))]
+#[blaze_query::tracked(returns(copy))]
 pub(crate) fn crate_root(db: &Db, krate: Crate) -> ModuleId {
     // This query creates it with the same fields every time, so the id is the same for as long
     // as the crate is.
@@ -377,10 +377,9 @@ pub(crate) fn crate_root(db: &Db, krate: Crate) -> ModuleId {
 /// The id of the module `name` in `parent`, in `krate`'s def map or `block`'s. Created here, keyed
 /// by what names the module, so every collection that finds it shares it: a def-map query's,
 /// and the name-resolution maintainer's, which runs in no query and so can make no tracked
-/// struct itself. Its interned arguments are never collected: collecting them drops the memo and
-/// deletes the module it made, whose id published scopes of other crates still hold, and salsa
-/// gives that id to the next module made.
-#[salsa::tracked(returns(copy), revisions = usize::MAX)]
+/// struct itself. Its interned arguments are never collected: the query database frees no id,
+/// so the module it made keeps its id for the published scopes of other crates that hold it.
+#[blaze_query::tracked(returns(copy))]
 pub(crate) fn child_module(
     db: &Db,
     krate: Crate,
@@ -392,26 +391,26 @@ pub(crate) fn child_module(
 }
 
 /// The crate attributes of the root file (`seed_with_top_level`'s first part).
-#[salsa::tracked(returns(ref))]
+#[blaze_query::tracked(returns(ref))]
 pub(crate) fn crate_data(db: &Db, krate: Crate) -> Arc<DefMapCrateData> {
     collect::crate_data(db, krate)
 }
 
 /// The crate root's round-0 key: the extern prelude of the crate's dependencies.
-#[salsa::tracked(returns(copy))]
+#[blaze_query::tracked(returns(copy))]
 pub(crate) fn root_decl(db: &Db, krate: Crate) -> DeclKey {
     frame::task(Tag::Nameres, |frame| collect::root_decl(db, frame, krate))
 }
 
 /// One module's round-0 declarations.
-#[salsa::tracked(returns(ref))]
+#[blaze_query::tracked(returns(ref))]
 pub(crate) fn module_decls(db: &Db, key: DeclKey) -> ModuleDecls {
     frame::task(Tag::Nameres, |frame| collect::module_decls(db, frame, key))
 }
 
 /// The module's `macro_rules!` after collection, the last definition of each name: what a
 /// `#[macro_use] mod` brings into its parent. Backdates unless they change.
-#[salsa::tracked(returns(ref))]
+#[blaze_query::tracked(returns(ref))]
 pub(crate) fn legacy_exports(db: &Db, key: DeclKey) -> Box<[(Name, MacroId)]> {
     let legacy = &module_decls(db, key).legacy;
     let exports = || legacy.iter().filter_map(|(name, macs)| Some((*name, *macs.last()?)));
@@ -426,7 +425,7 @@ pub(crate) fn legacy_exports(db: &Db, key: DeclKey) -> Box<[(Name, MacroId)]> {
 /// between the root's collection and their subtrees) and of each descendant that has children
 /// of its own; a leaf's ops are read off its log in place, and only when its log writes the
 /// root at all (`OpLog::writes_elsewhere`).
-#[salsa::tracked(returns(ref))]
+#[blaze_query::tracked(returns(ref))]
 pub(crate) fn subtree_macro_exports(db: &Db, key: DeclKey) -> Box<[DeclOp]> {
     let root = crate_root(db, key.decl(db).krate);
     let ops = &module_decls(db, key).ops;
@@ -462,23 +461,23 @@ pub(crate) fn child_key(db: &Db, parent: DeclKey, child: ModuleId) -> Option<Dec
 }
 
 /// The module of `key`'s round-0 scope as a `ModuleScope`, for `Scope::Decl` reads.
-#[salsa::tracked(returns(copy))]
-pub(crate) fn decl_handle(db: &Db, key: DeclKey) -> salsa::Id {
+#[blaze_query::tracked(returns(copy))]
+pub(crate) fn decl_handle(db: &Db, key: DeclKey) -> blaze_query::db::Id {
     let decl = key.decl(db);
     let ops = &module_decls(db, key).ops;
     let scope = frame::task(Tag::Nameres, |frame| unit::local_scope(db, frame, decl.module, &decl.inherited, ops));
     let scope = crate::nameres::ModuleScope::new(db, decl.module, scope.scope, scope.children);
-    salsa::plumbing::AsId::as_id(&scope)
+    blaze_query::db::AsId::as_id(&scope)
 }
 
 /// Every module of the round, in order.
-#[salsa::tracked(returns(ref))]
+#[blaze_query::tracked(returns(ref))]
 pub(crate) fn round_modules(db: &Db, round: RoundKey) -> RoundModules {
     frame::task(Tag::Nameres, |frame| driver::round_modules(db, frame, round))
 }
 
 /// Which components of the round's partition run at the round.
-#[salsa::tracked(returns(ref))]
+#[blaze_query::tracked(returns(ref))]
 pub(crate) fn round_active(db: &Db, round: RoundKey) -> RoundActive {
     unit::round_active(db, round)
 }
@@ -516,19 +515,19 @@ pub(crate) fn ran_by(db: &Db, round: RoundKey, at: u32) -> u32 {
 }
 
 /// What the module gains at a round `>= 1`.
-#[salsa::tracked(returns(ref))]
+#[blaze_query::tracked(returns(ref))]
 pub(crate) fn module_round(db: &Db, key: FactKey) -> ModuleRound {
     frame::task(Tag::Nameres, |frame| driver::module_round(db, frame, key))
 }
 
 /// The round's import graph, for `graph::partition`. Backdates unless an import, a `mod` or
 /// an `extern crate self` changes.
-#[salsa::tracked(returns(ref))]
+#[blaze_query::tracked(returns(ref))]
 pub(crate) fn import_shape(db: &Db, round: RoundKey) -> ImportShape {
     frame::task(Tag::Nameres, |frame| driver::import_shape(db, frame, round))
 }
 
-#[salsa::tracked(returns(ref))]
+#[blaze_query::tracked(returns(ref))]
 pub(crate) fn partition(db: &Db, round: RoundKey) -> Partition {
     let shape = import_shape(db, round);
     frame::task(Tag::Nameres, |frame| super::graph::partition(frame, shape))
@@ -536,56 +535,56 @@ pub(crate) fn partition(db: &Db, round: RoundKey) -> Partition {
 
 /// The crate env the round's units and steps start from: the root's crate-level ops of every
 /// round before, and the injected std prelude.
-#[salsa::tracked(returns(copy))]
+#[blaze_query::tracked(returns(copy))]
 pub(crate) fn round_env(db: &Db, round: RoundKey) -> CrateEnvKey {
     driver::round_env(db, round)
 }
 
 /// One component's resolution at one round.
-#[salsa::tracked(returns(ref))]
+#[blaze_query::tracked(returns(ref))]
 pub(crate) fn scc_state(db: &Db, key: SccKey) -> SccState {
     frame::task(Tag::Nameres, |frame| unit::scc_state(db, frame, key))
 }
 
 /// The round whose state `scc_state(key)` hands out: `key`'s round, or the last before it at
 /// which the component changed.
-#[salsa::tracked(returns(copy))]
+#[blaze_query::tracked(returns(copy))]
 pub(crate) fn latest(db: &Db, key: SccKey) -> u32 {
     scc_state(db, key).round
 }
 
 /// The module's `ModuleScope` after the round's import fixed point. Backdates while the
 /// component hands out the same one.
-#[salsa::tracked(returns(copy))]
-pub(crate) fn fact_handle(db: &Db, key: FactKey) -> salsa::Id {
+#[blaze_query::tracked(returns(copy))]
+pub(crate) fn fact_handle(db: &Db, key: FactKey) -> blaze_query::db::Id {
     unit::fact_handle(db, key)
 }
 
 /// The module's plain imports still unresolved after the round's fixed point, by the name each
 /// binds, in import order: what case 1 of a step's macro calls reads (`unresolved_named`).
-#[salsa::tracked(returns(ref))]
+#[blaze_query::tracked(returns(ref))]
 pub(crate) fn unresolved_named(db: &Db, key: FactKey) -> Box<[(Name, ModPath)]> {
     unit::unresolved_named(db, key)
 }
 
 /// One module's macro resolution at one round.
-#[salsa::tracked(returns(ref))]
+#[blaze_query::tracked(returns(ref))]
 pub(crate) fn macro_step(db: &Db, key: FactKey) -> MacroStep {
     frame::task(Tag::Nameres, |frame| macros::macro_step(db, frame, key))
 }
 
-#[salsa::tracked(returns(copy))]
+#[blaze_query::tracked(returns(copy))]
 pub(crate) fn round_progress(db: &Db, round: RoundKey) -> RoundOutcome {
     driver::round_progress(db, round)
 }
 
-#[salsa::tracked(returns(copy))]
+#[blaze_query::tracked(returns(copy))]
 pub(crate) fn round_kind(db: &Db, round: RoundKey) -> RoundKind {
     driver::round_kind(db, round)
 }
 
 /// The row of `module` in a view that does not hold it.
-#[salsa::tracked(returns(ref))]
+#[blaze_query::tracked(returns(ref))]
 pub(crate) fn row(db: &Db, rows: RowsKey, module: ModuleId) -> Option<ModuleData> {
     match rows.rows(db) {
         Rows::Round(round) => driver::round_row(db, round, module),
@@ -593,8 +592,8 @@ pub(crate) fn row(db: &Db, rows: RowsKey, module: ModuleId) -> Option<ModuleData
     }
 }
 
-/// The `ModuleScope` (as `salsa::Id`) a `ScopeSlot::Fact` names.
-pub(crate) fn scope_of(db: &Db, scope: ScopeRef) -> salsa::Id {
+/// The `ModuleScope` (as `blaze_query::db::Id`) a `ScopeSlot::Fact` names.
+pub(crate) fn scope_of(db: &Db, scope: ScopeRef) -> blaze_query::db::Id {
     match scope.scope(db) {
         Scope::Fact(key) => fact_handle(db, key),
         Scope::Decl(key) => decl_handle(db, key),
@@ -603,5 +602,5 @@ pub(crate) fn scope_of(db: &Db, scope: ScopeRef) -> salsa::Id {
 
 /// A `ScopeSlot::Fact` for `scope`.
 pub(super) fn fact_slot(db: &Db, scope: Scope) -> crate::nameres::ScopeSlot {
-    crate::nameres::ScopeSlot::Fact(salsa::plumbing::AsId::as_id(&ScopeRef::new(db, scope)))
+    crate::nameres::ScopeSlot::Fact(blaze_query::db::AsId::as_id(&ScopeRef::new(db, scope)))
 }

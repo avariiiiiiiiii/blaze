@@ -2,7 +2,7 @@
 //! path went through, marked as rustc's `record_use` marks them, and how each macro call of a
 //! def map resolved.
 //!
-//! A lookup records nothing as it goes, so salsa sees no side effect. Once a def map's fixed
+//! A lookup records nothing as it goes, so the query database sees no side effect. Once a def map's fixed
 //! point is reached, its collection resolves each `use` and each macro call's path again, as
 //! rustc's `finalize_imports` does, into the def map's [`NameRecords`]. [`used_imports`] adds the
 //! paths of every signature and body of the crate, resolved again through the [`Resolver`]
@@ -12,7 +12,7 @@
 //! A path's uses are its segments' bindings: each prefix is resolved on its own (paths have one
 //! to three segments, and this runs once per path, not per lookup), the last segment in the
 //! namespace the path is resolved in. Records are in the order collection and the walk made
-//! them, never sorted by salsa id, so they are the same bytes in every run.
+//! them, never sorted by id, so they are the same bytes in every run.
 
 use std::alloc::Allocator;
 
@@ -411,7 +411,7 @@ impl UsedImports {
 /// The uses of the imports of `krate` by every path of the crate: its imports, macro calls,
 /// signatures and bodies, block def maps included. The traits method resolution picks are
 /// not paths: [`used_imports_with`] adds them.
-#[salsa::tracked(returns(ref))]
+#[blaze_query::tracked(returns(ref))]
 pub fn used_imports(db: &Db, krate: Crate) -> UsedImports {
     finish(db, krate, crate_uses(db, krate), &[])
 }
@@ -432,7 +432,7 @@ pub(crate) struct CrateUses {
     glob_targets: Box<[(GlobId, ModuleId)]>,
 }
 
-#[salsa::tracked(returns(ref))]
+#[blaze_query::tracked(returns(ref))]
 pub(crate) fn crate_uses(db: &Db, krate: Crate) -> CrateUses {
     let def_map = crate_def_map(db, krate);
     let mut walk = Walk::new(db);

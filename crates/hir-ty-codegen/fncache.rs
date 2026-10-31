@@ -44,7 +44,7 @@ use hir_def::{
 };
 use rustc_hash::{FxBuildHasher, FxHashMap, FxHashSet};
 use rustc_type_ir::inherent::{GenericArgs as _, IntoKind};
-use salsa::plumbing::{AsId, FromId};
+use blaze_query::db::{AsId, FromId};
 
 use hir_ty::{
     InferBodyId,
@@ -92,14 +92,14 @@ fn is_codec(db: &Db, func: FunctionId) -> bool {
 
 /// The closure that `#[blaze::cache]` put the body of `func` in, when it is a cached
 /// function: the one it asks for the code of.
-pub(super) fn cached_closure(db: &Db, func: FunctionId) -> Option<salsa::Id> {
+pub(super) fn cached_closure(db: &Db, func: FunctionId) -> Option<blaze_query::db::Id> {
     if !hir_ty::fn_cache::uses_fn_cache(db, func.krate(db)) {
         return None;
     }
     cached_closure_of(db, func).map(|it| it.as_id())
 }
 
-#[salsa::tracked]
+#[blaze_query::tracked]
 fn cached_closure_of<'db>(
     db: &'db Db,
     func: FunctionId,
@@ -120,7 +120,7 @@ fn cached_closure_of<'db>(
 
 /// The hash of the code of the closure a cached function keeps its body in and of all it
 /// reaches, or why the function can't be cached.
-#[salsa::tracked(returns(ref))]
+#[blaze_query::tracked(returns(ref))]
 pub(super) fn cache_code(
     db: &Db,
     closure: Instance,

@@ -7164,7 +7164,7 @@
      "unexpected_cfgs": {
       "check-cfg": [
        "cfg(bootstrap)",
-       "cfg(no_salsa_async_drops)"
+       "cfg(no_async_drops)"
       ],
       "level": "warn"
      },

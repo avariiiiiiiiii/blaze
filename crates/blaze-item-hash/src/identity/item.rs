@@ -4,7 +4,7 @@
 //! The identity is computed inside `infer_body_query`, so nothing it hashes may depend on the
 //! inference of a body: an interface hash includes what bodies leak (an `async fn`'s or an
 //! `impl Trait` return's hidden type, a `const fn`'s, a const's and a static's body), which
-//! could reach back to the body being inferred, a salsa cycle. A signature hash leaves each
+//! could reach back to the body being inferred, a query cycle. A signature hash leaves each
 //! leak out; what a body reads of one (a hidden type, a constant's value) is a fact of its
 //! trace instead (section 5). An item of any crate is hashed alike.
 

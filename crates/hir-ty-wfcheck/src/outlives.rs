@@ -18,7 +18,6 @@ use rustc_type_ir::{
     TypeVisitableExt as _, TypeVisitor,
     inherent::{GenericArgs as _, IntoKind, Term as _, Ty as _},
 };
-use salsa::SalsaValue;
 
 use hir_ty::{
     GenericPredicates,
@@ -682,26 +681,26 @@ impl<'db> Inferred<'db> {
     }
 }
 
-/// One of an ADT's inferred outlives predicates as salsa keeps it: what outlives, a type or a
+/// One of an ADT's inferred outlives predicates as the query database keeps it: what outlives, a type or a
 /// region, and the region.
-#[derive(Debug, Clone, PartialEq, Eq, SalsaValue)]
+#[derive(Debug, Clone, PartialEq, Eq, blaze_query::Value)]
 enum InferredArg {
     Type(StoredTy),
     Region(StoredRegion),
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, SalsaValue)]
+#[derive(Debug, Clone, PartialEq, Eq, blaze_query::Value)]
 struct InferredPredicate {
     arg: InferredArg,
     region: StoredRegion,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Default, SalsaValue)]
+#[derive(Debug, Clone, PartialEq, Eq, Default, blaze_query::Value)]
 struct InferredOutlives(Vec<InferredPredicate>);
 
 /// A query, so an edit checks again only the ADTs it changes. Worked out to a fixed point, as
 /// ADTs can contain each other.
-#[salsa::tracked(
+#[blaze_query::tracked(
     returns(ref),
     cycle_fn = inferred_outlives_cycle_fn,
     cycle_initial = inferred_outlives_cycle_initial,
@@ -739,7 +738,7 @@ fn inferred_outlives(db: &Db, adt: AdtId) -> InferredOutlives {
 
 fn inferred_outlives_cycle_initial(
     _db: &Db,
-    _: salsa::Id,
+    _: blaze_query::db::Id,
     _adt: AdtId,
 ) -> InferredOutlives {
     InferredOutlives::default()
@@ -747,7 +746,7 @@ fn inferred_outlives_cycle_initial(
 
 fn inferred_outlives_cycle_fn(
     _db: &Db,
-    _: &salsa::Cycle<'_>,
+    _: &blaze_query::db::Cycle<'_>,
     _last_provisional_value: &InferredOutlives,
     value: InferredOutlives,
     _adt: AdtId,

@@ -161,12 +161,12 @@ fn hash_ast_id<N, H: Hasher>(id: AstId<N>, state: &mut H) -> u64 {
     u64::from(id.value.erase().into_raw()) | file << 32
 }
 
-// An `AstId` is 16 bytes: the file 12 (a tag word and an id), the file-local id 4.
-const _: () = assert!(size_of::<AstId<ast::Struct>>() == 16);
+// An `AstId` is 12 bytes: the file 8 (a tag word and an id), the file-local id 4.
+const _: () = assert!(size_of::<AstId<ast::Struct>>() == 12);
 
-// 24 bytes per item (module 8, `AstId` 16), no padding; hashed in 3 Fx rounds (module, file,
+// 16 bytes per item (module 4, `AstId` 12), no padding; hashed in 3 Fx rounds (module, file,
 // file-local id with the file's variant).
-const _: () = assert!(size_of::<ItemLoc<ast::Struct>>() == 24);
+const _: () = assert!(size_of::<ItemLoc<ast::Struct>>() == 16);
 const _: () = assert!(align_of::<ItemLoc<ast::Struct>>() == 4);
 
 impl<N: AstIdNode> HasModule for ItemLoc<N> {
@@ -178,7 +178,7 @@ impl<N: AstIdNode> HasModule for ItemLoc<N> {
 
 #[derive(Debug)]
 pub struct AssocItemLoc<N: AstIdNode> {
-    // FIXME: Store this as an erased `salsa::Id` to save space
+    // FIXME: Store this as an erased `blaze_query::db::Id` to save space
     pub container: ItemContainerId,
     pub id: AstId<N>,
 }
@@ -208,9 +208,9 @@ impl<N: AstIdNode> Hash for AssocItemLoc<N> {
     }
 }
 
-// 28 bytes per item (container 12: a tag word and an id, `AstId` 16); hashed in 3 Fx rounds
+// 20 bytes per item (container 8: a tag word and an id, `AstId` 12); hashed in 3 Fx rounds
 // (container, file, file-local id with both variants).
-const _: () = assert!(size_of::<AssocItemLoc<ast::Fn>>() == 28);
+const _: () = assert!(size_of::<AssocItemLoc<ast::Fn>>() == 20);
 const _: () = assert!(align_of::<AssocItemLoc<ast::Fn>>() == 4);
 
 impl<N: AstIdNode> HasModule for AssocItemLoc<N> {
@@ -393,10 +393,10 @@ impl Hash for BuiltinDeriveImplLoc {
     }
 }
 
-// 24 bytes per impl (adt 12, attr id 4, index 4, trait 1, 3 of padding); hashed in 3 Fx rounds.
-const _: () = assert!(size_of::<BuiltinDeriveImplLoc>() == 24);
+// 20 bytes per impl (adt 8, attr id 4, index 4, trait 1, 3 of padding); hashed in 3 Fx rounds.
+const _: () = assert!(size_of::<BuiltinDeriveImplLoc>() == 20);
 
-#[salsa::interned(debug, unsafe(no_lifetime), revisions = usize::MAX)]
+#[blaze_query::interned(debug, unsafe(no_lifetime))]
 #[derive(PartialOrd, Ord)]
 pub struct BuiltinDeriveImplId {
     #[returns(ref)]
@@ -437,9 +437,9 @@ impl Hash for EnumVariantLoc {
     }
 }
 
-// 28 bytes per variant (`AstId` 16, enum 8, name 4), no padding; hashed in 4 Fx rounds (file,
+// 20 bytes per variant (`AstId` 12, enum 4, name 4), no padding; hashed in 4 Fx rounds (file,
 // file-local id, enum, name).
-const _: () = assert!(size_of::<EnumVariantLoc>() == 28);
+const _: () = assert!(size_of::<EnumVariantLoc>() == 20);
 
 impl EnumVariantLoc {
     pub fn index(&self, db: &Db) -> usize {
@@ -493,9 +493,9 @@ impl Hash for Macro2Loc {
     }
 }
 
-// 28 bytes per macro (module 8, `AstId` 16, expander 2, flag 1, edition 1), no padding; hashed
+// 20 bytes per macro (module 4, `AstId` 12, expander 2, flag 1, edition 1), no padding; hashed
 // in 3 Fx rounds.
-const _: () = assert!(size_of::<Macro2Loc>() == 28);
+const _: () = assert!(size_of::<Macro2Loc>() == 20);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct MacroRulesLoc {
@@ -520,9 +520,9 @@ impl Hash for MacroRulesLoc {
     }
 }
 
-// 28 bytes per macro (module 8, `AstId` 16, expander 2, flags 1, edition 1), no padding; hashed
+// 20 bytes per macro (module 4, `AstId` 12, expander 2, flags 1, edition 1), no padding; hashed
 // in 3 Fx rounds.
-const _: () = assert!(size_of::<MacroRulesLoc>() == 28);
+const _: () = assert!(size_of::<MacroRulesLoc>() == 20);
 
 bitflags::bitflags! {
     #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -583,11 +583,11 @@ impl Hash for ProcMacroLoc {
     }
 }
 
-// 32 bytes per proc macro (module 8, `AstId` 16, expander 4, kind 1, edition 1, 2 of padding);
+// 24 bytes per proc macro (module 4, `AstId` 12, expander 4, kind 1, edition 1, 2 of padding);
 // hashed in 4 Fx rounds (module, file, expander, the rest in one word).
-const _: () = assert!(size_of::<ProcMacroLoc>() == 32);
+const _: () = assert!(size_of::<ProcMacroLoc>() == 24);
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, salsa::SalsaValue)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, blaze_query::Value)]
 pub enum LoweringMode {
     Analysis,
     Ide,
@@ -614,7 +614,7 @@ mod tracked_struct_token {
     }
 }
 
-#[salsa::tracked(constructor = new_)]
+#[blaze_query::tracked(constructor = new_)]
 #[derive(PartialOrd, Ord)]
 pub struct BlockIdLt<'db> {
     #[returns(copy)]
@@ -647,10 +647,10 @@ impl<'db> BlockIdLt<'db> {
     /// # Contract
     ///
     /// The id is only meaningful in the revision it was read in. Read after a revision that
-    /// deleted it, salsa panics or gives the fields of another `BlockId`; it is never UB
-    /// (salsa's `FromId` is safe for every lifetime).
+    /// deleted it, it gives the fields the `BlockId` last had (the query database frees no id);
+    /// it is never UB (`blaze_query::db::FromId` is safe for every lifetime).
     pub fn to_static(self) -> BlockId {
-        salsa::plumbing::FromId::from_id(salsa::plumbing::AsId::as_id(&self))
+        blaze_query::db::FromId::from_id(blaze_query::db::AsId::as_id(&self))
     }
 }
 impl BlockId {
@@ -661,11 +661,11 @@ impl BlockId {
     /// The id must come from `_db`, and is only meaningful in the revision it was read in;
     /// otherwise its fields are unspecified, never UB, as for [`BlockIdLt::to_static`].
     pub fn to_db<'db>(self, _db: &'db Db) -> BlockIdLt<'db> {
-        salsa::plumbing::FromId::from_id(salsa::plumbing::AsId::as_id(&self))
+        blaze_query::db::FromId::from_id(blaze_query::db::AsId::as_id(&self))
     }
 }
 
-#[salsa::tracked(debug)]
+#[blaze_query::tracked(debug)]
 #[derive(PartialOrd, Ord)]
 pub struct ModuleIdLt<'db> {
     /// The crate this module belongs to.
@@ -692,10 +692,10 @@ impl<'db> ModuleIdLt<'db> {
     /// # Contract
     ///
     /// The id is only meaningful in the revision it was read in. Read after a revision that
-    /// deleted it, salsa panics or gives the fields of another `ModuleId`; it is never UB
-    /// (salsa's `FromId` is safe for every lifetime).
+    /// deleted it, it gives the fields the `ModuleId` last had (the query database frees no id);
+    /// it is never UB (`blaze_query::db::FromId` is safe for every lifetime).
     pub fn to_static(self) -> ModuleId {
-        salsa::plumbing::FromId::from_id(salsa::plumbing::AsId::as_id(&self))
+        blaze_query::db::FromId::from_id(blaze_query::db::AsId::as_id(&self))
     }
 
     pub fn def_map(self, db: &'db Db) -> &'db DefMap {
@@ -751,7 +751,7 @@ impl ModuleId {
     /// The id must come from `_db`, and is only meaningful in the revision it was read in;
     /// otherwise its fields are unspecified, never UB, as for [`ModuleIdLt::to_static`].
     pub fn to_db<'db>(self, _db: &'db Db) -> ModuleIdLt<'db> {
-        salsa::plumbing::FromId::from_id(salsa::plumbing::AsId::as_id(&self))
+        blaze_query::db::FromId::from_id(blaze_query::db::AsId::as_id(&self))
     }
 
     /// The prelude a name not in scope in this module is looked up in, and the
@@ -788,17 +788,17 @@ impl HasModule for ModuleId {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, salsa::SalsaValue)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, blaze_query::Value)]
 pub struct FieldId {
-    // FIXME: Store this as an erased `salsa::Id` to save space
+    // FIXME: Store this as an erased `blaze_query::db::Id` to save space
     pub parent: VariantId,
     pub local_id: LocalFieldId,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, salsa::SalsaValue)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, blaze_query::Value)]
 pub struct TupleId(pub u32);
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, salsa::SalsaValue)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, blaze_query::Value)]
 pub struct TupleFieldId {
     pub tuple: TupleId,
     pub index: u32,
@@ -806,7 +806,7 @@ pub struct TupleFieldId {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct TypeOrConstParamId {
-    // FIXME: Store this as an erased `salsa::Id` to save space
+    // FIXME: Store this as an erased `blaze_query::db::Id` to save space
     pub parent: GenericDefId,
     pub local_id: LocalTypeOrConstParamId,
 }
@@ -875,7 +875,7 @@ impl From<ConstParamId> for TypeOrConstParamId {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct LifetimeParamId {
-    // FIXME: Store this as an erased `salsa::Id` to save space
+    // FIXME: Store this as an erased `blaze_query::db::Id` to save space
     pub parent: GenericDefId,
     pub local_id: LocalLifetimeParamId,
 }
@@ -886,7 +886,7 @@ pub struct HrtbLifetimeParamId {
     pub local_id: usize,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, salsa::Supertype)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, blaze_query::Supertype)]
 pub enum ItemContainerId {
     ExternBlockId(ExternBlockId),
     ModuleId(ModuleId),
@@ -922,7 +922,7 @@ impl ItemContainerId {
 }
 
 /// A Data Type
-#[derive(Debug, PartialOrd, Ord, Clone, Copy, PartialEq, Eq, Hash, salsa::Supertype)]
+#[derive(Debug, PartialOrd, Ord, Clone, Copy, PartialEq, Eq, Hash, blaze_query::Supertype)]
 pub enum AdtId {
     StructId(StructId),
     UnionId(UnionId),
@@ -962,7 +962,7 @@ impl AdtId {
 }
 
 /// A macro
-#[derive(Debug, PartialOrd, Ord, Clone, Copy, PartialEq, Eq, Hash, salsa::Supertype)]
+#[derive(Debug, PartialOrd, Ord, Clone, Copy, PartialEq, Eq, Hash, blaze_query::Supertype)]
 pub enum MacroId {
     Macro2Id(Macro2Id),
     MacroRulesId(MacroRulesId),
@@ -976,10 +976,10 @@ impl MacroId {
     }
 }
 
-#[salsa::tracked]
+#[blaze_query::tracked]
 impl MacroId {
     /// Turns a MacroId into a MacroDefId, describing the macro's definition post name resolution.
-    #[salsa::tracked(returns(copy), mem_tag = Nameres)]
+    #[blaze_query::tracked(returns(copy), mem_tag = Nameres)]
     pub fn definition(self, db: &Db) -> MacroDefId {
         let kind = |expander, file_id, m| {
             let in_file = InFile::new(file_id, m);
@@ -1087,7 +1087,7 @@ impl From<DefWithBodyId> for ModuleDefId {
 }
 
 /// The defs which have a body.
-#[derive(Debug, PartialOrd, Ord, Clone, Copy, PartialEq, Eq, Hash, salsa::Supertype)]
+#[derive(Debug, PartialOrd, Ord, Clone, Copy, PartialEq, Eq, Hash, blaze_query::Supertype)]
 pub enum DefWithBodyId {
     /// A function body.
     FunctionId(FunctionId),
@@ -1131,7 +1131,7 @@ impl DefWithBodyId {
     }
 }
 
-#[derive(Debug, Copy, Clone, PartialEq, Eq, Hash, salsa::Supertype)]
+#[derive(Debug, Copy, Clone, PartialEq, Eq, Hash, blaze_query::Supertype)]
 pub enum AssocItemId {
     FunctionId(FunctionId),
     ConstId(ConstId),
@@ -1153,7 +1153,7 @@ impl_from!(
     for ModuleDefId
 );
 
-#[derive(Debug, PartialOrd, Ord, Clone, Copy, PartialEq, Eq, Hash, salsa::Supertype)]
+#[derive(Debug, PartialOrd, Ord, Clone, Copy, PartialEq, Eq, Hash, blaze_query::Supertype)]
 pub enum GenericDefId {
     AdtId(AdtId),
     // consts can have type parameters from their parents (i.e. associated consts of traits)
@@ -1181,8 +1181,8 @@ impl_from!(
 /// Owner of an expression store - either a body or a signature.
 /// This is used for queries that operate on expression stores generically,
 /// such as `expr_scopes`.
-// NOTE: This type cannot be `salsa::Supertype` as its variants are overlapping.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord /* !salsa::Supertype */)]
+// NOTE: This type cannot be `blaze_query::Supertype` as its variants are overlapping.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord /* !blaze_query::Supertype */)]
 pub enum ExpressionStoreOwnerId {
     Signature(GenericDefId),
     /// A body, something with a root expression.
@@ -1192,11 +1192,11 @@ pub enum ExpressionStoreOwnerId {
     VariantFields(VariantId),
 }
 
-/// The item whose store it is, for a query keyed by it (`salsa::Zalsa::ids_of`, read by
+/// The item whose store it is, for a query keyed by it (`blaze_query::db::Storage::ids_of`, read by
 /// `crates/hir-firewall`).
-impl salsa::plumbing::interned::NamesIds for ExpressionStoreOwnerId {
-    fn names_ids(&self, out: &mut Vec<salsa::Id>) {
-        use salsa::plumbing::AsId;
+impl blaze_query::db::NamesIds for ExpressionStoreOwnerId {
+    fn names_ids(&self, out: &mut Vec<blaze_query::db::Id>) {
+        use blaze_query::db::AsId;
         out.push(match *self {
             ExpressionStoreOwnerId::Signature(it) => it.as_id(),
             ExpressionStoreOwnerId::Body(it) => it.as_id(),
@@ -1310,7 +1310,7 @@ impl_from!(
     for GenericDefId
 );
 
-#[derive(Debug, PartialOrd, Ord, Clone, Copy, PartialEq, Eq, Hash, salsa::Supertype)]
+#[derive(Debug, PartialOrd, Ord, Clone, Copy, PartialEq, Eq, Hash, blaze_query::Supertype)]
 pub enum CallableDefId {
     FunctionId(FunctionId),
     StructId(StructId),
@@ -1337,7 +1337,7 @@ impl CallableDefId {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, salsa::Supertype)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, blaze_query::Supertype)]
 pub enum AttrDefId {
     ModuleId(ModuleId),
     AdtId(AdtId),
@@ -1377,7 +1377,7 @@ impl_from!(
 );
 
 #[derive(
-    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, salsa::Supertype, salsa::SalsaValue,
+    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, blaze_query::Supertype, blaze_query::Value,
 )]
 pub enum VariantId {
     EnumVariantId(EnumVariantId),
@@ -1796,7 +1796,7 @@ impl Complete {
 }
 
 // return: macro call id and include file id
-#[salsa::tracked(returns(ref), mem_tag = Nameres)]
+#[blaze_query::tracked(returns(ref), mem_tag = Nameres)]
 pub fn include_macro_invoc(
     db: &Db,
     krate: Crate,
@@ -1832,7 +1832,7 @@ mod loc_hash_tests {
     };
     use intern::Symbol;
     use rustc_hash::{FxBuildHasher, FxHashSet};
-    use salsa::plumbing::FromId;
+    use blaze_query::db::FromId;
     use span::{Edition, ErasedFileAstId, FileAstId};
     use syntax::ast;
 
@@ -1842,37 +1842,37 @@ mod loc_hash_tests {
         FxBuildHasher.hash_one(it)
     }
 
-    /// An id of a salsa struct whose data no test reads.
-    fn salsa_id<T: FromId>(index: u32) -> T {
-        T::from_id(salsa::Id::from_bits(u64::from(index)))
+    /// An id of an interned struct whose data no test reads.
+    fn query_id<T: FromId>(index: u32) -> T {
+        T::from_id(blaze_query::db::Id::from_u32(index))
     }
 
     fn ast_ids<N: AstIdNode>() -> [AstId<N>; 4] {
         let raw = |it| FileAstId::from_erased_unchecked(ErasedFileAstId::from_raw(it));
         [
-            InFile::new(HirFileId::FileId(salsa_id::<EditionedFileId>(3)), raw(7)),
-            InFile::new(HirFileId::MacroFile(salsa_id::<MacroCallId>(3)), raw(7)),
-            InFile::new(HirFileId::FileId(salsa_id::<EditionedFileId>(4)), raw(7)),
-            InFile::new(HirFileId::FileId(salsa_id::<EditionedFileId>(3)), raw(8)),
+            InFile::new(HirFileId::FileId(query_id::<EditionedFileId>(3)), raw(7)),
+            InFile::new(HirFileId::MacroFile(query_id::<MacroCallId>(3)), raw(7)),
+            InFile::new(HirFileId::FileId(query_id::<EditionedFileId>(4)), raw(7)),
+            InFile::new(HirFileId::FileId(query_id::<EditionedFileId>(3)), raw(8)),
         ]
     }
 
     fn containers() -> [ItemContainerId; 5] {
         [
-            ItemContainerId::ModuleId(salsa_id(5)),
-            ItemContainerId::ImplId(salsa_id(5)),
-            ItemContainerId::TraitId(salsa_id(5)),
-            ItemContainerId::ExternBlockId(salsa_id(5)),
-            ItemContainerId::ModuleId(salsa_id(6)),
+            ItemContainerId::ModuleId(query_id(5)),
+            ItemContainerId::ImplId(query_id(5)),
+            ItemContainerId::TraitId(query_id(5)),
+            ItemContainerId::ExternBlockId(query_id(5)),
+            ItemContainerId::ModuleId(query_id(6)),
         ]
     }
 
     fn adts() -> [AdtId; 4] {
         [
-            AdtId::StructId(salsa_id(5)),
-            AdtId::UnionId(salsa_id(5)),
-            AdtId::EnumId(salsa_id(5)),
-            AdtId::StructId(salsa_id(6)),
+            AdtId::StructId(query_id(5)),
+            AdtId::UnionId(query_id(5)),
+            AdtId::EnumId(query_id(5)),
+            AdtId::StructId(query_id(6)),
         ]
     }
 
@@ -1903,9 +1903,9 @@ mod loc_hash_tests {
     fn item_locs() {
         let mut locs = Vec::new();
         for id in ast_ids::<ast::Struct>() {
-            locs.push(ItemLoc { container: salsa_id(5), id });
+            locs.push(ItemLoc { container: query_id(5), id });
         }
-        locs.push(ItemLoc { container: salsa_id(6), id: ast_ids()[0] });
+        locs.push(ItemLoc { container: query_id(6), id: ast_ids()[0] });
         check(&locs);
     }
 
@@ -1924,7 +1924,7 @@ mod loc_hash_tests {
     fn enum_variant_locs() {
         let mut locs = Vec::new();
         for id in ast_ids() {
-            for parent in [salsa_id::<EnumId>(5), salsa_id(6)] {
+            for parent in [query_id::<EnumId>(5), query_id(6)] {
                 for name in ["A", "B"] {
                     let name = Name::new_symbol_root(Symbol::intern(name));
                     locs.push(EnumVariantLoc { id, parent, name });
@@ -1944,14 +1944,14 @@ mod loc_hash_tests {
     #[test]
     fn macro_locs() {
         let base = Macro2Loc {
-            container: salsa_id(5),
+            container: query_id(5),
             id: ast_ids()[0],
             expander: MacroExpander::UnimplementedBuiltIn,
             allow_internal_unsafe: false,
             edition: Edition::Edition2015,
         };
         let mut locs = vec![base];
-        locs.push(Macro2Loc { container: salsa_id(6), ..base });
+        locs.push(Macro2Loc { container: query_id(6), ..base });
         locs.extend(ast_ids().into_iter().skip(1).map(|id| Macro2Loc { id, ..base }));
         locs.extend(expanders().into_iter().skip(1).map(|expander| Macro2Loc { expander, ..base }));
         locs.push(Macro2Loc { allow_internal_unsafe: true, ..base });
@@ -1960,14 +1960,14 @@ mod loc_hash_tests {
         check(&locs);
 
         let base = MacroRulesLoc {
-            container: salsa_id(5),
+            container: query_id(5),
             id: ast_ids()[0],
             expander: MacroExpander::Declarative { styles: MacroCallStyles::FN_LIKE },
             flags: MacroRulesLocFlags::empty(),
             edition: Edition::Edition2015,
         };
         let mut locs = vec![base];
-        locs.push(MacroRulesLoc { container: salsa_id(6), ..base });
+        locs.push(MacroRulesLoc { container: query_id(6), ..base });
         locs.extend(ast_ids().into_iter().skip(1).map(|id| MacroRulesLoc { id, ..base }));
         locs.extend(expanders().into_iter().map(|expander| MacroRulesLoc { expander, ..base }));
         locs.extend(
@@ -1980,14 +1980,14 @@ mod loc_hash_tests {
         check(&locs);
 
         let base = ProcMacroLoc {
-            container: salsa_id(5),
+            container: query_id(5),
             id: ast_ids()[0],
             expander: CustomProcMacroExpander::new(0),
             kind: ProcMacroKind::Bang,
             edition: Edition::Edition2015,
         };
         let mut locs = vec![base];
-        locs.push(ProcMacroLoc { container: salsa_id(6), ..base });
+        locs.push(ProcMacroLoc { container: query_id(6), ..base });
         locs.extend(ast_ids().into_iter().skip(1).map(|id| ProcMacroLoc { id, ..base }));
         locs.push(ProcMacroLoc { expander: CustomProcMacroExpander::new(1), ..base });
         locs.push(ProcMacroLoc { expander: CustomProcMacroExpander::disabled(), ..base });

@@ -612,7 +612,7 @@ pub(crate) fn round_row(db: &Db, round: RoundKey, module: ModuleId) -> Option<Mo
 pub(crate) fn collect_crate<'db>(db: &'db Db, frame: &Frame, krate: Crate) -> (DefMap, LocalDefMap) {
     let mut r = 0;
     while queries::round_kind(db, RoundKey::new(db, krate, r)) != RoundKind::Final {
-        salsa::Database::unwind_if_revision_cancelled(db);
+        blaze_query::db::unwind_if_cancelled(db);
         r += 1;
     }
     let round = RoundKey::new(db, krate, r);
@@ -1089,7 +1089,7 @@ pub(crate) fn collect_block<'db>(
     let mut eager_with_errors = false;
     'resolve_attr: loop {
         'resolve_macros: loop {
-            salsa::Database::unwind_if_revision_cancelled(db);
+            blaze_query::db::unwind_if_cancelled(db);
             sink.unit.set_unexpanded(!pending.is_empty());
             sink.unit.resolve_imports();
             let result =

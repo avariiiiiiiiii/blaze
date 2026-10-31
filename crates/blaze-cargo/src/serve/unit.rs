@@ -196,11 +196,11 @@ impl Steps for Real {
             // A front end kept and moved to the view keeps what it was served: only crates of
             // the build's dependencies were, and moving reads again only the view's files.
             let (mut lowered, session, seeded) = match kept {
-                Some(KeptLowered { session, mut lowered, seeds, .. }) => match lowered.refresh(lower()).map_err(failed)? {
-                    true => {
-                        let seeded = seed(&lowered, seeds);
-                        (lowered, Some(session), seeded)
-                    }
+                Some(KeptLowered { session, mut lowered, seeds, .. }) => match lowered
+                    .refresh(lower(), |db| seed(db, &seeds))
+                    .map_err(failed)?
+                {
+                    true => (lowered, Some(session), seeds),
                     false => {
                         drop((session, lowered, seeds));
                         (blaze_lower::lower(lower()).map_err(failed)?, None, Vec::new())
@@ -254,12 +254,24 @@ impl Steps for Real {
     }
 }
 
-/// The kept `seeds` a front end moved to their edit's commit took, each as its file's next
-/// parse ([`base_db::EditionedFileId::seed_parse`]); the others are dropped.
-fn seed(lowered: &Lowered, mut seeds: Vec<blaze_intent::Seed>) -> Vec<blaze_intent::Seed> {
-    let db = lowered.db();
-    seeds.retain(|it| base_db::EditionedFileId::new(db, it.file, it.edition).seed_parse(db, it.content, &it.parse));
-    seeds
+/// Hands each of the kept `seeds` to its file as its next parse
+/// ([`base_db::EditionedFileId::seed_parse`]), inside the refresh's write once the edit's
+/// commit's texts are set and before its maintainers parse them. A seed refused (the text set
+/// is not the one its tree was made of, or the file was parsed first) is an error naming the
+/// file, never a whole parse in its place.
+fn seed(db: &base_db::Db, seeds: &[blaze_intent::Seed]) -> Result<(), blaze_lower::LowerError> {
+    for it in seeds {
+        if !base_db::EditionedFileId::new(db, it.file, it.edition).seed_parse(db, it.content, &it.parse) {
+            // alloc: an error path.
+            let at = db.path_for_file(it.file).map_or_else(|| format!("{:?}", it.file), |path| path.to_string());
+            let what = format!(
+                "the edit's parse of the file was not taken (its text is not {}, or it was parsed first): it would be parsed again whole",
+                it.content
+            );
+            return Err(blaze_lower::LowerError { what, at: Some(at) });
+        }
+    }
+    Ok(())
 }
 
 fn lower_error(error: blaze_lower::LowerError) -> ApiError {
@@ -508,7 +520,7 @@ pub(crate) fn cancellable<T>(work: impl FnOnce() -> T) -> Result<T, Failed> {
     match caught {
         Ok(it) => Ok(it),
         Err(payload) => {
-            if payload.is::<salsa::Cancelled>() || payload.is::<blaze_graph::Cancelled>() {
+            if payload.is::<blaze_query::db::Cancelled>() || payload.is::<blaze_graph::Cancelled>() {
                 Err(Failed::Again)
             } else if let Some(it) = hir_def::nameres::Unmaintained::of_payload(&*payload) {
                 Err(Failed::Error(ApiError::new(it.to_string(), None))) // alloc: an error, once

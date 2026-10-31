@@ -733,7 +733,7 @@ pub fn buffer_id(buffer: &[u8]) -> ContentId {
 
 /// [`open_as`] of bytes from outside this process (the store, a pack, the image, the
 /// network), after checking they are the buffer `key` names. A decoder that trusts what a
-/// record holds beyond its bounds (a salsa index, an interned handle) is only given bytes
+/// record holds beyond its bounds (a query ID, an interned handle) is only given bytes
 /// opened this way.
 pub fn open_verified<R: Record>(
     buffer: &[u8],

@@ -1,7 +1,7 @@
 //! The SwissTable group probe every interner's table shares (docs/v2/plan/design/hardware.md,
-//! "interner and memo lookups"): `intern`'s arena store and mapped index, and salsa's interned
-//! key map and query node map. `intern` re-exports it as `intern::swiss`; it lives here, a
-//! leaf every table's crate already depends on, so salsa and `blaze-ids` reach it without
+//! "interner and memo lookups"): `intern`'s arena store and mapped index, and the query engine's
+//! interned key map. `intern` re-exports it as `intern::swiss`; it lives here, a
+//! leaf every table's crate already depends on, so `blaze-query` and `blaze-ids` reach it without
 //! `intern`'s image and format crates.
 //!
 //! A table is a power of two of groups; a group is a [`Ctrl`] word of tag bytes beside its
@@ -348,9 +348,9 @@ mod tests {
 
     use super::*;
 
-    /// The copies this module replaced (`intern`'s arena and mapped index, salsa's interned
-    /// table and node map), as the spec: the subtraction trick, whose borrow may also flag the
-    /// byte above a match, filtered by comparing the byte.
+    /// The copies this module replaced (`intern`'s arena and mapped index, the old query
+    /// engine's interned table and node map), as the spec: the subtraction trick, whose borrow
+    /// may also flag the byte above a match, filtered by comparing the byte.
     mod reference {
         pub fn matching(word: u64, tag: u64, low: u64) -> u64 {
             let high = low << 7;

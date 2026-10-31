@@ -5,7 +5,7 @@
 //!
 //! A read is found by its ingredient's debug name in [`RULES`], sorted, by binary search, then
 //! told apart from a same-named ingredient by the file its ingredient was declared in: a field
-//! of a salsa struct is named by the field alone (`data`, `scope`), so the name says little.
+//! of an input or tracked struct is named by the field alone (`data`, `scope`), so the name says little.
 //! A read no rule names is refused.
 
 use std::cmp::Ordering;
@@ -17,28 +17,25 @@ use blaze_items::{
     goals::{FactRefKey, Goals},
     key, kinds as items,
 };
+use blaze_query::db::{Database as _, FromIdIn, Id, ReadKind};
 use hir_def::{
-    AdtId, AssocItemId, AttrDefId, BuiltinDeriveImplId, ConstId, DefWithBodyId, EnumId,
-    EnumVariantId, ExpressionStoreOwnerId, FunctionId, GenericDefId, HasModule, ImplId,
-    ItemContainerId, Lookup, ModuleId, StaticId, TraitId, TypeAliasId, VariantId,
+    AdtId, AssocItemId, AttrDefId, BuiltinDeriveImplId, DefWithBodyId, EnumId, EnumVariantId,
+    ExpressionStoreOwnerId, FunctionId, GenericDefId, HasModule, ImplId, ItemContainerId, Lookup,
+    ModuleId, StaticId, TraitId, TypeAliasId, VariantId,
     hir::{ClosureKind, CoroutineKind},
 };
-use hir_expand::name::Name;
 use hir_ty::{
     InferBodyId,
     body_store::{Classified, Step},
     db::{InternedClosureId, InternedCoroutineId},
     generics::generics,
-    method_resolution::SelfTyKey,
-    next_solver::{
-        StoredGenericArgs,
-        goal_store::{FactObject, FactRef, GoalFacts},
+    method_resolution::{
+        InherentImpls_in_crate_for_self_ty, TraitImpls_blanket_in_crate_and_deps,
+        TraitImpls_for_crate_and_trait, TraitImpls_in_crate_and_deps_for_trait_and_self_ty,
+        TraitImpls_in_crate_for_trait_and_self_ty, impl_value_item, in_crate_trait_value_items,
+        scope_sets::module_items_named, trait_value_item,
     },
-    traits::StoredParamEnvAndCrate,
-};
-use salsa::{
-    ReadKind,
-    plumbing::{Id, Ingredient as _, SalsaStructInDb, ZalsaDatabase as _},
+    next_solver::goal_store::{FactObject, FactRef, GoalFacts},
 };
 
 use crate::values;
@@ -110,7 +107,7 @@ pub(crate) enum Rule {
     OwnStep(Step),
 }
 
-/// The arguments of a [`Rule::DepCrate`] read, as salsa interns them.
+/// The arguments of a [`Rule::DepCrate`] read, as the query's key interns them.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(crate) enum Args {
     /// `(Crate, SelfTyKey)`.
@@ -282,15 +279,14 @@ pub fn classify(
     db: &Db,
     def: DefWithBodyId,
     step: Step,
-    read: salsa::DatabaseKeyIndex,
+    read: blaze_query::db::DatabaseKeyIndex,
     kind: ReadKind,
     name: &'static str,
 ) -> Classified {
     match kind {
         // An interned value is a function of its fields, which whoever interned it read.
         ReadKind::Interned => return Classified::Covered,
-        ReadKind::Accumulator => return Classified::Refused,
-        ReadKind::Input | ReadKind::TrackedStruct | ReadKind::Query => {}
+        ReadKind::Function | ReadKind::InputField(_) | ReadKind::TrackedField(_) => {}
     }
     // Lane items' table lists names of types without generics, as they are written.
     let name = match listed_parts(name) {
@@ -303,11 +299,11 @@ pub fn classify(
     }
 }
 
-/// `name` as [`RULES`] lists it, as the two parts it is the concatenation of. Salsa names a
-/// method of a `#[salsa::tracked] impl` after its self type as written, generics and all
-/// (`TraitImpls < 'db >::for_crate`), and its hygienic inner function, the method's name with
-/// `_` added (`Body::of_`); the listed name is the type's without its generics and the
-/// method's (`TraitImpls::for_crate`). A free tracked function or a field keeps its name.
+/// `name` as [`RULES`] lists it, as the two parts it is the concatenation of. The query engine
+/// names a method of a `#[blaze_query::tracked] impl` after its self type as written, generics and
+/// all (`TraitImpls < 'db >::for_crate`), and its hygienic inner function, the method's name with
+/// `_` added (`Body::of_`); the listed name is the type's without its generics and the method's
+/// (`TraitImpls::for_crate`). A free tracked function or a field keeps its name.
 pub(crate) fn listed_parts(name: &str) -> [&str; 2] {
     let name = match name.contains("::") {
         true => name.trim_end_matches('_'),
@@ -342,14 +338,18 @@ pub(crate) fn cmp_listed(listed: &str, name: &str) -> Ordering {
 }
 
 /// The rule for `name`, if one is had for the ingredient `read` is of.
-pub(crate) fn rule_of(db: &Db, read: salsa::DatabaseKeyIndex, name: &str) -> Option<Rule> {
+pub(crate) fn rule_of(
+    db: &Db,
+    read: blaze_query::db::DatabaseKeyIndex,
+    name: &str,
+) -> Option<Rule> {
     let first = RULES.partition_point(|&(it, _, _)| cmp_listed(it, name) == Ordering::Less);
-    let same = RULES[first..].iter().take_while(|&&(it, _, _)| cmp_listed(it, name) == Ordering::Equal);
+    let same =
+        RULES[first..].iter().take_while(|&&(it, _, _)| cmp_listed(it, name) == Ordering::Equal);
     let mut file = None;
     for &(_, at, rule) in same {
-        let file = *file.get_or_insert_with(|| {
-            db.zalsa().lookup_ingredient(read.ingredient_index()).location().file
-        });
+        let file =
+            *file.get_or_insert_with(|| db.storage().ingredient_file(read.ingredient_index()));
         if ends_with_path(file, at) {
             return Some(rule);
         }
@@ -369,7 +369,7 @@ fn apply(
     db: &Db,
     def: DefWithBodyId,
     step: Step,
-    read: salsa::DatabaseKeyIndex,
+    read: blaze_query::db::DatabaseKeyIndex,
     name: &'static str,
     rule: Rule,
 ) -> Classified {
@@ -434,13 +434,13 @@ fn apply(
             krate => krate.map(|krate| whole_crate(db, krate)),
         },
         Rule::FieldNamed(of) => match of {
-            Of::Impl => args::<(ImplId, Name)>(db, key).map(|(it, _)| ItemId::Impl(it)),
-            Of::Trait => args::<(TraitId, Name)>(db, key).map(|(it, _)| ItemId::Trait(it)),
+            Of::Impl => impl_value_item::arguments(db, key).map(|(it, _)| ItemId::Impl(it)),
+            Of::Trait => trait_value_item::arguments(db, key).map(|(it, _)| ItemId::Trait(it)),
             _ => None,
         }
         .map(|item| values::fields(db, item)),
         Rule::OwnStore => {
-            return match args::<(ExpressionStoreOwnerId, ())>(db, key) {
+            return match hir_ty::db::closure_exprs::arguments(db, key) {
                 Some((owner, ())) if owner == ExpressionStoreOwnerId::Body(def) => {
                     Classified::Covered
                 }
@@ -453,17 +453,15 @@ fn apply(
             }
             values::step_fact(db, def, earlier)
         }
-        Rule::ConstEval => {
-            match args::<(ConstId, StoredGenericArgs, Option<StoredParamEnvAndCrate>)>(db, key) {
-                Some((konst, subst, None))
-                    if subst.as_ref().is_empty()
-                        && generics(db, konst.into()).iter(true).next().is_none() =>
-                {
-                    Some(item_fact(db, items::CONST_VALUE, ItemId::Const(konst)))
-                }
-                _ => None,
+        Rule::ConstEval => match hir_ty::consteval::const_eval_query::arguments(db, key) {
+            Some((konst, subst, None))
+                if subst.as_ref().is_empty()
+                    && generics(db, konst.into()).iter(true).next().is_none() =>
+            {
+                Some(item_fact(db, items::CONST_VALUE, ItemId::Const(konst)))
             }
-        }
+            _ => None,
+        },
     };
     match found {
         None => Classified::Refused,
@@ -537,20 +535,20 @@ fn is_own_step(db: &Db, def: DefWithBodyId, key: Id) -> bool {
 /// The crate a [`Rule::DepCrate`] read's arguments name.
 fn crate_of_args(db: &Db, key: Id, of: Args) -> Option<Crate> {
     Some(match of {
-        Args::SelfTy => args::<(Crate, SelfTyKey<'static>)>(db, key)?.0,
-        Args::Trait => args::<(Crate, TraitId)>(db, key)?.0,
-        Args::TraitSelfTy => args::<(Crate, TraitId, SelfTyKey<'static>)>(db, key)?.0,
-        Args::Name => args::<(Crate, Name)>(db, key)?.0,
-        Args::ModuleName => args::<(ModuleId, Name)>(db, key)?.0.krate(db),
+        Args::SelfTy => InherentImpls_in_crate_for_self_ty::arguments(db, key)?.0,
+        Args::Trait => {
+            TraitImpls_for_crate_and_trait::arguments(db, key)
+                .or_else(|| TraitImpls_blanket_in_crate_and_deps::arguments(db, key))?
+                .0
+        }
+        Args::TraitSelfTy => {
+            TraitImpls_in_crate_for_trait_and_self_ty::arguments(db, key)
+                .or_else(|| TraitImpls_in_crate_and_deps_for_trait_and_self_ty::arguments(db, key))?
+                .0
+        }
+        Args::Name => in_crate_trait_value_items::arguments(db, key)?.0,
+        Args::ModuleName => module_items_named::arguments(db, key)?.0.krate(db),
     })
-}
-
-/// The arguments of a tracked fn of several, which salsa interns as one tuple, from the key of
-/// a read of it: `None` for a key of other arguments.
-fn args<F: Clone + 'static>(db: &Db, key: Id) -> Option<F> {
-    // dyn: salsa's handle to any database, one ingredient lookup
-    // clone: the arguments, of which a `Name` is a symbol's handle
-    salsa::plumbing::interned_arguments::<F>(db, key)
 }
 
 fn generic_def_item(def: GenericDefId) -> ItemId {
@@ -592,7 +590,7 @@ fn is_own_attrs(db: &Db, def: DefWithBodyId, subject: ContentId) -> bool {
     !matches!(def, DefWithBodyId::VariantId(_)) && subject == owner_keys(db, def).0
 }
 
-#[salsa::tracked(returns(copy))]
+#[blaze_query::tracked(returns(copy))]
 fn owner_keys(db: &Db, def: DefWithBodyId) -> (ContentId, Option<ContentId>) {
     let owner = key::item_key(db, ItemId::of_body(db, def)).0;
     let container = match def {
@@ -609,6 +607,6 @@ fn owner_keys(db: &Db, def: DefWithBodyId) -> (ContentId, Option<ContentId>) {
 }
 
 /// `key` as a `T`, if its page holds `T`s.
-fn arg<T: SalsaStructInDb>(db: &Db, key: Id) -> Option<T> {
-    T::cast(key, db.zalsa().lookup_page_type_id(key))
+fn arg<T: FromIdIn>(db: &Db, key: Id) -> Option<T> {
+    T::from_id_in(db.storage(), key)
 }

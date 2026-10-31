@@ -97,7 +97,7 @@ fn one<T: inventory::Collect>(by: &str) -> &'static T {
     first
 }
 
-/// How many of the lowered bodies salsa keeps the value of once a revision is over; 0 keeps
+/// How many of the lowered bodies the query engine keeps the value of once a view is over; 0 keeps
 /// every one.
 pub fn set_mir_capacity(db: &mut Db, capacity: usize) {
     mir_body_query::set_lru_capacity(db, capacity);
@@ -106,8 +106,8 @@ pub fn set_mir_capacity(db: &mut Db, capacity: usize) {
     mir_body_for_coroutine_by_move_query::set_lru_capacity(db, capacity);
 }
 
-/// How many of the runtime bodies (and their monomorphized copies) salsa keeps the value of once
-/// a revision is over; 0 keeps every one. A body let go is lowered again when it is next asked
+/// How many of the runtime bodies (and their monomorphized copies) the query engine keeps the
+/// value of once a view is over; 0 keeps every one. A body let go is lowered again when it is next asked
 /// for, and what depends on it cannot be backdated then.
 pub fn set_runtime_mir_capacity(db: &mut Db, capacity: usize) {
     runtime_mir_body_query::set_lru_capacity(db, capacity);
@@ -229,36 +229,36 @@ fn compute_monomorphized<'db>(
 
 // A body that needs itself to be built is an error, not a fixpoint: one per arity of the keys.
 
-fn mir_loop1<'db, A>(_: &'db Db, _: salsa::Id, _: A) -> Built<'db> {
+fn mir_loop1<'db, A>(_: &'db Db, _: blaze_query::db::Id, _: A) -> Built<'db> {
     Err(MirLowerError::Loop)
 }
 
-fn mir_loop2<'db, A, B>(_: &'db Db, _: salsa::Id, _: A, _: B) -> Built<'db> {
+fn mir_loop2<'db, A, B>(_: &'db Db, _: blaze_query::db::Id, _: A, _: B) -> Built<'db> {
     Err(MirLowerError::Loop)
 }
 
-fn mir_loop3<'db, A, B, C>(_: &'db Db, _: salsa::Id, _: A, _: B, _: C) -> Built<'db> {
+fn mir_loop3<'db, A, B, C>(_: &'db Db, _: blaze_query::db::Id, _: A, _: B, _: C) -> Built<'db> {
     Err(MirLowerError::Loop)
 }
 
-fn mir_loop4<'db, A, B, C, D>(_: &'db Db, _: salsa::Id, _: A, _: B, _: C, _: D) -> Built<'db> {
+fn mir_loop4<'db, A, B, C, D>(_: &'db Db, _: blaze_query::db::Id, _: A, _: B, _: C, _: D) -> Built<'db> {
     Err(MirLowerError::Loop)
 }
 
 // Built MIR.
 
-#[salsa::tracked(returns(as_ref), cycle_result = mir_loop1, lru = 0, mem_tag = Mir)]
+#[blaze_query::tracked(returns(as_ref), cycle_result = mir_loop1, lru = 0, mem_tag = Mir)]
 pub fn mir_body_query<'db>(db: &'db Db, def: InferBodyId<'db>) -> Built<'db> {
     compute(db, MirOwner::Body(def), MirStage::Built)
 }
 
-#[salsa::tracked(returns(as_ref), cycle_result = mir_loop1, lru = 0, mem_tag = Mir)]
+#[blaze_query::tracked(returns(as_ref), cycle_result = mir_loop1, lru = 0, mem_tag = Mir)]
 pub fn mir_body_for_closure_query<'db>(db: &'db Db, closure: InternedClosureId<'db>) -> Built<'db> {
     compute(db, MirOwner::Closure(closure), MirStage::Built)
 }
 
 /// The body of an `async` block, as the `Future::poll` of the block's type.
-#[salsa::tracked(returns(as_ref), cycle_result = mir_loop1, lru = 0, mem_tag = Mir)]
+#[blaze_query::tracked(returns(as_ref), cycle_result = mir_loop1, lru = 0, mem_tag = Mir)]
 pub fn mir_body_for_coroutine_query<'db>(
     db: &'db Db,
     coroutine: InternedCoroutineId<'db>,
@@ -269,7 +269,7 @@ pub fn mir_body_for_coroutine_query<'db>(
 /// The body of the `async` block of an `async` closure that is called by value though it could
 /// be called again: the future that makes owns what the closure captured, where the block
 /// itself borrows from the closure.
-#[salsa::tracked(returns(as_ref), cycle_result = mir_loop1, lru = 0, mem_tag = Mir)]
+#[blaze_query::tracked(returns(as_ref), cycle_result = mir_loop1, lru = 0, mem_tag = Mir)]
 pub fn mir_body_for_coroutine_by_move_query<'db>(
     db: &'db Db,
     coroutine: InternedCoroutineId<'db>,
@@ -279,7 +279,7 @@ pub fn mir_body_for_coroutine_by_move_query<'db>(
 
 // Built MIR, monomorphized.
 
-#[salsa::tracked(returns(as_ref), cycle_result = mir_loop3, mem_tag = Mir)]
+#[blaze_query::tracked(returns(as_ref), cycle_result = mir_loop3, lru = 0, mem_tag = Mir)]
 pub fn monomorphized_mir_body_query<'db>(
     db: &'db Db,
     owner: InferBodyId<'db>,
@@ -289,7 +289,7 @@ pub fn monomorphized_mir_body_query<'db>(
     compute_monomorphized(db, MirOwner::Body(owner), MirStage::Built, subst, trait_env)
 }
 
-#[salsa::tracked(returns(as_ref), cycle_result = mir_loop3, mem_tag = Mir)]
+#[blaze_query::tracked(returns(as_ref), cycle_result = mir_loop3, lru = 0, mem_tag = Mir)]
 pub fn monomorphized_mir_body_for_closure_query<'db>(
     db: &'db Db,
     closure: InternedClosureId<'db>,
@@ -299,7 +299,7 @@ pub fn monomorphized_mir_body_for_closure_query<'db>(
     compute_monomorphized(db, MirOwner::Closure(closure), MirStage::Built, subst, trait_env)
 }
 
-#[salsa::tracked(returns(as_ref), cycle_result = mir_loop3, mem_tag = Mir)]
+#[blaze_query::tracked(returns(as_ref), cycle_result = mir_loop3, lru = 0, mem_tag = Mir)]
 pub fn monomorphized_mir_body_for_coroutine_query<'db>(
     db: &'db Db,
     coroutine: InternedCoroutineId<'db>,
@@ -309,7 +309,7 @@ pub fn monomorphized_mir_body_for_coroutine_query<'db>(
     compute_monomorphized(db, MirOwner::Coroutine(coroutine), MirStage::Built, subst, trait_env)
 }
 
-#[salsa::tracked(returns(as_ref), cycle_result = mir_loop3, mem_tag = Mir)]
+#[blaze_query::tracked(returns(as_ref), cycle_result = mir_loop3, lru = 0, mem_tag = Mir)]
 pub fn monomorphized_mir_body_for_coroutine_by_move_query<'db>(
     db: &'db Db,
     coroutine: InternedCoroutineId<'db>,
@@ -322,12 +322,12 @@ pub fn monomorphized_mir_body_for_coroutine_by_move_query<'db>(
 
 // Runtime MIR.
 
-#[salsa::tracked(returns(as_ref), cycle_result = mir_loop1, lru = 0, mem_tag = Mir)]
+#[blaze_query::tracked(returns(as_ref), cycle_result = mir_loop1, lru = 0, mem_tag = Mir)]
 pub fn runtime_mir_body_query<'db>(db: &'db Db, def: InferBodyId<'db>) -> Built<'db> {
     compute(db, MirOwner::Body(def), MirStage::Runtime)
 }
 
-#[salsa::tracked(returns(as_ref), cycle_result = mir_loop1, lru = 0, mem_tag = Mir)]
+#[blaze_query::tracked(returns(as_ref), cycle_result = mir_loop1, lru = 0, mem_tag = Mir)]
 pub fn runtime_mir_body_for_closure_query<'db>(
     db: &'db Db,
     closure: InternedClosureId<'db>,
@@ -335,7 +335,7 @@ pub fn runtime_mir_body_for_closure_query<'db>(
     compute(db, MirOwner::Closure(closure), MirStage::Runtime)
 }
 
-#[salsa::tracked(returns(as_ref), cycle_result = mir_loop1, lru = 0, mem_tag = Mir)]
+#[blaze_query::tracked(returns(as_ref), cycle_result = mir_loop1, lru = 0, mem_tag = Mir)]
 pub fn runtime_mir_body_for_coroutine_query<'db>(
     db: &'db Db,
     coroutine: InternedCoroutineId<'db>,
@@ -343,7 +343,7 @@ pub fn runtime_mir_body_for_coroutine_query<'db>(
     compute(db, MirOwner::Coroutine(coroutine), MirStage::Runtime)
 }
 
-#[salsa::tracked(returns(as_ref), cycle_result = mir_loop1, lru = 0, mem_tag = Mir)]
+#[blaze_query::tracked(returns(as_ref), cycle_result = mir_loop1, lru = 0, mem_tag = Mir)]
 pub fn runtime_mir_body_for_coroutine_by_move_query<'db>(
     db: &'db Db,
     coroutine: InternedCoroutineId<'db>,
@@ -351,7 +351,7 @@ pub fn runtime_mir_body_for_coroutine_by_move_query<'db>(
     compute(db, MirOwner::CoroutineByMove(coroutine), MirStage::Runtime)
 }
 
-#[salsa::tracked(returns(as_ref), cycle_result = mir_loop3, lru = 0, mem_tag = Mir)]
+#[blaze_query::tracked(returns(as_ref), cycle_result = mir_loop3, lru = 0, mem_tag = Mir)]
 pub fn monomorphized_runtime_mir_body_query<'db>(
     db: &'db Db,
     def: InferBodyId<'db>,
@@ -361,7 +361,7 @@ pub fn monomorphized_runtime_mir_body_query<'db>(
     compute_monomorphized(db, MirOwner::Body(def), MirStage::Runtime, subst, trait_env)
 }
 
-#[salsa::tracked(returns(as_ref), cycle_result = mir_loop3, lru = 0, mem_tag = Mir)]
+#[blaze_query::tracked(returns(as_ref), cycle_result = mir_loop3, lru = 0, mem_tag = Mir)]
 pub fn monomorphized_runtime_mir_body_for_closure_query<'db>(
     db: &'db Db,
     closure: InternedClosureId<'db>,
@@ -371,7 +371,7 @@ pub fn monomorphized_runtime_mir_body_for_closure_query<'db>(
     compute_monomorphized(db, MirOwner::Closure(closure), MirStage::Runtime, subst, trait_env)
 }
 
-#[salsa::tracked(returns(as_ref), cycle_result = mir_loop3, lru = 0, mem_tag = Mir)]
+#[blaze_query::tracked(returns(as_ref), cycle_result = mir_loop3, lru = 0, mem_tag = Mir)]
 pub fn monomorphized_runtime_mir_body_for_coroutine_query<'db>(
     db: &'db Db,
     coroutine: InternedCoroutineId<'db>,
@@ -382,7 +382,7 @@ pub fn monomorphized_runtime_mir_body_for_coroutine_query<'db>(
     compute_monomorphized(db, owner, MirStage::Runtime, subst, trait_env)
 }
 
-#[salsa::tracked(returns(as_ref), cycle_result = mir_loop3, lru = 0, mem_tag = Mir)]
+#[blaze_query::tracked(returns(as_ref), cycle_result = mir_loop3, lru = 0, mem_tag = Mir)]
 pub fn monomorphized_runtime_mir_body_for_coroutine_by_move_query<'db>(
     db: &'db Db,
     coroutine: InternedCoroutineId<'db>,
@@ -395,7 +395,7 @@ pub fn monomorphized_runtime_mir_body_for_coroutine_by_move_query<'db>(
 
 // Optimized MIR.
 
-#[salsa::tracked(returns(as_ref), cycle_result = mir_loop2, mem_tag = Mir)]
+#[blaze_query::tracked(returns(as_ref), cycle_result = mir_loop2, lru = 0, mem_tag = Mir)]
 pub fn optimized_mir_body_query<'db>(
     db: &'db Db,
     def: InferBodyId<'db>,
@@ -404,7 +404,7 @@ pub fn optimized_mir_body_query<'db>(
     compute(db, MirOwner::Body(def), MirStage::Optimized(options))
 }
 
-#[salsa::tracked(returns(as_ref), cycle_result = mir_loop2, mem_tag = Mir)]
+#[blaze_query::tracked(returns(as_ref), cycle_result = mir_loop2, lru = 0, mem_tag = Mir)]
 pub fn optimized_mir_body_for_closure_query<'db>(
     db: &'db Db,
     closure: InternedClosureId<'db>,
@@ -415,7 +415,7 @@ pub fn optimized_mir_body_for_closure_query<'db>(
 
 /// The body of an `async` block's `poll` with `options`: of the passes, only the UB checks run
 /// on a coroutine body.
-#[salsa::tracked(returns(as_ref), cycle_result = mir_loop2, mem_tag = Mir)]
+#[blaze_query::tracked(returns(as_ref), cycle_result = mir_loop2, lru = 0, mem_tag = Mir)]
 pub fn optimized_mir_body_for_coroutine_query<'db>(
     db: &'db Db,
     coroutine: InternedCoroutineId<'db>,
@@ -424,7 +424,7 @@ pub fn optimized_mir_body_for_coroutine_query<'db>(
     compute(db, MirOwner::Coroutine(coroutine), MirStage::Optimized(options))
 }
 
-#[salsa::tracked(returns(as_ref), cycle_result = mir_loop2, mem_tag = Mir)]
+#[blaze_query::tracked(returns(as_ref), cycle_result = mir_loop2, lru = 0, mem_tag = Mir)]
 pub fn optimized_mir_body_for_coroutine_by_move_query<'db>(
     db: &'db Db,
     coroutine: InternedCoroutineId<'db>,
@@ -433,7 +433,7 @@ pub fn optimized_mir_body_for_coroutine_by_move_query<'db>(
     compute(db, MirOwner::CoroutineByMove(coroutine), MirStage::Optimized(options))
 }
 
-#[salsa::tracked(returns(as_ref), cycle_result = mir_loop4, mem_tag = Mir)]
+#[blaze_query::tracked(returns(as_ref), cycle_result = mir_loop4, lru = 0, mem_tag = Mir)]
 pub fn monomorphized_optimized_mir_body_query<'db>(
     db: &'db Db,
     def: InferBodyId<'db>,
@@ -445,7 +445,7 @@ pub fn monomorphized_optimized_mir_body_query<'db>(
     compute_monomorphized(db, MirOwner::Body(def), stage, subst, trait_env)
 }
 
-#[salsa::tracked(returns(as_ref), cycle_result = mir_loop4, mem_tag = Mir)]
+#[blaze_query::tracked(returns(as_ref), cycle_result = mir_loop4, lru = 0, mem_tag = Mir)]
 pub fn monomorphized_optimized_mir_body_for_closure_query<'db>(
     db: &'db Db,
     closure: InternedClosureId<'db>,
@@ -457,7 +457,7 @@ pub fn monomorphized_optimized_mir_body_for_closure_query<'db>(
     compute_monomorphized(db, MirOwner::Closure(closure), stage, subst, trait_env)
 }
 
-#[salsa::tracked(returns(as_ref), cycle_result = mir_loop4, mem_tag = Mir)]
+#[blaze_query::tracked(returns(as_ref), cycle_result = mir_loop4, lru = 0, mem_tag = Mir)]
 pub fn monomorphized_optimized_mir_body_for_coroutine_query<'db>(
     db: &'db Db,
     coroutine: InternedCoroutineId<'db>,
@@ -469,7 +469,7 @@ pub fn monomorphized_optimized_mir_body_for_coroutine_query<'db>(
     compute_monomorphized(db, MirOwner::Coroutine(coroutine), stage, subst, trait_env)
 }
 
-#[salsa::tracked(returns(as_ref), cycle_result = mir_loop4, mem_tag = Mir)]
+#[blaze_query::tracked(returns(as_ref), cycle_result = mir_loop4, lru = 0, mem_tag = Mir)]
 pub fn monomorphized_optimized_mir_body_for_coroutine_by_move_query<'db>(
     db: &'db Db,
     coroutine: InternedCoroutineId<'db>,
@@ -488,7 +488,7 @@ pub fn monomorphized_optimized_mir_body_for_coroutine_by_move_query<'db>(
 /// `ignore_for_traits` marks), generic in the parameters of the coroutine's parent, with regions
 /// erased. No cycle result: a goal on a coroutine of the body being inferred waits until that
 /// body is checked, as rustc's stalled coroutine goals, so a cycle here is a bug to stop on.
-#[salsa::tracked(returns(deref), mem_tag = Mir)]
+#[blaze_query::tracked(returns(deref), mem_tag = Mir)]
 pub fn coroutine_witnesses_query<'db>(
     db: &'db Db,
     coroutine: InternedCoroutineId<'db>,

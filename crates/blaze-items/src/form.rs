@@ -7,7 +7,7 @@
 //! and the positions of code, which go to [`Code::spans`] instead. Every other item it mentions
 //! is a slot, numbered in the order the form first meets it, for [`crate::hash`] to fill.
 //!
-//! Dense ids (salsa ids, arena indexes across items) are never hashed. Inside one body the
+//! Dense ids (query database ids, arena indexes across items) are never hashed. Inside one body the
 //! blocks and locals are numbered by a walk from the start block, and expression ids, binding
 //! ids and closure positions are positions in that body's own store.
 
@@ -460,8 +460,7 @@ const _: () = assert!(size_of::<Option<(Ty<'static>, &'static Code)>>() == 16);
 pub(crate) struct Cx<'db> {
     db: &'db Db,
     /// The type forms asked of [`ty_form`] lately, direct-mapped by the type's hash: one probe
-    /// and no allocation, against salsa's interning of the key (a shard lock) and its memo
-    /// lookup. A `Cx` lives inside one query, so a hit skips only a read that query recorded.
+    /// and no allocation, against the engine's interning of the key and its memo lookup. A `Cx` lives inside one query, so a hit skips only a read that query recorded.
     seen: [Cell<Option<(Ty<'db>, &'db Code)>>; SEEN],
     /// Writing signature forms ([`Cx::leak_free`]): [`LEAK`] in place of each leak.
     leak_free: bool,
@@ -470,8 +469,8 @@ pub(crate) struct Cx<'db> {
 }
 
 /// A type as [`ty_form`] and [`signature_ty_form`] keep it, interned: a tracked function's one
-/// argument is a salsa struct.
-#[salsa::interned(debug, revisions = usize::MAX)]
+/// argument is an ID.
+#[blaze_query::interned(debug)]
 pub(crate) struct FormTy<'db> {
     #[returns(copy)]
     pub(crate) ty: StoredTy,
@@ -479,8 +478,8 @@ pub(crate) struct FormTy<'db> {
 
 /// A type's form, spelled once per revision for every item that writes it and kept across
 /// revisions while what it reads is unchanged: rustc's stable hash cached in each interned
-/// type, with salsa's backdating on top.
-#[salsa::tracked(returns(ref), cycle_result = ty_form_cycle)]
+/// type, with the query engine's backdating on top.
+#[blaze_query::tracked(returns(ref), cycle_result = ty_form_cycle)]
 pub(crate) fn ty_form<'db>(db: &'db Db, ty: FormTy<'db>) -> Code {
     let mut form = Form::new("ty");
     Cx::new(db).spell(&mut form, ty.ty(db).as_ref());
@@ -489,7 +488,7 @@ pub(crate) fn ty_form<'db>(db: &'db Db, ty: FormTy<'db>) -> Code {
 
 /// A type met again while it is spelled contains itself, which only a program rustc rejects
 /// has: every type of the cycle gets this, whichever of them was asked for first.
-fn ty_form_cycle<'db>(_: &'db Db, _: salsa::Id, _: FormTy<'db>) -> Code {
+fn ty_form_cycle<'db>(_: &'db Db, _: blaze_query::db::Id, _: FormTy<'db>) -> Code {
     let mut form = Form::new("ty");
     form.error(Missed::ErrorType);
     form.code()
@@ -498,7 +497,7 @@ fn ty_form_cycle<'db>(_: &'db Db, _: salsa::Id, _: FormTy<'db>) -> Code {
 /// A type's form as a signature form writes it: [`ty_form`]'s, with [`LEAK`] in place of a
 /// closure's captures and a coroutine's held locals, which are of the inference and MIR of
 /// the body the closure is written in.
-#[salsa::tracked(returns(ref), cycle_result = ty_form_cycle)]
+#[blaze_query::tracked(returns(ref), cycle_result = ty_form_cycle)]
 pub(crate) fn signature_ty_form<'db>(db: &'db Db, ty: FormTy<'db>) -> Code {
     let mut form = Form::new("ty");
     Cx::leak_free(db).spell(&mut form, ty.ty(db).as_ref());
@@ -541,7 +540,7 @@ fn unobserved() -> AttrFlags {
 }
 
 /// The auto traits a crate declares, by key.
-#[salsa::tracked(returns(ref))]
+#[blaze_query::tracked(returns(ref))]
 fn crate_auto_traits(db: &Db, krate: Crate) -> Box<[(ItemKey, TraitId)]> {
     // alloc: the memo's own list, its length known once the crate is walked.
     let mut traits = Vec::new();
@@ -558,7 +557,7 @@ fn crate_auto_traits(db: &Db, krate: Crate) -> Box<[(ItemKey, TraitId)]> {
 }
 
 /// The auto traits of the crates `krate` loads, in the order of their keys.
-#[salsa::tracked(returns(ref))]
+#[blaze_query::tracked(returns(ref))]
 fn loaded_auto_traits(db: &Db, krate: Crate) -> Box<[TraitId]> {
     frame::task(Tag::Other, |frame| {
         let mut traits: Vec<(ItemKey, TraitId), &Frame> = Vec::new_in(frame);
@@ -572,7 +571,7 @@ fn loaded_auto_traits(db: &Db, krate: Crate) -> Box<[TraitId]> {
 }
 
 /// What an item's visibility is resolved to, once per item.
-#[salsa::tracked(returns(copy))]
+#[blaze_query::tracked(returns(copy))]
 fn item_visibility(db: &Db, id: ItemId) -> Visibility {
     item_visibility_uncached(db, id)
 }

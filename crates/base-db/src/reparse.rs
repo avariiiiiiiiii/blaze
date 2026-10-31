@@ -15,8 +15,8 @@
 //! parse), so what `parse` returns is a function of the text and edition alone and the slot
 //! only changes how long it takes.
 //!
-//! A slot holds its parse weakly: it lives as long as salsa keeps the parse, so the slots add
-//! no tree to what salsa's LRU keeps. Reading a slot is acquire loads (a `OnceLock` each, never
+//! A slot holds its parse weakly: it lives as long as the query engine keeps the parse, so the slots add
+//! no tree to what its `lru` cap keeps. Reading a slot is acquire loads (a `OnceLock` each, never
 //! a lock, docs/v2/plan/design/concurrency.md) and a weak count, done only when `parse` runs:
 //! a cache hit of `parse` reads none, and nothing here allocates outside the setter.
 
@@ -32,7 +32,7 @@ use syntax::{Parse, SourceFile, Text, TextRange, TextSize, WeakParse};
 use crate::trees::{TreeError, Trees};
 
 /// How many parses of one text a slot keeps: one per edition and kind it is parsed in, and
-/// again after salsa let one go. Past that, the file's next edit is a whole parse.
+/// again after the query engine let one go. Past that, the file's next edit is a whole parse.
 const KEPT: usize = 4;
 
 /// What [`EditionedFileId::parse`](crate::EditionedFileId::parse) makes a text's parse from:
@@ -382,7 +382,7 @@ pub(crate) fn common_suffix_scalar(a: &[u8], b: &[u8]) -> usize {
 mod seed_tests {
     use std::cell::Cell;
 
-    use salsa::Durability;
+    use blaze_query::db::Durability;
     use span::Edition;
     use syntax::SourceFile;
     use triomphe::Arc;

@@ -180,7 +180,7 @@ mod tests {
     }
 
     /// Against the reference: the hand-written forwarders `blaze-hashcons`, `hir-ty-share`,
-    /// `hir-ty-codegen` and salsa each carried, here as the bytes they wrote.
+    /// `hir-ty-codegen` and the old query engine each carried, here as the bytes they wrote.
     #[hegel::test]
     fn matches_the_reference(tc: TestCase) {
         let a: u8 = tc.draw(gs::integers());

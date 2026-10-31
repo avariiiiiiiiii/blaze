@@ -4,7 +4,7 @@
 //!
 //! - Persisted: a query result holds types as their place in a table of its own
 //!   ([`TyTableWriter`], [`TyTableReader`]): each value written once, after the values it holds,
-//!   as its words, each child as its place in the table, definitions as salsa ids, an ADT as its
+//!   as its words, each child as its place in the table, definitions as ids, an ADT as its
 //!   id alone (its flags are read again from the database the table is read into).
 //! - In memory a row keeps its kind whole (`interner::table::Rows`); the codec gives the row's
 //!   tag when it is added ([`tag`]), and in debug builds checks that what it writes reads back
@@ -53,14 +53,14 @@ pub(crate) trait Sink<'db> {
     fn node<N: Node<'db>>(&mut self, node: N);
     /// An ADT: in memory with its flags, persisted as its id alone.
     fn adt(&mut self, adt: AdtDef);
-    /// A salsa id as [`put_id`] writes it, unless the sink names ids otherwise.
+    /// An id as [`put_id`] writes it, unless the sink names ids otherwise.
     fn id<T: crate::check_cache::Relocate>(&mut self, id: T)
     where
         Self: Sized,
     {
         put_id(self, id.as_id());
     }
-    /// A definition: its variant and salsa id, unless the sink names definitions otherwise.
+    /// A definition: its variant and id, unless the sink names definitions otherwise.
     fn def(&mut self, def: SolverDefId<'db>)
     where
         Self: Sized,
@@ -75,7 +75,7 @@ pub(crate) trait Source<'db> {
     fn word(&mut self) -> Result<u32, Self::Error>;
     fn node<N: Node<'db>>(&mut self) -> Result<N, Self::Error>;
     fn adt(&mut self) -> Result<AdtDef, Self::Error>;
-    /// A salsa id, as [`Sink::id`] wrote it.
+    /// An id, as [`Sink::id`] wrote it.
     fn id<T: crate::check_cache::Relocate>(&mut self) -> Result<T, Self::Error>
     where
         Self: Sized,
@@ -402,20 +402,22 @@ struct_code! {
     rustc_type_ir::FnSigTys<DbInterner<'db>> { inputs_and_output },
 }
 
-/// A salsa id: its index (never 0) and its generation.
-fn put_id<'db>(sink: &mut impl Sink<'db>, id: salsa::Id) {
-    let bits = id.as_bits();
-    sink.word(bits as u32);
-    sink.word((bits >> 32) as u32);
+/// An id: its bits (never 0) and a generation word, always 0, which the format keeps.
+fn put_id<'db>(sink: &mut impl Sink<'db>, id: blaze_query::db::Id) {
+    sink.word(id.as_u32());
+    sink.word(0);
 }
 
-fn get_id<'db, S: Source<'db>>(source: &mut S) -> Result<salsa::Id, S::Error> {
+fn get_id<'db, S: Source<'db>>(source: &mut S) -> Result<blaze_query::db::Id, S::Error> {
     let index = source.word()?;
     let generation = source.word()?;
     if index == 0 {
-        return Err(source.invalid("a salsa id of index 0"));
+        return Err(source.invalid("an id of index 0"));
     }
-    Ok(salsa::Id::from_bits(u64::from(index) | (u64::from(generation) << 32)))
+    if generation != 0 {
+        return Err(source.invalid("an id of a generation"));
+    }
+    Ok(blaze_query::db::Id::from_u32(index))
 }
 
 impl<'db> Code<'db> for SolverDefId<'db> {
@@ -430,7 +432,7 @@ impl<'db> Code<'db> for SolverDefId<'db> {
     }
 }
 
-/// A definition as its variant and salsa id: [`Sink::def`]'s default.
+/// A definition as its variant and id: [`Sink::def`]'s default.
 pub(crate) fn put_def<'db>(sink: &mut impl Sink<'db>, def: SolverDefId<'db>) {
     match def {
         SolverDefId::AdtId(AdtId::StructId(id)) => {
@@ -2042,7 +2044,7 @@ impl<'db, A: Fn(AdtId) -> AdtDef> Source<'db> for Reading<'_, A> {
         let index = self.word()?;
         let generation = self.word()?;
         crate::check_cache::id_of(u64::from(index) | (u64::from(generation) << 32))
-            .ok_or_else(|| self.invalid("a salsa id of index 0 or not in the table"))
+            .ok_or_else(|| self.invalid("an id of index 0 or not in the table"))
     }
 
     fn count(&mut self) -> Result<usize, FormatError> {
@@ -2065,7 +2067,7 @@ mod tests {
     use blaze_format::{Aligned, HEADER_LEN, Writer};
     use hir_def::{CallableDefId, FunctionId, TypeAliasId};
     use rustc_type_ir::{FlagComputation, Flags, INNERMOST, TypeFlags};
-    use salsa::plumbing::FromId;
+    use blaze_query::db::FromId;
 
     use super::*;
     use crate::next_solver::TermId;
@@ -2090,7 +2092,7 @@ mod tests {
     }
 
     fn id<T: FromId>(index: u32) -> T {
-        T::from_id(salsa::Id::from_bits(u64::from(index)))
+        T::from_id(blaze_query::db::Id::from_u32(index))
     }
 
     fn local<T>(index: u32) -> Idx<T> {

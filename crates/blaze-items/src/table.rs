@@ -161,7 +161,7 @@ fn dense<T>(count: usize, values: impl Iterator<Item = T>) -> Box<[T]> {
 /// The hashes of every item of `krate` with an [`crate::ItemId`], bodies' items included, in
 /// one pass: what the store keeps of a crate and diffs against the last build. Its rows are
 /// gathered in the task's frame (the hash queries it runs take frames of their own).
-#[salsa::tracked(returns(ref))]
+#[blaze_query::tracked(returns(ref))]
 pub fn crate_hashes(db: &Db, krate: Crate) -> HashColumns {
     frame::task(Tag::Other, |frame| {
         let items = crate_items_by_key(db, krate);
@@ -181,7 +181,7 @@ pub fn crate_hashes(db: &Db, krate: Crate) -> HashColumns {
 /// Every item of `krate` with an [`crate::ItemId`] and its key, sorted by key. An edit that
 /// adds, removes, renames or moves no item leaves it as it was, so [`crate_hashes`] rebuilt
 /// after a body edit reads no key and sorts nothing.
-#[salsa::tracked(returns(deref))]
+#[blaze_query::tracked(returns(deref))]
 fn crate_items_by_key(db: &Db, krate: Crate) -> Box<[(ItemKey, crate::ItemId)]> {
     let mut items: Vec<(ItemKey, crate::ItemId)> =
         key::crate_item_ids(db, krate).map(|id| (key::item_key(db, id), id)).collect(); // alloc: a memo's column.

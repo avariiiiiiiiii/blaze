@@ -1,5 +1,5 @@
 //! The key of an item's record: what is asked of it and where it is written, in terms that are
-//! the same in every process (no salsa id), hashed into a [`ContentId`].
+//! the same in every process (no query database id), hashed into a [`ContentId`].
 //!
 //! An item is named by its container and its ast id. A module is its index in the crate's
 //! `DefMap` (which the image's own def map part gives in the same order); an impl, a trait or an
@@ -85,7 +85,7 @@ impl Item {
 }
 
 /// The modules of `krate`'s `DefMap` by their index in it.
-#[salsa::tracked(returns(ref), mem_tag = Nameres)]
+#[blaze_query::tracked(returns(ref), mem_tag = Nameres)]
 pub(super) fn module_indexes(db: &Db, krate: Crate) -> FxHashMap<ModuleId, u32> {
     let modules = crate_def_map(db, krate).modules(db);
     // alloc: once per crate, the map every key of the crate reads.

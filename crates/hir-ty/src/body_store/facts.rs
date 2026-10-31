@@ -52,8 +52,8 @@ pub trait BodyFacts: Send + Sync + 'static {
         db: &Db,
         def: DefWithBodyId,
         step: Step,
-        read: salsa::DatabaseKeyIndex,
-        kind: salsa::ReadKind,
+        read: blaze_query::db::DatabaseKeyIndex,
+        kind: blaze_query::db::ReadKind,
         name: &'static str,
     ) -> Classified;
 

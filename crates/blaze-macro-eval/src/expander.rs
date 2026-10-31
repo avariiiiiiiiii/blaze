@@ -193,7 +193,7 @@ impl fmt::Debug for Library {
 /// One calling crate's calls of a library's macros in one revision.
 #[derive(Default)]
 struct Session {
-    at: Option<(Nonce, salsa::Revision)>,
+    at: Option<(Nonce, blaze_query::db::View)>,
     /// The statics the calls so far left that hold no address.
     statics: Vec<(StaticId, Vec<u8>)>,
     /// Whether a static they left holds an address: then [`Session::calls`] are run again.

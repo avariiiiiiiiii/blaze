@@ -55,7 +55,7 @@ use hir_def::{
 use hir_expand::{mod_path::ModPath, name::AsName};
 use la_arena::RawIdx;
 use rustc_hash::FxHashMap;
-use salsa::plumbing::AsId;
+use blaze_query::db::AsId;
 
 use super::item::{Part, SELF, item_part, own_item, self_part, variant_part};
 
@@ -86,7 +86,7 @@ pub(crate) enum Target {
 }
 
 /// [`Names`] of `def`'s body.
-#[salsa::tracked(returns(ref))]
+#[blaze_query::tracked(returns(ref))]
 pub(crate) fn names_of(db: &Db, def: DefWithBodyId) -> Result<Names, &'static str> {
     let body = Body::of(db, def);
     let mut names = scratch::lend_bytes();
@@ -138,7 +138,7 @@ fn write(
             seen,
             resolved: usize::MAX,
         },
-        traits: Traits { db, out: traits, seen: scratch::lend_u64s() },
+        traits: Traits { db, out: traits, seen: scratch::lend_u32s() },
         pats: scratch::lend_u32s(),
         types: scratch::lend_u32s(),
         lifetimes: scratch::lend_u32s(),
@@ -314,13 +314,13 @@ impl StoreVisitor for Collect<'_> {
 struct Traits<'a, 'db> {
     db: &'db Db,
     out: &'a mut Vec<u8>,
-    seen: scratch::Lent<Vec<u64>>,
+    seen: scratch::Lent<Vec<u32>>,
 }
 
 impl Traits<'_, '_> {
     fn scope(&mut self, resolver: &Resolver<'_>) -> R {
         let module = resolver.module();
-        let bits = module.as_id().as_bits();
+        let bits = module.as_id().as_u32();
         if self.seen.contains(&bits) {
             return Ok(());
         }

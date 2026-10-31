@@ -753,7 +753,7 @@ fn is_local_trait(cx: &Cx<'_, '_>, trait_: hir::Trait) -> bool {
 /// Whether the crate being checked has an impl of `trait_`, one of its own traits: rustc's
 /// `all_impls(..)` of the local crate, which is all a local trait can have (crates after it are
 /// not seen). Reads the trait's row of the crate's impl table and of the trait's block's, both
-/// salsa-cached, and allocates nothing.
+/// memoized queries, and allocates nothing.
 fn has_impls(cx: &Cx<'_, '_>, trait_: hir::Trait) -> bool {
     let id = hir_def::TraitId::from(trait_);
     let module = hir_def::ModuleId::from(trait_.module(cx.db));

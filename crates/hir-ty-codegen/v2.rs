@@ -165,16 +165,16 @@ impl Hashes for HashSource {
     }
 }
 
-/// A body whose code [`Hashes::code`] says. The ids are salsa's interned closures and
+/// A body whose code [`Hashes::code`] says. The ids are the query database's interned closures and
 /// coroutines (`InternedClosureId`, `InternedCoroutineId`), without their database lifetime.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub enum Body {
     Item(DefWithBodyId),
-    Closure(salsa::Id),
+    Closure(blaze_query::db::Id),
     /// The `Future::poll` of an `async` block.
-    Coroutine(salsa::Id),
+    Coroutine(blaze_query::db::Id),
     /// The future an `async` closure gives when called by value though it could be again.
-    CoroutineByMove(salsa::Id),
+    CoroutineByMove(blaze_query::db::Id),
 }
 
 /// A function instance as the front end holds it.

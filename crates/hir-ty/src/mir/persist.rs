@@ -11,10 +11,10 @@
 //! are the body's own indices: a span is an `ExprId`, `PatId` or `BindingId` of the body's
 //! store, never a position in a file, so moving the body in its file changes no byte.
 //!
-//! Every salsa id (the owner, a static, a variant, a closure, each definition a type names) is
+//! Every id (the owner, a static, a variant, a closure, each definition a type names) is
 //! written through `check_cache::id_bits`: in the item store's relocating scope that is its
 //! place in the record's id table, which the store writes as item keys, so two databases that
-//! built the same body write the same bytes. Outside a scope it is the id's salsa bits, read
+//! built the same body write the same bytes. Outside a scope it is the id's own bits, read
 //! back only by the database that wrote them.
 //!
 //! A constant a location macro made (`line!()`, `column!()`, `file!()`, `module_path!()`, a

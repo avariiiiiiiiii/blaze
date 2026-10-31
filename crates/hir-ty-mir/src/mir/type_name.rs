@@ -944,7 +944,7 @@ fn closures_around(
 /// the body, and what it finds does not. The map orders closures by the macro calls they are
 /// in, so a body that called no macro is ordered without it, as every closure of it is in
 /// the same file.
-#[salsa::tracked(returns(ref))]
+#[blaze_query::tracked(returns(ref))]
 fn closures_around_query(
     db: &Db,
     owner: DefWithBodyId,

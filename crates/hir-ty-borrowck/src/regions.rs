@@ -37,7 +37,6 @@ use hir_ty::{
         TyKind, infer::region_constraints::Constraint,
     },
 };
-use salsa::SalsaValue;
 
 pub(super) use super::inference::{RegionValues, infer};
 use super::{
@@ -1129,7 +1128,8 @@ impl<'a, 'db> Builder<'_, 'a, 'db> {
                 _ => None,
             };
             // The lifetime elision counts no trait object's default lifetime, `'static` in
-            // `&dyn Any` or salsa's `&dyn Database`, only what a parameter writes or elides.
+            // `&dyn Any` or the query database's `&dyn Database`, only what a parameter writes or
+            // elides.
             if let InferBodyId::DefWithBodyId(DefWithBodyId::FunctionId(function)) = owner
                 && signature.is_some()
                 && !writes_object_lifetime(&FunctionSignature::of(self.ctx.db, function).store)
@@ -1707,7 +1707,7 @@ impl<'a, 'db> Builder<'_, 'a, 'db> {
     /// The closure's parameter `index` written `&dyn Trait`, as `&'r (dyn Trait + 'r)` with
     /// its reference's lifetime, as rustc's object lifetime default, where inference gave the
     /// object a region of its own. A trait bounded by `'static` (`trait Db: 'static`, as
-    /// salsa's `Database` is) defaults its objects to `'static` instead, as rustc's
+    /// `blaze_query::db::Database` is) defaults its objects to `'static` instead, as rustc's
     /// `object_region_bounds` does before it looks at the reference.
     fn written_object_default(&mut self, index: usize, ty: Ty<'db>) -> Option<Ty<'db>> {
         let closure = self.ctx.closure_expr?;
@@ -2814,8 +2814,8 @@ impl<'a, 'db> Builder<'_, 'a, 'db> {
                         rustc_type_ir::ExistentialPredicate::AutoTrait(it) => it.0,
                         rustc_type_ir::ExistentialPredicate::Projection(_) => continue,
                     };
-                    // Its supertraits' too, as rustc elaborates them: salsa's `dyn Database`
-                    // through `ZalsaDatabase: Any`.
+                    // Its supertraits' too, as rustc elaborates them: a `dyn Db` through a
+                    // supertrait bounded by `'static`.
                     if static_trait(self.ctx.db, trait_) {
                         pairs.push((shorter, self.regions.static_rv));
                     }
@@ -6333,12 +6333,12 @@ impl<'a, 'db> Builder<'_, 'a, 'db> {
     }
 }
 
-/// What proving a trait reference gives a body, as salsa keeps it: its region variables are
+/// What proving a trait reference gives a body, as the query database keeps it: its region variables are
 /// the trait reference's, numbered in order, and after them the ones proving it made. The
 /// universes it names past the root, of the placeholders of a `for<'a>` it proved and of the
 /// variables made in them, are the query's own, `1..=universes`, which the body makes anew in
 /// the same order, as rustc's canonical query response does.
-#[derive(Debug, Clone, PartialEq, Eq, SalsaValue)]
+#[derive(Debug, Clone, PartialEq, Eq, blaze_query::Value)]
 enum Proven {
     /// What it gives names a variable the query resolved, which the body would have to see
     /// resolved too.
@@ -6404,7 +6404,7 @@ fn constraint_pairs<'db>(
 /// Proves `trait_ref`, whose region variables are the first `vars`, in `env`, as rustc's
 /// canonical `type_op_prove_predicate`: a query, so a goal is proven once for every body of the
 /// same environment, and an edit proves again only the goals of what it changes.
-#[salsa::tracked(returns(ref))]
+#[blaze_query::tracked(returns(ref))]
 fn prove_query(
     db: &Db,
     env: hir_ty::traits::StoredParamEnvAndCrate,
@@ -7283,9 +7283,9 @@ fn normalize_canonical<'db>(
     Some(Some(normalized))
 }
 
-/// What normalizing a type gives, as salsa keeps it, its region variables numbered as
+/// What normalizing a type gives, as the query database keeps it, its region variables numbered as
 /// [`Proven`]'s.
-#[derive(Debug, Clone, PartialEq, Eq, SalsaValue)]
+#[derive(Debug, Clone, PartialEq, Eq, blaze_query::Value)]
 enum Normalized {
     /// What it gives names a placeholder, a variable of another universe or a type variable.
     Here,
@@ -7299,7 +7299,7 @@ enum Normalized {
 /// Normalizes `ty`, whose region variables are the first `vars`, in `env`, with the region
 /// constraints that records: as [`prove_query`], once per environment and not again after an
 /// edit.
-#[salsa::tracked(returns(ref))]
+#[blaze_query::tracked(returns(ref))]
 fn normalize_query(
     db: &Db,
     env: hir_ty::traits::StoredParamEnvAndCrate,

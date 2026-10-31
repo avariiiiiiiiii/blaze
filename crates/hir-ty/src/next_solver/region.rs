@@ -157,7 +157,7 @@ impl<'db> RegionExt<'db> for Region<'db> {
 
 /// A region as kept in a query result: its row, which stays valid in every revision, as an
 /// interned value is never freed.
-#[derive(Clone, Copy, PartialEq, Eq, Hash, salsa::SalsaValue)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash, blaze_query::Value)]
 pub struct StoredRegion {
     index: NonZeroU32,
 }
@@ -348,7 +348,7 @@ mod tests {
         let a = BoundRegion { var: BoundVar::from_u32(0), kind: BoundRegionKind::Anon };
         let b = BoundRegion { var: BoundVar::from_u32(1), kind: BoundRegionKind::Anon };
         let scope: SolverDefId<'static> = SolverDefId::StaticId(
-            salsa::plumbing::FromId::from_id(salsa::Id::from_bits(1)),
+            blaze_query::db::FromId::from_id(blaze_query::db::Id::from_u32(1)),
         );
         let late = |kind| RegionKind::ReLateParam(LateParamRegion { scope, kind });
         assert_ne!(Region::new_without_interner(late(a)), Region::new_without_interner(late(b)));

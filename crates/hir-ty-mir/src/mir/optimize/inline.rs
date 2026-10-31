@@ -602,7 +602,7 @@ fn callee_options(
 /// whether other crates may build its body into theirs. rustc infers it for a small leaf
 /// function only where its inliner runs and the build is not incremental, which `inline`
 /// says.
-#[salsa::tracked(returns(copy))]
+#[blaze_query::tracked(returns(copy))]
 fn cross_crate_inlinable(db: &Db, func: FunctionId, options: MirOptions) -> bool {
     let attrs = Attrs::of_fn(db, func);
     if attrs.extern_indicator() {

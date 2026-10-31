@@ -22,7 +22,7 @@ mod tests;
 /// associated item path of a body resolved through ([`InferenceResult::traits_in_scope_used`]),
 /// found from the scope of the expression or pattern that picked it, as rustc's `lookup_method`
 /// and `resolve_fully_qualified_call` mark `TraitCandidate::import_ids`.
-#[salsa::tracked(returns(ref), mem_tag = Infer)]
+#[blaze_query::tracked(returns(ref), mem_tag = Infer)]
 pub fn used_imports_with_traits(db: &Db, krate: Crate) -> UsedImports {
     // alloc: the query's result's input, once per execution.
     let mut uses = Vec::new();

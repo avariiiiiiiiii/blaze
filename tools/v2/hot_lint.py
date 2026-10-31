@@ -1,7 +1,7 @@
 """Flags allocation, dynamic dispatch and cloning in v2's hot crates without building anything.
 
 Input: `{"root": "<workspace>"}`, optionally `"crates": [...]` to narrow the set (inline, a path,
-or `-`): a name under `crates/`, or a directory relative to the root (`vendor/salsa`, `fuzz`).
+or `-`): a name under `crates/`, or a directory relative to the root (`fuzz`).
 Prints `path:line: what` per finding, then a count per crate, and exits 1 when there is any. A
 crate that doesn't exist, or a run that reads no file, is an error (exit 2), never a clean
 result. A line is exempt when it, or the line above it, has a `// alloc: <why>`, `// dyn: <why>`
@@ -25,7 +25,7 @@ HOT = (
     "blaze-link", "blaze-codegen", "blaze-stencil", "blaze-lazy", "blaze-items",
     "parser", "syntax-tree", "span", "tt", "mbe", "hir-def", "hir-expand", "hir-ty",
     "hir-ty-mir", "hir-ty-codegen", "base-db", "blaze-diagnostics",
-    "vendor/salsa", "vendor/salsa-macros", "vendor/salsa-macro-rules", "fuzz",
+    "fuzz",
 )
 CHECKS = (
     ("clone", re.compile(r"\.clone\(\)"), "`.clone()`: borrow, copy an ID, or make the type not `Clone`"),

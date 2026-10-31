@@ -26,7 +26,7 @@ use crate::{
 type R<T = ()> = Result<T, String>;
 
 /// The crates whose impls are frozen, set by whoever has the bytes.
-#[salsa::input(singleton, debug)]
+#[blaze_query::input(singleton, debug)]
 pub struct FrozenImpls {
     #[returns(ref)]
     pub maps: StdArc<FxHashMap<Crate, Frozen>>,
@@ -34,7 +34,7 @@ pub struct FrozenImpls {
 
 /// Has finding the impls of a crate use `maps`.
 pub fn set(db: &mut Db, maps: FxHashMap<Crate, Frozen>) {
-    use salsa::{Durability, Setter};
+    use blaze_query::db::{Durability, Setter};
     let maps = StdArc::new(maps);
     match FrozenImpls::try_get(db) {
         Some(it) => {

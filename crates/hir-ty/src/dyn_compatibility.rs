@@ -287,7 +287,7 @@ fn method_site(
     }
 }
 
-#[salsa::tracked(returns(copy), mem_tag = Infer)]
+#[blaze_query::tracked(returns(copy), mem_tag = Infer)]
 pub fn dyn_compatibility_of_trait_query(
     db: &Db,
     trait_: TraitId,
@@ -301,7 +301,7 @@ pub fn dyn_compatibility_of_trait_query(
     res
 }
 
-#[salsa::tracked(returns(copy), mem_tag = Infer)]
+#[blaze_query::tracked(returns(copy), mem_tag = Infer)]
 pub fn generics_require_sized_self(db: &Db, def_id: GenericDefId) -> bool {
     let krate = def_id.krate(db);
     let interner = DbInterner::new_with(db, krate);

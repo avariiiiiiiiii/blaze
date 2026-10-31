@@ -17,7 +17,7 @@ use hir_def::{
     StructId, TraitId, TypeAliasId, UnionId,
 };
 use rustc_hash::FxHashMap;
-use salsa::plumbing::{AsId, FromId};
+use blaze_query::db::{AsId, FromId};
 
 use super::{BodyFacts, INSTALLED, Lookup, Step};
 use crate::{
@@ -88,7 +88,7 @@ fn stored<'db>(db: &'db Db, def: DefWithBodyId, run: impl FnOnce() -> InferenceR
     match lookup_inference(db, def) {
         Lookup::Off => ran(run),
         Lookup::Miss => {
-            let (result, reads) = salsa::capture_reads(db, || ran(run));
+            let (result, reads) = blaze_query::db::capture_reads(db, || ran(run));
             offer_inference(db, def, &result, reads);
             result
         }
@@ -113,7 +113,7 @@ pub(crate) fn offer_inference<'db>(
     db: &'db Db,
     def: DefWithBodyId,
     result: &InferenceResult<'db>,
-    reads: Option<salsa::Reads>,
+    reads: Option<blaze_query::db::Reads>,
 ) {
     super::offer(db, def, Step::Infer, SCHEMA, reads, |facts, out| encode(db, facts, def, result, out));
 }
@@ -288,7 +288,7 @@ impl ItemSink for Keyed<'_, '_> {
 
 /// The item `bits` of `kind` name, as the solver names it; `None` for a kind that is no item.
 fn solver_def<'db>(kind: IdKind, bits: u64) -> Option<SolverDefId<'db>> {
-    let id = salsa::Id::from_bits(bits);
+    let id = blaze_query::db::Id::from_u32(u32::try_from(bits).ok().filter(|&bits| bits != 0)?);
     Some(match kind {
         IdKind::Function => SolverDefId::FunctionId(FunctionId::from_id(id)),
         IdKind::Struct => SolverDefId::AdtId(AdtId::StructId(StructId::from_id(id))),
@@ -324,5 +324,5 @@ fn bits_of(kind: IdKind, def: SolverDefId<'_>) -> Option<u64> {
         (IdKind::EnumVariant, SolverDefId::EnumVariantId(it)) => it.as_id(),
         _ => return None,
     };
-    Some(id.as_bits())
+    Some(u64::from(id.as_u32()))
 }

@@ -11,7 +11,7 @@ const _: () = is_shared::<Db>();
 
 /// What a test query over `&Db` sees: a tracked function whose database is the concrete type,
 /// as every front-end query's is.
-#[salsa::tracked(returns(copy))]
+#[blaze_query::tracked(returns(copy))]
 fn text_len(db: &Db, text: FileText) -> u32 {
     text.text(db).len() as u32
 }
@@ -136,7 +136,7 @@ fn line_column_is_rustcs_from_zero() {
 
 /// A memo hit of a query over `&Db` is static calls and loads: no call through a vtable or a
 /// function pointer, so the hit inlines into its caller (docs/v2/plan/lanes/frontend/db.md,
-/// "Proof"). The miss paths salsa keeps out of line (`fetch_unclaimed`, `fetch_cold`) are
+/// "Proof"). The miss paths the engine keeps out of line (`fetch_cold`) are
 /// direct calls from the hit's code, so any indirect call or jump in it is the hit's own.
 ///
 /// Reads this test binary's own code for [`base_db_memo_hit`] with `objdump`, on x86-64 Linux

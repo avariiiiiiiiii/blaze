@@ -1,6 +1,6 @@
-//! A `ModuleId` kept across revisions that delete its module and make others: salsa panics, or
-//! reads the fields of a module of the same type, never UB (the contract of
-//! `ModuleIdLt::to_static`, a safe `fn` over salsa's `FromId`). `blaze test --ub` runs this under
+//! A `ModuleId` kept across revisions that delete its module and make others: the query
+//! database reads the fields the module last had, never UB (the contract of
+//! `ModuleIdLt::to_static`, a safe `fn` over `blaze_query::db::FromId`). `blaze test --ub` runs this under
 //! the UB checker.
 
 use std::panic::{AssertUnwindSafe, catch_unwind};
@@ -36,7 +36,7 @@ pub struct T;
     db.set_file_text(main, "mod bar;\n");
     assert!(crate_def_map(&db, krate).modules(&db).all(|(id, _)| id != foo), "`foo` is gone");
 
-    // New modules, so salsa may hand `foo`'s freed slot to one of them.
+    // New modules, which must not be handed `foo`'s id.
     db.set_file_text(main, "mod bar;\nmod baz {}\nmod qux {}\n");
     let live: Vec<Option<String>> =
         crate_def_map(&db, krate).modules(&db).map(|(id, _)| name_of(id.name(&db))).collect();

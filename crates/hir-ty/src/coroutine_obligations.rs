@@ -26,7 +26,7 @@ use crate::{
 /// its own), where an ambiguity is an error too. The opaque uses solving adds are dropped
 /// unchecked, as rustc drops them: no region constraint is checked here either. Empty, with no
 /// inference context made, for a body whose inference set no goal aside.
-#[salsa::tracked(returns(deref), mem_tag = Infer)]
+#[blaze_query::tracked(returns(deref), mem_tag = Infer)]
 pub fn coroutine_obligation_errors<'db>(
     db: &'db Db,
     body: InferBodyId<'db>,

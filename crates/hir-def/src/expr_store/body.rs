@@ -89,13 +89,13 @@ impl ops::Deref for BodySourceMap {
     }
 }
 
-#[salsa::tracked]
+#[blaze_query::tracked]
 impl Body {
     /// The body with where each part of it is written. For a body written in a file, this is
     /// [`Body::relative`] with its source map moved to where the body is in the file: the map
     /// is made once, and an edit elsewhere in the file only moves it. The body is equal to
     /// [`Body::of`], with the same ids, but lowered again with the map.
-    #[salsa::tracked(lru = 512, returns(ref))]
+    #[blaze_query::tracked(lru = 512, returns(ref))]
     pub fn with_source_map(
         db: &Db,
         def: DefWithBodyId,
@@ -144,7 +144,7 @@ impl Body {
     /// [`Body::with_source_map`] is: what is lowered again after it is let go of has changed
     /// to all that reads it. The body is [`Body::of`] lowered again for its map, with the same
     /// blocks, and checked equal to it.
-    #[salsa::tracked(lru = 4096, returns(ref))]
+    #[blaze_query::tracked(lru = 4096, returns(ref))]
     pub fn relative(
         db: &Db,
         def: DefWithBodyId,
@@ -163,7 +163,7 @@ impl Body {
     /// part of them is written, so their maps are built only when read: [`Body::relative`] and
     /// [`Body::with_source_map`] lower the body again, with the map and this body's blocks.
     /// The body is the memo's own value, lent by reference: no `Arc` and no count to write.
-    #[salsa::tracked(returns(ref))]
+    #[blaze_query::tracked(returns(ref))]
     pub fn of(db: &Db, def: DefWithBodyId) -> Body {
         let _p = tracing::info_span!("body_query").entered();
         match lower_relative(db, def, BodyLowering::Body) {
@@ -576,7 +576,7 @@ mod trees {
 }
 
 /// The [`BodySyntax`] of a body written in a file, `None` for one a macro writes.
-#[salsa::tracked(returns(ref))]
+#[blaze_query::tracked(returns(ref))]
 pub fn body_syntax(db: &Db, def: DefWithBodyId) -> Option<BodySyntax> {
     let src = def_syntax(db, def);
     let SpanMap::RealSpanMap(span_map) = src.file_id.span_map(db) else { return None };

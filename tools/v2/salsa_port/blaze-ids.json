@@ -1,0 +1,15 @@
+{
+ "crate": "crates/blaze-ids",
+ "base": "adc8bbbf04a20c189070000982f22445be80764f",
+ "files": [
+  {
+   "path": "crates/blaze-ids/src/std_hash.rs",
+   "edits": [
+    {
+     "old": "    /// `hir-ty-codegen` and salsa each carried, here as the bytes they wrote.\n",
+     "new": "    /// `hir-ty-codegen` and the old query engine each carried, here as the bytes they wrote.\n"
+    }
+   ]
+  }
+ ]
+}

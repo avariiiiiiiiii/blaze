@@ -12,9 +12,10 @@
 //! Only answers that leave the inference context as they found it are kept: `Ok(Yes)` with no
 //! change, or `Err(NoSolution)`, with an equal [`Mark`] before and after, so no overflow note,
 //! region constraint, variable or universe was added. Such an answer replayed has the effect
-//! the evaluation had. The salsa reads of the evaluation are kept with it and replayed on a
+//! the evaluation had. The query reads of the evaluation are kept with it and replayed on a
 //! hit, as `tls_cache`'s shared cache does, so the asking query depends on what the answer
-//! read; an evaluation salsa could not capture (a cycle head, an untracked read) is not kept.
+//! read; an evaluation whose reads `blaze_query::db::capture_reads` could not capture (a cycle
+//! head, an untracked read) is not kept.
 
 pub(crate) mod shape;
 mod table;
@@ -38,9 +39,9 @@ use super::{
 use crate::Span;
 
 /// The table of one (crate, regions flag, revision): each global goal's answer and its reads.
-pub(crate) type Goals = table::Table<(Answer, salsa::Reads)>;
+pub(crate) type Goals = table::Table<(Answer, blaze_query::db::Reads)>;
 
-const _: () = assert!(table::slot_size::<(Answer, salsa::Reads)>() == 64);
+const _: () = assert!(table::slot_size::<(Answer, blaze_query::db::Reads)>() == 64);
 
 /// A goal with these flags reads the inference context, or is not one goal for every body.
 const NOT_GLOBAL: TypeFlags = TypeFlags::HAS_INFER
@@ -221,7 +222,7 @@ pub(crate) fn holds_at_registration<'db>(
     let interner = infcx.interner;
     match interner.with_global_goals(|table| table.get(key)) {
         Some((Answer::Holds, reads)) => {
-            salsa::replay_reads(interner.db, reads);
+            blaze_query::db::replay_reads(interner.db, reads);
             true
         }
         Some((Answer::Fails, _)) | None => false,
@@ -246,7 +247,7 @@ pub(crate) fn evaluate_root_goal<'db>(
     };
     let interner = infcx.interner;
     if let Some((answer, reads)) = interner.with_global_goals(|table| table.get(key)) {
-        salsa::replay_reads(interner.db, reads);
+        blaze_query::db::replay_reads(interner.db, reads);
         return answer.evaluation(resolved);
     }
     if let Some(found) = goal_store::lookup(interner, key) {
@@ -259,7 +260,7 @@ pub(crate) fn evaluate_root_goal<'db>(
         return delegate.evaluate_root_goal(goal, span, None);
     };
     let (result, reads) =
-        salsa::capture_reads(interner.db, || delegate.evaluate_root_goal(goal, span, None));
+        blaze_query::db::capture_reads(interner.db, || delegate.evaluate_root_goal(goal, span, None));
     if let Some(reads) = reads
         && let Some(answer) = Answer::of(resolved, &result)
         && Mark::of(infcx) == Some(before)

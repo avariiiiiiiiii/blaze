@@ -46,7 +46,7 @@ pub fn bound_hash(db: &Db, id: ItemId) -> Result<Option<ContentId>, Unhashable> 
     bound_of(db, id)
 }
 
-#[salsa::tracked(returns(copy))]
+#[blaze_query::tracked(returns(copy))]
 fn bound_of(db: &Db, id: ItemId) -> Result<Option<ContentId>, Unhashable> {
     let Some(code) = hash::code_hash(db, id)? else { return Ok(None) };
     let (Some(body), Some(def)) = (id.body(), id.generic_def()) else {

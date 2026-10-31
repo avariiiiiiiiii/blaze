@@ -30,8 +30,8 @@ pub enum Visibility {
     Public,
 }
 
-// A module id (8 bytes) and the explicitness, whose spare values tag the other two.
-const _: () = assert!(size_of::<Visibility>() <= 12);
+// A module id (4 bytes) and the explicitness, whose spare values tag the other two.
+const _: () = assert!(size_of::<Visibility>() <= 8);
 
 /// Why a `pub(in path)` (or `pub(super)`) gives no visibility: rustc's `VisResolutionError`,
 /// from `rustc_resolve::build_reduced_graph`'s `try_resolve_visibility`.
@@ -345,10 +345,10 @@ impl Visibility {
     }
 }
 
-#[salsa::tracked]
+#[blaze_query::tracked]
 impl VariantFields {
     /// Resolve visibility of all specific fields of a struct or union variant.
-    #[salsa::tracked(returns(ref))]
+    #[blaze_query::tracked(returns(ref))]
     pub fn field_visibilities(
         db: &Db,
         variant_id: VariantId,
@@ -386,10 +386,10 @@ pub fn visibility_from_ast_view(
     }
 }
 
-#[salsa::tracked]
+#[blaze_query::tracked]
 impl AssocItemId {
     /// Resolve visibility of an assoc item.
-    #[salsa::tracked(returns(copy))]
+    #[blaze_query::tracked(returns(copy))]
     pub fn assoc_visibility(self, db: &Db) -> Visibility {
         match self {
             AssocItemId::FunctionId(function_id) => {

@@ -457,7 +457,7 @@ pub fn apply_args_to_binder<'db, T: TypeFoldable<DbInterner<'db>>>(
     b.skip_binder().fold_with(&mut instantiate)
 }
 
-#[derive(salsa::Supertype)]
+#[derive(Clone, Copy, blaze_query::Supertype)]
 pub(crate) enum ItemWithBounds<'db> {
     TypeAliasId(TypeAliasId),
     InternedOpaqueTyId(InternedOpaqueTyId<'db>),
@@ -504,13 +504,13 @@ impl ItemBounds {
     }
 }
 
-#[salsa::tracked]
+#[blaze_query::tracked]
 impl ItemBounds {
     #[allow(
         clippy::drop_non_drop,
-        reason = "this happens in a Salsa macro, not sure why only here"
+        reason = "this happens in the tracked macro's expansion, not sure why only here"
     )]
-    #[salsa::tracked]
+    #[blaze_query::tracked]
     fn of(db: &Db, def_id: ItemWithBounds<'_>) -> ItemBounds {
         let (krate, explicit_bounds) = match def_id {
             ItemWithBounds::TypeAliasId(type_alias) => (
@@ -547,7 +547,7 @@ impl ItemBounds {
     }
 }
 
-#[salsa::tracked]
+#[blaze_query::tracked]
 pub(crate) fn impl_super_outlives(
     db: &Db,
     impl_: ImplId,

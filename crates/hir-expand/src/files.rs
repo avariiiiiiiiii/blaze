@@ -89,7 +89,7 @@ impl FileRange {
 
 /// `AstId` points to an AST node in any file.
 ///
-/// It is stable across reparses, and can be used as salsa key/value.
+/// It is stable across reparses, and can be used as a query key or value.
 pub type AstId<N> = crate::InFile<FileAstId<N>>;
 
 impl<N: AstNode> AstId<N> {

@@ -32,7 +32,6 @@ use hir_def::{
 };
 use intern::Symbol;
 use rustc_type_ir::inherent::{GenericArgs as _, IntoKind};
-use salsa::SalsaValue;
 
 use hir_ty::{
     InferBodyId, InferenceResult,
@@ -47,7 +46,7 @@ use super::{
     framed::{Bits, bits_in},
 };
 
-#[derive(Debug, Clone, PartialEq, Eq, SalsaValue)]
+#[derive(Debug, Clone, PartialEq, Eq, blaze_query::Value)]
 pub struct ConstCheckDiagnostic {
     pub kind: ConstCheckKind,
     /// The const context of the body the error is in, which rustc's messages name.
@@ -63,7 +62,7 @@ pub struct ConstCheckDiagnostic {
 /// `ConditionallyConstCall`: the callee is const when its `[const]` bounds hold, which they do,
 /// and calling it needs `#![feature(const_trait_impl)]` (`E0658`); otherwise the callee is not
 /// const (`FnCallNonConst`, `E0015`).
-#[derive(Debug, Clone, PartialEq, Eq, SalsaValue)]
+#[derive(Debug, Clone, PartialEq, Eq, blaze_query::Value)]
 pub enum ConstCheckKind {
     /// `RawPtrToIntCast`.
     PointerToInt,
@@ -136,7 +135,7 @@ pub enum ConstCheckKind {
 }
 
 /// rustc's `NonConstClosureNote`: what the closure called is.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, SalsaValue)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, blaze_query::Value)]
 pub enum ClosureNote {
     FnDef(CallableDefId),
     FnPtr,
@@ -145,7 +144,7 @@ pub enum ClosureNote {
 }
 
 /// rustc's `CallDesugaringKind`, of the desugarings a const context can have.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, SalsaValue)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, blaze_query::Value)]
 pub enum Desugaring {
     ForLoopIntoIter,
     ForLoopNext,
@@ -297,7 +296,7 @@ impl fmt::Display for TypeName {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Default, SalsaValue)]
+#[derive(Debug, Clone, PartialEq, Eq, Default, blaze_query::Value)]
 pub struct ConstCheck {
     pub diagnostics: Vec<ConstCheckDiagnostic>,
 }
@@ -344,7 +343,7 @@ pub(crate) fn of_a_trait(db: &Db, func: FunctionId) -> bool {
 }
 
 /// What rustc's const checker reports in `def`'s body, when it is a const context.
-#[salsa::tracked(returns(ref))]
+#[blaze_query::tracked(returns(ref))]
 pub fn const_check<'db>(db: &'db Db, def: DefWithBodyId) -> ConstCheck {
     let Some(context) = const_context(db, def) else { return ConstCheck::default() };
     if let DefWithBodyId::FunctionId(func) = def

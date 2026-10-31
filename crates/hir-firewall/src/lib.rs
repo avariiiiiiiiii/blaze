@@ -25,10 +25,7 @@ use hir_def::{
     signatures::FunctionSignature, src::HasSource,
 };
 use rustc_hash::FxHashSet;
-use salsa::{
-    Database as _, DatabaseKeyIndex, Durability, EventKind,
-    plumbing::ZalsaDatabase as _,
-};
+use blaze_query::db::{Database as _, DatabaseKeyIndex, Durability, EventKind};
 use syntax::{TextRange, TextSize};
 
 pub use codegen::Codegen;
@@ -88,7 +85,7 @@ pub struct Leak {
     pub edited: String,
     /// In the pass after the edit was undone.
     pub undo: bool,
-    /// The query, as salsa names it.
+    /// The query, as the query database names it.
     pub query: String,
     pub key: String,
     /// What the pass asked when it executed.
@@ -173,9 +170,9 @@ pub struct Harness {
 impl Harness {
     /// Lists `krate`'s bodies, asks for everything once, then once more in a revision that
     /// changed nothing. Keeps every value of `db` from now on
-    /// ([`salsa::plumbing::Zalsa::keep_every_value`]).
+    /// ([`blaze_query::db::Storage::keep_every_value`]).
     pub fn new(db: &mut Db, krate: Crate, codegen: Option<Codegen>) -> Result<Harness, String> {
-        db.zalsa_mut().keep_every_value(true);
+        db.storage_mut().keep_every_value(true);
         let bodies = bodies(db, krate);
         let modules = hir::check::file_modules(db, hir::Crate::from(krate));
         let mut harness = Harness {
@@ -190,7 +187,7 @@ impl Harness {
         };
         let cold = harness.pass(db, None)?;
         harness.seen.extend(cold.touched.iter().copied());
-        db.synthetic_write(Durability::LOW);
+        db.storage_mut().synthetic_write(Durability::LOW);
         let warm = harness.pass(db, None)?;
         harness.seen.extend(warm.touched.iter().copied());
         harness.volatile.extend(warm.executed.iter().map(|&(key, _)| key));
@@ -236,7 +233,7 @@ impl Harness {
     /// What the setup found: the volatile queries and the bodies no edit is made in.
     pub fn report_setup(&self, db: &Db, report: &mut Report) {
         let mut volatile: Vec<String> =
-            self.volatile.iter().map(|key| db.ingredient_debug_name(key.ingredient_index()).into_owned()).collect(); // alloc: tests only
+            self.volatile.iter().map(|key| db.storage().ingredient_name(key.ingredient_index()).to_owned()).collect(); // alloc: tests only
         volatile.sort_unstable();
         volatile.dedup();
         report.volatile = volatile;
@@ -344,7 +341,7 @@ impl Harness {
                 Whose::Own | Whose::File => continue,
                 Whose::Other => {}
             }
-            let query = db.ingredient_debug_name(key.ingredient_index());
+            let query = db.storage().ingredient_name(key.ingredient_index());
             // E4: a constant's evaluation calls the edited `const fn` and evaluates again; its
             // value is backdated when it is the same.
             if is_const && query.contains("const_eval") {
@@ -354,7 +351,7 @@ impl Harness {
                 // clone: tests only, names for the report
                 edited: self.bodies[edited.index as usize].name.clone(),
                 undo,
-                query: query.into_owned(),
+                query: query.to_owned(),
                 key: format!("{key:?}"), // alloc: tests only, a leak's report
                 request: self.request_name(request),
             });
@@ -426,7 +423,7 @@ impl Harness {
 
 /// Adds `events`' executions to `pass` and, for a body's request, the macro calls it interned
 /// first to `interned` under the body's place.
-fn record(db: &Db, events: &[salsa::Event], request: Request, pass: &mut Pass, mut body: Option<(u32, &mut Interned)>) {
+fn record(db: &Db, events: &[blaze_query::db::Event], request: Request, pass: &mut Pass, mut body: Option<(u32, &mut Interned)>) {
     for event in events {
         match event.kind {
             EventKind::WillExecute { database_key } => {
@@ -436,7 +433,7 @@ fn record(db: &Db, events: &[salsa::Event], request: Request, pass: &mut Pass, m
             EventKind::DidValidateMemoizedValue { database_key } => pass.touched.push(database_key),
             EventKind::DidInternValue { key, .. } => {
                 if let Some((index, interned)) = &mut body
-                    && db.ingredient_debug_name(key.ingredient_index()) == "MacroCallId"
+                    && db.storage().ingredient_name(key.ingredient_index()) == "MacroCallId"
                 {
                     interned.entry(key.key_index()).or_insert(*index);
                 }

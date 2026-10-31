@@ -356,7 +356,7 @@ impl<'db, 'f> Unit<'db, 'f> {
             krate,
             block: None,
             root: queries::crate_root(db, krate),
-            modules: ModulesSlot::Unit { own, rows: salsa::plumbing::AsId::as_id(&rows) },
+            modules: ModulesSlot::Unit { own, rows: blaze_query::db::AsId::as_id(&rows) },
             prelude: None,
             macro_use_prelude: FxHashMap::default(),
             derive_helpers_in_scope: FxHashMap::default(),
@@ -1456,7 +1456,7 @@ pub(crate) fn local_scope(
 
 /// The round's `#[prelude_import]`: the index of the module that holds it. The graph puts that
 /// module's component upstream of every other.
-#[salsa::tracked(returns(copy))]
+#[blaze_query::tracked(returns(copy))]
 fn prelude_holder(db: &Db, round: RoundKey) -> Option<u32> {
     let shape = queries::import_shape(db, round);
     let at = shape.modules.iter().position(|it| it.imports.iter().any(|import| import.is_prelude))?;
@@ -1466,7 +1466,7 @@ fn prelude_holder(db: &Db, round: RoundKey) -> Option<u32> {
 /// The std prelude the round's `#[prelude_import]` resolved to, if one did: what every other
 /// component installs, from the holder's state at the last round its component ran.
 /// Backdates while it stays.
-#[salsa::tracked(returns(copy))]
+#[blaze_query::tracked(returns(copy))]
 fn round_prelude(db: &Db, round: RoundKey) -> Option<(ModuleId, Option<UseId>)> {
     let holder = prelude_holder(db, round)?;
     let krate = round.krate(db);
@@ -1706,8 +1706,8 @@ pub(crate) fn scc_state(db: &Db, frame: &Frame, key: SccKey) -> SccState {
         let ScopeSlot::Building(building) = &data.scope else {
             unreachable!("a unit's rows are building")
         };
-        let same = |id: salsa::Id| {
-            let scope = <ModuleScope<'_> as salsa::plumbing::FromId>::from_id(id);
+        let same = |id: blaze_query::db::Id| {
+            let scope = <ModuleScope<'_> as blaze_query::db::FromId>::from_id(id);
             *scope.scope(db) == building.scope && *scope.children(db) == building.children
         };
         let handle = match before {
@@ -1718,7 +1718,7 @@ pub(crate) fn scc_state(db: &Db, frame: &Frame, key: SccKey) -> SccState {
                 let (scope, children) = (&building.scope, &building.children);
                 // clone: the state carries the scope on; the database holds this copy, once per change.
                 let scope = ModuleScope::new(db, module, scope.clone(), children.clone());
-                salsa::plumbing::AsId::as_id(&scope)
+                blaze_query::db::AsId::as_id(&scope)
             }
         };
         handles.push(handle);
@@ -1813,7 +1813,7 @@ fn member_state(db: &Db, key: FactKey) -> (&SccState, usize) {
 }
 
 /// The module's `ModuleScope` after the round's import fixed point.
-pub(crate) fn fact_handle(db: &Db, key: FactKey) -> salsa::Id {
+pub(crate) fn fact_handle(db: &Db, key: FactKey) -> blaze_query::db::Id {
     let (state, at) = member_state(db, key);
     state.handles[at]
 }

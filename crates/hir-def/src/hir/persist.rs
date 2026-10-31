@@ -8,7 +8,7 @@
 //! other text is in the buffer once, as a [`Str`] in a table the words name it by; a
 //! [`Symbol`] is written as its text and interned again when read.
 //!
-//! What salsa interns or tracks (a crate, a file, a macro call, a block, a syntax context) is
+//! What the query database interns or tracks (a crate, a file, a macro call, a block, a syntax context) is
 //! written as its dense index, which means something only to the database that made it: these
 //! buffers are one run's state, the daemon's image of what it let go of ("IDs, two kinds":
 //! a dense index may be kept in the image), never a key, a hash or the bytes of an output.
@@ -39,15 +39,15 @@ use thin_vec::ThinVec;
 
 use crate::hir::ExprOrPatIdPacked;
 
-/// `Code` for salsa's ids, as their bits: the database that wrote them is the one reading.
+/// `Code` for the query database's ids, as their bits: the database that wrote them is the one reading.
 /// Inside [`relocating`], as their place in the table, by the [`Relocate::KIND`] of their type.
-macro_rules! salsa_ids {
+macro_rules! query_ids {
     ($($ty:ty),* $(,)?) => {$(
         impl $crate::hir::persist::Code for $ty {
             fn put(&self, w: &mut $crate::hir::persist::Words) {
-                w.salsa_id(
+                w.query_id(
                     <$ty as $crate::hir::persist::Relocate>::KIND,
-                    ::salsa::plumbing::AsId::as_id(self),
+                    blaze_query::db::AsId::as_id(self),
                 );
             }
 
@@ -55,14 +55,24 @@ macro_rules! salsa_ids {
                 r: &mut $crate::hir::persist::Read<'_>,
             ) -> Result<Self, ::blaze_format::FormatError> {
                 let kind = <$ty as $crate::hir::persist::Relocate>::KIND;
-                Ok(<$ty as ::salsa::plumbing::FromId>::from_id(r.salsa_id_of(kind)?))
+                Ok(<$ty as blaze_query::db::FromId>::from_id(r.query_id_of(kind)?))
             }
         }
     )*};
 }
-pub(crate) use salsa_ids;
+pub(crate) use query_ids;
 
-/// What an id in a [`Relocation`] table is: which salsa type, or a syntax context, or a span's
+/// The id whose bits are the word `bits`: `None` for 0 or a word past `u32`, which no id is.
+pub(crate) fn id_of_bits(bits: u64) -> Option<blaze_query::db::Id> {
+    u32::try_from(bits).ok().filter(|&it| it != 0).map(blaze_query::db::Id::from_u32)
+}
+
+/// The id of a [`Relocation`] entry's bits, which this database made.
+pub(crate) fn entry_id(bits: u64) -> blaze_query::db::Id {
+    id_of_bits(bits).expect("a relocation entry of an id that is no id of this database")
+}
+
+/// What an id in a [`Relocation`] table is: which query database type, or a syntax context, or a span's
 /// file. An entry is read back only as the kind it was written as.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub(crate) enum Kind {
@@ -122,7 +132,7 @@ const _: () = {
     }
 };
 
-/// A salsa id type [`salsa_ids`] writes, by the kind its table entries are.
+/// An id type [`query_ids`] writes, by the kind its table entries are.
 pub(crate) trait Relocate {
     const KIND: Kind;
 }
@@ -446,9 +456,10 @@ impl Words {
         value.put(self);
     }
 
-    /// An id salsa made: its bits, or inside [`relocating`] its index in the table.
-    pub(crate) fn salsa_id(&mut self, kind: Kind, id: salsa::Id) {
-        let bits = id.as_bits();
+    /// An id the query database made: its bits as a `u64` word, or inside [`relocating`] its
+    /// index in the table.
+    pub(crate) fn query_id(&mut self, kind: Kind, id: blaze_query::db::Id) {
+        let bits = u64::from(id.as_u32());
         match relocated(kind, bits) {
             Some(index) => self.u32(index),
             None => self.u64(bits),
@@ -635,26 +646,21 @@ impl<'a> Read<'a> {
         (0..len).map(|_| T::get(self)).collect()
     }
 
-    /// The id of something salsa made, as [`salsa_ids`] wrote it outside [`relocating`].
-    pub(crate) fn salsa_id(&mut self) -> Result<salsa::Id, FormatError> {
+    /// The id of something the query database made, as [`query_ids`] wrote it outside
+    /// [`relocating`].
+    pub(crate) fn query_id(&mut self) -> Result<blaze_query::db::Id, FormatError> {
         let bits = self.u64()?;
-        match bits as u32 {
-            0 => Err(self.invalid("a salsa id of index 0")),
-            _ => Ok(salsa::Id::from_bits(bits)),
-        }
+        id_of_bits(bits).ok_or_else(|| self.invalid("an id of 0 or of more than 32 bits"))
     }
 
-    /// The id of something salsa made of `kind`, as [`Words::salsa_id`] wrote it: inside
-    /// [`relocating`], looked up in the table.
-    pub(crate) fn salsa_id_of(&mut self, kind: Kind) -> Result<salsa::Id, FormatError> {
+    /// The id of something the query database made of `kind`, as [`Words::query_id`] wrote it:
+    /// inside [`relocating`], looked up in the table.
+    pub(crate) fn query_id_of(&mut self, kind: Kind) -> Result<blaze_query::db::Id, FormatError> {
         if !in_scope() {
-            return self.salsa_id();
+            return self.query_id();
         }
         let bits = self.relocated(kind)?;
-        match bits as u32 {
-            0 => Err(self.invalid("a relocated salsa id of index 0")),
-            _ => Ok(salsa::Id::from_bits(bits)),
-        }
+        id_of_bits(bits).ok_or_else(|| self.invalid("a relocated id of 0 or of more than 32 bits"))
     }
 
     /// The bits of the id of `kind` the next word names in the [`relocating`] table.
@@ -1132,7 +1138,7 @@ impl Code for CfgExpr {
     }
 }
 
-salsa_ids!(base_db::Crate, base_db::EditionedFileId, MacroCallId, crate::BlockId);
+query_ids!(base_db::Crate, base_db::EditionedFileId, MacroCallId, crate::BlockId);
 
 impl Code for HirFileId {
     fn put(&self, w: &mut Words) {
@@ -1308,12 +1314,12 @@ mod tests {
         blaze_alloc_count::assert_at_most(0, "names on warm words", name_all);
     }
 
-    fn crate_of(bits: u64) -> base_db::Crate {
-        <base_db::Crate as salsa::plumbing::FromId>::from_id(salsa::Id::from_bits(bits))
+    fn crate_of(bits: u32) -> base_db::Crate {
+        <base_db::Crate as blaze_query::db::FromId>::from_id(blaze_query::db::Id::from_u32(bits))
     }
 
-    fn call_of(bits: u64) -> MacroCallId {
-        <MacroCallId as salsa::plumbing::FromId>::from_id(salsa::Id::from_bits(bits))
+    fn call_of(bits: u32) -> MacroCallId {
+        <MacroCallId as blaze_query::db::FromId>::from_id(blaze_query::db::Id::from_u32(bits))
     }
 
     /// The words `value` is written as, in a scope of `table` when there is one.
@@ -1341,8 +1347,9 @@ mod tests {
 
     #[test]
     fn ids_outside_a_relocation_are_their_bits() {
-        let bits = 5 | (3 << 32);
-        assert_eq!(words_of(&crate_of(bits), None), [5, 3]);
+        assert_eq!(words_of(&crate_of(5), None), [5, 0]);
+        let high = blaze_query::db::Id::MAX_U32;
+        assert_eq!(words_of(&crate_of(high), None), [high, 0]);
         let context = SyntaxContext::root(Edition::Edition2021);
         assert_eq!(words_of(&context, None), [context.into_u32()]);
         let file = span::EditionedFileId::new(span::FileId::from_raw(9), Edition::Edition2018);
@@ -1355,7 +1362,7 @@ mod tests {
         let value = (crate_of(7), (call_of(7), (crate_of(9), crate_of(7))));
         let words = words_of(&value, Some(&mut table));
         assert_eq!(words, [0, 1, 2, 0], "one index per distinct id and kind");
-        let bits = |it: base_db::Crate| salsa::plumbing::AsId::as_id(&it).as_bits();
+        let bits = |it: base_db::Crate| u64::from(blaze_query::db::AsId::as_id(&it).as_u32());
         assert_eq!(
             table.entries(),
             [(Kind::Crate, bits(crate_of(7))), (Kind::MacroCall, 7), (Kind::Crate, 9)]

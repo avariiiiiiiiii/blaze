@@ -1528,6 +1528,8 @@ fn signing_allocates_nothing_per_page() {
 fn linkedit_encodes_into_one_buffer() {
     const IMPORTS: [&[u8]; 4] = [b"_malloc", b"_free", b"_open", b"_close"];
     let spans = spans();
+    // One worker, measured on it: the rebases are checked on the pool's threads.
+    let pool = rayon::ThreadPoolBuilder::new().num_threads(1).build().unwrap();
     for n in [100u64, 2000] {
         // In order, as `Placed` lists them.
         let rebases: Vec<u64> = (0..n).map(|it| 0x1_0000_8000 + 8 * it).collect();
@@ -1548,13 +1550,15 @@ fn linkedit_encodes_into_one_buffer() {
         let mut out =
             Vec::with_capacity(linkedit::capacity(rebases.len(), &binds, &exports, functions.len()));
         let (at, room) = (out.as_ptr(), out.capacity());
-        let (len, used) = blaze_alloc_count::measure(|| {
-            linkedit::rebases(&rebases, &spans, &mut out).unwrap()
-                + linkedit::binds(&mut binds, &spans, &mut out).unwrap()
-                + linkedit::trie(&mut exports, &mut out).unwrap()
-                + linkedit::function_starts(0x1_0000_0000, &functions, &mut out)
+        let (len, used) = pool.install(|| {
+            blaze_alloc_count::measure(|| {
+                linkedit::rebases(&rebases, &spans, &mut out).unwrap()
+                    + linkedit::binds(&mut binds, &spans, &mut out).unwrap()
+                    + linkedit::trie(&mut exports, &mut out).unwrap()
+                    + linkedit::function_starts(0x1_0000_0000, &functions, &mut out)
+            })
         });
-        assert_eq!(used.allocations, 4, "{n}: the trie's four scratch columns");
+        assert_eq!(used.allocations, 6, "{n}: the trie's four scratch columns and each stream's cuts");
         assert_eq!((out.as_ptr(), out.capacity()), (at, room), "{n}: the buffer never grew");
         assert_eq!(out.len(), len);
     }

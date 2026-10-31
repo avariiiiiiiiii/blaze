@@ -221,7 +221,7 @@ impl Store {
         def: DefWithBodyId,
         step: Step,
         schema: SchemaHash,
-        reads: Option<salsa::Reads>,
+        reads: Option<blaze_query::db::Reads>,
         // dyn: the store's facts, given to the step's encoder once per offer
         write: impl FnOnce(&dyn BodyFacts, &mut Vec<u8>) -> Result<(), String>,
     ) {
@@ -241,7 +241,7 @@ impl Store {
         def: DefWithBodyId,
         step: Step,
         schema: SchemaHash,
-        reads: Option<salsa::Reads>,
+        reads: Option<blaze_query::db::Reads>,
         // dyn: as in `offer`
         write: impl FnOnce(&dyn BodyFacts, &mut Vec<u8>) -> Result<(), String>,
         scratch: &mut Scratch,
@@ -250,10 +250,12 @@ impl Store {
         let reads = reads.ok_or(Refusal::Unshareable)?;
         let mut refused = None;
         let facts = &mut scratch.facts;
-        let _ = reads.for_each_read(db, |read, kind, name| {
-            if kind == salsa::ReadKind::Interned {
+        let storage = blaze_query::db::Database::storage(db);
+        let _ = reads.for_each_read(storage, |blaze_query::db::Read { key: read, kind }| {
+            if kind == blaze_query::db::ReadKind::Interned {
                 return ControlFlow::Continue(());
             }
+            let name = storage.ingredient_name(read.ingredient_index());
             match self.facts.classify(db, def, step, read, kind, name) {
                 Classified::Covered => ControlFlow::Continue(()),
                 Classified::Fact(fact) => {
@@ -469,7 +471,7 @@ pub(crate) fn offer(
     def: DefWithBodyId,
     step: Step,
     schema: SchemaHash,
-    reads: Option<salsa::Reads>,
+    reads: Option<blaze_query::db::Reads>,
     // dyn: as `Store::offer`
     write: impl FnOnce(&dyn BodyFacts, &mut Vec<u8>) -> Result<(), String>,
 ) {
@@ -490,11 +492,11 @@ pub(crate) fn fail(db: &Db, def: DefWithBodyId, step: Step, why: fmt::Arguments<
 /// `run`, with what it read captured when an item store is installed for any database: what
 /// [`offer`] and [`offer_passed`] are given. Only inside a query is anything captured.
 #[inline]
-pub fn capture<R>(db: &Db, run: impl FnOnce() -> R) -> (R, Option<salsa::Reads>) {
+pub fn capture<R>(db: &Db, run: impl FnOnce() -> R) -> (R, Option<blaze_query::db::Reads>) {
     if INSTALLED.load(Ordering::Relaxed) == 0 {
         return (run(), None);
     }
-    salsa::capture_reads(db, run)
+    blaze_query::db::capture_reads(db, run)
 }
 
 /// Before `def`'s borrow check by the checker named `checker` (`hir_ty_borrowck::gate::checked`):
@@ -533,7 +535,7 @@ fn lookup_passed_in(db: &Db, def: DefWithBodyId, checker: &'static str, check: i
 /// [`capture`], around the check): its verdict, for the flush to store. A failing verdict is
 /// never offered.
 #[inline]
-pub fn offer_passed(db: &Db, def: DefWithBodyId, checker: &'static str, reads: Option<salsa::Reads>) {
+pub fn offer_passed(db: &Db, def: DefWithBodyId, checker: &'static str, reads: Option<blaze_query::db::Reads>) {
     if INSTALLED.load(Ordering::Relaxed) == 0 {
         return;
     }

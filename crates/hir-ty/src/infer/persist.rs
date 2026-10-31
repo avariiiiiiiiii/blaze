@@ -1,7 +1,7 @@
 //! [`InferenceResult`] in blaze's format (docs/v2/plan/design/data.md). [`InferenceRecord`] is
 //! its `'static` form: the result's columns as they are, in three flat arrays of `u64`, `u32` and
 //! `u8` words, each type an index in a type table of its own (`next_solver::persist`), each
-//! definition its salsa id (the database that wrote a buffer is the one reading it, as
+//! definition its id (the database that wrote a buffer is the one reading it, as
 //! `crates/hir-def/src/hir/persist.rs` writes ids), and what few nodes have (diagnostics, the
 //! closures' captures) as tagged `u32` words beside them. [`Persist`] writes the arrays and the
 //! table's buffer into one buffer and reads them back in place;
@@ -98,7 +98,7 @@ macro_rules! columns {
 }
 
 columns! {
-    /// The columns of `u64` words: salsa ids, bitset words, and which keys a sparse column has
+    /// The columns of `u64` words: ids, bitset words, and which keys a sparse column has
     /// a row or list for.
     C64, N64 {
         MethodPresent,
@@ -278,7 +278,7 @@ fn table_in<'b>(buffer: &'b [u8], table: &[u128]) -> &'b [u8] {
     &buffer[start..][..size_of_val(table)]
 }
 
-/// An id's word: its salsa bits, or inside `check_cache::relocating` its place in the table.
+/// An id's word: its bits, or inside `check_cache::relocating` its place in the table.
 fn id_bits<T: crate::check_cache::Relocate>(id: T) -> u64 {
     crate::check_cache::id_bits(id)
 }
@@ -598,7 +598,7 @@ fn span_of(words: &[u32]) -> Option<Span> {
 trait TyEncode<'db> {
     fn ty(&mut self, ty: Ty<'db>) -> u32;
     fn args(&mut self, args: GenericArgs<'db>) -> u32;
-    /// The trait as two words of its salsa id and its arguments.
+    /// The trait as two words of its id and its arguments.
     fn trait_ref(&mut self, trait_ref: &StoredTraitRef) -> [u32; 3];
     fn predicate(&mut self, predicate: Predicate<'db>) -> u32;
 }
@@ -1080,7 +1080,7 @@ impl<'a> InferenceRecordRef<'a> {
     }
 
     fn id<T: crate::check_cache::Relocate>(&self, bits: u64) -> Result<T, FormatError> {
-        id_of(bits).ok_or(self.invalid("a salsa id of index 0 or not in the table"))
+        id_of(bits).ok_or(self.invalid("an id of index 0 or not in the table"))
     }
 
     fn same_len(&self, lens: &[usize], what: &'static str) -> Result<(), FormatError> {
@@ -2547,7 +2547,7 @@ impl Source<'_> {
 
     fn id<T: crate::check_cache::Relocate>(&mut self) -> Result<T, FormatError> {
         let bits = self.u64()?;
-        id_of(bits).ok_or(self.invalid("a salsa id of index 0 or not in the table"))
+        id_of(bits).ok_or(self.invalid("an id of index 0 or not in the table"))
     }
 
     /// A list's length, which is at most the words left: each entry is at least a word.
@@ -3492,7 +3492,7 @@ mod tests {
         hir::{BindingId, PatId},
     };
     use la_arena::ArenaMap;
-    use salsa::plumbing::FromId;
+    use blaze_query::db::FromId;
 
     use super::*;
     use crate::{
@@ -3555,8 +3555,8 @@ mod tests {
         }
     }
 
-    fn id(index: u32) -> salsa::Id {
-        salsa::Id::from_bits(u64::from(index) | (3 << 32))
+    fn id(index: u32) -> blaze_query::db::Id {
+        blaze_query::db::Id::from_u32(index + (3 << 20))
     }
 
     fn expr(index: u32) -> ExprId {
@@ -4330,7 +4330,7 @@ mod tests {
         let result = result();
         let back = round_trip(&result);
         assert_eq!(back, result);
-        assert_eq!(salsa_hash(&back), salsa_hash(&result));
+        assert_eq!(content_hash(&back), content_hash(&result));
         assert_eq!(back.diagnostics.len(), every_diagnostic().len());
         assert_eq!(back.unreachable.len(), every_unreachable().len());
         assert_eq!(back.traits_in_scope_used(), result.traits_in_scope_used(), "in their order");
@@ -4401,12 +4401,8 @@ mod tests {
         assert_eq!(round_trip(&result), result);
     }
 
-    fn salsa_hash(result: &InferenceResult<'_>) -> u128 {
-        use std::hash::Hash;
-        let mut hasher = salsa::StableHasher::new();
-        result.hash(&mut hasher);
-        let (low, high) = hasher.finish128();
-        u128::from(high) << 64 | u128::from(low)
+    fn content_hash(result: &InferenceResult<'_>) -> blaze_ids::ContentId {
+        blaze_ids::Hasher::new("hir-ty test").std(result).finish()
     }
 
     #[test]

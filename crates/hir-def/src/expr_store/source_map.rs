@@ -20,7 +20,7 @@ use blaze_ids::radix;
 use either::Either;
 use hir_expand::{HirFileId, InFile, MacroCallId, name::Name};
 use la_arena::{Idx, RawIdx};
-use salsa::plumbing::AsId;
+use blaze_query::db::AsId;
 use syntax::{AstNode, AstPtr, SyntaxKind, SyntaxNodePtr, TextRange, TextSize, ast, view};
 
 use crate::{
@@ -104,7 +104,7 @@ impl<T, V: Copy + Send + Sync> IdTable<Idx<T>, V> {
 }
 
 /// The order of a [`SourceTable`]'s keys, total and the same on every run (a hash map's is
-/// neither): the file (files before macro files, each by its salsa id's bits), the range's start
+/// neither): the file (files before macro files, each by its id's bits), the range's start
 /// and end, the syntax kind. `expr_store/persist/source_map.rs` writes and checks tables in
 /// exactly this order (`Src::key`), so a change here is a change of its format.
 pub(crate) trait SourceKey {
@@ -115,8 +115,8 @@ impl<N: AstNode> SourceKey for InFile<AstPtr<N>> {
     #[inline]
     fn source_key(&self) -> (u8, u64, u32, u32, u16) {
         let (file_kind, file) = match self.file_id {
-            HirFileId::FileId(file) => (1, file.as_id().as_bits()),
-            HirFileId::MacroFile(call) => (2, call.as_id().as_bits()),
+            HirFileId::FileId(file) => (1, u64::from(file.as_id().as_u32())),
+            HirFileId::MacroFile(call) => (2, u64::from(call.as_id().as_u32())),
         };
         let range = self.value.text_range();
         (file_kind, file, range.start().into(), range.end().into(), u16::from(self.value.kind()))
@@ -1200,7 +1200,7 @@ mod view_tests;
 pub(in crate::expr_store) mod tests {
     use blaze_ids::rng::SplitMix64;
     use rustc_hash::FxHashMap;
-    use salsa::plumbing::FromId;
+    use blaze_query::db::FromId;
     use smallvec::SmallVec;
     use syntax::{SyntaxKind, TextSize};
 
@@ -1219,7 +1219,7 @@ pub(in crate::expr_store) mod tests {
         start: u32,
         end: u32,
     ) -> InFile<AstPtr<N>> {
-        let id = salsa::Id::from_bits(u64::from(file) + 1);
+        let id = blaze_query::db::Id::from_u32(file + 1);
         let file_id = match in_macro {
             true => HirFileId::MacroFile(FromId::from_id(id)),
             false => HirFileId::FileId(FromId::from_id(id)),

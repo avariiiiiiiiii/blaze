@@ -1,7 +1,7 @@
 //! Dependencies' constants by content (docs/v2/plan/lanes/frontend/fast-const-deps.md): a
 //! dependency's `const` item with no generic arguments, once evaluated, is kept in the driver's
 //! store under its crate's check-result key and its stable item key ([`key`]), as bytes with no
-//! salsa id ([`codec`]). [`cached`] gives `const_eval_query` the kept value before it reads
+//! database id ([`codec`]). [`cached`] gives `const_eval_query` the kept value before it reads
 //! anything of the body; [`record`] notes a value evaluated on a miss, and the driver writes the
 //! values noted with [`drain`] once the build is done.
 //!
@@ -58,7 +58,7 @@ pub fn key(base: ContentId, item: ContentId) -> ContentId {
 
 /// Where the values of dependencies' constants are kept, and which crates' are: set by the
 /// driver ([`set`]).
-#[salsa::input(singleton, debug)]
+#[blaze_query::input(singleton, debug)]
 pub struct KeptConsts {
     #[returns(ref)]
     pub kept: Kept,
@@ -128,7 +128,7 @@ pub fn set(
     crates: FxHashMap<Crate, Option<ContentId>>,
     mode: Mode,
 ) {
-    use salsa::{Durability, Setter};
+    use blaze_query::db::{Durability, Setter};
     let current = KeptConsts::try_get(&*db);
     if let Some(it) = current {
         let now = &it.kept(&*db).0;
@@ -145,7 +145,7 @@ pub fn set(
             it.set_kept(db).with_durability(Durability::HIGH).to(kept);
         }
         None => {
-            _ = KeptConsts::builder(kept).durability(Durability::HIGH).new(&*db);
+            _ = KeptConsts::builder(kept).durability(Durability::HIGH).new(db);
         }
     }
 }

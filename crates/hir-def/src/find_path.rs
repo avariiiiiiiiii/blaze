@@ -19,7 +19,7 @@ use hir_expand::{
 };
 use intern::sym;
 use rustc_hash::{FxBuildHasher, FxHashSet};
-use salsa::plumbing::{AsId, FromId};
+use blaze_query::db::{AsId, FromId};
 use smallvec::SmallVec;
 
 use crate::{
@@ -117,14 +117,14 @@ pub fn find_path_with<'db>(
 /// allocates only while it grows.
 pub struct FindPathScratch {
     /// `(item, module)` pairs the local searches on the current stack have looked at, the module
-    /// as its `salsa::Id`. Empty between top-level searches: each local search removes what it
+    /// as its `blaze_query::db::Id`. Empty between top-level searches: each local search removes what it
     /// added.
-    visited: FxHashSet<(ItemInNs, salsa::Id)>,
+    visited: FxHashSet<(ItemInNs, blaze_query::db::Id)>,
     /// The segments of every candidate of the call, each linked to the one before it, so a
     /// candidate extended by a name shares its prefix instead of copying it.
     segments: Vec<Segment>,
     /// Worklists of [`find_local_import_locations`], one per depth of its recursion.
-    worklists: Vec<Vec<(salsa::Id, bool)>>,
+    worklists: Vec<Vec<(blaze_query::db::Id, bool)>>,
 }
 
 impl Default for FindPathScratch {
@@ -586,7 +586,7 @@ fn calculate_best_path_local<'db>(
 }
 
 /// A candidate path: its kind, its segments as a chain in [`FindPathScratch::segments`], and
-/// what the tie-breaks compare. 28 bytes (the `PathKind` is 12: `DollarCrate` holds a salsa id),
+/// what the tie-breaks compare. 24 bytes (the `PathKind` is 8: `DollarCrate` holds an id),
 /// `Copy`; comparing two is a few integer compares.
 #[derive(Clone, Copy, Debug)]
 struct Choice {

@@ -39,7 +39,7 @@ use crate::{
 /// The crate's def map as a fresh maintainer makes it: maintained from an empty state, without
 /// the database's state or published inputs. A query of its own, so the tracked structs it
 /// makes live in one.
-#[salsa::tracked(returns(ref))]
+#[blaze_query::tracked(returns(ref))]
 fn cold_crate_local_def_map(db: &Db, krate: Crate) -> DefMapPair<'_> {
     blaze_mem::frame::task(Tag::Nameres, |frame| {
         let (mut def_map, local) = super::cold(db, frame, krate);
@@ -454,7 +454,7 @@ pub struct L;
     let lib = *all_crates(&loaded.db).iter().find(|it| **it != main).expect("the crate `lib`");
     let map = crate_local_def_map(&loaded.db, lib).def_map(&loaded.db);
     assert!(map.module(&loaded.db, map.root).scope(&loaded.db).type_(&name("L")).is_some(), "`lib` is maintained");
-    base_db::set_all_crates_with_durability(&mut loaded.db, [main], salsa::Durability::LOW);
+    base_db::set_all_crates_with_durability(&mut loaded.db, [main], blaze_query::db::Durability::LOW);
     let db = &loaded.db;
     let map = crate_local_def_map(db, main).def_map(db);
     assert!(map.module(db, map.root).scope(db).type_(&name("M")).is_some(), "`main` is still maintained");

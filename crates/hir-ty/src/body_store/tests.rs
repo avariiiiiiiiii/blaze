@@ -22,7 +22,7 @@ use hir_def::{
 };
 use hir_expand::name::Name;
 use rustc_hash::FxHashMap;
-use salsa::Setter;
+use blaze_query::db::Setter;
 use hir_expand::fixture;
 
 use super::{
@@ -205,8 +205,8 @@ impl BodyFacts for TestFacts {
         _: &Db,
         _: DefWithBodyId,
         _: Step,
-        _: salsa::DatabaseKeyIndex,
-        _: salsa::ReadKind,
+        _: blaze_query::db::DatabaseKeyIndex,
+        _: blaze_query::db::ReadKind,
         name: &'static str,
     ) -> Classified {
         self.names.lock().unwrap().push(name);
@@ -522,7 +522,7 @@ fn verify_runs_every_hit_and_a_difference_is_an_error_naming_the_body() {
 const CHECKER: &str = "polonius";
 
 /// A borrow check's stand-in: `def`'s check passes when `passes` says so.
-#[salsa::input]
+#[blaze_query::input]
 struct Verdict {
     #[returns(copy)]
     def: DefWithBodyId,
@@ -532,7 +532,7 @@ struct Verdict {
 
 /// What `hir_ty_borrowck::borrowck` does with the store: the check, captured, and its verdict
 /// offered when it passes.
-#[salsa::tracked(returns(copy))]
+#[blaze_query::tracked(returns(copy))]
 fn borrow_checked(db: &Db, verdict: Verdict) -> bool {
     let (passes, reads) = capture(db, || verdict.passes(db));
     if passes {

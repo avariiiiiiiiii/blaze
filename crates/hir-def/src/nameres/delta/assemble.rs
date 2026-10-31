@@ -35,7 +35,7 @@ use crate::{
 /// The crate's modules in group order, the published map. `root_input` is the published
 /// (censored) root scope of a proc-macro crate, whose state row keeps the scope before the
 /// censor.
-pub(super) fn modules(state: &CrateState, root_input: Option<salsa::Id>) -> ModulesMap {
+pub(super) fn modules(state: &CrateState, root_input: Option<blaze_query::db::Id>) -> ModulesMap {
     let mut modules = state.ordered_rows();
     if let Some(input) = root_input {
         modules[state.root].scope = ScopeSlot::Input(input);

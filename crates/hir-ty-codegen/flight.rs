@@ -108,14 +108,14 @@ impl Flight {
 // The compile that names itself depends on the name: a query of its own keeps what the name is
 // spelled from (bodies, for one) out of the compile's inputs, so an edit that leaves the name
 // as it was recompiles nothing.
-#[salsa::tracked(returns(ref))]
+#[blaze_query::tracked(returns(ref))]
 fn root_name(db: &Db, func: FunctionId) -> String {
     let name = hir_ty_mir::mir::type_name::rustc_function_name(db, func, &[]);
     // alloc: a memoized query's value, once per function while someone hears the build
     name.unwrap_or_else(|| FunctionSignature::of(db, func).name.as_str().to_owned())
 }
 
-#[salsa::tracked(returns(ref))]
+#[blaze_query::tracked(returns(ref))]
 fn instance_named(
     db: &Db,
     instance: Instance,

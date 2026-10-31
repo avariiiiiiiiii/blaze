@@ -1,0 +1,28 @@
+{
+ "crate": "crates/proc-macro-api",
+ "base": "adc8bbbf04a20c189070000982f22445be80764f",
+ "files": [
+  {
+   "path": "crates/proc-macro-api/src/bridge/spans.rs",
+   "edits": [
+    {
+     "old": "    // database in this process; a wrong value panics in `from_u32` or in salsa's checked\n    // lookup, or names another context's hygiene.\n",
+     "new": "    // database in this process; a wrong value panics in `from_u32` or in the query engine's\n    // checked lookup, or names another context's hygiene.\n"
+    },
+    {
+     "old": "        // value panics in `from_u32` or in salsa's checked lookup, or names another context's\n",
+     "new": "        // value panics in `from_u32` or in the query engine's checked lookup, or names another context's\n"
+    }
+   ]
+  },
+  {
+   "path": "crates/proc-macro-api/src/bridge/wire.rs",
+   "edits": [
+    {
+     "old": "        // before (`relative`); a wrong value panics in `from_u32` or in salsa's checked\n        // lookup, or names another context's hygiene.\n",
+     "new": "        // before (`relative`); a wrong value panics in `from_u32` or in the query engine's\n        // checked lookup, or names another context's hygiene.\n"
+    }
+   ]
+  }
+ ]
+}

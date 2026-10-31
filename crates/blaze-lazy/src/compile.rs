@@ -37,7 +37,7 @@ pub struct Kept {
 /// Why a compile against one reader gave no code.
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub enum Refusal {
-    /// A write to the database stopped the reader before the compile ended (salsa's
+    /// A write to the database stopped the reader before the compile ended (the query engine's
     /// `Cancelled::PendingWrite`): compiled again on the next reader.
     Stopped,
     /// The function can't be compiled, and why, naming it: the run's failure.

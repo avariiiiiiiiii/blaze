@@ -272,7 +272,7 @@ const _: () = {
 
 #[cfg(target_pointer_width = "64")]
 const _: () = {
-    assert!(size_of::<ModPath>() == 24);
+    assert!(size_of::<ModPath>() == 16);
     assert!(size_of::<Name>() == 4);
     assert!(size_of::<TypeBound>() == 16);
 };
@@ -1348,7 +1348,7 @@ impl ExpressionStoreBuilder {
 mod tests {
     use intern::Symbol;
     use la_arena::RawIdx;
-    use salsa::plumbing::FromId;
+    use blaze_query::db::FromId;
 
     use super::*;
     use crate::{FunctionId, type_ref::TraitBoundModifier};
@@ -1366,7 +1366,7 @@ mod tests {
     }
 
     fn lang_item() -> LangItemTarget {
-        LangItemTarget::FunctionId(FunctionId::from_id(salsa::Id::from_bits(5 | (1 << 32))))
+        LangItemTarget::FunctionId(FunctionId::from_id(blaze_query::db::Id::from_u32(5 + (1 << 20))))
     }
 
     /// Every shape: bare, lang items with and without a name, `Normal` with a type anchor only,

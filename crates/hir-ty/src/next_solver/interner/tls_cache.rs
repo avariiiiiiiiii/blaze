@@ -1,7 +1,7 @@
 //! The trait solver's caches of solved goals, in the two scopes of
 //! [`CacheScope`](rustc_type_ir::search_graph::CacheScope):
 //!
-//! - [`shared`]: a goal whose reads `salsa::capture_reads` recorded, for every query and
+//! - [`shared`]: a goal whose reads `blaze_query::db::capture_reads` recorded, for every query and
 //!   thread of one database, crate and revision. A query that takes an answer from it replays
 //!   the reads (`Tracked`), so it reruns when they change, as rustc's `with_cached_task` /
 //!   `get_tracked` do.
@@ -20,7 +20,7 @@ use base_db::{Db, Crate, Nonce};
 use blaze_mem::{Cache, Pool, Pooled, Tag, pool::Limbo};
 use rustc_hash::FxBuildHasher;
 use rustc_type_ir::search_graph::GlobalCache;
-use salsa::Revision;
+use blaze_query::db::View;
 use std::{
     cell::Cell,
     hash::BuildHasher,
@@ -143,10 +143,10 @@ struct SharedCaches {
     goals: crate::next_solver::global_goals::Goals,
 }
 
-static SHARED_GENERATIONS: LazyLock<Pool<Generation<Scope, Revision, SharedCaches>>> =
+static SHARED_GENERATIONS: LazyLock<Pool<Generation<Scope, View, SharedCaches>>> =
     LazyLock::new(pool);
 
-static SHARED: LazyLock<Shared<'static, Scope, Revision, SharedCaches>> =
+static SHARED: LazyLock<Shared<'static, Scope, View, SharedCaches>> =
     LazyLock::new(|| Shared::new(SHARED_BITS, LazyLock::force(&SHARED_GENERATIONS)));
 
 /// Runs `f` on the shared cache of `krate` (and `regions`) in `db`, as it is now.
@@ -434,11 +434,11 @@ const SLOT_BITS: u32 = 9;
 /// The cache of one interner. Its database and revision are those the interner was made in,
 /// for as long as it is used: a `Solved` is made with its interner and used only through it,
 /// and the interner's `&'db` borrow of the database keeps the revision from advancing
-/// (salsa's `new_revision` takes `&mut Zalsa`). So a lookup reads neither; debug builds check.
+/// (a new view takes `&mut Storage`). So a lookup reads neither; debug builds check.
 #[derive(Default)]
 struct OfQuery {
     #[cfg(debug_assertions)]
-    state: std::sync::OnceLock<(Nonce, Revision)>,
+    state: std::sync::OnceLock<(Nonce, View)>,
     cache: Erased,
 }
 
@@ -450,7 +450,7 @@ static OF_QUERY: LazyLock<Shared<'static, Solved, (), OfQuery>> =
 
 // A generation's header is one line; the rest is the search graph's cache.
 const _: () = assert!(
-    size_of::<Generation<Scope, Revision, SharedCaches>>() - size_of::<SharedCaches>() <= 64
+    size_of::<Generation<Scope, View, SharedCaches>>() - size_of::<SharedCaches>() <= 64
         && size_of::<Generation<Solved, (), OfQuery>>() - size_of::<Erased>() <= 64
 );
 

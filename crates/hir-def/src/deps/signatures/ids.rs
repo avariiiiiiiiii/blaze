@@ -4,7 +4,7 @@
 
 use base_db::{Crate, Db};
 use blaze_ids::ContentId;
-use salsa::plumbing::{AsId, FromId};
+use blaze_query::db::{AsId, FromId};
 
 use super::{
     key::{self, Item},
@@ -13,7 +13,7 @@ use super::{
 use crate::{
     ConstId, DefWithBodyId, EnumId, EnumVariantId, FunctionId, ImplId, StaticId, StructId, TraitId,
     TypeAliasId, UnionId, VariantId,
-    hir::persist::{Kind, Relocation},
+    hir::persist::{Kind, Relocation, entry_id},
 };
 
 /// [`key::KEY_DOMAIN`]: a part filed by [`body_key`]s puts it in its schema, so a new key
@@ -62,12 +62,12 @@ impl PortableIds {
 
     /// The index of `id`, added when it is new.
     pub fn index<T: PortableId>(&mut self, id: T) -> u32 {
-        self.0.index(T::KIND.0, id.as_id().as_bits())
+        self.0.index(T::KIND.0, u64::from(id.as_id().as_u32()))
     }
 
     /// The item at `index`, `None` when there is none or it is another type.
     pub fn get<T: PortableId>(&self, index: u32) -> Option<T> {
-        self.0.get(T::KIND.0, index).map(|bits| T::from_id(salsa::Id::from_bits(bits)))
+        self.0.get(T::KIND.0, index).map(|bits| T::from_id(entry_id(bits)))
     }
 
     pub fn len(&self) -> usize {

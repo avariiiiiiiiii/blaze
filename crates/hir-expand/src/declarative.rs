@@ -101,10 +101,10 @@ impl DeclarativeMacroExpander {
     }
 }
 
-#[salsa::tracked]
+#[blaze_query::tracked]
 impl AstId<ast::Macro> {
     /// Fetches (and compiles) the expander of this decl macro.
-    #[salsa::tracked(returns(ref), mem_tag = Expand)]
+    #[blaze_query::tracked(returns(ref), mem_tag = Expand)]
     pub fn decl_macro_expander(
         self,
         db: &Db,

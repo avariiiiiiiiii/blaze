@@ -82,7 +82,7 @@ fn a_task_that_would_wait_on_itself_runs_again_and_another_panic_goes_on() {
     let ran: Vec<AtomicU32> = (0..8).map(|_| AtomicU32::new(0)).collect();
     on_pool(ran.len(), &|at| {
         if ran[at].fetch_add(1, Ordering::Relaxed) == 0 && at % 3 == 0 {
-            std::panic::panic_any(salsa::Cancelled::WouldWaitOnItself);
+            std::panic::panic_any(blaze_query::db::Cancelled::WouldWaitOnItself);
         }
     });
     let runs: Vec<u32> = ran.iter().map(|it| it.load(Ordering::Relaxed)).collect();

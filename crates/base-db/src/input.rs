@@ -18,7 +18,7 @@ use cfg::{CfgOptions, HashableCfgOptions};
 use intern::Symbol;
 use la_arena::{Arena, Idx, RawIdx};
 use rustc_hash::{FxBuildHasher, FxHashMap, FxHashSet};
-use salsa::{Durability, Setter};
+use blaze_query::db::{Durability, Setter};
 use span::Edition;
 use triomphe::Arc;
 use crate::{AbsPathBuf, AnchoredPath, FileId, FileSet, VfsPath};
@@ -91,7 +91,7 @@ pub struct SourceRoot {
     /// Sysroot or crates.io library.
     ///
     /// Libraries are considered mostly immutable, this assumption is used to
-    /// optimize salsa's query structure
+    /// optimize the query engine's dependency structure
     pub is_library: bool,
     file_set: FileSet,
 }
@@ -682,7 +682,7 @@ pub type CratesIdMap = FxHashMap<CrateBuilderId, Crate>;
 /// A crate. Its fields are set only through base-db ([`Crate::create`], [`Crate::set_env`] and
 /// the other setters, [`CrateGraphBuilder::set_in_db`]), which keep [`Crate::content`] the
 /// content ID of them all and of its dependencies' content IDs.
-#[salsa::input]
+#[blaze_query::input]
 #[derive(Debug, PartialOrd, Ord)]
 pub struct Crate {
     #[returns(ref)]
@@ -740,34 +740,34 @@ impl Crate {
     /// [`LintOptions`] follow, each flag's lint and level and then the cap.
     pub const DOMAIN: &'static str = "blaze v2 crate 4";
 
-    pub fn data<'db, Db: ?Sized + salsa::Database>(self, db: &'db Db) -> &'db BuiltCrateData {
+    pub fn data<'db, Db: ?Sized + blaze_query::db::Database>(self, db: &'db Db) -> &'db BuiltCrateData {
         self.data_field(db)
     }
 
-    pub fn extra_data<'db, Db: ?Sized + salsa::Database>(self, db: &'db Db) -> &'db ExtraCrateData {
+    pub fn extra_data<'db, Db: ?Sized + blaze_query::db::Database>(self, db: &'db Db) -> &'db ExtraCrateData {
         self.extra_data_field(db)
     }
 
-    pub fn workspace_data<'db, Db: ?Sized + salsa::Database>(
+    pub fn workspace_data<'db, Db: ?Sized + blaze_query::db::Database>(
         self,
         db: &'db Db,
     ) -> &'db Arc<CrateWorkspaceData> {
         self.workspace_data_field(db)
     }
 
-    pub fn cfg_options<'db, Db: ?Sized + salsa::Database>(self, db: &'db Db) -> &'db CfgOptions {
+    pub fn cfg_options<'db, Db: ?Sized + blaze_query::db::Database>(self, db: &'db Db) -> &'db CfgOptions {
         self.cfg_options_field(db)
     }
 
-    pub fn env<'db, Db: ?Sized + salsa::Database>(self, db: &'db Db) -> &'db Env {
+    pub fn env<'db, Db: ?Sized + blaze_query::db::Database>(self, db: &'db Db) -> &'db Env {
         self.env_field(db)
     }
 
-    pub fn content<Db: ?Sized + salsa::Database>(self, db: &Db) -> ContentId {
+    pub fn content<Db: ?Sized + blaze_query::db::Database>(self, db: &Db) -> ContentId {
         self.content_field(db).id()
     }
 
-    pub fn lint_options<'db, Db: ?Sized + salsa::Database>(self, db: &'db Db) -> &'db LintOptions {
+    pub fn lint_options<'db, Db: ?Sized + blaze_query::db::Database>(self, db: &'db Db) -> &'db LintOptions {
         self.lint_options_field(db)
     }
 
@@ -984,7 +984,7 @@ impl Crate {
     }
 }
 
-#[salsa::tracked(returns(deref))]
+#[blaze_query::tracked(returns(deref))]
 fn transitive_deps(db: &Db, krate: Crate) -> Box<[Crate]> {
     blaze_mem::frame::task(blaze_mem::Tag::Query, |frame| {
         let mut worklist = Vec::new_in(frame);
@@ -1003,7 +1003,7 @@ fn transitive_deps(db: &Db, krate: Crate) -> Box<[Crate]> {
     })
 }
 
-#[salsa::tracked(returns(deref))]
+#[blaze_query::tracked(returns(deref))]
 fn transitive_rev_deps(db: &Db, krate: Crate) -> Box<[Crate]> {
     blaze_mem::frame::task(blaze_mem::Tag::Query, |frame| {
         let all = all_crates(db);
@@ -1396,7 +1396,7 @@ impl CrateGraphBuilder {
         Ok(())
     }
 
-    /// Sets the graph's crates in `db`, writing only what differs from what is set (salsa does
+    /// Sets the graph's crates in `db`, writing only what differs from what is set (the query engine does
     /// not compare an input's new value with its old one). A crate whose fields, root path and
     /// dependencies' content IDs are what its content ID was made from is not hashed again.
     pub fn set_in_db(self, db: &mut Db) -> CratesIdMap {

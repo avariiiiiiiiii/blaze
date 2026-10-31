@@ -44,7 +44,7 @@ pub static L: u32 = K + 1;
 "#;
 
 /// What reads a signature's store: whether it ran again is whether the store changed.
-#[salsa::tracked(returns(clone))]
+#[blaze_query::tracked(returns(clone))]
 fn signature_store_bytes(db: &Db, def: GenericDefId) -> Vec<u8> {
     let (_, store) = GenericParams::with_store(db, def);
     blaze_format::to_bytes(store)
@@ -170,10 +170,10 @@ fn an_edit_in_one_body_lowers_only_that_body() {
             signature_store_bytes(&db, def);
         }
     });
-    for query in ["Body::of_", "ExprScopes::body_expr_scopes_"] {
+    for query in ["Body::of", "ExprScopes::body_expr_scopes"] {
         assert_eq!(count(&log, query), 1, "`{query}` ran for more than the edited body: {log:#?}");
     }
-    assert_eq!(count(&log, "Body::relative_"), 0, "a source map was lowered: {log:#?}");
+    assert_eq!(count(&log, "Body::relative"), 0, "a source map was lowered: {log:#?}");
     assert_eq!(count(&log, "signature_store_bytes"), 0, "a signature's store changed: {log:#?}");
 
     for (&def, (at, bytes)) in bodies.iter().zip(&before) {
@@ -213,7 +213,7 @@ fn a_body_lowered_again_on_a_reused_scratch_is_the_same() {
     let log = db.executed_in_read_order(|| {
         relative_body(&db, add);
     });
-    assert_eq!(count(&log, "Body::relative_"), 1, "`add` was not lowered again: {log:#?}");
+    assert_eq!(count(&log, "Body::relative"), 1, "`add` was not lowered again: {log:#?}");
     let again = relative_body(&db, add);
     assert!(!Arc::ptr_eq(&before, &again), "`add` was not lowered again");
     assert_eq!(*before, *again);

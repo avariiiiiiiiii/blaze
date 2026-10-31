@@ -6,7 +6,7 @@ use base_db::{Db, all_crates};
 use blaze_alloc_count::{assert_at_most, measure};
 use blaze_mem::{Tag, frame};
 use hir_def::{AssocItemId, DefWithBodyId, LoweringMode, ModuleDefId, nameres::crate_def_map};
-use salsa::{Database, Durability};
+use blaze_query::db::{Database, Durability};
 use hir_expand::fixture;
 
 use crate::{InferenceResult, infer::infer_body_in};
@@ -132,9 +132,9 @@ fn a_recheck_of_unchanged_bodies_allocates_nothing() {
     infer_all(&db, &bodies);
     // The first re-check after a write warms what verification keeps per worker; the second is
     // the steady state.
-    db.synthetic_write(Durability::LOW);
+    db.storage_mut().synthetic_write(Durability::LOW);
     infer_all(&db, &bodies);
-    db.synthetic_write(Durability::LOW);
+    db.storage_mut().synthetic_write(Durability::LOW);
     assert_at_most(0, "re-checking the inference of unchanged bodies", || {
         infer_all(&db, &bodies)
     });

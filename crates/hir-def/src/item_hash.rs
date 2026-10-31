@@ -14,7 +14,7 @@
 
 use base_db::{Crate, Db};
 use hir_expand::{MacroCallId, mod_path::ModPath, name::Name};
-use salsa::plumbing::{AsId, FromId};
+use blaze_query::db::{AsId, FromId};
 use span::SyntaxContext;
 
 use crate::{
@@ -24,7 +24,7 @@ use crate::{
     expr_store::{Body, ExpressionStore},
     hir::{
         ExprId,
-        persist::{Anonymous, Kind, Relocation, anonymous, relocating, syntax_context},
+        persist::{Anonymous, Kind, Relocation, anonymous, entry_id, relocating, syntax_context},
     },
     nameres::frozen::Enc,
 };
@@ -132,7 +132,7 @@ impl PortableBody {
 }
 
 fn id<T: FromId>(bits: u64) -> T {
-    T::from_id(salsa::Id::from_bits(bits))
+    T::from_id(entry_id(bits))
 }
 
 /// `body` written as [`PortableBody::bytes`] describes, with the table of what it names.

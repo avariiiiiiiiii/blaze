@@ -1,0 +1,28 @@
+{
+ "crate": "crates/blaze-image",
+ "base": "adc8bbbf04a20c189070000982f22445be80764f",
+ "files": [
+  {
+   "path": "crates/blaze-image/src/image.rs",
+   "edits": [
+    {
+     "old": "    /// salsa's graph), with no mapping layer of its own. They start 8-aligned, so 8-byte records\n",
+     "new": "    /// the query graph), with no mapping layer of its own. They start 8-aligned, so 8-byte records\n"
+    }
+   ]
+  },
+  {
+   "path": "crates/blaze-image/src/lib.rs",
+   "edits": [
+    {
+     "old": "    /// salsa's interned values, at their IDs (`salsa::image`).\n    pub const SALSA_INTERNED: SectionId = SectionId(0x0500);\n    /// salsa's frozen query graph (`salsa::graph::frozen`).\n    pub const SALSA_GRAPH: SectionId = SectionId(0x0501);\n",
+     "new": "    /// The query database's interned rows, at their IDs (`blaze_query::db`), so IDs stay\n    /// stable across restarts.\n    pub const QUERY_INTERNED: SectionId = SectionId(0x0500);\n    /// The query database's frozen graph (`blaze_query::db`).\n    pub const QUERY_GRAPH: SectionId = SectionId(0x0501);\n"
+    },
+    {
+     "old": "            SectionId::SALSA_INTERNED => \"salsa's interned values\",\n            SectionId::SALSA_GRAPH => \"salsa query graph\",\n",
+     "new": "            SectionId::QUERY_INTERNED => \"the query database's interned rows\",\n            SectionId::QUERY_GRAPH => \"the query graph\",\n"
+    }
+   ]
+  }
+ ]
+}

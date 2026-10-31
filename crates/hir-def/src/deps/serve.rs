@@ -257,6 +257,9 @@ pub fn serve(
     frozen::set(db, maps);
     frozen::set_lang_items(db, lang_items);
     set_images(db, served);
+    // A served crate's modules are the decoded map's, not the ones its dependents were
+    // maintained against: the maintainers run again over the crates now served.
+    db.note_crates_changed();
     Ok(Served { keys, hits, stale })
 }
 
@@ -312,7 +315,7 @@ fn open(db: &Db, krate: Crate, filed: ContentId, bytes: ImageBuf) -> Fetched {
 }
 
 fn set_images(db: &mut Db, images: FxHashMap<Crate, Image>) {
-    use salsa::{Durability, Setter};
+    use blaze_query::db::{Durability, Setter};
     // alloc: setup: the one input value, once per session
     let images = Arc::new(images);
     match DepImages::try_get(&*db) {
@@ -320,7 +323,7 @@ fn set_images(db: &mut Db, images: FxHashMap<Crate, Image>) {
             it.set_images(db).with_durability(Durability::HIGH).to(images);
         }
         None => {
-            _ = DepImages::builder(images).durability(Durability::HIGH).new(&*db);
+            _ = DepImages::builder(images).durability(Durability::HIGH).new(db);
         }
     }
 }

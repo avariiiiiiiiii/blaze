@@ -1,0 +1,15 @@
+{
+ "crate": "crates/blaze-hashcons",
+ "base": "adc8bbbf04a20c189070000982f22445be80764f",
+ "files": [
+  {
+   "path": "crates/blaze-hashcons/src/table.rs",
+   "edits": [
+    {
+     "old": "/// values are. It hashes as its fingerprint, so a map or a salsa fingerprint of it is the\n",
+     "new": "/// values are. It hashes as its fingerprint, so a map or a query's hash of it is the\n"
+    }
+   ]
+  }
+ ]
+}

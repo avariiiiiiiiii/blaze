@@ -2,7 +2,7 @@
 //! goal answered from the global cache, nothing for a cached canonical response met by a fresh
 //! context, and nothing for re-solving an unchanged body's goals on warm storage.
 //!
-//! These run outside any salsa query, so a goal's cache is the interner's own
+//! These run outside any query, so a goal's cache is the interner's own
 //! (`tls_cache::of_query`, keyed by `DbInterner::solved`) and they measure the solver alone.
 
 use base_db::{Crate, Db};

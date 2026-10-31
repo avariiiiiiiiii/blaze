@@ -73,8 +73,8 @@ fn adding_an_impl_costs_one_op_and_one_slice() {
     assert!(failures.is_empty(), "{failures}");
 }
 
-/// Whether `query` is among the salsa debug names in `executed`, which end in `_` for a
-/// method of a tracked impl (`TraitImpls < 'db >::for_crate_and_trait_`).
+/// Whether `query` is among the ingredient names in `executed`, which name a method of a
+/// tracked impl by its type and method (`TraitImpls::for_crate_and_trait`).
 fn ran(executed: &[String], query: &str) -> usize {
     executed.iter().filter(|it| it.trim_end_matches('_').ends_with(query)).count()
 }

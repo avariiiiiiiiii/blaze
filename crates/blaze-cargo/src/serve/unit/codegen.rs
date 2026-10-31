@@ -453,8 +453,8 @@ impl Generated<'_> {
 }
 
 /// The code generator's view of the job's front end, its files named as rustc names them. Every
-/// thread of the build reads the one database of the task's reader by reference: salsa's reads
-/// take `&self`, so none waits on another and none is cloned.
+/// thread of the build reads the one database of the task's reader by reference: the query
+/// engine's reads take `&self`, so none waits on another and none is cloned.
 fn frontend<'db>(job: &Job, reader: &'db UnitReader, mounted: &Arc<Mounted>) -> HirFrontend<'db> {
     frontend_over(job, reader.db(), reader.paths(), mounted)
 }

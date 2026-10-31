@@ -1,9 +1,9 @@
-//! Salsa's memos against recomputation: over any run of edits, reads, LRU evictions and
+//! The query engine's memos against recomputation: over any run of edits, reads, LRU evictions and
 //! synthetic writes, a query and one that reads it give what the text they read gives now.
 
 use hegel::{Hegel, Settings, TestCase};
 use hegel::generators as gs;
-use salsa::{Database as _, Durability};
+use blaze_query::db::{Database as _, Durability};
 use crate::FileId;
 
 use crate::{Db, FileText};
@@ -11,13 +11,13 @@ use crate::{Db, FileText};
 const FILES: u32 = 4;
 
 /// Held to two memos, so most runs evict some.
-#[salsa::tracked(returns(copy), lru = 2)]
+#[blaze_query::tracked(returns(copy), lru = 2)]
 fn text_len(db: &Db, text: FileText) -> u32 {
     text.text(db).len() as u32
 }
 
 /// Not held to a count: kept while what it read may be evicted under it.
-#[salsa::tracked(returns(copy))]
+#[blaze_query::tracked(returns(copy))]
 fn len_read_through(db: &Db, text: FileText) -> u32 {
     text_len(db, text) * 3 + 1
 }
@@ -26,6 +26,7 @@ fn len_read_through(db: &Db, text: FileText) -> u32 {
 enum Op {
     Set(u32, String),
     Read { file: u32, through: bool },
+    /// The `lru` caps apply when a view opens: a write that changed nothing, of every kind.
     Evict,
     SyntheticWrite,
 }
@@ -68,8 +69,8 @@ fn gives_what_recomputing_gives(tc: TestCase) {
                     assert_eq!(text_len(&db, text), len, "file {file}");
                 }
             }
-            Op::Evict => db.trigger_lru_eviction(),
-            Op::SyntheticWrite => db.synthetic_write(Durability::LOW),
+            Op::Evict => db.storage_mut().synthetic_write(Durability::HIGH),
+            Op::SyntheticWrite => db.storage_mut().synthetic_write(Durability::LOW),
         }
     }
 }

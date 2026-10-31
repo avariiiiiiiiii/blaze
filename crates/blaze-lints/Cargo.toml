@@ -27,7 +27,7 @@ intern.workspace = true
 memchr.workspace = true
 rustc-hash.workspace = true
 rustc_type_ir.workspace = true
-salsa.workspace = true
+blaze-query.workspace = true
 serde = { workspace = true, features = ["derive"] }
 serde_json.workspace = true
 span.workspace = true

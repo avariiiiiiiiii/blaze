@@ -177,7 +177,7 @@ fn attr_owner(resolved: Resolved) -> Option<AttrDefId> {
 /// The names of `item`'s members, in order, over its signature hash, which infers no body, so
 /// a body's inference may ask it of its own owner; `None` for an item with no members of this
 /// kind or no signature hash.
-#[salsa::tracked(returns(copy))]
+#[blaze_query::tracked(returns(copy))]
 fn fields_of(db: &Db, item: ItemId) -> Option<ContentId> {
     let signature = blaze_items::signature_hash(db, item).ok()?;
     let mut h = Hasher::new(FIELDS_DOMAIN);
@@ -228,7 +228,7 @@ fn member_names(h: &mut Hasher, items: &[(Name, AssocItemId)]) {
 
 /// Everything a read of `owner`'s attributes in a step can give: the flags, the `#[unstable]`
 /// feature, and a function's target features, sorted.
-#[salsa::tracked(returns(copy))]
+#[blaze_query::tracked(returns(copy))]
 fn attrs_of(db: &Db, owner: AttrDefId) -> ContentId {
     let flags = AttrFlags::query(db, owner);
     let mut h = Hasher::new(ATTRS_DOMAIN);
@@ -252,7 +252,7 @@ fn attrs_of(db: &Db, owner: AttrDefId) -> ContentId {
 
 /// A crate's lang items by item key, the crates it loads and depends on by crate key (itself
 /// as a mark: its key is of all its files), its features, sorted, and its recursion limit.
-#[salsa::tracked(returns(copy))]
+#[blaze_query::tracked(returns(copy))]
 fn crate_root_of(db: &Db, krate: Crate) -> ContentId {
     let mut h = Hasher::new(CRATE_ROOT_DOMAIN);
     let lang = lang_items(db, krate);

@@ -1,0 +1,15 @@
+{
+ "crate": "crates/blaze-graph",
+ "base": "adc8bbbf04a20c189070000982f22445be80764f",
+ "files": [
+  {
+   "path": "crates/blaze-graph/src/exec.rs",
+   "edits": [
+    {
+     "old": "/// salsa's cancellation does, reaches whoever catches it. Work the frames' cap cancels\n",
+     "new": "/// the query engine's cancellation does, reaches whoever catches it. Work the frames' cap cancels\n"
+    }
+   ]
+  }
+ ]
+}

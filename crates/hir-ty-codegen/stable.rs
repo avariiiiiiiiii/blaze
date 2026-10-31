@@ -21,7 +21,7 @@ use rustc_type_ir::{
     AliasTy, AliasTyKind, BoundVarIndexKind, ExistentialPredicate, GenericArgKind, RegionKind,
     inherent::{IntoKind, Safety as _, Term as _},
 };
-use salsa::plumbing::FromId;
+use blaze_query::db::FromId;
 use span::ErasedFileAstId;
 
 use base_db::{Db, Crate};

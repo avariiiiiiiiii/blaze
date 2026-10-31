@@ -145,16 +145,16 @@ impl<T: PartialEq + std::fmt::Debug> Kept<T> {
 /// without its source map; `relative` and `with_source_map` lower it again with the map.
 macro_rules! signature_queries {
     ($Sig:ident, $Id:ident, $served:ident) => {
-        #[salsa::tracked]
+        #[blaze_query::tracked]
         impl $Sig {
             /// What [`Self::of`] reads: the image's signature, or the one lowered alone.
-            #[salsa::tracked(returns(ref), mem_tag = Nameres)]
+            #[blaze_query::tracked(returns(ref), mem_tag = Nameres)]
             fn kept(db: &Db, id: $Id) -> Kept<$Sig> {
                 Kept::new(crate::deps::signatures::$served(db, id), || Self::lower_alone(db, id))
             }
 
             /// The signature with where each part of it is written in its file.
-            #[salsa::tracked(returns(ref), lru = 1024, mem_tag = Nameres)]
+            #[blaze_query::tracked(returns(ref), lru = 1024, mem_tag = Nameres)]
             pub fn with_source_map(db: &Db, id: $Id) -> (Arc<$Sig>, ExpressionStoreSourceMap) {
                 match Self::relative(db, id) {
                     Some((it, map)) => {
@@ -173,7 +173,7 @@ macro_rules! signature_queries {
 
             /// The signature lowered again from its [`signature_syntax`], with the source map
             /// of that tree; `None` for one a macro writes.
-            #[salsa::tracked(returns(ref), mem_tag = Nameres)]
+            #[blaze_query::tracked(returns(ref), mem_tag = Nameres)]
             pub fn relative(db: &Db, id: $Id) -> Option<(Arc<$Sig>, ExpressionStoreSourceMap)> {
                 let syntax = signature_syntax(db, id.into()).as_ref()?;
                 let kept = Self::kept(db, id);
@@ -220,7 +220,7 @@ macro_rules! signature_queries {
 /// one lowers it again. One in a body the outline leaves out is read off the file.
 pub struct SignatureSyntax {
     pub file_id: HirFileId,
-    /// Compared by its content, not a hash of it: salsa compares a new value with the old one
+    /// Compared by its content, not a hash of it: the query database compares a new value with the old one
     /// only when the query runs again, and a compare of the columns reads each byte once where
     /// hashing them costs more and can collide.
     tree: std::sync::Arc<FlatTree>,
@@ -465,7 +465,7 @@ impl FileOutline {
 
 /// The [`FileOutline`] of `file_id`: one pass over the file's items, and one over what is left
 /// of the file for the copy and each map.
-#[salsa::tracked(returns(ref), mem_tag = Nameres)]
+#[blaze_query::tracked(returns(ref), mem_tag = Nameres)]
 pub fn file_outline(db: &Db, file_id: EditionedFileId) -> FileOutline {
     blaze_mem::frame::current(|frame| {
         let file = HirFileId::from(file_id);
@@ -567,7 +567,7 @@ pub(crate) fn outline_with_ids(
 }
 
 /// The [`SignatureSyntax`] of `def`'s signature, `None` for an item a macro writes.
-#[salsa::tracked(returns(ref), mem_tag = Nameres)]
+#[blaze_query::tracked(returns(ref), mem_tag = Nameres)]
 pub fn signature_syntax(db: &Db, def: GenericDefId) -> Option<SignatureSyntax> {
     let nothing: Elide = |_| None;
     let items: Elide = |it| it.child_where(|kind| kind == SyntaxKind::ASSOC_ITEM_LIST);
@@ -594,7 +594,7 @@ pub fn signature_syntax(db: &Db, def: GenericDefId) -> Option<SignatureSyntax> {
 /// The [`SignatureSyntax`] of an enum with its variants, nothing left out: what its
 /// [`EnumVariants`] and the [`VariantFields`] of its variants are lowered from. `None` for an
 /// enum a macro writes.
-#[salsa::tracked(returns(ref), mem_tag = Nameres)]
+#[blaze_query::tracked(returns(ref), mem_tag = Nameres)]
 pub fn variants_syntax(db: &Db, def: EnumId) -> Option<SignatureSyntax> {
     blaze_mem::frame::current(|frame| item_syntax(db, def.lookup(db).id, |_| None, frame))
 }
@@ -932,7 +932,7 @@ fn has_unsafe_field(fields: Option<ast::FieldList<'_>>, cfg_options: &CfgOptions
 /// Whether a field of a variant of `id` that its crate's cfg keeps is written `unsafe`. It
 /// reads the variants, which the enum's [`signature_syntax`] leaves out, so it is a query of
 /// its own: a variant edit runs it again, and the signature only when the answer changes.
-#[salsa::tracked(returns(copy), mem_tag = Nameres)]
+#[blaze_query::tracked(returns(copy), mem_tag = Nameres)]
 fn enum_has_unsafe_fields(db: &Db, id: EnumId) -> bool {
     let loc = id.lookup(db);
     let source = match variants_syntax(db, id) {
@@ -1504,10 +1504,10 @@ fn variant_syntax(db: &Db, id: VariantId) -> Option<&SignatureSyntax> {
     }
 }
 
-#[salsa::tracked]
+#[blaze_query::tracked]
 impl VariantFields {
     /// What [`Self::of`] reads: the image's fields, or those lowered alone.
-    #[salsa::tracked(returns(ref), mem_tag = Nameres)]
+    #[blaze_query::tracked(returns(ref), mem_tag = Nameres)]
     fn kept(db: &Db, id: VariantId) -> Kept<VariantFields> {
         Kept::new(crate::deps::signatures::served_variant_fields(db, id), || {
             Self::lower_alone(db, id)
@@ -1515,7 +1515,7 @@ impl VariantFields {
     }
 
     /// The fields with where each part of them is written in their file.
-    #[salsa::tracked(returns(ref), lru = 1024, mem_tag = Nameres)]
+    #[blaze_query::tracked(returns(ref), lru = 1024, mem_tag = Nameres)]
     pub fn with_source_map(
         db: &Db,
         id: VariantId,
@@ -1538,7 +1538,7 @@ impl VariantFields {
 
     /// The fields lowered from their [`variant_syntax`], with the source map of that tree;
     /// `None` for a variant, struct or union a macro writes.
-    #[salsa::tracked(returns(ref), mem_tag = Nameres)]
+    #[blaze_query::tracked(returns(ref), mem_tag = Nameres)]
     pub fn relative(
         db: &Db,
         id: VariantId,
@@ -1812,9 +1812,9 @@ impl PartialEq for EnumVariants {
 
 impl Eq for EnumVariants {}
 
-#[salsa::tracked]
+#[blaze_query::tracked]
 impl EnumVariants {
-    #[salsa::tracked(returns(ref), mem_tag = Nameres)]
+    #[blaze_query::tracked(returns(ref), mem_tag = Nameres)]
     pub(crate) fn of(
         db: &Db,
         e: EnumId,
@@ -1962,7 +1962,7 @@ impl EnumVariants {
     }
 }
 
-#[salsa::tracked(returns(copy), mem_tag = Nameres)]
+#[blaze_query::tracked(returns(copy), mem_tag = Nameres)]
 pub(crate) fn extern_block_abi(db: &Db, extern_block: ExternBlockId) -> ExternAbi {
     let source = extern_block.lookup(db).source_view(db);
     source

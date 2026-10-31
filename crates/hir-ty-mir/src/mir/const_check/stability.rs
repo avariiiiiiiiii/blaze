@@ -23,7 +23,6 @@ use hir_def::{
 use hir_expand::{MacroCallId, MacroDefKind, attrs::expand_cfg_attr_view};
 use hir_ty::effects::trait_is_const;
 use intern::Symbol;
-use salsa::SalsaValue;
 use syntax::{
     NodeOrToken, SyntaxKind,
     view::{self, AstToken, HasAttrs, TokenTreeChildren},
@@ -47,7 +46,7 @@ impl Item {
 }
 
 /// rustc's `ConstStability`.
-#[derive(Debug, Clone, PartialEq, Eq, SalsaValue)]
+#[derive(Debug, Clone, PartialEq, Eq, blaze_query::Value)]
 pub(super) struct ConstStability {
     pub(super) level: Level,
     /// `#[rustc_const_stable_indirect]`, or a `const fn` unmarked and unstable, which rustc
@@ -55,7 +54,7 @@ pub(super) struct ConstStability {
     pub(super) const_stable_indirect: bool,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, SalsaValue)]
+#[derive(Debug, Clone, PartialEq, Eq, blaze_query::Value)]
 pub(super) enum Level {
     Stable,
     Unstable { feature: Symbol, implied_by: Option<Symbol>, issue: Option<NonZero<u32>> },
@@ -197,14 +196,14 @@ fn lists<'t>(
 }
 
 /// A function's const stability and the attributes that go with it.
-#[derive(Debug, Clone, PartialEq, Eq, Default, SalsaValue)]
+#[derive(Debug, Clone, PartialEq, Eq, Default, blaze_query::Value)]
 struct FnConst {
     stability: Option<ConstStability>,
     intrinsic_const_stable_indirect: bool,
     written_unstable: bool,
 }
 
-#[salsa::tracked(returns(ref))]
+#[blaze_query::tracked(returns(ref))]
 fn fn_const(db: &Db, func: FunctionId) -> FnConst {
     let krate = func.module(db).krate(db);
     let is_const = FunctionSignature::of(db, func).is_const();
@@ -250,7 +249,7 @@ fn fn_const(db: &Db, func: FunctionId) -> FnConst {
     }
 }
 
-#[salsa::tracked(returns(ref))]
+#[blaze_query::tracked(returns(ref))]
 fn trait_const(db: &Db, trait_: TraitId) -> Option<ConstStability> {
     let krate = trait_.module(db).krate(db);
     if !UnstableFeatures::query(db, krate).staged_api {

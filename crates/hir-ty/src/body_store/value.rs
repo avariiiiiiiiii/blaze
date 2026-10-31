@@ -42,7 +42,7 @@ pub fn step_value(db: &Db, def: DefWithBodyId, step: Step) -> Option<ContentId> 
 
 /// [`step_value`] of [`Step::Infer`]. A store is installed for a database before any query of it
 /// runs and stays for its life, so which store answers is no input.
-#[salsa::tracked(returns(copy))]
+#[blaze_query::tracked(returns(copy))]
 fn inference_value(db: &Db, def: DefWithBodyId) -> Option<ContentId> {
     with_store(db, |store| {
         let result = InferenceResult::of(db, def);
@@ -55,7 +55,7 @@ fn inference_value(db: &Db, def: DefWithBodyId) -> Option<ContentId> {
 }
 
 /// [`step_value`] of [`Step::Mir`], as [`inference_value`].
-#[salsa::tracked(returns(copy))]
+#[blaze_query::tracked(returns(copy))]
 fn mir_value(db: &Db, def: DefWithBodyId) -> Option<ContentId> {
     with_store(db, |store| mir_hash(db, &*store.facts, def)).flatten()
 }

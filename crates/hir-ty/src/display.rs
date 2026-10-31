@@ -1513,11 +1513,11 @@ impl<'db> HirDisplay<'db> for Ty<'db> {
                         return write!(
                             f,
                             "{{closure#{:?}}}",
-                            salsa::plumbing::AsId::as_id(&id).index()
+                            (blaze_query::db::AsId::as_id(&id).as_u32() - 1)
                         );
                     }
                     ClosureStyle::ClosureWithSubst => {
-                        write!(f, "{{closure#{:?}}}", salsa::plumbing::AsId::as_id(&id).index())?;
+                        write!(f, "{{closure#{:?}}}", (blaze_query::db::AsId::as_id(&id).as_u32() - 1))?;
                         return hir_fmt_generics(f, substs.as_slice(), None, None);
                     }
                     _ => (),
@@ -1572,14 +1572,14 @@ impl<'db> HirDisplay<'db> for Ty<'db> {
                         return write!(
                             f,
                             "{{{closure_label}#{:?}}}",
-                            salsa::plumbing::AsId::as_id(&id).index()
+                            (blaze_query::db::AsId::as_id(&id).as_u32() - 1)
                         );
                     }
                     ClosureStyle::ClosureWithSubst => {
                         write!(
                             f,
                             "{{{closure_label}#{:?}}}",
-                            salsa::plumbing::AsId::as_id(&id).index()
+                            (blaze_query::db::AsId::as_id(&id).as_u32() - 1)
                         )?;
                         return hir_fmt_generics(f, args.as_slice(), None, None);
                     }

@@ -314,7 +314,7 @@ impl<T: Consed> Interner<T> for HashCons<T> {
 }
 
 /// An interned value: one pointer. Two handles of one interner are equal exactly when their
-/// values are. It hashes as its fingerprint, so a map or a salsa fingerprint of it is the
+/// values are. It hashes as its fingerprint, so a map or a query's hash of it is the
 /// same in every run; it has no `Ord`, as its address and index are not (sort by
 /// [`Interned::content`]).
 pub struct Interned<'a, T> {

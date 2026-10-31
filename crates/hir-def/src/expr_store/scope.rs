@@ -67,9 +67,8 @@ const _: () = assert!(size_of::<ScopeKind>() == 1);
 // 12 bytes an entry: a symbol, a hygiene and a binding id.
 #[cfg(target_pointer_width = "64")]
 const _: () = assert!(size_of::<ScopeEntry>() == 12);
-// 16 bytes a block scope: a salsa id (index and generation) and an `Option` of an arena id,
-// which has no niche.
-const _: () = assert!(size_of::<(BlockId, Option<LabelId>)>() == 16);
+// 12 bytes a block scope: an id (4) and an `Option` of an arena id, which has no niche.
+const _: () = assert!(size_of::<(BlockId, Option<LabelId>)>() == 12);
 const _: () = assert!(size_of::<ScopeId>() == 4);
 
 #[derive(Debug, PartialEq, Eq)]
@@ -112,21 +111,21 @@ impl ScopeByExpr {
     }
 }
 
-#[salsa::tracked]
+#[blaze_query::tracked]
 impl ExprScopes {
-    #[salsa::tracked(returns(ref))]
+    #[blaze_query::tracked(returns(ref))]
     pub fn body_expr_scopes(db: &Db, def: DefWithBodyId) -> ExprScopes {
         let body = Body::of(db, def);
         build(|scopes| walk_body(scopes, body))
     }
 
-    #[salsa::tracked(returns(ref))]
+    #[blaze_query::tracked(returns(ref))]
     pub fn sig_expr_scopes(db: &Db, def: GenericDefId) -> ExprScopes {
         let (_, store) = GenericParams::with_store(db, def);
         build(|scopes| walk_store(scopes, store, store.expr_roots()))
     }
 
-    #[salsa::tracked(returns(ref))]
+    #[blaze_query::tracked(returns(ref))]
     pub fn variant_scopes(db: &Db, def: VariantId) -> ExprScopes {
         let fields = VariantFields::of(db, def);
         build(|scopes| walk_store(scopes, &fields.store, fields.store.expr_roots()))

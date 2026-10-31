@@ -17,7 +17,6 @@ use hir_def::{
     signatures::{FunctionSignature, StaticFlags, StaticSignature},
 };
 use rustc_type_ir::inherent::IntoKind;
-use salsa::SalsaValue;
 
 use hir_ty::{
     InferBodyId,
@@ -34,7 +33,7 @@ use super::{
 };
 
 /// Why a function is not const-pure.
-#[derive(Debug, Clone, PartialEq, Eq, SalsaValue)]
+#[derive(Debug, Clone, PartialEq, Eq, blaze_query::Value)]
 pub struct Impure {
     /// What the function that does it does, said of it: "reads or writes mutable state:
     /// `CALLS` is `AtomicU64`, which is not `Freeze`".
@@ -78,7 +77,7 @@ pub fn is_const_pure(db: &Db, func: FunctionId) -> bool {
 
 /// Why `func`, a function const code may call (a `const fn`, or a method of a trait or of an
 /// `impl` of one), is not const-pure, if it is not.
-#[salsa::tracked(returns(ref), cycle_result = const_purity_cycle_result)]
+#[blaze_query::tracked(returns(ref), cycle_result = const_purity_cycle_result)]
 pub fn const_purity<'db>(db: &'db Db, func: FunctionId) -> Option<Impure> {
     let unknown =
         // alloc: the impurity the query keeps, only when there is one
@@ -183,7 +182,7 @@ pub fn const_purity<'db>(db: &'db Db, func: FunctionId) -> Option<Impure> {
 /// is not.
 fn const_purity_cycle_result(
     _db: &Db,
-    _: salsa::Id,
+    _: blaze_query::db::Id,
     _func: FunctionId,
 ) -> Option<Impure> {
     Some(Impure {

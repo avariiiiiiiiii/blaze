@@ -80,9 +80,9 @@ pub type TagEncoding = hir_def::layout::TagEncoding<RustcEnumVariantIdx>;
 pub type Variants = hir_def::layout::Variants<RustcFieldIdx, RustcEnumVariantIdx>;
 
 /// A layout as the layout queries return it: hash-consed in [`LAYOUTS`], as rustc interns
-/// `Layout<'tcx>`, so equal layouts are kept once, a read is a pointer copy, equality is a
-/// pointer compare and the fingerprint salsa backdates by is computed once. A newtype because
-/// [`Layout`] is `rustc_abi`'s.
+/// `Layout<'tcx>`, so equal layouts are kept once, a read is a pointer copy, and equality (what
+/// the query engine backdates by) is a pointer compare. A newtype because [`Layout`] is
+/// `rustc_abi`'s.
 #[derive(Debug, PartialEq, Eq)]
 pub struct InternedLayout(pub Layout);
 
@@ -181,7 +181,7 @@ impl<F> From<LayoutCalculatorError<F>> for LayoutError {
 
 /// What a layout reads of a struct's signature: its flags. A rename, or a change to its
 /// generics or their bounds, leaves this equal.
-#[salsa::tracked(returns(copy), mem_tag = Infer)]
+#[blaze_query::tracked(returns(copy), mem_tag = Infer)]
 pub fn struct_flags(db: &Db, id: StructId) -> StructFlags {
     StructSignature::of(db, id).flags
 }
@@ -190,7 +190,7 @@ pub fn struct_flags(db: &Db, id: StructId) -> StructFlags {
 /// stays last for all of them, so that unsizing the struct does not move it. The answer reads
 /// the struct's own declaration and the crate's `Sized`, never a layout's generic arguments, so
 /// it is asked once per struct and crate rather than once per instantiation.
-#[salsa::tracked(returns(copy), mem_tag = Infer)]
+#[blaze_query::tracked(returns(copy), mem_tag = Infer)]
 pub fn struct_tail_may_be_unsized(db: &Db, id: StructId, krate: Crate) -> bool {
     variant_field_ids(db, id.into()).last().is_some_and(|&fd| {
         let interner = DbInterner::new_with(db, krate);
@@ -202,7 +202,7 @@ pub fn struct_tail_may_be_unsized(db: &Db, id: StructId, krate: Crate) -> bool {
 
 /// The fields of a variant, in order: what a layout reads of them besides their types. A
 /// field's rename or visibility leaves this equal.
-#[salsa::tracked(returns(deref), mem_tag = Infer)]
+#[blaze_query::tracked(returns(deref), mem_tag = Infer)]
 pub fn variant_field_ids(db: &Db, variant: VariantId) -> Box<[LocalFieldId]> {
     let fields = variant.fields(db).fields();
     let mut ids = Vec::with_capacity(fields.len());
@@ -211,7 +211,7 @@ pub fn variant_field_ids(db: &Db, variant: VariantId) -> Box<[LocalFieldId]> {
 }
 
 /// The variants of an enum, in order: what a layout reads of them besides their fields.
-#[salsa::tracked(returns(deref), mem_tag = Infer)]
+#[blaze_query::tracked(returns(deref), mem_tag = Infer)]
 pub fn enum_variant_ids(db: &Db, id: EnumId) -> Box<[EnumVariantId]> {
     let variants = &id.enum_variants(db).variants;
     let mut ids = Vec::with_capacity(variants.len());
@@ -400,7 +400,7 @@ fn univariant_of(
     )?)
 }
 
-#[salsa::tracked(cycle_result = layout_of_ty_cycle_result, returns(clone), mem_tag = Infer)]
+#[blaze_query::tracked(cycle_result = layout_of_ty_cycle_result, returns(clone), mem_tag = Infer)]
 pub fn layout_of_ty_query(
     db: &Db,
     ty: StoredTy,
@@ -822,7 +822,7 @@ fn layout_of_ty_in(
 
 fn layout_of_ty_cycle_result(
     _: &Db,
-    _: salsa::Id,
+    _: blaze_query::db::Id,
     _: StoredTy,
     _: StoredParamEnvAndCrate,
 ) -> Result<Interned<'static, InternedLayout>, LayoutError> {
@@ -949,7 +949,7 @@ mod tests {
     use blaze_ids::rng::SplitMix64;
     use hir_def::{ConstId, TypeAliasId};
     use rustc_type_ir::{TypeSuperVisitable, TypeVisitable, TypeVisitor};
-    use salsa::plumbing::FromId;
+    use blaze_query::db::FromId;
 
     use super::*;
     use crate::next_solver::{
@@ -1096,7 +1096,7 @@ mod tests {
     }
 
     fn id<T: FromId>(index: u32) -> T {
-        T::from_id(salsa::Id::from_bits(u64::from(index)))
+        T::from_id(blaze_query::db::Id::from_u32(index))
     }
 
     fn ty<'db>(kind: TyKind<'db>) -> Ty<'db> {

@@ -1,0 +1,40 @@
+{
+ "crate": "crates/hir-ty-wfcheck",
+ "base": "adc8bbbf04a20c189070000982f22445be80764f",
+ "files": [
+  {
+   "path": "crates/hir-ty-wfcheck/src/outlives.rs",
+   "edits": [
+    {
+     "old": "/// One of an ADT's inferred outlives predicates as salsa keeps it: what outlives, a type or a\n",
+     "new": "/// One of an ADT's inferred outlives predicates as the query database keeps it: what outlives, a type or a\n"
+    }
+   ]
+  },
+  {
+   "path": "crates/hir-ty-wfcheck/src/persist.rs",
+   "edits": [
+    {
+     "old": "//! [`WfResult`] in blaze's format: one row per diagnostic, its site as a tag word and the salsa\n//! id of the definition it is in (the database that wrote a buffer is the one reading it, as\n",
+     "new": "//! [`WfResult`] in blaze's format: one row per diagnostic, its site as a tag word and the query\n//! database id of the definition it is in (the database that wrote a buffer is the one reading it, as\n"
+    },
+    {
+     "old": "        id.as_id().as_u32()\n",
+     "new": "        u64::from(id.as_id().as_u32())\n"
+    },
+    {
+     "old": "    if row.id as u32 == 0 {\n        return Err(invalid(\"a salsa id of index 0\"));\n",
+     "new": "    if row.id == 0 || row.id > u64::from(u32::MAX) {\n        return Err(invalid(\"an id of 0 or wider than 32 bits\"));\n"
+    },
+    {
+     "old": "        T::from_id(blaze_query::db::Id::from_u32(bits))\n",
+     "new": "        T::from_id(blaze_query::db::Id::from_u32(bits as u32))\n"
+    },
+    {
+     "old": "        T::from_id(blaze_query::db::Id::from_bits(u64::from(index) | (3 << 32)))\n",
+     "new": "        T::from_id(blaze_query::db::Id::from_u32(index + (3 << 20)))\n"
+    }
+   ]
+  }
+ ]
+}

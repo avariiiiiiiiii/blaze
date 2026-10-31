@@ -22,7 +22,6 @@ use hir_expand::{
 };
 use intern::{Symbol, sym};
 use rustc_hash::FxHashMap;
-use salsa::Database as _;
 use span::{Edition, FileAstId, ROOT_ERASED_FILE_AST_ID};
 use syntax::ast;
 use triomphe::Arc;
@@ -259,7 +258,7 @@ pub(crate) fn root_decl(
 
 /// The `LocalDefMap` paths read under a crate env: one per env, shared by every module whose
 /// collection starts from it.
-#[salsa::tracked(returns(ref))]
+#[blaze_query::tracked(returns(ref))]
 fn crate_env_local(
     db: &Db,
     env: CrateEnvKey,
@@ -276,7 +275,7 @@ struct FileHead {
     macro_use: bool,
 }
 
-#[salsa::tracked(returns(ref))]
+#[blaze_query::tracked(returns(ref))]
 fn mod_file_head(
     db: &Db,
     file: EditionedFileId,
@@ -450,7 +449,7 @@ impl<'a, 'db, 'f> DeclSink<'a, 'db, 'f> {
     fn new(cx: &'a CollectCx<'db, 'f>, key: DeclKey, decl: &'db Decl) -> Self {
         let db = cx.db;
         let env = decl.env.env(db);
-        let rows = salsa::plumbing::AsId::as_id(&RowsKey::new(db, Rows::Decl(key)));
+        let rows = blaze_query::db::AsId::as_id(&RowsKey::new(db, Rows::Decl(key)));
         let mut def_map = DefMap {
             krate: decl.krate,
             block: None,
@@ -786,7 +785,7 @@ impl<'a, 'db, 'f> Sink<'db> for DeclSink<'a, 'db, 'f> {
         };
         self.def_map.modules.building().insert(child, row);
         if let ModulesSlot::Unit { rows, .. } = &mut self.def_map.modules {
-            *rows = salsa::plumbing::AsId::as_id(&RowsKey::new(db, Rows::Decl(key)));
+            *rows = blaze_query::db::AsId::as_id(&RowsKey::new(db, Rows::Decl(key)));
         }
         self.log.push(DeclOp::Splice { child, key });
         if own == self.def_map.root {
@@ -1025,7 +1024,7 @@ pub(crate) fn collect_expansion<'db, S: Sink<'db>, A: Allocator + Clone>(
         && exp.requires_session(db, def.krate)
     {
         // Equal expansion output still has state changes to replay next revision.
-        db.report_untracked_read();
+        blaze_query::db::report_untracked_read(db);
         sink.apply(DeclOp::SessionMacros);
     }
     let file_id: HirFileId = call.into();
@@ -1689,7 +1688,7 @@ impl<'db, 'f, S: Sink<'db>, A: Allocator + Clone> ModCollector<'_, 'db, 'f, S, A
         };
 
         // The creating query is keyed by content including the parent, so every revision in
-        // which a value naming this id is live re-creates it and salsa keeps it
+        // which a value naming this id is live re-creates it and the query database keeps it
         // (nameres-core.md §3).
         let module = super::queries::child_module(
             db,

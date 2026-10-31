@@ -27,8 +27,8 @@
 //! batch added with `reads` ([`crate::serve::plane::Plane::add`]): every compile, the
 //! `--ub` selection and evaluations, a reach (of both its views) and the codegen inputs. Each
 //! is posted with a [`Steps::Reader`], a shared reference it holds for its run and drops as it ends,
-//! with no lock, no clone of the database and no cancellation. The tables are measured, which
-//! salsa does only with the database exclusive: their task, the front end's last use, is
+//! with no lock, no clone of the database and no cancellation. The tables are measured with
+//! the database exclusive, so no reader adds to them: their task, the front end's last use, is
 //! handed the job's [`Writer`] itself. So is a pack's, whose recording of expansions sets the
 //! database's proc macros, once its check's own plane request is over.
 //!
@@ -471,7 +471,7 @@ pub trait Writer<S: Steps>: Send + 'static {
     /// costing one load. An error ends the job.
     fn apply(&mut self) -> Result<bool, ApiError>;
     /// On a worker, the writer handed to the tables' task as the front end's last use: its
-    /// tables (name, elements, bytes), measured with it exclusive, as salsa measures; an
+    /// tables (name, elements, bytes), measured with it exclusive; an
     /// error while a reader of it is alive.
     fn tables(&mut self) -> Result<Vec<(&'static str, u64, u64)>, Failed>;
     /// On the loop, once every task of the job's build has ended and before it is kept: what

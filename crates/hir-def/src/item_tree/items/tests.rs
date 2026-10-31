@@ -180,7 +180,7 @@ fn an_edit_inside_bodies_lowers_no_item() {
     }
 }
 
-/// An edit that changes no item gives back the kept tree itself: salsa sees the same value.
+/// An edit that changes no item gives back the kept tree itself: the query database sees the same value.
 #[test]
 fn an_edit_inside_a_body_gives_the_kept_tree() {
     let (mut db, file) = db_of(ITEMS);

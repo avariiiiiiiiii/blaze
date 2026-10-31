@@ -7,7 +7,7 @@ use std::{panic::RefUnwindSafe, sync};
 use base_db::{Crate, CrateBuilderId, CratesIdMap, Db, Env, ProcMacroLoadingError};
 use intern::Symbol;
 use rustc_hash::FxHashMap;
-use salsa::{Durability, Setter};
+use blaze_query::db::{Durability, Setter};
 use span::Span;
 use triomphe::Arc;
 
@@ -175,22 +175,22 @@ impl FromIterator<(CrateBuilderId, ProcMacroLoadResult)> for ProcMacrosBuilder {
 pub struct CrateProcMacros(StoredProcMacroLoadResult);
 
 /// The proc macros. Do not use [`Self::get`]! Use [`Self::get_for_crate`] instead.
-#[salsa::input(singleton, debug)]
+#[blaze_query::input(singleton, debug)]
 pub struct ProcMacros {
     #[returns(ref)]
     pub by_crate: FxHashMap<Crate, Arc<CrateProcMacros>>,
 }
 
 impl ProcMacros {
-    pub fn init_default(db: &Db, durability: Durability) {
+    pub fn init_default(db: &mut Db, durability: Durability) {
         _ = Self::builder(Default::default()).durability(durability).new(db);
     }
 }
 
-#[salsa::tracked]
+#[blaze_query::tracked]
 impl ProcMacros {
     /// Incrementality query to prevent queries from directly depending on [`Self::get`].
-    #[salsa::tracked(returns(as_ref), mem_tag = Expand)]
+    #[blaze_query::tracked(returns(as_ref), mem_tag = Expand)]
     pub fn get_for_crate(db: &Db, krate: Crate) -> Option<Arc<CrateProcMacros>> {
         Self::get(db).by_crate(db).get(&krate).cloned()
     }
@@ -255,7 +255,7 @@ impl CrateProcMacros {
 
 /// Whether this crate can call a macro whose state belongs to a compilation session,
 /// including macros reexported by a dependency.
-#[salsa::tracked(returns(copy), mem_tag = Expand)]
+#[blaze_query::tracked(returns(copy), mem_tag = Expand)]
 pub fn may_have_session_macros(db: &Db, krate: Crate) -> bool {
     ProcMacros::get_for_crate(db, krate)
         .and_then(|it| {

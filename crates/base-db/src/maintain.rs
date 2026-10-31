@@ -1,6 +1,6 @@
 //! Write-side view maintenance (docs/v2/plan/design/dbsp.md §3): every write to a [`Db`] input
 //! ends by running the [`Maintainer`]s over what it [`Written`], and each maintainer updates
-//! its state by that delta and sets the salsa inputs whose slice changed. Queries never read a
+//! its state by that delta and sets the query inputs whose slice changed. Queries never read a
 //! maintainer's state, only the inputs it sets, so every query stays a pure function of inputs.
 //!
 //! A write method of [`Db`] notes what it changed into the database's pending [`Written`];

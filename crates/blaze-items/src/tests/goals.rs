@@ -14,7 +14,7 @@ use hir_ty::{
         goal_store::{FactObject, FactRef, GoalFacts},
     },
 };
-use salsa::plumbing::AsId;
+use blaze_query::db::AsId;
 use hir_expand::fixture;
 
 use super::{TestDB, edit, item, items, single, table::every_kind};
@@ -158,7 +158,7 @@ fn a_read_of_an_items_query_stands_for_its_signature() {
         })
         .expect("`Tr` has a type");
 
-    let read = |name: &str, key: salsa::Id| fact_of_read(&db, name, key);
+    let read = |name: &str, key: blaze_query::db::Id| fact_of_read(&db, name, key);
     for name in [
         "ImplSignature::kept",
         "ImplItems::of",
@@ -221,7 +221,7 @@ fn a_read_of_the_impls_of_a_trait_stands_for_its_implements_fact() {
         ItemId::Adt(it) => HirSimplifiedType::Adt(it.into()),
         other => panic!("`{path}` is {other:?}"),
     };
-    let read = |name: &str, key: salsa::Id| fact_of_read(&db, name, key);
+    let read = |name: &str, key: blaze_query::db::Id| fact_of_read(&db, name, key);
     let trait_key = item_key(&db, ItemId::Trait(tr));
     let sorted_keys = |impls: &[AnyImplId]| {
         let mut keys: Vec<_> = impls
@@ -281,7 +281,7 @@ fn a_read_of_specialization_stands_for_its_fact() {
         .collect();
     let blanket = *all.iter().find(|&&it| impl_self_ty(&db, it).is_none()).expect("a blanket");
     let for_s = *all.iter().find(|&&it| impl_self_ty(&db, it).is_some()).expect("`impl Tr for S`");
-    let read = |name: &str, key: salsa::Id| fact_of_read(&db, name, key);
+    let read = |name: &str, key: blaze_query::db::Id| fact_of_read(&db, name, key);
 
     assert_eq!(read("may_specialize", for_s.as_id()), Some(specializes(&db, for_s)));
     let pair = ImplPair::new(&db, for_s, blanket);
@@ -403,7 +403,7 @@ pub type T = u8;
     );
     let ItemId::Function(f) = item(&db, "f") else { panic!("`f` is no fn") };
     let ItemId::Alias(t) = item(&db, "T") else { panic!("`T` is no alias") };
-    let read = |name: &str, key: salsa::Id| fact_of_read(&db, name, key);
+    let read = |name: &str, key: blaze_query::db::Id| fact_of_read(&db, name, key);
     let rpit = read("rpit_hidden_types", f.as_id());
     assert_eq!(rpit, Some(hidden_types(&db, ItemId::Function(f))));
     assert_ne!(rpit, Some(Fact::Signature(item_key(&db, ItemId::Function(f)))));

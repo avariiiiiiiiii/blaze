@@ -6,7 +6,7 @@ use std::hint::black_box;
 use base_db::Db;
 use hir_expand::name::Name;
 use intern::Symbol;
-use salsa::plumbing::AsId;
+use blaze_query::db::AsId;
 use syntax::view::{self as ast, AstNode};
 use hir_expand::fixture;
 
@@ -42,16 +42,14 @@ fn snapshot(db: &TestDB, module: ModuleId) -> (Vec<String>, Vec<String>, usize) 
 
 /// The modules `module_impls` ran for while `f` ran, by key, from the same `WillExecute` events
 /// `TestDB::log_executed` names.
-fn ran_for(db: &TestDB, f: impl FnOnce()) -> Vec<salsa::Id> {
+fn ran_for(db: &TestDB, f: impl FnOnce()) -> Vec<blaze_query::db::Id> {
     let base: &Db = db;
     db.log_in_read_order(f)
         .into_iter()
         .filter_map(|event| match event.kind {
-            salsa::EventKind::WillExecute { database_key } => {
-                let name = salsa::Database::ingredient_debug_name(
-                    base,
-                    database_key.ingredient_index(),
-                );
+            blaze_query::db::EventKind::WillExecute { database_key } => {
+                let name = blaze_query::db::Database::storage(base)
+                    .ingredient_name(database_key.ingredient_index());
                 (name == "module_impls").then(|| database_key.key_index())
             }
             _ => None,

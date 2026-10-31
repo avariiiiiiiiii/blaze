@@ -52,7 +52,7 @@ use blaze_units::{
 use cfg::{CfgAtom, CfgOptions};
 use hir_expand::proc_macro::{CrateProcMacros, ProcMacros};
 use rustc_hash::{FxHashMap, FxHashSet};
-use salsa::{Durability, Setter};
+use blaze_query::db::{Database as _, Durability, Setter};
 use triomphe::Arc;
 use base_db::FileSetConfig;
 
@@ -305,7 +305,7 @@ pub fn lower_into<T: blaze_query::Tree>(db: Db, lower: Lower<'_, T>) -> Result<L
 
     let tree = files::Mounts { mounts: &config.mounts, view: root, tree: files, read_view: Cell::new(false) };
     let mut db = db;
-    ProcMacros::init_default(&db, Durability::HIGH);
+    ProcMacros::init_default(&mut db, Durability::HIGH);
     for (index, &is_library) in library.iter().enumerate() {
         let source_root = match is_library {
             true => SourceRoot::new_library(FileSet::default()),
@@ -322,8 +322,8 @@ pub fn lower_into<T: blaze_query::Tree>(db: Db, lower: Lower<'_, T>) -> Result<L
             .map(|it| SourceRootId(it as u32))
             .collect()
     };
-    _ = LibraryRoots::builder(roots(true)).durability(Durability::MEDIUM).new(&db);
-    _ = LocalRoots::builder(roots(false)).durability(Durability::MEDIUM).new(&db);
+    _ = LibraryRoots::builder(roots(true)).durability(Durability::MEDIUM).new(&mut db);
+    _ = LocalRoots::builder(roots(false)).durability(Durability::MEDIUM).new(&mut db);
 
     let mut loaded = Vec::new();
     let mut read = Vec::with_capacity(loads.len());
@@ -695,8 +695,8 @@ impl Lowered {
     }
 
     /// The front end's tables by owner and name: how many each holds and their bytes, as
-    /// salsa counts them. It takes `&mut self`, as a write does: salsa measures its storage
-    /// only with no reader.
+    /// the query engine counts them. It takes `&mut self`, as a write does: the counts are of a
+    /// database no reader is adding to.
     pub fn tables(&mut self) -> Vec<(&'static str, u64, u64)> {
         tables(&mut self.db)
     }
@@ -828,19 +828,13 @@ fn identity_of(db: &Db, krate: Crate, known: &mut FxHashMap<Crate, ContentId>) -
 }
 
 /// The front end's tables, each of the database's structs and memoized queries by its name,
-/// with how many it holds and their bytes (fields, salsa's metadata and what the fields hold
-/// on the heap), as salsa counts them. salsa measures only with the database exclusive.
+/// with how many rows it holds and their bytes (the rows and what their values hold), as
+/// [`blaze_query::db::Storage::memory_usage`] counts them, with the database exclusive.
 fn tables(db: &mut Db) -> Vec<(&'static str, u64, u64)> {
-    // dyn: salsa's `memory_usage` is on `dyn Database`; a report, off any build's path
-    let db: &mut dyn salsa::Database = db;
-    let info = db.memory_usage();
-    let row = |it: &salsa::IngredientInfo| {
-        let bytes = it.size_of_fields() + it.size_of_metadata() + it.heap_size_of_fields().unwrap_or(0);
-        (it.debug_name(), it.count() as u64, bytes as u64)
-    };
-    let mut rows: Vec<_> = info.structs.iter().map(row).collect();
-    rows.extend(info.queries.values().map(row));
-    rows
+    // alloc: a report, off any build's path
+    let mut usage = Vec::new();
+    db.storage().memory_usage(&mut usage);
+    usage.into_iter().map(|it| (it.name, it.rows, it.row_bytes + it.value_bytes)).collect()
 }
 
 /// `change` of source root `set` made in `paths` too.

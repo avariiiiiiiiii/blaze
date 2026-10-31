@@ -72,7 +72,7 @@ against `admission::Estimates`; queries read files through `Cx::file` and facts 
 | core | `crates/blaze-core/`, `crates/blaze-graph/`, `docs/v2/plan/lanes/core/plane.md` |
 | vfs | `crates/blaze-vfs/` (v1 `vfs` and `vfs-notify` deleted 2026-10-30) |
 | format | `crates/blaze-ids/`, `crates/blaze-format/`, `crates/syntax-tree/`, `crates/syntax/`, `crates/parser/`, `crates/span/`, `crates/intern/`, `crates/tt/`, `crates/mbe/`, `crates/syntax-bridge/`, `crates/const-ast/`; in `crates/hir-def/src/`: `expr_store.rs`, `expr_store/`, `hir.rs`, `hir/`, `item_tree.rs`, `item_tree/` |
-| db | `crates/blaze-query/`, `vendor/salsa/`, `vendor/rustc_type_ir/`, `vendor/rustc_next_trait_solver/`, `vendor/salsa-macros/`, `vendor/salsa-macro-rules/`, `crates/base-db/`, `crates/hir-expand/`, `crates/hir/`, `crates/hir-def/` but format's files, `crates/hir-ty/` but items' and codegen's files, `crates/hir-ty-borrowck/`, `crates/hir-ty-wfcheck/` |
+| db | `crates/blaze-query/`, `crates/blaze-query-macros/`, `vendor/rustc_type_ir/`, `vendor/rustc_next_trait_solver/`, `crates/base-db/`, `crates/hir-expand/`, `crates/hir/`, `crates/hir-def/` but format's files, `crates/hir-ty/` but items' and codegen's files, `crates/hir-ty-borrowck/`, `crates/hir-ty-wfcheck/` |
 | items | `crates/blaze-items/`; in `crates/hir-ty/src/`: `method_resolution.rs`, `method_resolution/`, `traits.rs`, `specialization.rs`, `opaques.rs`, `layout.rs`, `layout/`, `drop.rs` |
 | store | `crates/blaze-cas/` |
 | codegen | `crates/blaze-codegen/`, `crates/hir-ty-codegen/`, `crates/hir-ty-mir/`, `crates/blaze-engine/`, `vendor/llvm-sys/`; in `crates/hir-ty/src/`: `mir.rs`, `mir/` (the MIR types, whose layout is codegen's, [data.md](../design/data.md)) |
@@ -112,7 +112,7 @@ coordinator's: a change there is a request.
 | `tt`, `mbe`, `syntax-bridge`, `const-ast` | changed: onto the flat tree | format |
 | `hir-def` | changed: SoA HIR and outlines (format); signature and body split, parallel expansion (db) | format, db |
 | `hir-expand`, `base-db`, `hir` | changed: queries keyed by input hashes with fingerprints, inputs per view | db |
-| `vendor/salsa*` | changed: remade into blaze's query database behind `blaze-query` | db |
+| `vendor/salsa*` | removed (query-unify, 2026-10-31): the front end runs on `blaze_query::db` and `blaze-query-macros` (docs/v2/plan/lanes/db/query-unify.md) | db |
 | `hir-ty` | changed: facts recorded where they are read (items); queries split and fingerprinted (db); the MIR types' columnar layout (codegen) | items, db, codegen |
 | `hir-ty-borrowck`, `hir-ty-wfcheck` | changed only as `hir-ty` moves | db |
 | `blaze-protocol` | left: `blaze-api` uses its CBOR and frames; its `events` stay for the build view | ci |

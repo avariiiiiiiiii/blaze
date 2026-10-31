@@ -1,0 +1,24 @@
+{
+ "crate": "crates/hir-ty-pure",
+ "base": "adc8bbbf04a20c189070000982f22445be80764f",
+ "files": [
+  {
+   "path": "crates/hir-ty-pure/src/lib.rs",
+   "edits": [
+    {
+     "old": "//! - [`walk`](script_purity): the instances from `main`, each summarized bottom-up as a salsa\n",
+     "new": "//! - [`walk`](script_purity): the instances from `main`, each summarized bottom-up as a\n"
+    }
+   ]
+  },
+  {
+   "path": "crates/hir-ty-pure/src/walk.rs",
+   "edits": [
+    {
+     "old": "//! run, each summarized once by [`summary`], a salsa query, so a callee shared by many scripts\n",
+     "new": "//! run, each summarized once by [`summary`], a query, so a callee shared by many scripts\n"
+    }
+   ]
+  }
+ ]
+}

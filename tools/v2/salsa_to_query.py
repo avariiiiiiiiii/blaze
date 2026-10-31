@@ -20,6 +20,15 @@ What it rewrites, in code only (never in comments or string literals):
   table already has `blaze-query`).
 
 With `"write": false` it prints the unified diff it would make; with `true` it writes the files.
+
+The port replays: `"base": "<git ref>"` reads each crate's files from that commit instead of the
+working tree, and `"hand": "tools/v2/salsa_port"` then applies `<hand>/<crate dir name>.json`,
+the crate's recorded hand edits (exact replacements in order, files created or deleted), on
+the mechanical rewrite. An edit that no longer matches exactly once stops the run naming the
+file and edit: redo that case on the new base and record again; never resolve it in the JSON.
+`"record": true` (with `base` and `hand`) writes those files: each crate's working files against
+the mechanical rewrite of `base`'s, checked to replay byte for byte. After a change to this
+script's rules, record every crate again (its working files are the truth).
 Either way it then prints every salsa use it left, per file and line: `hand` (code that needs a
 person: plumbing, zalsa, events, generation bits, `salsa::Database` methods, u64-to-u32 ID
 types), `string` (salsa in a string literal: test expectations, `cfg(feature = "salsa")`) and
@@ -28,9 +37,11 @@ wrong, before anything is read or written.
 """
 
 import difflib
+import json
 import re
+import subprocess
 import sys
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 
 from hot_lint import LITERAL
@@ -44,6 +55,9 @@ class Input:
     root: str
     crates: tuple[str, ...]
     write: bool = False
+    base: str = ""
+    hand: str = ""
+    record: bool = False
 
 
 MACROS = {"tracked", "input", "interned", "Supertype"}
@@ -99,7 +113,6 @@ AS_BITS = re.compile(r"\.as_bits\(\)")
 U64_FROM = re.compile(r"^u64::from\((.*)\)(\s*\+\s*\d+)?$", re.DOTALL)
 LEFT = re.compile(r"salsa|Salsa|SALSA")
 EVENT = re.compile(r"\bEventKind::(\w+)")
-UNSIZED_DB = re.compile(r"\?Sized\s*\+\s*blaze_query::db::Database|blaze_query::db::Database\s*\+\s*\?Sized")
 INDEX = re.compile(r"\bas_id\(\)\.index\(\)")
 READ_KIND = re.compile(r"\bReadKind::(\w+)")
 READ_KINDS = {"Function", "InputField", "TrackedField", "Interned"}
@@ -379,7 +392,53 @@ def drop_revisions(text: str) -> str:
     return apply(text, edits)
 
 
+# span's optional engine feature, `salsa` before and `query` now (tt and the proc-macro crates
+# take span without it).
+FEATURE = re.compile(r'\bfeature\s*=\s*"salsa"')
+# A tracked impl method's name in a log: the fork's `"Modules < 'db >::module_"`, the contract's
+# `"Modules::module"`.
+METHOD_NAME = re.compile(r'"([A-Z][A-Za-z0-9]*)(?: < [^"]*? >)?::([a-z_0-9]+?)_"')
+
+
+NESTED_USE = re.compile(r"(?<![\w:])use\s+(?:::)?base_db::\{")
+
+
+def leaf(path: list[str], alias: str | None) -> str:
+    return "::".join(path) + (f" as {alias}" if alias else "")
+
+
+def split_nested(text: str) -> str:
+    """Moves the `salsa::` leaves of a `use base_db::{..}` tree into a `use salsa::..;` of their
+    own, which `rewrite_uses` then reads: in place, `salsa::X` would become `base_db::blaze_query::..`."""
+    masked, _ = mask(text)
+    edits: list[tuple[int, int, str]] = []
+    for m in NESTED_USE.finditer(masked):
+        brace = m.end() - 1
+        end = masked.index(";", m.end())
+        if masked[brace:end] != text[brace:end]:
+            continue
+        tokens = TOKEN.findall(text[brace:end]) + ["<end>"]
+        leaves: list[tuple[list[str], str | None]] = []
+        if parse_tree(tokens, 0, [], leaves) != len(tokens) - 1:
+            continue
+        ours = [(path[1:], alias) for path, alias in leaves if path[0] == "salsa"]
+        if not ours:
+            continue
+        rest = [leaf(path, alias) for path, alias in leaves if path[0] != "salsa"]
+        use_start = masked.index("use", m.start())
+        indent = text[text.rfind("\n", 0, use_start) + 1:use_start]
+        indent = indent if indent.strip() == "" else ""
+        head = text[use_start:m.end() - 1]
+        salsa = [leaf(path, alias) for path, alias in ours]
+        statements = [f"{head}{rest[0] if len(rest) == 1 else '{' + ', '.join(rest) + '}'}"] if rest else []
+        tail = "salsa::" + (salsa[0] if len(salsa) == 1 else "{" + ", ".join(salsa) + "}")
+        statements.append(f"use {tail}")
+        edits.append((use_start, end, f";\n{indent}".join(statements)))
+    return apply(text, edits)
+
+
 def migrate(text: str) -> FileResult:
+    text = split_nested(text)
     masked, _ = mask(text)
     edits: list[tuple[int, int, str]] = []
     use_spans = [(m.start(), masked.index(";", m.end())) for m in USE.finditer(masked)]
@@ -393,7 +452,17 @@ def migrate(text: str) -> FileResult:
     left: list[Left] = []
     new = drop_revisions(new)
     new = rewrite_bits(new, salsa_id, had_salsa, left)
+    new = FEATURE.sub('feature = "query"', new)
+    new = METHOD_NAME.sub(r'"\1::\2"', new)
+    left.extend(scan(new, had_salsa or "blaze_query::db" in new))
+    return FileResult(new, left)
 
+
+def scan(new: str, shapes: bool) -> list[Left]:
+    """Every salsa `new` still names; with `shapes`, also the fork's API shapes the contract
+    changed (`salsa::Database` methods, `ReadKind`, ..), which only a mechanical rewrite's
+    output is read for: after the hand edits, the contract's own `synthetic_write` is no case."""
+    left: list[Left] = []
     masked, spans = mask(new)
     named: set[int] = set()
     for m in USE.finditer(masked):
@@ -413,8 +482,9 @@ def migrate(text: str) -> FileResult:
             left.append(Left(line_of(new, lo), "hand", "the `salsa` cargo feature"))
         elif LEFT.search(new, lo, hi):
             left.append(Left(line_of(new, lo), kind, f"salsa in a {kind}"))
-    if had_salsa or "blaze_query::db" in new:
-        for m in re.finditer(r"\.(\w+)\(", masked):
+    if shapes:
+        # A call on the storage (`db.storage().stop_readers()`) is the contract's own method.
+        for m in re.finditer(r"(?<!storage\(\))(?<!storage_mut\(\))(?<!\.storage)\.(\w+)\(", masked):
             if m.group(1) in DB_METHODS:
                 left.append(Left(line_of(new, m.start()), "hand", f"`salsa::Database::{m.group(1)}`: {DB_METHODS[m.group(1)]}"))
         for m in EVENT.finditer(masked):
@@ -428,11 +498,9 @@ def migrate(text: str) -> FileResult:
                 left.append(Left(line_of(new, m.start()), "hand", f"`Cancelled::{m.group(1)}` is not in the contract"))
         for m in FOR_EACH_READ.finditer(masked):
             left.append(Left(line_of(new, m.start()), "hand", "`for_each_read(storage, |read: Read| ..)`: one `Read { key, kind }`, the name from `ingredient_name`"))
-        for m in UNSIZED_DB.finditer(masked):
-            left.append(Left(line_of(new, m.start()), "hand", "generic over `?Sized` `Database`: the generated accessors take the concrete `&Db`"))
         for m in INDEX.finditer(masked):
             left.append(Left(line_of(new, m.start()), "hand", "`Id::index()` is `as_u32() - 1`"))
-    return FileResult(new, left)
+    return left
 
 
 def migrate_manifest(text: str) -> tuple[str, list[Left]]:
@@ -460,6 +528,124 @@ def migrate_manifest(text: str) -> tuple[str, list[Left]]:
     return "\n".join(out), left
 
 
+def ported(rel: str) -> bool:
+    """Whether the port reads `rel` (relative to its crate): its manifest, its Rust sources, the
+    parser's expected trees of them and the tests' expected files (`expect_file!`), which print
+    query ids."""
+    parts = rel.split("/")
+    return "target" not in parts and (rel == "Cargo.toml" or rel.endswith((".rs", ".rast", ".txt")))
+
+
+def mechanical(rel: str, text: str) -> tuple[str, list[Left]]:
+    if rel.endswith("Cargo.toml"):
+        return migrate_manifest(text)
+    if rel.endswith((".rast", ".txt")):
+        return text, []
+    result = migrate(text)
+    return result.text, result.left
+
+
+def git_files(root: Path, base: str, crate: str) -> dict[str, str]:
+    """`crate`'s ported files at `base`, by path relative to the root (read-only git)."""
+    names = subprocess.run(
+        ["git", "-C", str(root), "ls-tree", "-r", "--name-only", base, "--", crate + "/"],
+        check=True, capture_output=True, text=True,
+    ).stdout.split()
+    names = [it for it in names if ported(it[len(crate) + 1:])]
+    out = subprocess.run(
+        ["git", "-C", str(root), "cat-file", "--batch"],
+        input="".join(f"{base}:{it}\n" for it in names).encode(), check=True, capture_output=True,
+    ).stdout
+    files, at = {}, 0
+    for name in names:
+        header_end = out.index(b"\n", at)
+        size = int(out[at:header_end].split()[2])
+        files[name] = out[header_end + 1:header_end + 1 + size].decode()
+        at = header_end + 1 + size + 1
+    return files
+
+
+def work_files(root: Path, crate: str) -> dict[str, str]:
+    base = root / crate
+    return {
+        p.relative_to(root).as_posix(): p.read_text()
+        for p in sorted(base.rglob("*"))
+        if p.is_file() and ported(p.relative_to(base).as_posix())
+    }
+
+
+def occurrences(text: str, old: str) -> int:
+    """How often `old` occurs in `text`, overlapping ones counted (`str.count` skips them)."""
+    n, at = 0, text.find(old)
+    while at >= 0:
+        n += 1
+        at = text.find(old, at + 1)
+    return n
+
+
+def hand_edits(before: str, after: str) -> list[dict[str, str]]:
+    """`after` as exact replacements on `before`, applied in order: each `old` is whole lines,
+    widened by context until it occurs once in the text it is applied to."""
+    a, b = before.splitlines(keepends=True), after.splitlines(keepends=True)
+    cur, shift, edits = list(a), 0, []
+    for tag, i1, i2, j1, j2 in difflib.SequenceMatcher(None, a, b, autojunk=False).get_opcodes():
+        if tag == "equal":
+            continue
+        lo0, hi0 = i1 + shift, i2 + shift
+        text = "".join(cur)
+        for c in range(len(cur) + 1):
+            lo, hi = max(0, lo0 - c), min(len(cur), hi0 + c)
+            old = "".join(cur[lo:hi])
+            if old and occurrences(text, old) == 1:
+                break
+        new_lines = cur[lo:lo0] + b[j1:j2] + cur[hi0:hi]
+        edits.append({"old": old, "new": "".join(new_lines)})
+        cur[lo:hi] = new_lines
+        shift += (j2 - j1) - (i2 - i1)
+    return edits
+
+
+def replay(rel: str, text: str, edits: list[dict[str, str]]) -> str:
+    for n, edit in enumerate(edits):
+        if (found := occurrences(text, edit["old"])) != 1:
+            fail(SCRIPT, f"{rel}: hand edit {n} no longer applies once (found {found} times); "
+                 "redo it on this base and record again")
+        text = text.replace(edit["old"], edit["new"])
+    return text
+
+
+def hand_path(hand: str, root: Path, crate: str) -> Path:
+    return root / hand / f"{Path(crate).name}.json"
+
+
+def record(cfg: Input, root: Path) -> None:
+    """Writes each crate's hand edits: the working files against the mechanical rewrite of
+    `base`'s, so a replay on `base` gives the working files byte for byte."""
+    for crate in cfg.crates:
+        before, after = git_files(root, cfg.base, crate), work_files(root, crate)
+        files: list[dict[str, object]] = []
+        for rel in sorted(set(before) | set(after)):
+            if rel not in after:
+                files.append({"path": rel, "delete": True})
+            elif rel not in before:
+                files.append({"path": rel, "create": after[rel]})
+            else:
+                mech = mechanical(rel, before[rel])[0]
+                if mech != after[rel]:
+                    edits = hand_edits(mech, after[rel])
+                    if replay(rel, mech, edits) != after[rel]:
+                        fail(SCRIPT, f"{rel}: its recorded edits don't give the working file")
+                    files.append({"path": rel, "edits": edits})
+        path = hand_path(cfg.hand, root, crate)
+        if files:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(json.dumps({"crate": crate, "base": cfg.base, "files": files}, indent=1) + "\n")
+        elif path.exists():
+            path.unlink()
+        edits = sum(len(it.get("edits", [])) or 1 for it in files)
+        print(f"{crate}: {len(files)} files, {edits} hand edits -> {path.relative_to(root)}")
+
+
 def main() -> None:
     match sys.argv[1:]:
         case [text]:
@@ -473,29 +659,47 @@ def main() -> None:
     for crate in cfg.crates:
         if not (root / crate / "Cargo.toml").is_file():
             fail(SCRIPT, f"{crate}: no Cargo.toml under {root / crate}")
+    if cfg.record:
+        if not cfg.base or not cfg.hand or cfg.write:
+            fail(SCRIPT, "record takes base and hand, and no write")
+        base = subprocess.run(["git", "-C", str(root), "rev-parse", "--verify", cfg.base + "^{commit}"],
+                              check=True, capture_output=True, text=True).stdout.strip()
+        record(replace(cfg, base=base), root)
+        return
+    if cfg.hand and not cfg.base:
+        fail(SCRIPT, "hand edits replay on a base: give base")
     totals: dict[str, dict[str, int]] = {}
     report: list[str] = []
     for crate in cfg.crates:
-        base = root / crate
         counts = totals.setdefault(crate, {"files": 0, "hand": 0, "string": 0, "comment": 0})
-        files = [base / "Cargo.toml"] + sorted(
-            p for p in base.rglob("*.rs") if "target" not in p.relative_to(base).parts
-        )
-        for path in files:
-            text = path.read_text()
-            if path.name == "Cargo.toml":
-                new, left = migrate_manifest(text)
+        sources = git_files(root, cfg.base, crate) if cfg.base else work_files(root, crate)
+        recorded: dict[str, dict[str, object]] = {}
+        if cfg.hand and (path := hand_path(cfg.hand, root, crate)).exists():
+            recorded = {it["path"]: it for it in json.loads(path.read_text())["files"]}
+        for rel in sorted(set(sources) | set(recorded)):
+            entry = recorded.get(rel, {})
+            target = root / rel
+            if entry.get("delete"):
+                counts["files"] += 1
+                if cfg.write and target.exists():
+                    target.unlink()
+                continue
+            if "create" in entry:
+                new, left = str(entry["create"]), scan(str(entry["create"]), False)
             else:
-                result = migrate(text)
-                new, left = result.text, result.left
-            rel = path.relative_to(root).as_posix()
-            if new != text:
+                new, left = mechanical(rel, sources[rel])
+                if "edits" in entry:
+                    new = replay(rel, new, entry["edits"])  # type: ignore[arg-type]
+                    left = scan(new, False) if not rel.endswith("Cargo.toml") else migrate_manifest(new)[1]
+            old = target.read_text() if target.exists() else ""
+            if new != old:
                 counts["files"] += 1
                 if cfg.write:
-                    path.write_text(new)
+                    target.parent.mkdir(parents=True, exist_ok=True)
+                    target.write_text(new)
                 else:
                     sys.stdout.writelines(difflib.unified_diff(
-                        text.splitlines(keepends=True), new.splitlines(keepends=True), f"a/{rel}", f"b/{rel}"))
+                        old.splitlines(keepends=True), new.splitlines(keepends=True), f"a/{rel}", f"b/{rel}"))
             lines = new.split("\n")
             for it in sorted(left, key=lambda it: (it.line, it.kind)):
                 counts[it.kind] += 1
@@ -503,9 +707,9 @@ def main() -> None:
     print("\n# left by salsa_to_query.py")
     for line in report:
         print(line)
-    print("\n# per crate: files rewritten, hand, string, comment")
+    print("\n# per crate: files changed, hand, string, comment")
     for crate, c in totals.items():
-        print(f"{crate}: {c['files']} rewritten, {c['hand']} hand, {c['string']} string, {c['comment']} comment")
+        print(f"{crate}: {c['files']} changed, {c['hand']} hand, {c['string']} string, {c['comment']} comment")
     sys.exit(1 if report else 0)
 
 

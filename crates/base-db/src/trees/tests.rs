@@ -1,7 +1,7 @@
 use std::{cell::Cell, panic, sync::Arc as StdArc};
 
 use blaze_bytes::Bytes;
-use salsa::Durability;
+use blaze_query::db::Durability;
 use span::Edition;
 use syntax::{FlatTree, SourceFile};
 use triomphe::Arc;

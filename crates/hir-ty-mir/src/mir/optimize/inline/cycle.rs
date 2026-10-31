@@ -10,7 +10,7 @@ use base_db::Db;
 use hir_def::{FunctionId, HasModule, nameres::crate_def_map, signatures::FunctionSignature};
 use rustc_hash::{FxHashMap, FxHashSet};
 use rustc_type_ir::inherent::GenericArgs as _;
-use salsa::{SalsaValue, plumbing::AsId};
+use blaze_query::db::AsId;
 use smallvec::SmallVec;
 
 use crate::{
@@ -48,7 +48,7 @@ fn callees_of(body: &MirBody<'_>) -> Vec<(FunctionId, StoredGenericArgs)> {
     callees
 }
 
-#[salsa::tracked(returns(ref))]
+#[blaze_query::tracked(returns(ref))]
 pub(super) fn inliner_callees_of_fn(
     db: &Db,
     func: FunctionId,
@@ -59,7 +59,7 @@ pub(super) fn inliner_callees_of_fn(
     }
 }
 
-#[salsa::tracked(returns(ref))]
+#[blaze_query::tracked(returns(ref))]
 pub(super) fn inliner_callees_of_closure<'db>(
     db: &'db Db,
     closure: InternedClosureId<'db>,
@@ -90,13 +90,13 @@ pub(super) struct Walked<B: Eq + Hash> {
 }
 
 /// [`Walked`] of the bodies of the root's crate, each list sorted by [`key`].
-#[derive(Debug, PartialEq, Eq, SalsaValue)]
+#[derive(Debug, PartialEq, Eq, blaze_query::Value)]
 pub(super) struct Callgraph<'db> {
     cyclic: Vec<InlinedBody<'db>>,
     reached: Vec<InlinedBody<'db>>,
 }
 
-fn key(body: &InlinedBody<'_>) -> (bool, salsa::Id) {
+fn key(body: &InlinedBody<'_>) -> (bool, blaze_query::db::Id) {
     match *body {
         InlinedBody::Fn(func) => (false, func.as_id()),
         InlinedBody::Closure(closure) => (true, closure.as_id()),
@@ -127,7 +127,7 @@ impl<'db> Callgraph<'db> {
     }
 }
 
-#[salsa::tracked(returns(ref))]
+#[blaze_query::tracked(returns(ref))]
 pub(super) fn callgraph_cyclic_fn<'db>(
     db: &'db Db,
     root: FunctionId,
@@ -135,7 +135,7 @@ pub(super) fn callgraph_cyclic_fn<'db>(
     cyclic(db, InlinedBody::Fn(root))
 }
 
-#[salsa::tracked(returns(ref))]
+#[blaze_query::tracked(returns(ref))]
 pub(super) fn callgraph_cyclic_closure<'db>(
     db: &'db Db,
     root: InternedClosureId<'db>,

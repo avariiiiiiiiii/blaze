@@ -15,7 +15,6 @@ use rustc_type_ir::{
         AdtDef as _, GenericArgs as _, IntoKind, ParamEnv as _, SliceLike as _,
     },
 };
-use salsa::SalsaValue;
 
 use hir_ty::{
     db::HirDatabase,
@@ -604,7 +603,7 @@ fn expand<'db>(
 /// the ADT is dropped, which is also what keeps two ADTs that hold each other from asking each
 /// other. Once per ADT, so a body that drops a `Value` instantiates what that leaves rather
 /// than every field of every variant.
-#[derive(Debug, Clone, PartialEq, Eq, Default, SalsaValue)]
+#[derive(Debug, Clone, PartialEq, Eq, Default, blaze_query::Value)]
 struct DropConstraint {
     /// The lifetimes its `Drop` impl uses.
     regions: Vec<StoredRegion>,
@@ -614,7 +613,7 @@ struct DropConstraint {
     tys: Vec<StoredTy>,
 }
 
-#[salsa::tracked(returns(ref), cycle_result = drop_constraint_cycle)]
+#[blaze_query::tracked(returns(ref), cycle_result = drop_constraint_cycle)]
 fn drop_constraint(db: &Db, adt: AdtId) -> DropConstraint {
     blaze_mem::frame::task(blaze_mem::Tag::Mir, |frame| {
         let interner = DbInterner::new_no_crate(db);
@@ -660,7 +659,7 @@ fn drop_constraint(db: &Db, adt: AdtId) -> DropConstraint {
 }
 
 /// An ADT that holds itself by value has no size and no answer.
-fn drop_constraint_cycle(_db: &Db, _: salsa::Id, _adt: AdtId) -> DropConstraint {
+fn drop_constraint_cycle(_db: &Db, _: blaze_query::db::Id, _adt: AdtId) -> DropConstraint {
     DropConstraint::default()
 }
 

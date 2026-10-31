@@ -27,7 +27,7 @@ use hir_expand::proc_macro::{CrateProcMacros, ProcMacro, ProcMacros};
 use hir_ty_mir::const_macro::{CONST_AST, CONST_AST_NAME};
 use intern::Symbol;
 use rustc_hash::FxHashMap;
-use salsa::{Durability, Setter};
+use blaze_query::db::{Durability, Setter};
 use span::Edition;
 use triomphe::Arc;
 

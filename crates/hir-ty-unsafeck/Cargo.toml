@@ -14,7 +14,7 @@ doctest = false
 
 [dependencies]
 either.workspace = true
-salsa.workspace = true
+blaze-query.workspace = true
 
 rustc_type_ir.workspace = true
 

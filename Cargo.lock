@@ -101,6 +101,7 @@ dependencies = [
  "blaze-ids",
  "blaze-lint-defs",
  "blaze-mem",
+ "blaze-query",
  "blaze-vfs",
  "cfg",
  "hashbrown 0.17.1",
@@ -111,7 +112,6 @@ dependencies = [
  "la-arena",
  "paths",
  "rustc-hash",
- "salsa",
  "semver",
  "smallvec",
  "span",
@@ -277,7 +277,6 @@ dependencies = [
  "paths",
  "proc-macro-api",
  "rustc-hash",
- "salsa",
  "semver",
  "serde",
  "serde_json",
@@ -433,7 +432,6 @@ dependencies = [
  "rustc_abi",
  "rustc_apfloat",
  "rustc_type_ir",
- "salsa",
  "serde",
  "serde_json",
  "smallvec",
@@ -697,6 +695,7 @@ dependencies = [
  "blaze-ids",
  "blaze-items",
  "blaze-mem",
+ "blaze-query",
  "blaze-vfs",
  "either",
  "hir",
@@ -704,7 +703,6 @@ dependencies = [
  "hir-expand",
  "memchr",
  "rustc-hash",
- "salsa",
  "syntax",
 ]
 
@@ -728,7 +726,6 @@ dependencies = [
  "la-arena",
  "rustc-hash",
  "rustc_type_ir",
- "salsa",
  "smallvec",
  "span",
  "syntax",
@@ -754,7 +751,6 @@ dependencies = [
  "rustc-hash",
  "rustc_abi",
  "rustc_type_ir",
- "salsa",
  "serde",
  "smallvec",
  "span",
@@ -820,6 +816,7 @@ dependencies = [
  "blaze-alloc-count",
  "blaze-diagnostics",
  "blaze-phf",
+ "blaze-query",
  "cfg",
  "either",
  "expect-test",
@@ -833,7 +830,6 @@ dependencies = [
  "memchr",
  "rustc-hash",
  "rustc_type_ir",
- "salsa",
  "serde",
  "serde_json",
  "span",
@@ -866,7 +862,6 @@ dependencies = [
  "intern",
  "proc-macro-api",
  "rustc-hash",
- "salsa",
  "span",
  "toml",
  "triomphe",
@@ -901,7 +896,6 @@ dependencies = [
  "proc-macro-api",
  "ra-ap-rustc_lexer",
  "rustc-hash",
- "salsa",
  "serde",
  "serde_json",
  "span",
@@ -1321,6 +1315,7 @@ name = "blaze-wasm-pack"
 version = "0.0.0"
 dependencies = [
  "base-db",
+ "blaze-query",
  "cfg",
  "hir",
  "hir-expand",
@@ -1365,12 +1360,6 @@ dependencies = [
  "bytes",
  "cfg_aliases",
 ]
-
-[[package]]
-name = "boxcar"
-version = "0.2.14"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "36f64beae40a84da1b4b26ff2761a5b895c12adc41dc25aaee1c4f2bbfe97a6e"
 
 [[package]]
 name = "bumpalo"
@@ -1743,15 +1732,6 @@ name = "crossbeam-epoch"
 version = "0.9.18"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "5b82ac4a3c2ca9c3460964f020e1402edd5753411d7737aa39c3714ad1b5420e"
-dependencies = [
- "crossbeam-utils",
-]
-
-[[package]]
-name = "crossbeam-queue"
-version = "0.3.12"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0f58bbc28f91df819d0aa2a2c00cd19754769c2fad90579b3592b1c9ba7a3115"
 dependencies = [
  "crossbeam-utils",
 ]
@@ -2158,20 +2138,9 @@ version = "0.17.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ed5909b6e89a2db4456e54cd5f673791d7eca6732202bbf2a9cc504fe2f9b84a"
 dependencies = [
- "allocator-api2",
- "equivalent",
  "foldhash 0.2.0",
  "serde",
  "serde_core",
-]
-
-[[package]]
-name = "hashlink"
-version = "0.12.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a5081f264ed7adee96ea4b4778b6bb9da0a7228b084587aa3bd3ff05da7c5a3b"
-dependencies = [
- "hashbrown 0.17.1",
 ]
 
 [[package]]
@@ -2225,6 +2194,7 @@ dependencies = [
  "blaze-hashcons",
  "blaze-ids",
  "blaze-mem",
+ "blaze-query",
  "cfg",
  "either",
  "expect-test",
@@ -2241,7 +2211,6 @@ dependencies = [
  "la-arena",
  "rustc-hash",
  "rustc_type_ir",
- "salsa",
  "smallvec",
  "span",
  "stdx",
@@ -2283,7 +2252,6 @@ dependencies = [
  "rustc-hash",
  "rustc_abi",
  "rustc_apfloat",
- "salsa",
  "smallvec",
  "span",
  "stdx",
@@ -2306,6 +2274,7 @@ dependencies = [
  "blaze-ids",
  "blaze-mem",
  "blaze-phf",
+ "blaze-query",
  "blaze-vfs",
  "cfg",
  "cov-mark",
@@ -2316,7 +2285,6 @@ dependencies = [
  "mbe",
  "parser",
  "rustc-hash",
- "salsa",
  "smallvec",
  "span",
  "stdx",
@@ -2349,7 +2317,6 @@ dependencies = [
  "hir-ty-codegen",
  "hir-ty-share",
  "rustc-hash",
- "salsa",
  "serde",
  "serde_json",
  "syntax",
@@ -2364,13 +2331,13 @@ dependencies = [
  "blaze-ids",
  "blaze-lint-defs",
  "blaze-phf",
+ "blaze-query",
  "cfg",
  "hashbrown 0.17.1",
  "hir-def",
  "hir-expand",
  "intern",
  "rustc-hash",
- "salsa",
  "smallvec",
  "span",
  "syntax",
@@ -2413,7 +2380,6 @@ dependencies = [
  "rustc_apfloat",
  "rustc_next_trait_solver",
  "rustc_type_ir",
- "salsa",
  "serde",
  "serde_derive",
  "smallvec",
@@ -2437,6 +2403,7 @@ dependencies = [
  "blaze-format",
  "blaze-ids",
  "blaze-mem",
+ "blaze-query",
  "hir-def",
  "hir-expand",
  "hir-ty",
@@ -2447,7 +2414,6 @@ dependencies = [
  "ra-ap-rustc_ast_ir",
  "rustc-hash",
  "rustc_type_ir",
- "salsa",
  "smallvec",
  "syntax",
 ]
@@ -2465,6 +2431,7 @@ dependencies = [
  "blaze-ids",
  "blaze-items",
  "blaze-mem",
+ "blaze-query",
  "blaze-stencil",
  "cfg",
  "cranelift-codegen",
@@ -2491,7 +2458,6 @@ dependencies = [
  "rustc-stable-hash",
  "rustc_abi",
  "rustc_type_ir",
- "salsa",
  "serde",
  "serde_derive",
  "smallvec",
@@ -2510,6 +2476,7 @@ version = "0.0.0"
 dependencies = [
  "base-db",
  "blaze-alloc-count",
+ "blaze-query",
  "hir-def",
  "hir-expand",
  "hir-ty",
@@ -2518,7 +2485,6 @@ dependencies = [
  "ra-ap-rustc_pattern_analysis",
  "rustc_apfloat",
  "rustc_type_ir",
- "salsa",
  "smallvec",
  "stdx",
 ]
@@ -2533,6 +2499,7 @@ dependencies = [
  "blaze-hashcons",
  "blaze-ids",
  "blaze-mem",
+ "blaze-query",
  "blaze-rng",
  "blaze-units",
  "cfg",
@@ -2557,7 +2524,6 @@ dependencies = [
  "rustc_apfloat",
  "rustc_next_trait_solver",
  "rustc_type_ir",
- "salsa",
  "smallvec",
  "span",
  "stdx",
@@ -2578,6 +2544,7 @@ dependencies = [
  "blaze-item-hash",
  "blaze-items",
  "blaze-mem",
+ "blaze-query",
  "either",
  "hir-def",
  "hir-expand",
@@ -2587,7 +2554,6 @@ dependencies = [
  "intern",
  "rustc-hash",
  "rustc_type_ir",
- "salsa",
  "smallvec",
 ]
 
@@ -2599,6 +2565,7 @@ dependencies = [
  "blaze-alloc-count",
  "blaze-ids",
  "blaze-items",
+ "blaze-query",
  "either",
  "hegeltest",
  "hir-def",
@@ -2608,7 +2575,6 @@ dependencies = [
  "rustc-hash",
  "rustc_abi",
  "rustc_type_ir",
- "salsa",
  "smallvec",
 ]
 
@@ -2638,6 +2604,7 @@ name = "hir-ty-unsafeck"
 version = "0.0.0"
 dependencies = [
  "base-db",
+ "blaze-query",
  "either",
  "hir-def",
  "hir-expand",
@@ -2645,7 +2612,6 @@ dependencies = [
  "hir-ty",
  "hir-ty-mir",
  "rustc_type_ir",
- "salsa",
  "span",
  "syntax",
  "test-utils",
@@ -2659,6 +2625,7 @@ dependencies = [
  "blaze-alloc-count",
  "blaze-format",
  "blaze-mem",
+ "blaze-query",
  "hir-def",
  "hir-expand",
  "hir-ty",
@@ -2666,7 +2633,6 @@ dependencies = [
  "intern",
  "la-arena",
  "rustc_type_ir",
- "salsa",
  "smallvec",
 ]
 
@@ -2952,15 +2918,6 @@ dependencies = [
  "blaze-mem",
  "blaze-phf",
  "rustc-hash",
-]
-
-[[package]]
-name = "intrusive-collections"
-version = "0.10.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "80e165935eba36cb526af8389effd2005a741adcbb6ed32106cc68e3f7b92960"
-dependencies = [
- "memoffset",
 ]
 
 [[package]]
@@ -3952,49 +3909,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "salsa"
-version = "0.28.5"
-dependencies = [
- "blaze-format",
- "blaze-ids",
- "blaze-image",
- "blaze-mem",
- "boxcar",
- "crossbeam-queue",
- "crossbeam-utils",
- "hashbrown 0.17.1",
- "hashlink",
- "indexmap",
- "intern",
- "intrusive-collections",
- "inventory",
- "parking_lot",
- "portable-atomic",
- "rayon",
- "rustc-hash",
- "salsa-macro-rules",
- "salsa-macros",
- "smallvec",
- "thin-vec",
- "tracing",
- "triomphe",
- "typeid",
-]
-
-[[package]]
-name = "salsa-macro-rules"
-version = "0.28.5"
-
-[[package]]
-name = "salsa-macros"
-version = "0.28.5"
-dependencies = [
- "proc-macro2",
- "quote",
- "syn 3.0.3",
-]
-
-[[package]]
 name = "schannel"
 version = "0.1.30"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4263,8 +4177,8 @@ dependencies = [
  "blaze-format",
  "blaze-ids",
  "blaze-mem",
+ "blaze-query",
  "rustc-hash",
- "salsa",
  "stdx",
  "syntax",
  "text-size",
@@ -4724,10 +4638,6 @@ name = "triomphe"
 version = "0.1.17"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0d15f4f5898bcfc5d8a8e45ed30b2f108d710c1a2e5489dbf80e078f707181bc"
-dependencies = [
- "serde",
- "stable_deref_trait",
-]
 
 [[package]]
 name = "try-lock"

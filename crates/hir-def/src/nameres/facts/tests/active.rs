@@ -3,14 +3,14 @@
 //! The crate of [`fixture`] has fifty modules: the root; `leaf`, whose chain of path macros
 //! adds one item a round (`One` at round 1, `Two` at 2, `Three` at 3); `m1` to `m4`, which
 //! import `leaf::Two`; and `m5` to `m48`, which read nothing of `leaf`. Each test collects the
-//! crate cold, reads which resolver queries ran at round 2 off salsa's `WillExecute` events,
+//! crate cold, reads which resolver queries ran at round 2 off the query database's `WillExecute` events,
 //! and checks the map against the old collector's.
 
 use std::fmt::Write as _;
 
 use base_db::Db;
 use rustc_hash::FxHashSet;
-use salsa::plumbing::FromId;
+use blaze_query::db::FromId;
 
 use super::{Exempt, compare_db, fixture_db, new_crate_local_def_map};
 use crate::{
@@ -48,13 +48,14 @@ fn fixture() -> String {
 }
 
 /// The queries `f` executed: each ingredient's name and its key's id.
-fn executed(db: &TestDB, f: impl FnOnce()) -> Vec<(String, salsa::Id)> {
+fn executed(db: &TestDB, f: impl FnOnce()) -> Vec<(String, blaze_query::db::Id)> {
     db.log_in_read_order(f)
         .into_iter()
         .filter_map(|event| match event.kind {
-            salsa::EventKind::WillExecute { database_key } => Some((
-                salsa::Database::ingredient_debug_name(db, database_key.ingredient_index())
-                    .to_string(),
+            blaze_query::db::EventKind::WillExecute { database_key } => Some((
+                blaze_query::db::Database::storage(db)
+                    .ingredient_name(database_key.ingredient_index())
+                    .to_owned(),
                 database_key.key_index(),
             )),
             _ => None,
@@ -69,7 +70,7 @@ fn name(db: &Db, module: ModuleId) -> String {
 
 /// The modules whose `query` ran for round `round`: its key's module (a component's anchor
 /// for `scc_state`).
-fn ran_at(db: &TestDB, events: &[(String, salsa::Id)], query: &str, round: u32) -> FxHashSet<String> {
+fn ran_at(db: &TestDB, events: &[(String, blaze_query::db::Id)], query: &str, round: u32) -> FxHashSet<String> {
     events
         .iter()
         .filter(|(it, _)| it == query)

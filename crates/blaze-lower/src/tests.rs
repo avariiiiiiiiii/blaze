@@ -610,6 +610,30 @@ fn a_refresh_reads_the_view_again_and_no_fixed_mount() {
 }
 
 #[test]
+fn a_refresh_seeds_once_in_its_write_and_a_refused_seed_is_its_error() {
+    let units = units();
+    let tree = MemTree::default();
+    let more: &'static [u8] = b"pub fn more() -> u8 { 1 }\n";
+    let root = changed(&tree, &[("a/src/more.rs", Some(more))]);
+    let config = config(root, library(&MemTree::default()));
+    let lower = || Lower { units: &units, config: &config, files: &tree, root, host_cpu: None };
+    let mut built = lowered(&units).unwrap();
+    let mut seeded = 0;
+    let refreshed = built.lowered.refresh(lower(), |_| {
+        seeded += 1;
+        Ok(())
+    });
+    assert_eq!((refreshed, seeded), (Ok(true), 1));
+    let again = built.lowered.refresh(lower(), |_| panic!("seeded with no text written"));
+    assert_eq!(again, Ok(true), "the view did not move");
+
+    let mut built = lowered(&units).unwrap();
+    let refused = crate::LowerError { what: "the edit's parse was not taken".to_owned(), at: Some("/w/a/src/more.rs".to_owned()) };
+    let error = built.lowered.refresh(lower(), |_| Err(refused.clone()));
+    assert_eq!(error, Err(refused));
+}
+
+#[test]
 fn a_refresh_refuses_a_root_file_gone_and_leaves_a_new_workspace_root_to_lower() {
     let units = units();
     let tree = MemTree::default();

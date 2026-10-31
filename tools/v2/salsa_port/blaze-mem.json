@@ -1,0 +1,19 @@
+{
+ "crate": "crates/blaze-mem",
+ "base": "adc8bbbf04a20c189070000982f22445be80764f",
+ "files": [
+  {
+   "path": "crates/blaze-mem/src/swiss.rs",
+   "edits": [
+    {
+     "old": "//! \"interner and memo lookups\"): `intern`'s arena store and mapped index, and salsa's interned\n//! key map and query node map. `intern` re-exports it as `intern::swiss`; it lives here, a\n//! leaf every table's crate already depends on, so salsa and `blaze-ids` reach it without\n",
+     "new": "//! \"interner and memo lookups\"): `intern`'s arena store and mapped index, and the query engine's\n//! interned key map. `intern` re-exports it as `intern::swiss`; it lives here, a\n//! leaf every table's crate already depends on, so `blaze-query` and `blaze-ids` reach it without\n"
+    },
+    {
+     "old": "    /// The copies this module replaced (`intern`'s arena and mapped index, salsa's interned\n    /// table and node map), as the spec: the subtraction trick, whose borrow may also flag the\n    /// byte above a match, filtered by comparing the byte.\n",
+     "new": "    /// The copies this module replaced (`intern`'s arena and mapped index, the old query\n    /// engine's interned table and node map), as the spec: the subtraction trick, whose borrow\n    /// may also flag the byte above a match, filtered by comparing the byte.\n"
+    }
+   ]
+  }
+ ]
+}

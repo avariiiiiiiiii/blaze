@@ -1,0 +1,81 @@
+{
+ "crate": "crates/hir-ty-mir",
+ "base": "adc8bbbf04a20c189070000982f22445be80764f",
+ "files": [
+  {
+   "path": "crates/hir-ty-mir/src/mir/budget.rs",
+   "edits": [
+    {
+     "old": "//! salsa, so a test can count what one step allocates.\n",
+     "new": "//! the query database, so a test can count what one step allocates.\n"
+    },
+    {
+     "old": "/// What `mir_body_query` builds for `def`, without salsa.\n",
+     "new": "/// What `mir_body_query` builds for `def`, without the query database.\n"
+    }
+   ]
+  },
+  {
+   "path": "crates/hir-ty-mir/src/mir/location.rs",
+   "edits": [
+    {
+     "old": "            db.synthetic_write(blaze_query::db::Durability::HIGH);\n",
+     "new": "            db.storage_mut().synthetic_write(blaze_query::db::Durability::HIGH);\n"
+    },
+    {
+     "old": "        db.report_untracked_read();\n",
+     "new": "        blaze_query::db::report_untracked_read(db);\n"
+    }
+   ]
+  },
+  {
+   "path": "crates/hir-ty-mir/src/mir/lower.rs",
+   "edits": [
+    {
+     "old": "#[blaze_query::tracked(returns(as_ref))]\n",
+     "new": "#[blaze_query::tracked(returns(as_ref), lru = 0)]\n"
+    }
+   ]
+  },
+  {
+   "path": "crates/hir-ty-mir/src/mir/monomorphization.rs",
+   "edits": [
+    {
+     "old": "#[blaze_query::tracked(returns(as_ref))]\n",
+     "new": "#[blaze_query::tracked(returns(as_ref), lru = 0)]\n"
+    }
+   ]
+  },
+  {
+   "path": "crates/hir-ty-mir/src/mir/transform.rs",
+   "edits": [
+    {
+     "old": "#[blaze_query::tracked(returns(as_ref))]\n",
+     "new": "#[blaze_query::tracked(returns(as_ref), lru = 0)]\n"
+    }
+   ]
+  },
+  {
+   "path": "crates/hir-ty-mir/src/tests.rs",
+   "edits": [
+    {
+     "old": "fn salsa_bug() {\n",
+     "new": "fn query_cycle_bug() {\n"
+    }
+   ]
+  },
+  {
+   "path": "crates/hir-ty-mir/src/tests/incremental.rs",
+   "edits": [
+    {
+     "old": "use blaze_query::db::EventKind;\n",
+     "new": "use blaze_query::db::{Database as _, EventKind};\n"
+    },
+    {
+     "old": "                EventKind::WillExecute { database_key } => Some(\n                    salsa::Database::ingredient_debug_name(db, database_key.ingredient_index())\n                        .into_owned(),\n                ),\n",
+     "new": "                EventKind::WillExecute { database_key } => {\n                    Some(db.storage().ingredient_name(database_key.ingredient_index()).to_owned())\n                }\n"
+    }
+   ]
+  }
+ ]
+}

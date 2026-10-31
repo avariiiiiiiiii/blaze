@@ -14,7 +14,7 @@ doctest = false
 
 [dependencies]
 la-arena.workspace = true
-salsa.workspace = true
+blaze-query.workspace = true
 rustc-hash.workspace = true
 hashbrown.workspace = true
 smallvec.workspace = true

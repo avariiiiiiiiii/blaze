@@ -38,7 +38,7 @@ const BOTH: &str = concat!(line!(), \":\",\tcolumn!());
 ";
 
 /// The queries that build a body's source map.
-const MAP_QUERIES: [&str; 2] = ["Body::relative_", "Body::with_source_map_"];
+const MAP_QUERIES: [&str; 2] = ["Body::relative", "Body::with_source_map"];
 
 #[track_caller]
 fn assert_no_map(executed: &[String]) {
@@ -94,7 +94,7 @@ fn lowering_a_body_builds_no_source_map() {
             db.optimized_mir_body(func.into(), MirOptions::at(MirOptLevel::Debug))
                 .unwrap_or_else(|error| panic!("the optimized MIR of `add`: {error:?}"));
         });
-        assert!(executed.iter().any(|it| it == "Body::of_"), "{executed:#?}");
+        assert!(executed.iter().any(|it| it == "Body::of"), "{executed:#?}");
         assert_no_map(&executed);
     });
 }

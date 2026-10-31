@@ -323,7 +323,7 @@ fn a_warm_shape_allocates_nothing() {
 }
 
 /// Preparing an instance again takes fewer of the global allocator's blocks than the first
-/// time, and its frame is used. The rest is Cranelift's IR, salsa's results and the prepared
+/// time, and its frame is used. The rest is Cranelift's IR, the queries' results and the prepared
 /// function, which it keeps: no prepare can take none.
 #[test]
 fn a_warm_prepare_takes_its_tables_from_its_frame() {

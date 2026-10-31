@@ -78,7 +78,7 @@ impl Span {
         }
         // Differing context, we can't merge these so prefer the one that's root
         if self.ctx != other.ctx {
-            #[cfg(feature = "salsa")]
+            #[cfg(feature = "query")]
             if self.ctx.is_root() {
                 return Some(other);
             } else if other.ctx.is_root() {
@@ -246,8 +246,11 @@ impl EditionedFileId {
     }
 }
 
-#[cfg(not(feature = "salsa"))]
-mod salsa {
+#[cfg(feature = "query")]
+use blaze_query::db as query;
+
+#[cfg(not(feature = "query"))]
+mod query {
     #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
     pub struct Id(u32);
 }
@@ -266,13 +269,13 @@ mod salsa {
 /// (`MacroCallId` uses the location interning. You can check details here:
 /// <https://en.wikipedia.org/wiki/String_interning>).
 ///
-/// Internally this holds a `salsa::Id`, but we cannot use this definition here
+/// Internally this holds a `blaze_query::db::Id`, but we cannot use this definition here
 /// as it references things from base-db and hir-expand.
 // FIXME: Give this a better fitting name
 #[derive(Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
-pub struct HirFileId(pub salsa::Id);
+pub struct HirFileId(pub query::Id);
 
 /// `MacroCallId` identifies a particular macro invocation, like
 /// `println!("Hello, {}", world)`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct MacroCallId(pub salsa::Id);
+pub struct MacroCallId(pub query::Id);

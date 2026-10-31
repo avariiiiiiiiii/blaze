@@ -1,10 +1,11 @@
 //! The front end's one database, [`Db`]: every query of every front-end crate takes `&Db`.
 //!
 //! The type is declared here, in the lowest front-end crate, so that each crate above can name
-//! it: `hir-expand`, `hir-def`, `hir-ty` and the rest declare their queries as salsa tracked
+//! it: `hir-expand`, `hir-def`, `hir-ty` and the rest declare their queries as tracked
 //! functions over `&Db`, and a call to one is a static call whose memo hit inlines into the
-//! caller (docs/v2/plan/lanes/frontend/db.md). salsa registers each crate's ingredients by
-//! type when the storage is made, so this crate names none of them. A query whose code lives
+//! caller (docs/v2/plan/lanes/frontend/db.md). Each ingredient is a `static` of the crate that
+//! declares it, which the storage numbers when it is first used, so this crate names none of
+//! them. A query whose code lives
 //! above the crate that declares it is declared where its key and value types are, and its
 //! body is a provider the crate above installs (rustc's `Providers`); its memo hit is static
 //! all the same.
@@ -24,7 +25,7 @@ use std::{
 };
 
 use blaze_mem::{Tag, frame, scratch};
-use salsa::Durability;
+use blaze_query::db::Durability;
 use span::{FileId, TextSize};
 use triomphe::Arc;
 use crate::{AbsPath, AbsPathBuf, AnchoredPath, VfsPath};
@@ -42,15 +43,14 @@ use crate::{
 ///
 /// It has no `Default`: a build's is [`Db::new`] and a test's [`Db::for_tests`], and which one
 /// is never left to a default. A crate's tests name it `TestDB` (`type TestDB = Db;`), so that
-/// salsa's accessors, generic over the database, take `&TestDB` as they take `&Db`.
-#[salsa::db]
+/// the engine's accessors, generic over the database, take `&TestDB` as they take `&Db`.
 pub struct Db {
-    storage: salsa::Storage<Db>,
+    storage: blaze_query::db::Storage,
     files: Arc<Files>,
     crates_map: Arc<CratesMap>,
     nonce: Nonce,
     run: Run,
-    /// The events salsa reports, kept only while [`Db::log`] runs; `None` but in a database
+    /// The events the query engine reports, kept only while [`Db::log`] runs; `None` but in a database
     /// made by [`Db::for_tests`].
     log: Option<std::sync::Arc<EventLog>>,
     /// The maintainers' state and the writes they have yet to see ([`crate::maintain`]).
@@ -96,11 +96,11 @@ pub fn set_run_order(order: RunOrder) -> RunOrder {
 #[derive(Default)]
 struct EventLog {
     active: AtomicBool,
-    events: Mutex<Option<Vec<salsa::Event>>>,
+    events: Mutex<Option<Vec<blaze_query::db::Event>>>,
 }
 
 impl EventLog {
-    fn record(&self, f: impl FnOnce()) -> Vec<salsa::Event> {
+    fn record(&self, f: impl FnOnce()) -> Vec<blaze_query::db::Event> {
         *self.events.lock().unwrap_or_else(|it| it.into_inner()) = Some(Vec::new()); // alloc: tests only
         self.active.store(true, Ordering::Release);
         f();
@@ -124,7 +124,7 @@ impl Db {
         Db::with(Run::Pool, None)
     }
 
-    /// A build's database ([`Db::new`]) that keeps salsa's events while [`Db::log`] runs: for
+    /// A build's database ([`Db::new`]) that keeps the query engine's events while [`Db::log`] runs: for
     /// a harness that counts what a request of a real build executes (`crates/hir-firewall`).
     /// A build never makes one: each event takes a lock.
     pub fn logged() -> Db {
@@ -133,13 +133,13 @@ impl Db {
     }
 
     /// A database for tests: its batches run on the calling thread in this thread's
-    /// [`RunOrder`], it keeps salsa's events while [`Db::log`] runs, and it has empty library
+    /// [`RunOrder`], it keeps the query engine's events while [`Db::log`] runs, and it has empty library
     /// and local roots and an empty crate graph, as a fixture expects to find them.
     pub fn for_tests() -> Db {
         let log = std::sync::Arc::new(EventLog::default()); // alloc: a test database's setup
         let mut db = Db::with(Run::Here, Some(log));
-        _ = LibraryRoots::builder(Default::default()).durability(Durability::MEDIUM).new(&db);
-        _ = LocalRoots::builder(Default::default()).durability(Durability::MEDIUM).new(&db);
+        _ = LibraryRoots::builder(Default::default()).durability(Durability::MEDIUM).new(&mut db);
+        _ = LocalRoots::builder(Default::default()).durability(Durability::MEDIUM).new(&mut db);
         CrateGraphBuilder::default().set_in_db(&mut db);
         db
     }
@@ -148,8 +148,8 @@ impl Db {
         let traced = executions::traced();
         let callback = (log.is_some() || traced).then(|| {
             let log = log.clone(); // clone: an `Arc` of the test log, once per database
-            // alloc: setup, once per database: salsa's event hook
-            Box::new(move |event: salsa::Event| {
+            // alloc: setup, once per database: the engine's event hook
+            Box::new(move |_: &blaze_query::db::Storage, event: blaze_query::db::Event| {
                 if traced {
                     executions::record(&event);
                 }
@@ -160,10 +160,10 @@ impl Db {
                 {
                     events.push(event);
                 }
-            }) as Box<dyn Fn(salsa::Event) + Send + Sync> // dyn: salsa's event hook, set once at setup
+            }) as blaze_query::db::Hook
         });
         let mut db = Db {
-            storage: salsa::Storage::new(callback),
+            storage: blaze_query::db::Storage::new(callback),
             files: Default::default(),
             crates_map: Default::default(),
             nonce: Nonce::new(),
@@ -407,7 +407,7 @@ impl Db {
     /// thread, no thread of its own. A test database runs them here, in [`RunOrder`].
     ///
     /// Each task runs in a frame of its own, tagged `tag` (the caller's subsystem): its body
-    /// runs outside salsa's executor, and a task the pump runs on a waiting thread stays out of
+    /// runs outside the query engine's executor, and a task the pump runs on a waiting thread stays out of
     /// the waiting caller's frame.
     pub fn run_all<F: Fn(&Db, usize) + Sync>(&self, tag: Tag, count: usize, task: F) {
         if count == 0 {
@@ -415,7 +415,9 @@ impl Db {
         }
         let run = |db: &Db, at: usize| frame::task(tag, |_| task(db, at));
         match self.run {
-            Run::Pool => run_on_pool(self, blaze_graph::exec::shared(), count, &run),
+            Run::Pool => blaze_query::db::pump_barrier(|| {
+                run_on_pool(self, blaze_graph::exec::shared(), count, &run)
+            }),
             Run::Here => match RUN_ORDER.get() {
                 RunOrder::InOrder => (0..count).for_each(|at| run(self, at)),
                 RunOrder::Reversed => (0..count).rev().for_each(|at| run(self, at)),
@@ -433,8 +435,8 @@ impl Db {
     /// This database's nonce and the revision it is at: what tells a cached answer of another
     /// database or revision apart.
     #[inline]
-    pub fn nonce_and_revision(&self) -> (Nonce, salsa::Revision) {
-        (self.nonce, salsa::plumbing::ZalsaDatabase::zalsa(self).current_revision())
+    pub fn nonce_and_revision(&self) -> (Nonce, blaze_query::db::View) {
+        (self.nonce, self.storage.view())
     }
 
     /// The line and column of `offset` in `file`, both from 0, as rustc counts them (columns
@@ -456,27 +458,26 @@ impl Db {
     ///
     /// On a database not made by [`Db::for_tests`] or [`Db::logged`]: a build's keeps no
     /// events.
-    pub fn log(&self, f: impl FnOnce()) -> Vec<salsa::Event> {
+    pub fn log(&self, f: impl FnOnce()) -> Vec<blaze_query::db::Event> {
         let log = self.log.as_ref().expect("`Db::log` on a database made by neither `Db::for_tests` nor `Db::logged`");
         log.record(f)
     }
 
     /// [`Db::log`] of a write: `f` gets the database to set inputs on, so the events include
     /// what the write-side maintainers ran in it.
-    pub fn log_mut(&mut self, f: impl FnOnce(&mut Db)) -> Vec<salsa::Event> {
+    pub fn log_mut(&mut self, f: impl FnOnce(&mut Db)) -> Vec<blaze_query::db::Event> {
         // clone: one count of the log, tests only, so `f` can borrow the database.
         let log = self.log.clone().expect("`Db::log_mut` on a database made by neither `Db::for_tests` nor `Db::logged`");
         log.record(|| f(self))
     }
 
-    /// The names of the queries `f` executed, as salsa names them, in order.
+    /// The names of the queries `f` executed, as the query engine names them, in order.
     pub fn log_executed(&self, f: impl FnOnce()) -> Vec<String> {
         self.log(f)
             .into_iter()
             .filter_map(|event| match event.kind {
-                salsa::EventKind::WillExecute { database_key } => Some(
-                    salsa::Database::ingredient_debug_name(self, database_key.ingredient_index())
-                        .into_owned(),
+                blaze_query::db::EventKind::WillExecute { database_key } => Some(
+                    self.storage.ingredient_name(database_key.ingredient_index()).to_owned(),
                 ),
                 _ => None,
             })
@@ -490,13 +491,15 @@ impl fmt::Debug for Db {
     }
 }
 
-#[salsa::db]
-impl salsa::Database for Db {
-    /// The plane task this thread runs, from the pool's pump: a thread runs several tasks at
-    /// once, one above the other, and each has its own query stack.
+impl blaze_query::db::Database for Db {
     #[inline]
-    fn task_depth(&self) -> u32 {
-        u32::try_from(blaze_graph::pump::depth()).expect("a thread runs more than `u32::MAX` tasks")
+    fn storage(&self) -> &blaze_query::db::Storage {
+        &self.storage
+    }
+
+    #[inline]
+    fn storage_mut(&mut self) -> &mut blaze_query::db::Storage {
+        &mut self.storage
     }
 }
 
@@ -505,10 +508,10 @@ impl panic::RefUnwindSafe for Db {}
 /// [`Db::run_all`] on `pool`: each task is a job near this thread's group, reading `db` by
 /// reference, and the calling thread pump-waits for the batch ([`Pool::scope`]).
 ///
-/// A task that unwinds with [`salsa::Cancelled::WouldWaitOnItself`] asked for a query that a
+/// A task that unwinds with [`blaze_query::db::Cancelled::WouldWaitOnItself`] asked for a query that a
 /// task below it on its thread runs, which can't end before it does; it runs again in another
 /// round, once every task of this one has ended. A job's completion can't reach its scope, so
-/// the round is the way back. The first other panic, salsa's other cancellations included,
+/// the round is the way back. The first other panic, the engine's other cancellations included,
 /// goes on from here once its round is over, and nothing is run again after it.
 ///
 /// [`Pool::scope`]: blaze_graph::pool::Pool::scope
@@ -534,8 +537,8 @@ pub fn run_on_pool<F: Fn(&Db, usize) + Sync>(
                     move |ran| {
                         let Err(panic) = ran else { return };
                         let waited_on_itself = matches!(
-                            panic.downcast_ref::<salsa::Cancelled>(),
-                            Some(salsa::Cancelled::WouldWaitOnItself)
+                            panic.downcast_ref::<blaze_query::db::Cancelled>(),
+                            Some(blaze_query::db::Cancelled::WouldWaitOnItself)
                         );
                         if waited_on_itself {
                             again.lock().unwrap_or_else(|it| it.into_inner()).push(at);

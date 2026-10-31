@@ -1,7 +1,8 @@
 //! Whose a query's key is: the edited body's own, its file's, or another item's.
 //!
-//! A key is a salsa `Id`: a salsa struct a query takes alone, or the interned arguments of a
-//! query that takes several, whose fields list their ids ([`salsa::plumbing::Zalsa::ids_of`]).
+//! A key is a query database [`Id`]: an interned or input struct a query takes alone, or the
+//! interned arguments of a query that takes several, whose fields list their ids
+//! ([`blaze_query::db::Storage::ids_of`]).
 //! Each id is decoded by its ingredient: a closure, coroutine, opaque type or anonymous
 //! constant by the body it is written in, a block, block module or nested function by where
 //! its syntax is, a macro call by the body whose request first interned it, and a file and
@@ -15,10 +16,7 @@ use hir_ty::{
     db::{AnonConstId, InternedClosureId, InternedCoroutineClosureId, InternedCoroutineId, InternedOpaqueTyId},
 };
 use rustc_hash::FxHashMap;
-use salsa::{
-    Database as _, Id,
-    plumbing::{AsId, FromId, ZalsaDatabase as _},
-};
+use blaze_query::db::{AsId, Database as _, FromId, Id};
 use syntax::{AstNode, TextRange};
 
 /// How deep the fields of interned arguments are followed: a query's arguments, the
@@ -67,15 +65,15 @@ fn whose_at(db: &Db, interned: &Interned, edited: &Edited, id: Id, depth: u32, i
     if id == edited.def.as_id() {
         return Whose::Own;
     }
-    let zalsa = db.zalsa();
-    let name = db.ingredient_debug_name(zalsa.ingredient_index(id));
+    let storage = db.storage();
+    let name = storage.owner(id).map_or("", |it| storage.ingredient_name(it));
     let own = |yes: bool| if yes { Whose::Own } else { Whose::Other };
     // A closure or coroutine is the body's when it is written in it, or in an anonymous
     // constant of its expressions.
     let owned = |owner: InferBodyId<'_>| {
         own(owner.expression_store_owner(db) == ExpressionStoreOwnerId::Body(edited.def))
     };
-    match &*name {
+    match name {
         "InternedClosureId" => owned(InternedClosureId::from_id(id).loc(db).owner),
         "InternedCoroutineId" => owned(InternedCoroutineId::from_id(id).loc(db).owner),
         "InternedCoroutineClosureId" => owned(InternedCoroutineClosureId::from_id(id).loc(db).owner),
@@ -93,7 +91,7 @@ fn whose_at(db: &Db, interned: &Interned, edited: &Edited, id: Id, depth: u32, i
         _ if depth == 0 => Whose::Other,
         _ => {
             let start = ids.len();
-            zalsa.ids_of(id, ids);
+            storage.ids_of(id, ids);
             let mut found = Whose::Other;
             for at in start..ids.len() {
                 match whose_at(db, interned, edited, ids[at], depth - 1, ids) {

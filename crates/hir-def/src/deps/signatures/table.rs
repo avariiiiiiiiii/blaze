@@ -18,7 +18,7 @@
 use base_db::{Crate, Db};
 use blaze_format::{Aligned, FormatError, Persist, open_as};
 use hir_expand::MacroCallId;
-use salsa::plumbing::{AsId, FromId};
+use blaze_query::db::{AsId, FromId};
 use syntax::ast;
 
 use crate::{
@@ -26,7 +26,7 @@ use crate::{
     expr_store::{ExpressionStore, persist::StoreRoot},
     hir::{
         columns::ExprKind,
-        persist::{Kind, Relocation, syntax_context},
+        persist::{Kind, Relocation, entry_id, syntax_context},
     },
     nameres::{
         block_def_map,
@@ -37,7 +37,7 @@ use crate::{
 type R<T = ()> = Result<T, String>;
 
 fn id<T: FromId>(bits: u64) -> T {
-    T::from_id(salsa::Id::from_bits(bits))
+    T::from_id(entry_id(bits))
 }
 
 /// Appends to `out` the macro calls `table` names: what a record of it is made from beyond
@@ -103,7 +103,7 @@ fn block(enc: &mut Enc<'_>, db: &Db, table: &Relocation, index: usize, block: Bl
         // alloc: the reason of a corrupt image's panic, or of a part that fails.
         return Err("a block in a module of a block other than its root".to_owned());
     }
-    let outer = (Kind::Block, outer.as_id().as_bits());
+    let outer = (Kind::Block, u64::from(outer.as_id().as_u32()));
     let at = (table.entries()[..index].iter().position(|&it| it == outer))
         .ok_or("a block in a block the table names after it, or not at all")?;
     enc.u8(1);
@@ -152,7 +152,7 @@ pub(super) fn decode(db: &Db, krate: Crate, bytes: &[u8]) -> R<Relocation> {
 }
 
 fn bits(it: impl AsId) -> u64 {
-    it.as_id().as_bits()
+    u64::from(it.as_id().as_u32())
 }
 
 /// The bits of `def`, which must be of `kind`.

@@ -1,5 +1,5 @@
 //! The walk of a build script from its `main` (design sections 2 and 3): every instance it can
-//! run, each summarized once by [`summary`], a salsa query, so a callee shared by many scripts
+//! run, each summarized once by [`summary`], a query, so a callee shared by many scripts
 //! or reached many times is walked once.
 //!
 //! The walk is closed-world: it follows each call to what the code generator would call
@@ -54,7 +54,7 @@ use rustc_type_ir::{
         BoundExistentialPredicates as _, Clause as _, GenericArgs as _, IntoKind as _,
     },
 };
-use salsa::plumbing::{AsId, FromId};
+use blaze_query::db::{AsId, FromId};
 use smallvec::SmallVec;
 
 use crate::{
@@ -73,11 +73,11 @@ pub(crate) const LONGEST: usize = 256;
 pub(crate) enum Def {
     Fn(FunctionId),
     /// An `InternedClosureId`, without its database lifetime.
-    Closure(salsa::Id),
+    Closure(blaze_query::db::Id),
     /// An `InternedCoroutineId`: the `Future::poll` of an `async` block.
-    Coroutine(salsa::Id),
+    Coroutine(blaze_query::db::Id),
     /// The same of the future an `async` closure gives when called by value.
-    CoroutineByMove(salsa::Id),
+    CoroutineByMove(blaze_query::db::Id),
     Leaf(FunctionId, Leaf),
 }
 
@@ -142,7 +142,7 @@ pub fn main_of(db: &Db, krate: Crate) -> Option<FunctionId> {
 }
 
 /// Whether the build script whose `main` is `main` is pure, and its proof if it is.
-#[salsa::tracked(returns(ref))]
+#[blaze_query::tracked(returns(ref))]
 pub fn script_purity(db: &Db, main: FunctionId) -> Purity {
     let stored = ParamEnvAndCrate { param_env: ParamEnv::empty(), krate: main.krate(db) }.store();
     let cx = Cx::new(db, stored);
@@ -291,7 +291,7 @@ fn callees_of<'db>(
 
 /// What the instance does, in `env`. A cycle of instances starts from the empty summary and
 /// iterates to its fixpoint: each local's value only rises, in a lattice three high.
-#[salsa::tracked(returns(ref), cycle_initial = |_, _, _, _| Summary::default())]
+#[blaze_query::tracked(returns(ref), cycle_initial = |_, _, _, _| Summary::default())]
 pub(crate) fn summary(db: &Db, env: StoredParamEnvAndCrate, instance: Instance) -> Summary {
     let Some(body) = body_of(db, &env, &instance) else { return Summary::default() };
     match body {

@@ -2,7 +2,7 @@
 //! (docs/v2/plan/lanes/db/speed-of-light.md, "base-db: inputs and views"): a read allocates
 //! nothing, a view's unchanged file allocates nothing, and a changed file costs a constant.
 
-use salsa::Durability;
+use blaze_query::db::Durability;
 use span::Edition;
 use triomphe::Arc;
 use crate::{AbsPathBuf, FileId, FileSet, FileSetConfig, VfsPath};

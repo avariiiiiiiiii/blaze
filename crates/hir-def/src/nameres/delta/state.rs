@@ -1,4 +1,4 @@
-//! The maintainer's state per crate (design §6), outside salsa: what the last run of each group
+//! The maintainer's state per crate (design §6), outside the query database: what the last run of each group
 //! made, the view of every module the next run reads, and who read what.
 //!
 //! A *group* is a round-0 module and the modules its macro expansions declare, which are all

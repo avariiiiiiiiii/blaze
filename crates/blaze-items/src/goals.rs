@@ -24,7 +24,7 @@ use hir_ty::{
         goal_store::{FactRef, GoalFacts},
     },
 };
-use salsa::plumbing::{Id, SalsaStructInDb, ZalsaDatabase as _};
+use blaze_query::db::{Database as _, FromIdIn, Id};
 
 use crate::{Fact, ItemId, ItemKey, facts, key, table};
 
@@ -48,7 +48,7 @@ impl GoalFacts for Goals {
     fn fact_of(
         &self,
         db: &Db,
-        read: salsa::DatabaseKeyIndex,
+        read: blaze_query::db::DatabaseKeyIndex,
         name: &'static str,
     ) -> Option<FactRef> {
         Some(table::fact_ref(&fact_of_read(db, name, read.key_index())?))
@@ -60,7 +60,7 @@ impl GoalFacts for Goals {
 }
 
 /// A fact as the goal store keeps it, interned: the key of [`fact_value`].
-#[salsa::interned(debug, revisions = usize::MAX)]
+#[blaze_query::interned(debug)]
 pub struct FactRefKey<'db> {
     #[returns(copy)]
     pub fact: FactRef,
@@ -69,7 +69,7 @@ pub struct FactRefKey<'db> {
 /// The value of a fact now, `None` for parts that are no fact or a fact that cannot be hashed.
 /// One query, so that a body step that asks a value reads `fact_value` of that fact, never the
 /// queries the value is computed from: a reader of the step's reads names the fact exactly.
-#[salsa::tracked(returns(copy))]
+#[blaze_query::tracked(returns(copy))]
 pub fn fact_value<'db>(db: &'db Db, key: FactRefKey<'db>) -> Option<ContentId> {
     facts::value(db, &table::fact_of_ref(key.fact(db))?).ok()
 }
@@ -78,7 +78,7 @@ pub fn fact_value<'db>(db: &'db Db, key: FactRefKey<'db>) -> Option<ContentId> {
 /// is made, outside a goal's evaluation. Then the crates it loads, in order, by crate key:
 /// which crates' impls a `relevant_impls` read of it searches, which its `Implements` fact,
 /// covering every crate that can implement the trait, leaves out.
-#[salsa::tracked(returns(copy))]
+#[blaze_query::tracked(returns(copy))]
 fn goal_crate_key(db: &Db, krate: Crate) -> ContentId {
     let lang_items = lang_items(db, krate);
     let mut h = Hasher::new(GOAL_CRATE_DOMAIN);
@@ -96,8 +96,8 @@ fn goal_crate_key(db: &Db, krate: Crate) -> ContentId {
 }
 
 /// The fact a read of the query `name` (its ingredient's debug name) of `key` stands for. Each
-/// query here is keyed by one salsa struct, taken for one only when the key's page holds that
-/// struct, and returns part of an item's interface (its signature, bounds, fields, items,
+/// query here is keyed by one interned or input struct, taken for one only when the key's page
+/// holds that struct, and returns part of an item's interface (its signature, bounds, fields, items,
 /// variances, attribute flags: `crate::form`'s signature form), the hidden types of an item's
 /// `impl Trait`s, the crate's target, the impls of one trait for one simplified self type,
 /// whether an impl may specialize and what it specializes, or a dependency's batch, which
@@ -170,15 +170,15 @@ pub(crate) fn fact_of_read(db: &Db, name: &str, key: Id) -> Option<Fact> {
 }
 
 /// `key` as a `T`, if its page holds `T`s.
-fn arg<T: SalsaStructInDb>(db: &Db, key: Id) -> Option<T> {
-    T::cast(key, db.zalsa().lookup_page_type_id(key))
+fn arg<T: FromIdIn>(db: &Db, key: Id) -> Option<T> {
+    T::from_id_in(db.storage(), key)
 }
 
 /// The item whose interface `ItemBounds::of(key)` is part of: an associated type's trait, which
 /// hashes its items, another type alias itself, or the item an `impl Trait` is written in.
 fn bounds_owner(db: &Db, key: Id) -> Option<ItemId> {
-    let page = db.zalsa().lookup_page_type_id(key);
-    if let Some(alias) = TypeAliasId::cast(key, page) {
+    let storage = db.storage();
+    if let Some(alias) = TypeAliasId::from_id_in(storage, key) {
         return Some(match alias.lookup(db).container {
             ItemContainerId::TraitId(it) => ItemId::Trait(it),
             ItemContainerId::ModuleId(_)
@@ -186,7 +186,7 @@ fn bounds_owner(db: &Db, key: Id) -> Option<ItemId> {
             | ItemContainerId::ExternBlockId(_) => ItemId::Alias(alias),
         });
     }
-    let opaque = InternedOpaqueTyId::cast(key, page)?;
+    let opaque = InternedOpaqueTyId::from_id_in(storage, key)?;
     Some(key::opaque_of(db, opaque).0)
 }
 

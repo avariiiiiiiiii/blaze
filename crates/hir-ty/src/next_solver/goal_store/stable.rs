@@ -1,5 +1,5 @@
 //! A goal's stable form: `persist`'s words of its predicate and param env with each definition
-//! as its own variant and its item key ([`GoalFacts::def_key`]) where `persist` writes a salsa
+//! as its own variant and its item key ([`GoalFacts::def_key`]) where `persist` writes an
 //! ID, so the same goal has the same words in every database. Written either into a hash
 //! ([`goal_key`], a lookup, on the stack) or into words ([`goal_words`], an offer, into the
 //! thread's buffer).

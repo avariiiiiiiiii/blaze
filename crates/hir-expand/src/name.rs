@@ -93,7 +93,7 @@ impl Name {
     pub fn new(text: &str, mut ctx: SyntaxContext) -> Name {
         // For comparisons etc. we remove the edition, because sometimes we search for some `Name`
         // and we don't know which edition it came from.
-        // Can't do that for all `SyntaxContextId`s because it breaks Salsa.
+        // Can't do that for all `SyntaxContextId`s because it breaks the query engine.
         ctx.remove_root_edition();
         _ = ctx;
         let text = text.strip_prefix("r#").unwrap_or(text);
@@ -140,7 +140,7 @@ impl Name {
     ///
     /// Ideally, we want a `gensym` semantics for missing names -- each missing
     /// name is equal only to itself. It's not clear how to implement this in
-    /// salsa though, so we punt on that bit for a moment.
+    /// the query engine though, so we punt on that bit for a moment.
     #[inline]
     pub const fn missing() -> Name {
         Name { symbol: sym::MISSING_NAME, ctx: () }

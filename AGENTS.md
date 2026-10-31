@@ -23,13 +23,15 @@ then `bun tools/agents/rules.ts --write`). Skills: .agents/skills/.
    attributes, semantics) only has to work under blaze, never under rustc, as long as it is opt-in
    and every program that doesn't use it behaves exactly as under rustc. See
    [docs/no-rustc.md](docs/no-rustc.md).
-5. **useful-not-rustc-parity**: blaze's errors, warnings, lints and printed output are judged by how
-   useful they are, never by how closely they match rustc or cargo. Don't copy rustc's wording,
-   layout, error codes, ordering, closing lines or set of lints; don't add a check only because
-   rustc has one. A diagnostic is right when it catches the mistake, points at the code that causes
-   it, and says what is wrong and how to fix it. Tests assert those facts (reported or not, where,
-   the names and types involved), never rustc's text. This does not loosen `superset-of-rust`: a
-   program blaze builds still runs as it does under rustc.
+5. **useful-not-parity**: rustc and cargo are references, never specs. Judge everything blaze does by
+   how useful it is to the person or agent using it, not by how closely it matches them: errors,
+   warnings, lints, CLI commands and flags, printed and JSON output, progress, the target
+   directory's layout, file formats, caches, symbol names, debug info, what a build or test run does
+   and in what order. Match them only where real code or tools depend on it (a program's behavior, a
+   published crate's manifest, an editor reading the JSON); everywhere else pick the better design
+   and delete the copy. Tests check what makes the result useful and correct, never that it equals
+   rustc's or cargo's. `superset-of-rust` is unchanged: every program the pinned nightly builds
+   still builds and runs as it does under rustc.
 6. **own-nightly**: blaze is its own toolchain: it builds every project with its pinned nightly
    (`harness/toolchain`, bumped daily), ignoring rust-toolchain files, rustup, `RUSTUP_TOOLCHAIN`
    and `RUSTC`. Projects pin the blaze version, not Rust's. See

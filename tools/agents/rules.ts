@@ -50,9 +50,9 @@ export const rules = [
 		link: "docs/no-rustc.md",
 	},
 	{
-		id: "useful-not-rustc-parity",
-		info: "blaze's errors, warnings, lints and printed output are judged by how useful they are, never by how closely they match rustc or cargo. Don't copy rustc's wording, layout, error codes, ordering, closing lines or set of lints; don't add a check only because rustc has one. A diagnostic is right when it catches the mistake, points at the code that causes it, and says what is wrong and how to fix it. Tests assert those facts (reported or not, where, the names and types involved), never rustc's text. This does not loosen `superset-of-rust`: a program blaze builds still runs as it does under rustc.",
-		reason: "\"we dont need word for word ... be clear functional parity also not needed we care about usefulness just in general wrt rustc\" (Andrew, 2026-10-31). On 2026-10-31 166 of blaze-diagnostics' 1223 tests failed, most on text that differed from rustc's (`{integer}` against `i32`, a span one column off, a lint count) and not on whether the error was useful.",
+		id: "useful-not-parity",
+		info: "rustc and cargo are references, never specs. Judge everything blaze does by how useful it is to the person or agent using it, not by how closely it matches them: errors, warnings, lints, CLI commands and flags, printed and JSON output, progress, the target directory's layout, file formats, caches, symbol names, debug info, what a build or test run does and in what order. Match them only where real code or tools depend on it (a program's behavior, a published crate's manifest, an editor reading the JSON); everywhere else pick the better design and delete the copy. Tests check what makes the result useful and correct, never that it equals rustc's or cargo's. `superset-of-rust` is unchanged: every program the pinned nightly builds still builds and runs as it does under rustc.",
+		reason: "\"we dont need word for word ... be clear functional parity also not needed we care about usefulness just in general wrt rustc\" and \"make the rule MORE GENERAL than that not just errors\" (Andrew, 2026-10-31). On 2026-10-31 166 of blaze-diagnostics' 1223 tests failed, most on text that differed from rustc's (`{integer}` against `i32`, a span one column off, a lint count) and not on whether the error was useful. The plan's \"conformance only where real code depends on it\" (2fb77406fb) said this for behavior; this rule says it for everything.",
 	},
 	{
 		id: "own-nightly",

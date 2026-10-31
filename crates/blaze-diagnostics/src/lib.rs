@@ -1,6 +1,6 @@
 //! Compile errors and warnings (docs/v2/plan/process/building.md section 18; #1522, #1440, #780):
 //! computed from the front end's queries that found them, each with the facts it read. They
-//! are judged by usefulness, not by matching rustc (AGENTS.md `useful-not-rustc-parity`): an
+//! are judged by usefulness, not by matching rustc (AGENTS.md `useful-not-parity`): an
 //! error catches the mistake, points at the code that causes it, and says what is wrong and how
 //! to fix it. The modules below started as ports of rustc's; their wording is free to change.
 //!

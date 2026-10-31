@@ -63,7 +63,7 @@ Order:
   `crates/blaze-metadata/`, `crates/blaze-resolve/`, `crates/blaze-registry/`,
   `crates/blaze-source/`, `library/`.
 - **`diagnostics`**: compile errors and warnings judged by usefulness, not by matching rustc's
-  codes, lints, spans or text (AGENTS.md `useful-not-rustc-parity`), computed in the compiler from the queries that found
+  codes, lints, spans or text (AGENTS.md `useful-not-parity`), computed in the compiler from the queries that found
   them, with the facts they read (for the agent API). What builds need from `ide-diagnostics`
   moves here; the IDE crates are then removed. Owns `crates/blaze-diagnostics/` (new) and
   `crates/ide-diagnostics/` until it is removed.

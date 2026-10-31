@@ -19,14 +19,17 @@
 //! Work a closure hands to other threads is not counted; measure on the thread that does it.
 //!
 //! With `BLAZE_ALLOC_TRACE=1`, each counted allocation also keeps a backtrace, and a failing
-//! [`assert_at_most`] prints where every one of them came from.
+//! [`assert_at_most`] prints where every one of them came from. A test that checks a
+//! [`measure`]'s count itself gets them too: a panic on a thread prints the traces of that
+//! thread's last measurement after the panic message, so a budget assertion right after its
+//! measurement shows where the allocations it counted came from.
 
 use std::{
     alloc::{GlobalAlloc, Layout, System},
     backtrace::Backtrace,
     cell::{Cell, RefCell},
     fmt::Write as _,
-    sync::OnceLock,
+    sync::{Once, OnceLock},
 };
 
 /// The system allocator, counting each thread's allocations while [`measure`] runs on it.
@@ -56,6 +59,44 @@ thread_local! {
 }
 
 static TRACE: OnceLock<bool> = OnceLock::new();
+static PANIC_HOOK: Once = Once::new();
+
+/// Chains a panic hook that prints [`panic_report`] after the previous hook's output.
+fn install_panic_hook() {
+    PANIC_HOOK.call_once(|| {
+        own(|| {
+            let previous = std::panic::take_hook();
+            std::panic::set_hook(Box::new(move |info| {
+                previous(info);
+                if let Some(report) = panic_report() {
+                    own(|| eprintln!("{report}"));
+                }
+            }));
+        });
+    });
+}
+
+/// The traces this thread's last measurement kept, if it kept any. `try_`: a panic may come
+/// from inside the trace list's own borrow, or from a thread being torn down.
+fn panic_report() -> Option<String> {
+    own(|| {
+        let report = TRACES.try_with(|traces| {
+            let traces = traces.try_borrow().ok()?;
+            if traces.is_empty() {
+                return None;
+            }
+            let mut out = format!(
+                "this thread's last allocation measurement made {} traced allocations:",
+                traces.len()
+            );
+            for (n, (size, trace)) in traces.iter().enumerate() {
+                let _ = write!(out, "\nallocation {} ({size} bytes):\n{trace}", n + 1);
+            }
+            Some(out)
+        });
+        report.ok().flatten()
+    })
+}
 
 #[cfg(test)]
 fn forced() -> bool {
@@ -137,6 +178,9 @@ fn measure_traced<R>(f: impl FnOnce() -> R) -> (R, Used, usize) {
         *TRACE.get_or_init(|| std::env::var_os("BLAZE_ALLOC_TRACE").is_some_and(|v| v == "1"))
     }) || forced();
     let was_on = ON.with(|on| on.get());
+    if tracing {
+        install_panic_hook();
+    }
     let start = own(|| {
         TRACES.with(|traces| {
             let mut traces = traces.borrow_mut();
@@ -188,11 +232,12 @@ pub fn installed() -> bool {
 pub fn assert_at_most<R>(max: u64, what: &str, f: impl FnOnce() -> R) -> R {
     let (result, used, start) = measure_traced(f);
     if used.allocations > max {
+        let traces = traces_since(start);
+        // The message carries them, so the panic hook does not print them again.
+        own(|| TRACES.with(|t| t.borrow_mut().truncate(start)));
         panic!(
-            "{what}: {} allocations ({} bytes), budget {max}{}",
-            used.allocations,
-            used.bytes,
-            traces_since(start)
+            "{what}: {} allocations ({} bytes), budget {max}{traces}",
+            used.allocations, used.bytes
         );
     }
     result
@@ -226,6 +271,23 @@ mod tests {
             message.contains("a_traced_failure_names_where_each_allocation_came_from"),
             "{message}"
         );
+    }
+
+    #[test]
+    fn a_panic_after_a_traced_measurement_reports_its_allocations() {
+        FORCE_TRACE.with(|f| f.set(true));
+        let (_, used) = measure(|| Box::new([0u8; 24]));
+        let report = panic_report();
+        let _ = std::panic::catch_unwind(|| {
+            assert_at_most(0, "a box", || Box::new(1u8));
+        });
+        let after_assert = panic_report();
+        FORCE_TRACE.with(|f| f.set(false));
+        assert_eq!(used.allocations, 1);
+        let report = report.expect("a traced measurement's report");
+        assert!(report.contains("made 1 traced allocations"), "{report}");
+        assert!(report.contains("allocation 1 (24 bytes):\n"), "{report}");
+        assert_eq!(after_assert, None, "assert_at_most's message has its traces");
     }
 
     #[test]

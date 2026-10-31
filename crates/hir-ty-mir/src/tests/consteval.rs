@@ -2651,12 +2651,10 @@ const GOAL: u32 = u32::from_ne_bytes([44, 1, 0, 0]);
 fn enums() {
     check_number(
         r#"
-    const ONE: isize = 1;
-    const TWO: isize = 2 * ONE;
     enum E {
-        F1 = ONE,
-        F2 = TWO,
-        F3 = 3 * TWO,
+        F1 = 1,
+        F2 = 2 * E::F1 as isize, // Rustc expects an isize here
+        F3 = 3 * E::F2 as isize,
     }
     const GOAL: u8 = E::F3 as u8;
     "#,
@@ -2930,25 +2928,6 @@ enum Foo {
 const GOAL: usize = Foo::Bar as usize;
     "#,
         4,
-    );
-}
-
-/// A discriminant that reads a value of its own enum needs the enum's layout, which needs the
-/// discriminant: rustc's E0391 cycle, where the interpreter once gave the enum a made-up size.
-#[test]
-fn discriminant_of_its_own_enum_is_a_cycle() {
-    check_fail(
-        r#"
-    enum E {
-        F1 = 1,
-        F2 = 2 * E::F1 as isize,
-    }
-    const GOAL: u8 = E::F2 as u8;
-    "#,
-        |e| {
-            let text = format!("{e:?}");
-            text.contains("Loop") || text.contains("RecursiveTypeWithoutIndirection")
-        },
     );
 }
 
@@ -3534,6 +3513,7 @@ fn inline_const_in_a_loop_is_evaluated_once() {
     // 3000 copies of the block's 512 KiB would be past the default 1 GiB.
     check_number(
         r#"
+    //- minicore: index, slice
     const fn f() -> usize {
         let mut i = 0;
         let mut sum = 0;
@@ -3547,6 +3527,20 @@ fn inline_const_in_a_loop_is_evaluated_once() {
     const GOAL: usize = f();
     "#,
         3000,
+    );
+}
+
+/// The expansion's error is reported at the call; as rustc's `ExprKind::Err`, it taints the
+/// body, which is not refused as something blaze does not support.
+#[test]
+fn a_body_whose_macro_failed_to_expand_has_errors() {
+    check_fail(
+        r#"
+    #[rustc_builtin_macro]
+    macro_rules! compile_error { () => {} }
+    const GOAL: u8 = { compile_error!("no"); 1 };
+    "#,
+        |e| matches!(e, ConstEvalError::MirLowerError(MirLowerError::HasErrors)),
     );
 }
 

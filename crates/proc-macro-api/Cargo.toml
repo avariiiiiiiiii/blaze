@@ -14,7 +14,7 @@ doctest = false
 
 [dependencies]
 rustc-hash.workspace = true
-ra-ap-rustc_lexer.workspace = true
+rustc_lexer.workspace = true
 
 # local deps
 base-db.workspace = true

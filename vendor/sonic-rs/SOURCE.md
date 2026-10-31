@@ -16,3 +16,11 @@ Changes, marked `blaze:` in src/parser.rs:
    `webhook::tests::sonic_rs_takes_and_refuses_the_payloads_serde_json_did`, queue 01209). A
    surrogate pair is not checked when skipping, as serde_json's `ignore_escape` does not
    either. Report upstream.
+2. A checked skip of an object or array (`skip_one(true)`, so every ignored field) is
+   `Parser::skip_nested`, a loop over the containers still open held on the heap, as
+   serde_json's `ignore_value`. Upstream's `skip_object`/`skip_array` called `skip_one` once
+   per level with no depth limit, so an ignored value nested deep enough overflowed the
+   thread's stack and aborted the process (the same blaze-ci test on its 2 MiB thread, with a
+   field nested 100 deep, in round 8; a webhook body is anyone's). serde_json ignores at any
+   depth, so this takes and refuses what upstream did, with the same errors at the same places.
+   Report upstream.

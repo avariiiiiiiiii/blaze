@@ -328,6 +328,10 @@ fn sonic_rs_takes_and_refuses_the_payloads_serde_json_did() {
         ("ping", r#"{"repository":{"full_name":"\ud800"}}"#.to_owned()),
         ("ping", r#"{"x":1e400,"repository":{"full_name":"a/b"}}"#.to_owned()),
         ("ping", format!(r#"{{"x":{}{},"repository":{{"full_name":"a/b"}}}}"#, "[".repeat(100), "]".repeat(100))),
+        // A skipped field nested far past any stack, whole and cut short: serde_json skips it
+        // with its open brackets on the heap, at no depth limit, and so must sonic-rs.
+        ("ping", format!(r#"{{"x":{}1{},"repository":{{"full_name":"a/b"}}}}"#, r#"[{"k":"#.repeat(100_000), "}]".repeat(100_000))),
+        ("ping", format!(r#"{{"x":{}1{},"repository":{{"full_name":"a/b"}}}}"#, r#"[{"k":"#.repeat(100_000), "}]".repeat(99_999))),
         ("pull_request", pull_request("opened", SAME_REPO).replace("42", "042")),
         ("pull_request", pull_request("opened", SAME_REPO).replace("42", "18446744073709551616")),
         ("pull_request", pull_request("opened", SAME_REPO).replace("42", "4.2e1")),

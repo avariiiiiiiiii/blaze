@@ -216,6 +216,10 @@ enum Takes {
 
 /// cargo's arguments of the building commands, by long name; `short` is its letter.
 fn argument(command: Command, name: &str) -> Option<Takes> {
+    // `cargo doc` selects with `arg_targets_lib_bins_examples` alone.
+    if command == Command::Doc && matches!(name, "test" | "tests" | "bench" | "benches" | "all-targets") {
+        return None;
+    }
     let common: Option<Takes> = match name {
         "package" => Some(Takes::Value(|a, v| {
             a.packages.push(v);
@@ -302,6 +306,8 @@ fn argument(command: Command, name: &str) -> Option<Takes> {
     match (command, name) {
         (Command::Test, "doc") => Some(Takes::Flag(|a| a.doc = true)),
         (Command::Test | Command::Bench, "no-run" | "no-fail-fast") => Some(Takes::Flag(|_| {})),
+        // What the documentation is made of, not which units: the request's (`Request::Doc`).
+        (Command::Doc, "open" | "no-deps" | "document-private-items") => Some(Takes::Flag(|_| {})),
         _ => None,
     }
 }
@@ -430,6 +436,22 @@ mod tests {
         assert_eq!(asked(Command::Build, &["--nope"]).unwrap_err(), "unexpected argument '--nope' found");
         assert_eq!(asked(Command::Build, &["--doc"]).unwrap_err(), "unexpected argument '--doc' found");
         assert!(asked(Command::Build, &["--target"]).unwrap_err().starts_with("a value is required"));
+    }
+
+    #[test]
+    fn doc_takes_its_own_flags_and_cargo_docs_targets_alone() {
+        let it = asked(Command::Doc, &["--open", "--no-deps", "--document-private-items", "-p", "a", "--lib", "--bin", "x"]).unwrap();
+        assert_eq!(it.packages, ["a"]);
+        assert!(it.lib);
+        assert_eq!(it.bins, ["x"]);
+        assert!(asked(Command::Doc, &["--examples", "--example", "e", "--release"]).is_ok());
+        for refused in ["--tests", "--benches", "--all-targets", "--doc"] {
+            assert_eq!(asked(Command::Doc, &[refused]).unwrap_err(), format!("unexpected argument '{refused}' found"));
+        }
+        assert_eq!(asked(Command::Doc, &["--test", "t"]).unwrap_err(), "unexpected argument '--test' found");
+        assert_eq!(asked(Command::Check, &["--no-deps"]).unwrap_err(), "unexpected argument '--no-deps' found");
+        assert_eq!(Command::named("d"), Some(Command::Doc));
+        assert_eq!(Command::Doc.profile(), "dev");
     }
 
     #[test]

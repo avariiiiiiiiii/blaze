@@ -3,6 +3,7 @@ mod closure_captures;
 mod coercion;
 mod const_effects;
 mod consteval;
+mod const_valtree;
 mod derived_impls;
 mod diagnostics;
 mod display_source_code;

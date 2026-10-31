@@ -274,6 +274,9 @@ pub enum NotChecked {
     /// Lowering found an error in it (a cast that is not one, `..base` in a destructuring
     /// assignment).
     LoweringErrors,
+    /// A macro call in it failed to expand, an error reported at the call: rustc lowers it to
+    /// `ExprKind::Err`, which taints the body.
+    ExpansionErrors,
     /// Match checking refused it (E0004, E0005, E0030, a constant pattern that does not
     /// evaluate): rustc's `mir_built` gives such a body its error body, which nothing checks.
     MatchErrors,
@@ -326,6 +329,12 @@ fn check_def(db: &Db, def: DefWithBodyId, mode: Mode, frame: &Frame) -> Borrowck
         result.not_checked = Some(NotChecked::Off);
         return result;
     }
+    // A fn or associated item without a body, or a variant without a discriminant: rustc builds
+    // no MIR for it, so there is nothing to check and nothing to refuse.
+    let body = hir_def::expr_store::Body::of(db, def);
+    if matches!(body.expr(body.root_expr()), hir_def::hir::Expr::Missing) {
+        return result;
+    }
     let owner = InferBodyId::DefWithBodyId(def);
     let infer = InferenceResult::of(db, owner);
     if infer.has_type_mismatches() || infer.is_erroneous() || !infer.diagnostics().is_empty() {
@@ -334,13 +343,14 @@ fn check_def(db: &Db, def: DefWithBodyId, mode: Mode, frame: &Frame) -> Borrowck
     }
     // rustc borrow checks no body its lowering or type check found an error in, which an
     // error of either taints: a cast that is not one, `..base` in a destructuring assignment.
-    // The source map that stays the same while edits elsewhere move the body, so such an
-    // edit checks it again only if it changes it.
-    let source_map = hir_def::expr_store::Body::unmoved_source_map(db, def);
-    if source_map.diagnostics().iter().any(|it| {
-        !matches!(it, hir_def::expr_store::ExpressionStoreDiagnostics::InactiveCode { .. })
-    }) {
+    // A query of whether there was one, which reads no position: an edit elsewhere in the
+    // file checks the body again only if it changes that.
+    if hir_def::expr_store::Body::has_lowering_errors(db, def) {
         result.not_checked = Some(NotChecked::LoweringErrors);
+        return result;
+    }
+    if hir_ty_mir::mir::has_failed_expansion(db, owner) {
+        result.not_checked = Some(NotChecked::ExpansionErrors);
         return result;
     }
     if hir_ty_matchck::match_check(db, def).failed {
@@ -385,6 +395,12 @@ pub fn borrowck_anon_const<'db>(
         if infer.has_type_mismatches() || infer.is_erroneous() {
             return BorrowckResult {
                 not_checked: Some(NotChecked::TypeErrors),
+                ..Default::default()
+            };
+        }
+        if hir_ty_mir::mir::has_failed_expansion(db, owner) {
+            return BorrowckResult {
+                not_checked: Some(NotChecked::ExpansionErrors),
                 ..Default::default()
             };
         }

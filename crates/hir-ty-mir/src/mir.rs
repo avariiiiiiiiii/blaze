@@ -61,7 +61,8 @@ pub use hir_ty::providers::{
 };
 pub use lower::is_builtin_index;
 pub use lower::{
-    inline_const_at, lower_body_to_mir, lower_to_mir_with_store, promoted_mir_body_query,
+    has_failed_expansion, inline_const_at, lower_body_to_mir, lower_to_mir_with_store,
+    promoted_mir_body_query,
 };
 pub use monomorphization::monomorphized;
 pub use monomorphization::{monomorphized_args, monomorphized_const, monomorphized_ty};

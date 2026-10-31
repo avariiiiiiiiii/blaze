@@ -423,7 +423,7 @@ fn foo() {
 fn main() {}
 "#;
     assert_eq!(
-        ui_core("unused-parens-labeled-break-issue-143256.rs", "2015", "default, ord", source),
+        ui_core("unused-parens-labeled-break-issue-143256.rs", "2015", "default, ord, builtin_impls", source),
         ""
     );
 }

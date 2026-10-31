@@ -297,36 +297,33 @@ impl Disks {
     }
 
     /// The disks of an image's section, read in place: every length, end and name is checked
-    /// once here (bounds, order, UTF-8), so reads after never fail.
-    pub(crate) fn open(section: Section) -> Result<Disks, String> {
-        fn bad(what: &str) -> String {
-            // alloc: an error path.
-            format!("the VFS image's disks section: {what}")
+    /// once here (bounds, order, UTF-8), so reads after never fail. The error is what is wrong
+    /// with the section.
+    pub(crate) fn open(section: Section) -> Result<Disks, &'static str> {
+        fn cut(_: cursor::Error) -> &'static str {
+            "cut short"
         }
-        fn cut(_: cursor::Error) -> String {
-            bad("cut short")
-        }
-        fn text<'a>(read: &mut Reader<'a>) -> Result<&'a str, String> {
+        fn text<'a>(read: &mut Reader<'a>) -> Result<&'a str, &'static str> {
             read.str_u32().map_err(|error| match error.wanted {
-                Wanted::Utf8 { .. } => bad("a name that is not UTF-8"),
-                _ => bad("cut short"),
+                Wanted::Utf8 { .. } => "a name that is not UTF-8",
+                _ => "cut short",
             })
         }
         let bytes = section.bytes();
         let mut read = Reader::new(bytes);
         if read.array::<4>().ok() != Some(&MAGIC) {
-            return Err(bad("no magic"));
+            return Err("no magic");
         }
         let mut disks = Disks::default();
         for _ in 0..read.u32().map_err(cut)? {
             let head = text(&mut read)?;
-            let dir = FileName::new(text(&mut read)?).ok_or_else(|| bad("a directory that is no name"))?;
-            let cursor = Cursor::decode(read.remaining()).ok_or_else(|| bad("a bad cursor"))?;
+            let dir = FileName::new(text(&mut read)?).ok_or("a directory that is no name")?;
+            let cursor = Cursor::decode(read.remaining()).ok_or("a bad cursor")?;
             read.skip(Cursor::BYTES).map_err(cut)?;
             let root = match read.array::<33>().map_err(cut)? {
                 [0, ..] => None,
                 [1, id @ ..] => Some(ContentId(*id)),
-                _ => return Err(bad("a bad root")),
+                _ => return Err("a bad root"),
             };
             let count = read.u32().map_err(cut)? as usize;
             let names_len = read.u32().map_err(cut)? as usize;
@@ -340,15 +337,15 @@ impl Disks {
             for n in 0..count {
                 let stop = base.word(ends + n * 4);
                 if stop <= last || stop > names_len || bytes[names + stop - 1] != 0 {
-                    return Err(bad("a name's end out of order or not after its NUL"));
+                    return Err("a name's end out of order or not after its NUL");
                 }
                 let name = std::str::from_utf8(&bytes[names + last..names + stop - 1])
-                    .map_err(|_| bad("a name that is not UTF-8"))?;
+                    .map_err(|_| "a name that is not UTF-8")?;
                 if name.contains('\0')
                     || FileName::new(name).is_none_or(|it| !it.is_under(&dir))
                     || (n > 0 && base.name(n - 1) >= name)
                 {
-                    return Err(bad("names out of order or outside the directory"));
+                    return Err("names out of order or outside the directory");
                 }
                 last = stop;
             }

@@ -29,6 +29,10 @@ struct Total(AtomicI64);
 /// but for less than [`BATCH`] per thread not yet added.
 static HELD: Total = Total(AtomicI64::new(0));
 
+/// The most [`HELD`] was since [`high_water_from_now`] last began a watch: what a task that ran
+/// alone held at most on every thread, its own and those it handed work to.
+static HIGH: Total = Total(AtomicI64::new(0));
+
 /// A thread's counts, in one block so an allocation reaches its thread-local storage once.
 struct Local {
     /// The bytes this thread allocated less those it freed, through [`Counting`].
@@ -81,7 +85,10 @@ fn exit_flush(local: &Local) -> i64 {
 
 #[cfg_attr(not(test), allow(unused_variables))]
 fn add(local: &Local, bytes: i64) {
-    HELD.0.fetch_add(bytes, Ordering::Relaxed);
+    let now = HELD.0.fetch_add(bytes, Ordering::Relaxed).wrapping_add(bytes);
+    if bytes > 0 {
+        HIGH.0.fetch_max(now, Ordering::Relaxed);
+    }
     #[cfg(test)]
     local.flushed.set(local.flushed.get().wrapping_add(bytes));
 }
@@ -211,6 +218,22 @@ pub fn measure<R>(f: impl FnOnce() -> R) -> (R, u64) {
 pub fn held() -> u64 {
     let own = LOCAL.with(|local| local.unflushed.get());
     u64::try_from(HELD.0.load(Ordering::Relaxed).wrapping_add(own)).unwrap_or(0)
+}
+
+/// Begins a watch of the most the process holds: [`high_water`] from now on is at least what
+/// it holds now. What it holds now. One watch at a time: the plane's task that runs alone
+/// begins it, and nothing else does.
+pub fn high_water_from_now() -> u64 {
+    let now = held();
+    HIGH.0.store(i64::try_from(now).unwrap_or(i64::MAX), Ordering::Relaxed);
+    now
+}
+
+/// The most the process held through [`Counting`] since [`high_water_from_now`], within
+/// [`BATCH`] per thread: what the threads add to [`HELD`], which a thread does once per
+/// [`BATCH`] of drift, so a watch costs an allocation nothing.
+pub fn high_water() -> u64 {
+    u64::try_from(HIGH.0.load(Ordering::Relaxed)).unwrap_or(0).max(held())
 }
 
 /// Everything blaze itself holds: [`held`] (what goes through the global allocator) and the
@@ -559,6 +582,30 @@ mod tests {
         let big = vec![1u8; 32 * MB];
         assert!(held() >= 32 * MB as u64, "{}", held());
         std::hint::black_box(&big);
+    }
+
+    /// A watch sees the most every thread held at once, the threads a task hands its work to
+    /// as well as its own, though they freed it before the watch is read: what [`measure`] on
+    /// the task's thread misses. Other tests allocate and free meanwhile, so it asks for a
+    /// quarter of what the threads held together.
+    #[test]
+    fn a_watch_sees_what_every_thread_held_at_most() {
+        let start = high_water_from_now();
+        let together = std::sync::Barrier::new(4);
+        let ((), own) = measure(|| {
+            std::thread::scope(|scope| {
+                for _ in 0..4 {
+                    scope.spawn(|| {
+                        let held = std::hint::black_box(vec![1u8; 32 * MB]);
+                        together.wait();
+                        drop(held);
+                    });
+                }
+            });
+        });
+        let most = high_water().saturating_sub(start);
+        assert!(own < 32 * MB as u64, "the task's own thread held {own}");
+        assert!(most >= 32 * MB as u64, "the watch saw {most}");
     }
 
     /// What blaze holds counts the pages `blaze_mem` maps itself, which the global allocator

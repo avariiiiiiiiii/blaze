@@ -280,6 +280,17 @@ impl<'db> MirLowerCtx<'_, '_, 'db> {
                     .and_then(|it| it.split_last())
                     .map(|it| it.1)
                     .unwrap_or(&[]);
+                // rustc builds a builtin index only of an array or slice place, which the
+                // adjustments of a well-typed base reach: `ys[i]` of `ys: &[i32]` derefs it.
+                // Without them, inference found no `Index` impl and reported it.
+                let indexed = adjusts
+                    .last()
+                    .map_or_else(|| self.infer.expr_ty(base), |it| it.target.as_ref());
+                if !matches!(indexed.kind(), TyKind::Array(..) | TyKind::Slice(..)) {
+                    return Err(MirLowerError::TypeError(
+                        "a builtin index of a base that is not an array or slice",
+                    ));
+                }
                 let Some((mut p_base, current)) =
                     self.lower_expr_as_place_with_adjust(current, base, true, adjusts)?
                 else {

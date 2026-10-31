@@ -2722,14 +2722,26 @@ impl<'a, 'db, F: Fn(crate::DefWithBody) -> bool + ?Sized> DiagnosticsCollector<'
     }
 
     /// The checks of body `def`, which `bodies` asks for.
+    /// Every check reads the body and its results without positions, and asks for the source
+    /// map ([`Placing`]) only to place a diagnostic it found.
     fn check_body(&mut self, def: DefWithBodyId, type_owner: TypeOwnerId) {
-        let (body, source_map) = Body::with_source_map(self.db, def);
+        let db = self.db;
+        let body = Body::of(db, def);
+        let placing = Placing::new(db, def);
 
-        self.collect_expr_store(body, source_map);
-        self.emit_inference_errors(def.into(), source_map, type_owner);
+        self.collect_blocks(body);
+        if !Body::unmoved_source_map(db, def).diagnostics().is_empty() {
+            self.collect_store_diagnostics(placing.get());
+        }
+        let infer = InferenceResult::of(db, def);
+        let stalled = hir_ty::coroutine_obligations::coroutine_obligation_errors(db, def.into());
+        if !infer.diagnostics().is_empty() || !stalled.is_empty() {
+            self.emit_inference_errors(def.into(), placing.get(), type_owner);
+        }
 
         // FIXME: Body validation should be defined for any `InferBodyId`.
         for op in hir_ty_unsafeck::unsafety_check(self.db, def).ops() {
+            let source_map = placing.get();
             match source_map.expr_or_pat_syntax(op.node()) {
                 Ok(node) => self.acc.push(
                     MissingUnsafe {
@@ -2752,21 +2764,23 @@ impl<'a, 'db, F: Fn(crate::DefWithBody) -> bool + ?Sized> DiagnosticsCollector<'
         }
 
         for diagnostic in BodyValidationDiagnostic::collect(self.db, def, self.style_lints) {
-            self.acc
-                .extend(AnyDiagnostic::body_validation_diagnostic(self.db, diagnostic, source_map));
+            self.acc.extend(AnyDiagnostic::body_validation_diagnostic(
+                self.db,
+                diagnostic,
+                placing.get(),
+            ));
         }
         crate::match_lints::match_check_diagnostics(
-            self.db, def, source_map, type_owner, self.acc,
+            self.db,
+            def,
+            || placing.get(),
+            type_owner,
+            self.acc,
         );
-        self.collect_borrowck(def, body, source_map);
+        self.collect_borrowck(def, body, &placing);
     }
 
-    fn collect_borrowck(
-        &mut self,
-        def: DefWithBodyId,
-        body: &Body,
-        source_map: &hir_def::expr_store::BodySourceMap,
-    ) {
+    fn collect_borrowck(&mut self, def: DefWithBodyId, body: &Body, placing: &Placing<'db>) {
         use hir_ty_mir::mir::MirSpan;
         let result = hir_ty_borrowck::borrowck(self.db, def);
         // An `async fn`'s body is the future it makes, which rustc points at as its block.
@@ -2777,6 +2791,7 @@ impl<'a, 'db, F: Fn(crate::DefWithBody) -> bool + ?Sized> DiagnosticsCollector<'
             Some(InFile::new(source.file_id, view::ptr(block.syntax())))
         };
         let node_of = |span: MirSpan| -> Option<InFile<SyntaxNodePtr>> {
+            let source_map = placing.get();
             let source = match span {
                 MirSpan::ExprId(expr) | MirSpan::ExprEnd(expr) => {
                     match source_map.expr_syntax(expr) {
@@ -2857,7 +2872,7 @@ impl<'a, 'db, F: Fn(crate::DefWithBody) -> bool + ?Sized> DiagnosticsCollector<'
             let Some(node) = node else {
                 self.acc.push(
                     UnplacedDiagnostic {
-                        owner: unplaced_owner(self.db, def.into(), source_map),
+                        owner: unplaced_owner(self.db, def.into(), placing.get()),
                         what: Unplaced::Borrowck {
                             code: diagnostic.code,
                             // clone: error path, a reported borrowck error
@@ -2900,7 +2915,7 @@ impl<'a, 'db, F: Fn(crate::DefWithBody) -> bool + ?Sized> DiagnosticsCollector<'
             let Some(node) = node_of(diagnostic.span) else {
                 self.acc.push(
                     UnplacedDiagnostic {
-                        owner: unplaced_owner(self.db, def.into(), source_map),
+                        owner: unplaced_owner(self.db, def.into(), placing.get()),
                         what: Unplaced::ConstCheck {
                             code: diagnostic.code,
                             // clone: error path, a reported const check error
@@ -3142,10 +3157,19 @@ impl<'a, 'db, F: Fn(crate::DefWithBody) -> bool + ?Sized> DiagnosticsCollector<'
         store: &ExpressionStore,
         source_map: &ExpressionStoreSourceMap,
     ) {
+        self.collect_blocks(store);
+        self.collect_store_diagnostics(source_map);
+    }
+
+    /// The items of `store`'s block modules.
+    fn collect_blocks(&mut self, store: &ExpressionStore) {
         for (_, def_map) in store.blocks(self.db) {
             self.collect_module(def_map.root_module_id());
         }
+    }
 
+    /// What lowering the store of `source_map` found, placed.
+    fn collect_store_diagnostics(&mut self, source_map: &ExpressionStoreSourceMap) {
         for diag in source_map.diagnostics() {
             self.acc.push(match diag {
                 ExpressionStoreDiagnostics::InactiveCode { node, cfg } => InactiveCode {
@@ -4445,6 +4469,25 @@ impl<'db> AnyDiagnostic<'db> {
                 }
             }
         })
+    }
+}
+
+/// A body's source map, asked for the first time a diagnostic of the body is placed. The map
+/// holds file positions, so it is made again on every edit before the body in its file; a
+/// body with nothing to report never reads it (docs/v2/plan/lanes/firewall/notes.md).
+struct Placing<'db> {
+    db: &'db Db,
+    def: DefWithBodyId,
+    map: std::cell::OnceCell<&'db hir_def::expr_store::BodySourceMap>,
+}
+
+impl<'db> Placing<'db> {
+    fn new(db: &'db Db, def: DefWithBodyId) -> Placing<'db> {
+        Placing { db, def, map: std::cell::OnceCell::new() }
+    }
+
+    fn get(&self) -> &'db hir_def::expr_store::BodySourceMap {
+        self.map.get_or_init(|| &Body::with_source_map(self.db, self.def).1)
     }
 }
 

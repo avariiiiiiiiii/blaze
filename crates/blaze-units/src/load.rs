@@ -154,6 +154,7 @@ fn view_spec(asked: &Asked, library: Option<Mount>) -> Result<Spec, LoadError> {
         Command::Check => Intent::Check { test: asked.profile.as_deref() == Some("test") },
         Command::Test => Intent::Test,
         Command::Bench => Intent::Bench,
+        Command::Doc => Intent::Doc,
     };
     let filter = Filter::from_flags(
         asked.lib,

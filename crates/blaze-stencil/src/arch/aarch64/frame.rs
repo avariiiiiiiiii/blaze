@@ -19,7 +19,10 @@
 
 use std::alloc::Allocator;
 
-use cranelift_codegen::ir::{self, ArgumentPurpose, GlobalValueData, InstructionData, Opcode};
+use cranelift_codegen::{
+    ir::{self, ArgumentPurpose, GlobalValueData, InstructionData, Opcode},
+    isa::CallConv,
+};
 
 use super::{
     abi,
@@ -77,6 +80,13 @@ pub struct Frame {
     pub(super) windows: bool,
     /// The most bytes the prologue writes, the parameters' stores included.
     pub(super) entry: u32,
+    /// A `tail` function's incoming argument area, which its epilogue pops: Cranelift's
+    /// `tail_args_size`, the most of its own stack arguments' and its `return_call`s'. 0 in
+    /// the other conventions, whose caller pops.
+    pub(super) pop: u32,
+    /// How much the prologue grows the incoming argument area by, for a `return_call` of more
+    /// stack arguments than the function was given: `pop` less its own stack arguments.
+    pub(super) grow: u32,
 }
 
 impl Frame {
@@ -99,9 +109,18 @@ pub(super) fn layout(func: &ir::Function, target: &Target, area: Area) -> Result
     }
     let mut outgoing = 0;
     let mut calls = false;
+    let mut tail = 0;
     for block in func.layout.blocks() {
         for inst in func.layout.block_insts(block) {
-            if let Some(sig) = call_signature(func, inst) {
+            if let Some(sig) = return_call_signature(func, inst)? {
+                let size = abi::stack_args(&func.dfg.signatures[sig])
+                    .map_err(|e| Error::at(inst, e.what))?;
+                abi::rets(&func.dfg.signatures[sig], |_, _, _| Ok(()))
+                    .map_err(|e| Error::at(inst, e.what))?;
+                tail = tail.max(size);
+                // Cranelift's `FunctionCalls::TailOnly`: the probe covers the frame record.
+                calls = true;
+            } else if let Some(sig) = call_signature(func, inst) {
                 let size = abi::stack_args(&func.dfg.signatures[sig])
                     .map_err(|e| Error::at(inst, e.what))?;
                 outgoing = outgoing.max(size);
@@ -110,6 +129,21 @@ pub(super) fn layout(func: &ir::Function, target: &Target, area: Area) -> Result
                 calls = true;
             }
         }
+    }
+    let (pop, grow) = match func.signature.call_conv {
+        CallConv::Tail => {
+            let own = abi::stack_args(&func.signature)?;
+            let pop = own.max(tail);
+            (pop, pop - own)
+        }
+        _ => (0, 0),
+    };
+    if grow > 0 && target.os == Os::Windows {
+        // alloc: the error's message, once, as the function fails to compile.
+        return Err(Error::new(format!(
+            "a `tail` function growing its argument area by {grow} bytes on Windows: the glue \
+             writes no ARM64 unwind code for the growth"
+        )));
     }
     let sret = func.signature.uses_special_param(ArgumentPurpose::StructReturn);
     let private = if sret { 16 } else { 0 };
@@ -129,7 +163,7 @@ pub(super) fn layout(func: &ir::Function, target: &Target, area: Area) -> Result
         )));
     }
     let probe = if target.probe_stack {
-        probe(SAVES + stack + if calls { 16 } else { 0 }, target.probe_log2)?
+        probe(grow + SAVES + stack + if calls { 16 } else { 0 }, target.probe_log2)?
     } else {
         Probe::None
     };
@@ -142,11 +176,52 @@ pub(super) fn layout(func: &ir::Function, target: &Target, area: Area) -> Result
         probe,
         windows: target.os == Os::Windows,
         entry: 0,
+        pop,
+        grow,
     })
+}
+
+/// The signature of `inst` when it is a `return_call` or `return_call_indirect`, after
+/// checking the glue can make it: from a `tail` function to one (Cranelift's verifier and
+/// `gen_call_args`), not patchable.
+pub(super) fn return_call_signature(
+    func: &ir::Function,
+    inst: ir::Inst,
+) -> Result<Option<ir::SigRef>, Error> {
+    let opcode = func.dfg.insts[inst].opcode();
+    let sig = match func.dfg.insts[inst] {
+        InstructionData::Call { opcode: Opcode::ReturnCall, func_ref, .. } => {
+            if func.dfg.ext_funcs[func_ref].patchable {
+                return Err(Error::at(
+                    inst,
+                    "a patchable call, whose patch metadata the glue does not write",
+                ));
+            }
+            func.dfg.ext_funcs[func_ref].signature
+        }
+        InstructionData::CallIndirect { opcode: Opcode::ReturnCallIndirect, sig_ref, .. } => sig_ref,
+        _ => return Ok(None),
+    };
+    for (what, conv) in [("in", func.signature.call_conv), ("to", func.dfg.signatures[sig].call_conv)] {
+        if conv != CallConv::Tail {
+            return Err(Error::at(
+                inst,
+                // alloc: the error's message, once, as the function fails to compile.
+                format!(
+                    "`{opcode}` {what} a {conv} function: Cranelift's AArch64 backend tail-calls \
+                     only from a `tail` function to one"
+                ),
+            ));
+        }
+    }
+    Ok(Some(sig))
 }
 
 /// The signature of `inst` when it is a call that returns to the function.
 pub(super) fn call_signature(func: &ir::Function, inst: ir::Inst) -> Option<ir::SigRef> {
+    if matches!(func.dfg.insts[inst].opcode(), Opcode::ReturnCall | Opcode::ReturnCallIndirect) {
+        return None;
+    }
     match func.dfg.insts[inst] {
         InstructionData::Call { func_ref, .. } | InstructionData::TryCall { func_ref, .. } => {
             Some(func.dfg.ext_funcs[func_ref].signature)
@@ -238,7 +313,8 @@ pub(super) fn enter_bound(frame: &Frame) -> u32 {
         Probe::Unroll { count, .. } => count * (inst::ADD_ANY_MAX + 4) + inst::ADD_ANY_MAX,
         Probe::Loop { .. } => 4 + 16 + 16,
     };
-    8 + probe + 4 * (X_PAIRS.len() + D_PAIRS.len()) as u32 + inst::ADD_ANY_MAX
+    let grow = if frame.grow > 0 { inst::ADD_ANY_MAX + inst::LDST_MAX + 8 } else { 0 };
+    8 + probe + grow + 4 * (X_PAIRS.len() + D_PAIRS.len()) as u32 + inst::ADD_ANY_MAX
 }
 
 /// Writes the frame record, the probe, the saves and the frame's allocation, with the rows
@@ -252,6 +328,14 @@ pub(super) fn enter(buf: &mut Buf<'_>, frame: &Frame, rows: &mut Rows) {
     rows.push(at, Rule::Offset(DWARF_LR, -8));
     buf.put4(inst::MOV_FP_SP);
     write_probe(buf, frame.probe);
+    if frame.grow > 0 {
+        // `gen_clobber_save`: room for a `return_call`'s stack arguments below the caller's,
+        // the frame record moved down to its bottom (`lr` still holds the return address).
+        inst::add_any(buf, SP, SP, u64::from(frame.grow), true, X16);
+        inst::ldst(buf, inst::LDRX, FP, SP, frame.grow, X16);
+        buf.put4(inst::stp_off(FP, LR, SP, 0));
+        buf.put4(inst::MOV_FP_SP);
+    }
     rows.push(buf.len(), Rule::CfaRegister(DWARF_FP));
     let to_cfa = (16 + SAVES) as i32;
     let mut clobber = SAVES as i32;
@@ -295,12 +379,25 @@ fn write_probe(buf: &mut Buf<'_>, probe: Probe) {
     }
 }
 
-/// The most bytes [`exit`] writes.
-pub(super) const EXIT_MAX: u32 = inst::ADD_ANY_MAX + 4 * (D_PAIRS.len() + X_PAIRS.len()) as u32 + 8;
+/// The most bytes [`exit`] writes: [`unframe`]'s, a `tail` function's pop and the `ret`.
+pub(super) const EXIT_MAX: u32 = UNFRAME_MAX + inst::ADD_ANY_MAX + 4;
+/// The most bytes [`unframe`] writes.
+pub(super) const UNFRAME_MAX: u32 = inst::ADD_ANY_MAX + 4 * (D_PAIRS.len() + X_PAIRS.len()) as u32 + 4;
 
-/// Frees the frame, restores the saved registers and the frame record and returns, as
-/// `gen_epilogue` does. Like Cranelift's, it records no rows: the CFA stays said from `x29`.
+/// Frees the frame, restores the saved registers and the frame record, pops a `tail`
+/// function's incoming argument area and returns, as `gen_epilogue` does. Like Cranelift's,
+/// it records no rows: the CFA stays said from `x29`.
 pub(super) fn exit(buf: &mut Buf<'_>, frame: &Frame) {
+    unframe(buf, frame);
+    if frame.pop > 0 {
+        inst::add_any(buf, SP, SP, u64::from(frame.pop), false, X16);
+    }
+    buf.put4(inst::RET);
+}
+
+/// The epilogue up to the pop: the frame freed, the saved registers and the frame record
+/// restored, `sp` at the incoming argument area. What a `return_call` does before it jumps.
+pub(super) fn unframe(buf: &mut Buf<'_>, frame: &Frame) {
     if frame.stack > 0 {
         inst::add_any(buf, SP, SP, u64::from(frame.stack), false, X16);
     }
@@ -311,7 +408,6 @@ pub(super) fn exit(buf: &mut Buf<'_>, frame: &Frame) {
         buf.put4(inst::ldp_post(*a, *b, SP, 16));
     }
     buf.put4(inst::ldp_post(FP, LR, SP, 16));
-    buf.put4(inst::RET);
 }
 
 /// The most bytes [`set_base`] writes.

@@ -86,6 +86,10 @@ pub struct Expansion {
     pub name: String,
     /// Where the macro is defined, when rustc says.
     pub def_site: Option<Span>,
+    /// rustc's `ExpnData::diagnostic_opaque`: the macro is a builtin one (or marked
+    /// `#[diagnostic::opaque]`), which no note names as where a diagnostic originates.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub opaque: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
@@ -339,6 +343,31 @@ pub struct Diag {
     /// rustc's order, is written.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub fatal: bool,
+    /// rustc's `has_future_breakage`: a lint whose future-incompatibility is reported
+    /// (`report_in_deps`), and where it is written.
+    #[serde(default, skip_serializing_if = "Breakage::is_none")]
+    pub breakage: Breakage,
+}
+
+/// Where a diagnostic of rustc's future-incompatibility report is written.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum Breakage {
+    /// Not in the report.
+    #[default]
+    None,
+    /// To stderr, and in the report.
+    Written,
+    /// Allowed or expected: only in the report, as a warning.
+    Unwritten,
+    /// The report's copy of one (`--error-format=json`'s `future_incompat` message), written
+    /// after the closing lines.
+    Reported,
+}
+
+impl Breakage {
+    pub fn is_none(&self) -> bool {
+        *self == Breakage::None
+    }
 }
 
 /// A fact a diagnostic read, and what it stands for in words, written where the names are
@@ -361,6 +390,7 @@ impl Diag {
             suggestions_disabled: false,
             facts: Vec::new(), // alloc: empty, allocates nothing
             fatal: false,
+            breakage: Breakage::None,
         }
     }
 
@@ -572,6 +602,9 @@ impl Diag {
         let mut macros = spans.flat_map(Span::macro_backtrace);
         let first = macros.next()?;
         let last = macros.last().unwrap_or(first);
+        if last.opaque {
+            return None;
+        }
         let and_then = match last.name != first.name {
             // alloc: the note of a diagnostic in a macro, the edge
             true => format!(" which comes from the expansion of the {} `{}`", last.kind.descr(), last.name),
@@ -658,6 +691,7 @@ mod tests {
             kind: MacroKind::Bang,
             name: "assert_eq".to_owned(),
             def_site: None,
+            opaque: false,
         };
         let mut at = span(30, 40);
         at.expansion = Some(Box::new(inner));
@@ -667,6 +701,20 @@ mod tests {
             diag.children[0].message,
             "this error originates in the macro `assert_eq` (in Nightly builds, run with -Z macro-backtrace for more info)"
         );
+    }
+
+    /// rustc leaves the note out when the outermost macro is a builtin one, as `#[derive(Copy)]`.
+    #[test]
+    fn no_note_names_an_opaque_macro() {
+        let mut at = span(30, 40);
+        at.expansion = Some(Box::new(Expansion {
+            call_site: span(0, 4),
+            kind: MacroKind::Derive,
+            name: "Copy".to_owned(),
+            def_site: None,
+            opaque: true,
+        }));
+        assert_eq!(Diag::error(Some("E0184"), "x", at).origin_note(), None);
     }
 
     fn expanded(lo: u32, hi: u32, name: &str, call_site: Span) -> Span {
@@ -679,6 +727,7 @@ mod tests {
                 kind: MacroKind::Bang,
                 name: name.to_owned(),
                 def_site: None,
+                opaque: false,
             })),
         }
     }

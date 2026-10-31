@@ -830,6 +830,8 @@ impl<M: Memo> Plane<M> {
         let path = own.saturating_add(before.unwrap_or(0));
         let stats = &mut self.requests[node.request].stats;
         stats.critical_path_ns = stats.critical_path_ns.max(path);
+        let step = &mut stats.steps_ns[node.spec.kind as usize];
+        *step = step.saturating_add(own);
         self.nodes[me].path_ns = path;
         self.nodes[me].done_at = Some(at);
         self.moved(at, me, state, out);

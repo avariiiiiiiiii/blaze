@@ -76,6 +76,7 @@ a build first needs it.
     blaze run   [cargo's flags] [-- program arguments]                (r)
     blaze test  [cargo's flags] [TESTNAME] [-- test arguments]        (t)
     blaze bench [cargo's flags] [BENCHNAME] [-- bench arguments]
+    blaze doc   [cargo's flags]                                       (d)
     blaze serve [--socket PATH] [--http ADDR] [--activated]
     blaze stop
     blaze status
@@ -99,7 +100,7 @@ the package for `wasm32-unknown-unknown` with debug assertions off (as `--releas
 scripts run and proc macros loaded in the sandbox as any check's, and writes the program's crate
 and every crate it is made of, with each macro expansion its names and bodies needed, to `PATH`
 as one JSON file for the in-browser compiler (`crates/blaze-wasm-pack`, the agent API's
-`Request::Pack`); `pin` is [below](#pinning-a-release-of-blaze). Any other command (v1's `fmt`, `clippy`, `doc`, `tree`,
+`Request::Pack`); `pin` is [below](#pinning-a-release-of-blaze). Any other command (v1's `fmt`, `clippy`, `tree`,
 `metadata`, `toolchain`, ...) fails with `error: no such command` and status 101; none is
 passed to cargo, and no cargo plugin is run ([Every subcommand](#every-subcommand)).
 
@@ -124,6 +125,20 @@ rustc's diagnostic, `build-finished`), written as cargo and rustc write them
 editors read. The wording of a diagnostic is blaze's (`crates/blaze-diagnostics`), not always
 rustc's. `status` prints the daemon's process, the requests it has served, the checkouts it
 watches and the memory it holds of its budget. `stop` has the daemon write its state and end.
+
+`doc` takes `cargo doc`'s flags (`--open`, `--no-deps`, `--document-private-items`, `--lib`,
+`--bins`, `--bin`, `--examples`, `--example`, and the package, feature, profile and target
+ones) and documents what `cargo doc` documents, with no rustdoc: the daemon checks the targets
+`cargo doc` picks (a library, and each binary not named as it; `Intent::Doc` in
+`crates/blaze-units`) and every dependency, as any check, then makes every page from that front
+end with `cfg(doc)` set (`crates/blaze-doc`, `crates/blaze-cargo/src/serve/unit/doc.rs`, the
+agent API's `Request::Doc`). The client writes the pages to `target/doc`, or
+`target/<triple>/doc` with `--target`, keeps the crates earlier runs documented there in the
+search's list, and says `Documenting`, `Finished` and `Generated` (or `Opening`, and opens the
+page with `$BROWSER` or the system's opener, for `--open`) as cargo does. Not yet: cargo's
+`doc.browser` setting, `--message-format=json`'s messages for the pages, and doctests (v2
+refuses `test --doc`). What the pages hold is in [doc.md](doc.md), a record of v1's
+`blaze doc`, which wrote them from the same crate.
 
 While a build waits, the client prints each unit's lines as the daemon sends them; there is no
 live progress view in v2.
@@ -788,7 +803,7 @@ any other fails with status 101 and does nothing:
 
     error: no such command: `fmt`
 
-    help: blaze's commands are build, check, run, test, bench, serve, stop, status, daemon, codegen-inputs, trace, tables and pack
+    help: blaze's commands are build, check, run, test, bench, doc, serve, stop, status, daemon, codegen-inputs, trace, tables and pack
 
 The table below is a record of what v1 had (as of 2026-10-30): the crates it names
 (blaze-metadata, blaze-fmt, blaze-lints, ...) are still in the tree, and a command comes back

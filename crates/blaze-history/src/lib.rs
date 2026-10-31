@@ -171,4 +171,13 @@ impl Predict for History {
     fn encode(&self) -> Vec<u8> {
         History::encode(self)
     }
+
+    /// A keyed task is measured once its key has a record; one with no key, once its kind
+    /// has been seen.
+    fn measured(&self, kind: TaskKind, key: Option<Key>) -> bool {
+        match key {
+            Some(key) => self.keys.get(kind, &key).is_some(),
+            None => self.estimates.by_kind.get(&kind).is_some_and(|it| it.seen > 0),
+        }
+    }
 }

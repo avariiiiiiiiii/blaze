@@ -158,20 +158,17 @@ second version left in `Cargo.lock` is forced by an upstream's newest release, a
 |---|---|
 | `object` 0.39 beside 0.40 | `ar_archive_writer` 0.5.3, the build-dependency of `psm` 0.1.32 (under `stacker`, in `stdx`) that writes its assembly archive; 0.40 is the workspace's and cranelift 0.137's |
 | `hashbrown` 0.16 beside 0.17 | `gimli` 0.33, the one cranelift 0.137 pins (`gimli` itself is a single version) |
-| `sha2`, `digest`, `block-buffer`, `crypto-common`, `cpufeatures` 0.10/0.2 beside 0.11/0.3 | none once the lock re-resolves: they came from cranelift-codegen's `incremental-cache`, which hir-ty-codegen turned on and never used; it now asks for `enable-serde` alone (2026-10-30). 0.11 stays for `lzma-rust2` 0.24's `xz` check and `sha1` 0.11 (`blaze-web`) |
 | `getrandom` 0.2 | `ring` 0.17.14 (under `rustls`, in blaze-ci and blaze-global), its newest |
 | `rand_core` 0.9 beside 0.10 | `imbl` 7.0.2 (`rand_xoshiro` 0.7, for its vectors' quicksort pivots), blaze-resolve's persistent maps, its newest; 0.10 is `rand`'s under `hegeltest-c`. `im-rc` 15 (unmaintained, `rand_core` 0.6, `sized-chunks`, `bitmaps`, `typenum`) went for it (2026-10-30) |
 | `getrandom` 0.3 beside 0.4, `r-efi` 5 beside 6 | `ahash` 0.8.12 under `sonic-rs` (blaze-api, blaze-ci); goes if `sonic-rs` gives way to `serde_json` (below) |
 | `bitflags` 1 beside 2 | `defmt` 1.2 under `jiff`, under `cargo-util-schemas` =0.14.3 (cargo 1.99's pin) |
-| `miniz_oxide` 0.8 beside 0.9 | none once the lock re-resolves: `vendor/hegeltest-c` asks for 0.9.1 like `flate2` (vendor/hegeltest/SOURCE.md, change 5; 2026-10-30) |
-| `rustc-literal-escaper` 0.0.7 beside 0.0.8 | none once `ra-ap-*` 0.179 lands (queued after round 6): `ra-ap-rustc_parse_format` 0.179 asks for 0.0.8 |
-| `wasmparser`, `wasm-metadata`, `wit-component`, `wit-parser` 0.244, `hashbrown` 0.15, `foldhash` 0.1 | none: left in the lock by the deleted Wasmtime hosts; the workspace's `wasm-encoder` 0.263 without default features names no `wasmparser`, so the next re-resolve drops them |
 | `windows-sys` 0.52 | `ring` 0.17.14 |
 | `embedded-io` 0.4 beside 0.6 | `postcard` 1.1.3, which names both |
-| `syn` 2 beside 3 | both majors are in use upstream (syn 2: `thiserror-impl`, `tracing-attributes`, `zerocopy-derive`, `wasm-bindgen-macro-support`, `ra-ap-rustc_index_macros`, `synstructure` 0.13 under `yoke-derive`/`zerofrom-derive`; syn 3: `serde_derive`, `rkyv_derive`, `ref-cast-impl`, `salsa-macros`). The workspace's own `syn` stays 2 for now: moving `blaze-query-macros` and `macros` to 3 removes no copy and adds `synstructure` 0.14 beside 0.13 |
-| `rand` 0.8, `thiserror` 1, `nix` 0.23, `memoffset` 0.6, `windows` 0.34 (and its five `windows_*` 0.34 targets), `colored` 2 | none once the lock re-resolves: they were `tango-bench` 0.9's, which blaze-bench's own paired runner (`crates/blaze-bench/src/lib.rs`, the same statistic) replaced (2026-10-30) |
+| `syn` 2 beside 3 | both majors are in use upstream (syn 2: `thiserror-impl`, `tracing-attributes`, `zerocopy-derive`, `wasm-bindgen-macro-support`, `ra-ap-rustc_index_macros`, `synstructure` 0.13 under `yoke-derive`/`zerofrom-derive`; syn 3: `serde_derive`, `rkyv_derive`, `ref-cast-impl`, `defmt-macros`). The workspace's own `syn` stays 2 for now: moving `blaze-query-macros` and `macros` to 3 removes no copy and adds `synstructure` 0.14 beside 0.13 |
 | `unicode-width` 0.1 | `blaze-fmt` keeps the pinned nightly rustfmt's versions (`rustfmt-unicode-width`) |
-| `wit-bindgen` 0.57 (no dependencies of its own) | `wasip2` 1.0.3, under `getrandom` 0.3.4 (`ahash`, in `sonic-rs`); `wasm-encoder` is the workspace's 0.263 alone once `getrandom` 0.4 is at 0.4.3, which dropped `wasip2`/`wasip3` and with them the `wit-*` 0.244 crates (queue 01236) |
+| `wit-bindgen` 0.57 (no dependencies of its own) | `wasip2` 1.0.3, under `getrandom` 0.3.4 (`ahash`, in `sonic-rs`) |
+
+Gone from the lock as of f92a85458d (2026-10-31): the second `sha2`/`digest` family, `miniz_oxide` 0.8, `rustc-literal-escaper` 0.0.7, `hashbrown` 0.15, `foldhash` 0.1, `wasmparser`/`wasm-encoder` 0.244 with `wasm-metadata`, `wit-component`, `wit-parser` and `wit-bindgen` 0.51, `wasip3`, and tango-bench's `rand` 0.8, `thiserror` 1, `nix` 0.23, `memoffset` 0.6, `windows` 0.34 and `colored` 2.
 
 Where two libraries do one job, one stays: seeded randomness is `blaze-rng` (hir-ty-mir's
 `oorandom` went). blaze-resolve's persistent maps are `imbl` (im-rc's maintained fork, with `Rc` counts as

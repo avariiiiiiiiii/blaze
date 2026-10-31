@@ -4,7 +4,7 @@
 //! lexer as rustc's `FatalError` does.
 
 use parser::cook::{self, doc_comment_errors, escaped_char};
-use ra_ap_rustc_lexer::{self as rustc_lexer, Cursor, DocStyle, FrontmatterAllowed, LiteralKind};
+use rustc_lexer::{Cursor, DocStyle, FrontmatterAllowed, LiteralKind};
 use span::Edition;
 use unicode_normalization::{IsNormalized, UnicodeNormalization, is_nfc_quick};
 

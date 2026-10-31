@@ -1013,6 +1013,7 @@ impl<'r, 'a> State<'r, 'a> {
             Intent::Test | Intent::Bench => Mode::Test,
             Intent::Build => Mode::Build,
             Intent::Check { test } => Mode::check(test),
+            Intent::Doc => Mode::Check,
         }
     }
 
@@ -1100,6 +1101,10 @@ impl<'r, 'a> State<'r, 'a> {
                             Intent::Bench => t.benched,
                             Intent::Test => t.tested || is_example(t),
                             Intent::Build | Intent::Check { .. } => t.is_bin() || t.is_lib(),
+                            // cargo's: a binary named as its package's library is left out.
+                            Intent::Doc => {
+                                t.doc && (!t.is_bin() || !targets.iter().any(|l| l.is_lib() && l.name == t.name))
+                            }
                         };
                         if picked {
                             out.push(Proposal {

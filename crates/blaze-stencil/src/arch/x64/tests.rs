@@ -318,6 +318,12 @@ fn encodes_as_cranelifts_assembler() {
         (enc(|b| cmov(b, CC_AE, RAX, RCX)), &[0x48, 0x0f, 0x43, 0xc1]),
         (enc(|b| add(b, RCX, RDX)), &[0x48, 0x03, 0xca]),
         (enc(|b| movsxd_index4(b, RDX, RCX, RAX)), &[0x48, 0x63, 0x14, 0x81]),
+        (enc(|b| or(b, RAX, RCX)), &[0x48, 0x0b, 0xc1]),
+        (enc(|b| and(b, RCX, R10)), &[0x49, 0x23, 0xca]),
+        (enc(|b| sbb(b, R10, R10)), &[0x4d, 0x1b, 0xd2]),
+        (enc(|b| shl_imm(b, RDX, 8)), &[0x48, 0xc1, 0xe2, 0x08]),
+        (enc(|b| alu_imm(b, CMP, RCX, 16)), &[0x48, 0x83, 0xf9, 0x10]),
+        (enc(|b| load_u8_index(b, RCX, R11, RCX)), &[0x41, 0x0f, 0xb6, 0x0c, 0x0b]),
         (enc(|b| jmp_reg(b, RCX)), &[0xff, 0xe1]),
         (enc(|b| call_reg(b, R11)), &[0x41, 0xff, 0xd3]),
         (enc(|b| call_mem(b, at(RDI, 0))), &[0xff, 0x17]),
@@ -345,6 +351,13 @@ fn encodes_as_cranelifts_assembler() {
         (enc(|b| xload(b, Sse::Ss, 0, at(R12, 8))), &[0xf3, 0x41, 0x0f, 0x10, 0x44, 0x24, 0x08]),
         (enc(|b| xstore(b, Sse::Sd, at(R12, 8), 1)), &[0xf2, 0x41, 0x0f, 0x11, 0x4c, 0x24, 0x08]),
         (enc(|b| movq_to_xmm(b, 0, R10)), &[0x66, 0x49, 0x0f, 0x6e, 0xc2]),
+        (enc(|b| ret_imm(b, 0x30)), &[0xc2, 0x30, 0x00]),
+        (
+            enc(|b| {
+                jmp_rel32(b);
+            }),
+            &[0xe9, 0, 0, 0, 0],
+        ),
         (enc(ud2), &[0x0f, 0x0b]),
         (enc(ret), &[0xc3]),
     ];

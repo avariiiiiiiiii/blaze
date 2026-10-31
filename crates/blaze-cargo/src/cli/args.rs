@@ -26,6 +26,7 @@ impl Clap for Command {
             Command::Run => "cargo run",
             Command::Test => "cargo test",
             Command::Bench => "cargo bench",
+            Command::Doc => "cargo doc",
         }
     }
 
@@ -54,6 +55,10 @@ impl Clap for Command {
             Command::Bench => &[
                 GLOBAL, RUNNING, MESSAGE, SILENT, PACKAGES, TARGETS, FEATURES, JOBS, NO_KEEP_GOING, PROFILE,
                 TARGET, REPORTS, MANIFEST,
+            ],
+            Command::Doc => &[
+                GLOBAL, DOC_ONLY, MESSAGE, SILENT, PACKAGES, DOC_TARGETS, FEATURES, JOBS, KEEP_GOING, RELEASE,
+                PROFILE, TARGET, REPORTS, MANIFEST,
             ],
         }
     }
@@ -204,6 +209,17 @@ const TARGETS: &[Flag] = &[
     Flag::new("bench", None, Takes::Optional, "NAME").many(),
     Flag::switch("all-targets"),
 ];
+/// `doc`'s `arg_targets_lib_bins_examples`.
+const DOC_TARGETS: &[Flag] = &[
+    Flag::switch("lib"),
+    Flag::switch("bins"),
+    Flag::new("bin", None, Takes::Optional, "NAME").many(),
+    Flag::switch("examples"),
+    Flag::new("example", None, Takes::Optional, "NAME").many(),
+];
+/// What `doc` makes of the crates it checks: the daemon's load takes them and plans nothing by
+/// them; the request carries them ([`blaze_api::Request::Doc`]).
+const DOC_ONLY: &[Flag] = &[Flag::switch("open"), Flag::switch("no-deps"), Flag::switch("document-private-items")];
 const RUN_TARGETS: &[Flag] = &[
     Flag::new("bin", None, Takes::Optional, "NAME").many(),
     Flag::new("example", None, Takes::Optional, "NAME").many(),
@@ -376,6 +392,10 @@ pub struct Flags {
     pub verbose: u32,
     pub quiet: bool,
     pub doc: bool,
+    /// `doc`'s `--open`, `--no-deps` and `--document-private-items`.
+    pub open: bool,
+    pub no_deps: bool,
+    pub private: bool,
     pub no_run: bool,
     pub no_fail_fast: bool,
     pub reached: bool,
@@ -417,6 +437,9 @@ impl Flags {
             "verbose" => self.verbose += 1,
             "quiet" => self.quiet = true,
             "doc" => self.doc = true,
+            "open" => self.open = true,
+            "no-deps" => self.no_deps = true,
+            "document-private-items" => self.private = true,
             "no-run" => self.no_run = true,
             "no-fail-fast" => self.no_fail_fast = true,
             "reached" => self.reached = true,
@@ -716,7 +739,7 @@ fn command_line_after(command: Command, words: Vec<OsString>, before: usize) -> 
     if ended {
         let rest: Vec<OsString> = words.map(|(_, it)| it).collect();
         match command {
-            Command::Build | Command::Check => {
+            Command::Build | Command::Check | Command::Doc => {
                 if let Some(first) = rest.first() {
                     let arg = first.to_string_lossy().into_owned();
                     return Err(refused(Said::Unknown { arg, similar: None, trailing: false }, &[]));
@@ -883,7 +906,7 @@ fn usage_line(command: Option<Command>, used: &[Used], color: bool) -> String {
     let filter = used.contains(&Used::Filter);
     let program = used.contains(&Used::Program);
     match command {
-        Command::Build | Command::Check => {}
+        Command::Build | Command::Check | Command::Doc => {}
         Command::Run => pieces.push(paint(say::PLACEHOLDER, "[ARGS]...")),
         Command::Test | Command::Bench => {
             let name = if command == Command::Test { "TESTNAME" } else { "BENCHNAME" };

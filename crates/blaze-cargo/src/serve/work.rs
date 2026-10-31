@@ -551,6 +551,13 @@ pub trait Front<S: Steps>: Send + Sync + 'static {
     /// is made of packed for blaze's in-browser compiler, its macros' expansions recorded
     /// through the job's `writer`, the front end's last use ([`Response::Packed`]'s bytes).
     fn pack(&self, writer: S::Writer, program: &str) -> Result<Vec<u8>, Failed>;
+    /// On a worker, as [`Front::pack`] is but for `blaze doc`: the documentation of the crates
+    /// `cargo doc` documents for the check's root units (`blaze-doc`), and unless `no_deps` of
+    /// every library they depend on, made through the job's `writer`, the front end's last use,
+    /// which sets `cfg(doc)` on them. `private` is `--document-private-items`.
+    /// [`Response::Documented`], each file as a [`Response::DocPage`], then each warning as a
+    /// [`Response::Diagnostic`].
+    fn doc(&self, writer: S::Writer, no_deps: bool, private: bool) -> Result<Vec<Response>, Failed>;
 }
 
 /// User code of a job run through the loop's driver: it asks with effects whose tags are in

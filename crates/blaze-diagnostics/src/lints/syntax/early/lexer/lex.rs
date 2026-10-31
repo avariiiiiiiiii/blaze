@@ -2,7 +2,7 @@
 //! as far as the lints need it: what it buffers of comments, literals, reserved prefixes and
 //! guarded strings, and the identifiers it puts in the symbol gallery. It runs on the file's
 //! text as rustc's source map has it (`rustc_span/src/lib.rs`, `normalize_src`: no byte order
-//! mark, `\r\n` as `\n`), with the lexer rustc uses (`ra-ap-rustc_lexer`), and gives ranges in
+//! mark, `\r\n` as `\n`), with the pinned nightly's lexer (`crates/rustc_lexer`), and gives ranges in
 //! the file's own text.
 //!
 //! Follows `compiler/rustc_parse/src/lexer/mod.rs` (`lex_token_trees`, `next_token_from_cursor`,
@@ -14,7 +14,7 @@
 
 use std::borrow::Cow;
 
-use ra_ap_rustc_lexer::{self as rustc_lexer, Cursor, FrontmatterAllowed, LiteralKind, TokenKind};
+use rustc_lexer::{Cursor, FrontmatterAllowed, LiteralKind, TokenKind};
 use span::Edition;
 use syntax::{
     TextRange, TextSize,

@@ -257,6 +257,11 @@ pub(super) const fn ldp_post(rt: u8, rt2: u8, rn: u8, imm: i32) -> u32 {
     0xa8c0_0000 | ((imm / 8) as u32 & 0x7f) << 15 | r(rt2) << 10 | r(rn) << 5 | r(rt)
 }
 
+/// `stp` of two X registers at `[rn, #imm]`, the signed-offset form.
+pub(super) const fn stp_off(rt: u8, rt2: u8, rn: u8, imm: i32) -> u32 {
+    0xa900_0000 | ((imm / 8) as u32 & 0x7f) << 15 | r(rt2) << 10 | r(rn) << 5 | r(rt)
+}
+
 /// `stp`/`ldp` of two D registers, as [`stp_pre`] and [`ldp_post`].
 pub(super) const fn stp_d_pre(rt: u8, rt2: u8, rn: u8, imm: i32) -> u32 {
     0x6d80_0000 | ((imm / 8) as u32 & 0x7f) << 15 | r(rt2) << 10 | r(rn) << 5 | r(rt)

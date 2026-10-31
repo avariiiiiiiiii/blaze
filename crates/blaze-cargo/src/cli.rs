@@ -9,7 +9,7 @@
 //! - [`place`]: the checkout, the config files outside it, the environment, the color.
 //! - [`daemon`]: finding and starting `blaze serve`, and the [`daemon::Api`] it is spoken to by.
 //! - [`print`]: a build's responses as cargo's lines; [`say`] and [`json`] are their texts.
-//! - [`run`] and [`test`]: what runs after the build.
+//! - [`run`] and [`test`]: what runs after the build; [`doc`]: `doc`'s pages, written.
 //! - [`inspect`]: blaze's own looks at the last build (`codegen-inputs`, `trace`, `tables`),
 //!   and `pack`, the in-browser compiler's pack of a program.
 
@@ -17,6 +17,7 @@
 
 pub mod args;
 pub mod daemon;
+pub mod doc;
 pub mod inspect;
 pub mod json;
 pub mod place;
@@ -59,6 +60,7 @@ Commands:
     run, r      Run a binary or example of the local package
     test, t     Run the tests
     bench       Run the benchmarks
+    doc, d      Build a package's documentation, from blaze's front end: no rustdoc runs
     serve       Run the daemon the other commands are clients of
     stop        Make the daemon's state durable and stop it
     status      What the daemon is doing
@@ -78,6 +80,9 @@ Every command takes cargo's flags; `blaze help <COMMAND>` lists them.
 /// The `blaze` program, and `cargo-blaze`, which cargo runs for `cargo blaze` as
 /// `cargo-blaze blaze <command> ...`.
 pub fn main(args: impl Iterator<Item = OsString>) -> ExitCode {
+    blaze_profile::began();
+    // The client and `blaze serve` both: with `BLAZE_PROFILE` each records from here on.
+    blaze_profile::install();
     let words = words(args);
     if words.first().is_some_and(|it| it == "serve") {
         return crate::serve::main(words.into_iter().skip(1));
@@ -135,7 +140,7 @@ pub fn command(words: Vec<OsString>) -> i32 {
         Asked::Unknown(name) => {
             let what = format!(
                 "no such command: `{name}`\n\nhelp: blaze's commands are build, check, run, test, bench, \
-                 serve, stop, status, daemon, codegen-inputs, trace, tables and pack"
+                 doc, serve, stop, status, daemon, codegen-inputs, trace, tables and pack"
             );
             eprint!("{}", say::error(&what, auto_color()));
             FAILED
@@ -158,6 +163,7 @@ pub fn request(asked: &Invocation, cargo: Cargo) -> Result<Request, String> {
     let flags = &asked.flags;
     Ok(match asked.command() {
         Command::Check => Request::Check { view, targets },
+        Command::Doc => Request::Doc { view, targets, no_deps: flags.no_deps, private: flags.private },
         Command::Test | Command::Bench if in_daemon(asked) => {
             if flags.ub && flags.no_run {
                 return Err("`--ub` runs the tests in blaze's evaluator, which `--no-run` says not to do".to_owned());
@@ -241,10 +247,16 @@ fn cargo(asked: &Invocation) -> i32 {
         Ok(None) => return refused("no daemon answers, and none could be started", color),
         Err(error) => return refused(&format!("{error:#}"), color),
     };
-    let shown = Shown { format, quiet: asked.flags.quiet, verbose: asked.flags.verbose, color };
+    let stats = std::env::var_os("BLAZE_STATS").is_some();
+    let shown = Shown { format, quiet: asked.flags.quiet, verbose: asked.flags.verbose, color, stats };
     let (mut out, mut err) = (io::stdout().lock(), io::stderr().lock());
     let then = drive(&mut client, asked, &place, request, shown, started, &mut out, &mut err, &mut test::Spawned);
     drop(client);
+    // The daemon wrote its part before its last response, so every part is in by now.
+    if blaze_profile::on() {
+        blaze_profile::note("client", blaze_profile::CLIENT, blaze_profile::began());
+        blaze_profile::finish();
+    }
     match then {
         Ok(Then::Exit(code)) => code,
         Ok(Then::Exec(exec)) => {
@@ -281,8 +293,18 @@ pub fn drive<A: Api, O: Write, E: Write, P: Programs>(
     // alloc: once a request, for `--reached` and `--ub`; it grows by doubling, not by a result.
     let mut results: Vec<TestResult> = Vec::new();
     let mut unwritten = None;
+    let mut docs = doc::Docs::default();
     let called = api.call(request, |response, more| {
         let printed = match response {
+            ResponseRef::Documented(documented) => {
+                let printed = documented.crates.iter().try_for_each(|it| printer.status("Documenting", &it.package));
+                docs.documented(documented);
+                printed
+            }
+            ResponseRef::DocPage { path, page } => {
+                docs.page(path, page);
+                Ok(())
+            }
             ResponseRef::TestResult(result) => {
                 // alloc: a result held to the end, where libtest's format groups them by
                 // executable; only `--reached` and `--ub` have them.
@@ -312,6 +334,18 @@ pub fn drive<A: Api, O: Write, E: Write, P: Programs>(
             return Ok(Then::Exit(FAILED));
         }
     };
+    // The pages are written before cargo's `Finished`, and a page not written fails the command.
+    let documented = match (asked.command(), ok) {
+        (Command::Doc, true) => match docs.finish() {
+            Ok(documented) => Some(documented),
+            Err(what) => {
+                printer.finish(false, started.elapsed())?;
+                printer.err().write_all(say::error(&what, shown.color).as_bytes())?;
+                return Ok(Then::Exit(FAILED));
+            }
+        },
+        _ => None,
+    };
     printer.finish(ok, started.elapsed())?;
     if !ok {
         return Ok(Then::Exit(FAILED));
@@ -322,6 +356,12 @@ pub fn drive<A: Api, O: Write, E: Write, P: Programs>(
     let members = printer.members();
     match asked.command() {
         Command::Build | Command::Check => Ok(Then::Exit(0)),
+        Command::Doc => {
+            if let Some(documented) = &documented {
+                doc::done(documented, asked.flags.open, shown.quiet, shown.color, printer.err())?;
+            }
+            Ok(Then::Exit(0))
+        }
         Command::Run => {
             let exec = run::pick(&artifacts, &asked.flags).and_then(|it| run::planned(it, &asked.program, &place.cwd));
             match exec {

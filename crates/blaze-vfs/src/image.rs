@@ -132,11 +132,11 @@ pub enum ImageUse {
     None,
     /// The tree was mapped in place and the journal's tail loaded over it. `disks` says why
     /// the watchers' metadata was not used (they then scan), `None` when it was.
-    Used { name: ContentId, nodes: u64, disks: Option<String> },
+    Used { name: ContentId, nodes: u64, disks: Option<DisksUnused> },
     /// The journal starts from the image this one was written over, or from none: a stop
     /// came after the image's rename and before the journal's rewrite. The tree was mapped in
     /// place and the whole journal loaded over it; the next flush rewrites the journal.
-    Resumed { name: ContentId, nodes: u64, disks: Option<String> },
+    Resumed { name: ContentId, nodes: u64, disks: Option<DisksUnused> },
     /// Not an image this blaze opens: the journal was loaded alone.
     Unopened(OpenError),
     /// The image has no VFS tree, or one of another layout: the journal was loaded alone.
@@ -150,6 +150,34 @@ pub enum ImageUse {
     /// the one it was written over: the journal was loaded alone.
     Unnamed { image: ContentId, journal: Option<ContentId> },
 }
+
+/// Why [`Vfs::restore`] did not use the image's watcher metadata (the `vfs disks` section).
+/// [`DisksUnused::Refused`] is a section this blaze does not read, which the watchers' scan
+/// replaces; the rest are an image that is broken.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub enum DisksUnused {
+    /// The image has no disks section, or one of another schema.
+    Refused(Refused),
+    /// A page group of the disks section failed its check.
+    Corrupt(Corrupt),
+    /// The disks section's range is outside the image's file.
+    Outside,
+    /// The disks section is not one this blaze writes: what is wrong with it.
+    Malformed(&'static str),
+}
+
+impl fmt::Display for DisksUnused {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            DisksUnused::Refused(refused) => write!(f, "the VFS image's disks section is refused: {refused}"),
+            DisksUnused::Corrupt(corrupt) => write!(f, "the VFS image's disks section is corrupt: {corrupt}"),
+            DisksUnused::Outside => f.write_str("the VFS image's disks section is outside its file"),
+            DisksUnused::Malformed(what) => write!(f, "the VFS image's disks section: {what}"),
+        }
+    }
+}
+
+impl std::error::Error for DisksUnused {}
 
 impl From<Corrupt> for OpError {
     fn from(corrupt: Corrupt) -> OpError {
@@ -427,17 +455,13 @@ fn view<'a>(
     })
 }
 
-/// The watchers' metadata and cursors of the image, its groups checked; why not, as text.
-fn open_disks(image: &Image<Mapping>) -> Result<Disks, String> {
-    // alloc: an error's text, at the edge (and below).
-    let placed = image.section(SectionId::VFS_DISKS, DISKS_SCHEMA).map_err(|it| it.to_string())?;
-    // alloc: as above.
-    let range = image.whole_range(&placed).map_err(|it| it.to_string())?;
+/// The watchers' metadata and cursors of the image, its groups checked.
+fn open_disks(image: &Image<Mapping>) -> Result<Disks, DisksUnused> {
+    let placed = image.section(SectionId::VFS_DISKS, DISKS_SCHEMA).map_err(DisksUnused::Refused)?;
+    let range = image.whole_range(&placed).map_err(DisksUnused::Corrupt)?;
     // clone: a count of the mapping, once per start.
-    let section = Section::new(image.owner().clone(), range);
-    // alloc: as above.
-    let section = section.ok_or_else(|| "the VFS image's disks section is outside its file")?;
-    Disks::open(section)
+    let section = Section::new(image.owner().clone(), range).ok_or(DisksUnused::Outside)?;
+    Disks::open(section).map_err(DisksUnused::Malformed)
 }
 
 #[cfg(test)]

@@ -189,6 +189,13 @@ fn real_span_map_in(
     ANCHOR_SORT.with_borrow_mut(|scratch| {
         radix::sort_copy_by_key_in(&mut pairs, |&(offset, _)| u32::from(offset), scratch.take())
     });
+    // The root's anchor holds the text before the first item. With an item at 0 it holds none
+    // and no lookup finds it, but `RealSpanMap::within` would keep it in that item's map, so the
+    // item's maps (and the bodies compared by them) would change once an item is written above.
+    let zero = syntax::TextSize::new(0);
+    if pairs.iter().take_while(|&&(offset, _)| offset == zero).nth(1).is_some() {
+        pairs.retain(|&(offset, ast_id)| offset != zero || ast_id != span::ROOT_ERASED_FILE_AST_ID);
+    }
 
     RealSpanMap::from_file(
         editioned_file_id.span_file_id(db),
@@ -222,6 +229,28 @@ mod tests {
             at = end;
         }
         out
+    }
+
+    /// An item at the start of a file has the map of its own (`RealSpanMap::within`) it has
+    /// once an item is written above it: the root's empty anchor before it is not kept, so its
+    /// bodies stay equal and their readers are not run again (blaze-lints'
+    /// `an_edit_of_one_body_lints_that_body_and_no_other`).
+    #[test]
+    fn an_item_at_the_start_keeps_its_map_when_an_item_is_written_above() {
+        let item = "fn a() {\n    let _ = 1;\n}\n";
+        let own = [item.to_owned(), format!("struct S;\n{item}")].map(|text| {
+            let fixture = crate::fixture::db(&format!("//- /main.rs crate:main\n{text}"));
+            let map = real_span_map(fixture.db(), fixture.only_file());
+            let (ids, starts) = map.anchors();
+            let at_zero = starts.iter().take_while(|&&start| start == 0).count();
+            assert_eq!(at_zero, 1, "one anchor begins at 0, the first item's");
+            assert_ne!(ids[0][0], span::ROOT_ERASED_FILE_AST_ID.into_raw(), "an item is at 0");
+            let (start, len) = (*starts.last().expect("`a`"), ids.last().expect("`a`")[1]);
+            let within = map.within(TextRange::at(start.into(), len.into()));
+            let (ids, starts) = within.anchors();
+            (ids.iter().map(|&[_, len]| len).collect::<Vec<_>>(), starts.to_vec())
+        });
+        assert_eq!(own[0], own[1]);
     }
 
     /// The in-order mapper gives the spans the plain lookup gives, walking the tokens in order

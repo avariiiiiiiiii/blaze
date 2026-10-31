@@ -712,7 +712,7 @@ fn stack_frames_are_freed() {
     // 2 GiB of locals in all, of 1 MiB a call.
     check_number(
         r#"
-        //- minicore: fn
+        //- minicore: fn, index, slice
         const fn f(i: usize) -> u8 {
             let a = [7u8; 1 << 20];
             a[i]
@@ -1409,40 +1409,50 @@ fn atomic() {
 
 #[test]
 fn atomic_with_const_generic_orderings() {
-    // The pinned nightly's spelling: the orderings are const generics, not name suffixes.
+    // The pinned nightly's spelling: the orderings are const generics of core's
+    // `AtomicOrdering`, not name suffixes.
     check_number(
         r#"
-        //- minicore: copy
+        //- minicore: copy, const_param_ty
+        #![feature(adt_const_params)]
+        use core::marker::ConstParamTy;
+        #[derive(PartialEq, Eq, ConstParamTy)]
+        pub enum AtomicOrdering { Relaxed = 0, Release = 1, Acquire = 2, AcqRel = 3, SeqCst = 4 }
+        use AtomicOrdering::SeqCst;
         #[rustc_intrinsic]
-        pub fn atomic_load<T: Copy, const ORD: u8, const VOLATILE: bool>(src: *const T) -> T;
+        pub fn atomic_load<T: Copy, const ORD: AtomicOrdering>(src: *const T) -> T;
         #[rustc_intrinsic]
-        pub fn atomic_store<T: Copy, const ORD: u8, const VOLATILE: bool>(dst: *mut T, val: T);
+        pub fn atomic_store<T: Copy, const ORD: AtomicOrdering>(dst: *mut T, val: T);
         #[rustc_intrinsic]
-        pub fn atomic_xadd<T: Copy, U: Copy, const ORD: u8>(dst: *mut T, src: U) -> T;
+        pub fn atomic_xadd<T: Copy, U: Copy, const ORD: AtomicOrdering>(dst: *mut T, src: U) -> T;
         #[rustc_intrinsic]
-        pub fn atomic_max<T: Copy, const ORD: u8>(dst: *mut T, src: T) -> T;
+        pub fn atomic_max<T: Copy, const ORD: AtomicOrdering>(dst: *mut T, src: T) -> T;
         #[rustc_intrinsic]
-        pub fn atomic_min<T: Copy, const ORD: u8>(dst: *mut T, src: T) -> T;
+        pub fn atomic_min<T: Copy, const ORD: AtomicOrdering>(dst: *mut T, src: T) -> T;
         #[rustc_intrinsic]
-        pub fn atomic_umin<T: Copy, const ORD: u8>(dst: *mut T, src: T) -> T;
+        pub fn atomic_umin<T: Copy, const ORD: AtomicOrdering>(dst: *mut T, src: T) -> T;
         #[rustc_intrinsic]
-        pub fn atomic_cxchg<T: Copy, const S: u8, const F: u8>(dst: *mut T, old: T, src: T) -> (T, bool);
+        pub fn atomic_cxchg<T: Copy, const S: AtomicOrdering, const F: AtomicOrdering>(
+            dst: *mut T,
+            old: T,
+            src: T,
+        ) -> (T, bool);
         #[rustc_intrinsic]
-        pub fn atomic_fence<const ORD: u8>();
+        pub fn atomic_fence<const ORD: AtomicOrdering>();
 
         const GOAL: i32 = {
             let mut x = 5i32;
-            atomic_store::<i32, 4, false>(&mut x, 10);
-            atomic_xadd::<i32, i32, 4>(&mut x, 7);
-            atomic_fence::<4>();
-            let old = atomic_max::<i32, 4>(&mut x, -3);
-            let before = atomic_max::<i32, 4>(&mut x, 40);
+            atomic_store::<i32, { SeqCst }>(&mut x, 10);
+            atomic_xadd::<i32, i32, { SeqCst }>(&mut x, 7);
+            atomic_fence::<{ SeqCst }>();
+            let old = atomic_max::<i32, { SeqCst }>(&mut x, -3);
+            let before = atomic_max::<i32, { SeqCst }>(&mut x, 40);
             let mut u = 7u32;
-            atomic_umin::<u32, 4>(&mut u, 3);
+            atomic_umin::<u32, { SeqCst }>(&mut u, 3);
             let mut n = -10i32;
-            atomic_min::<i32, 4>(&mut n, 5);
-            let (prev, ok) = atomic_cxchg::<i32, 4, 4>(&mut x, 40, 41);
-            atomic_load::<i32, 4, false>(&x) + old + before + u as i32 + n + prev + ok as i32
+            atomic_min::<i32, { SeqCst }>(&mut n, 5);
+            let (prev, ok) = atomic_cxchg::<i32, { SeqCst }, { SeqCst }>(&mut x, 40, 41);
+            atomic_load::<i32, { SeqCst }>(&x) + old + before + u as i32 + n + prev + ok as i32
         };
         "#,
         41 + 17 + 17 + 3 - 10 + 40 + 1,

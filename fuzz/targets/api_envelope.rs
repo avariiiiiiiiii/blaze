@@ -356,6 +356,7 @@ fn seeds() -> Vec<Vec<u8>> {
             }],
             compiled: 4,
             critical_path_us: u64::MAX,
+            steps_us: vec![(blaze_api::NodeKind::Codegen, u64::MAX)],
         }),
         Response::TestResult(TestResult {
             name: "tests::a".to_owned(),

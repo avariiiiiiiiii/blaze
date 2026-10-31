@@ -73,7 +73,7 @@ impl Glue for X64 {
         count(cx, tier::CALLS);
         let func = cx.func;
         if let (Some(off), Some(place)) = (frame.sret, frame::sret_place(func)?) {
-            frame::param(cx.buf, place, ir::types::I64, super::Loc::Slot(off))?;
+            frame::param(cx.buf, frame.grow, place, ir::types::I64, super::Loc::Slot(off))?;
         }
         let entry = func.layout.entry_block().ok_or_else(|| Error::new("a function with no blocks"))?;
         let params = func.dfg.block_params(entry);
@@ -81,7 +81,7 @@ impl Glue for X64 {
             return Err(Error::new("an entry block whose parameters are not the signature's"));
         }
         abi::args(&func.signature, |i, param, place| {
-            frame::param(cx.buf, place, param.value_type, cx.plan.loc(func, params[i]))
+            frame::param(cx.buf, frame.grow, place, param.value_type, cx.plan.loc(func, params[i]))
         })?;
         debug_assert!(cx.buf.len() - start <= frame.prologue, "the prologue's bound");
         Ok(())

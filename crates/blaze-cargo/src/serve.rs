@@ -217,6 +217,7 @@ fn serve(args: impl IntoIterator<Item = OsString>) -> anyhow::Result<()> {
         activated,
     };
     signals::catch();
+    plane::record_panics();
     let steps = Arc::new(unit::Real::new(&paths).map_err(|why| anyhow::anyhow!(why))?);
     let scratch = paths.state.join("spawn");
     let runner = plane::Runner::Threads(plane::Threads::new(options.io));

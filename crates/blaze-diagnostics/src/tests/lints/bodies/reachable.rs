@@ -1,7 +1,11 @@
 //! `unreachable_code`, from rustc's UI tests (`tests/ui/reachable/`) with their `.stderr`.
 
 use super::types::ui_std;
-use crate::tests::ui;
+use crate::{
+    Options,
+    emit::Style,
+    tests::{Mode, checked_with, compiletest, normalized, ui},
+};
 
 /// std's `println!` and what it calls, for the tests that write one: what std's prelude has of
 /// it, and its items.
@@ -19,6 +23,26 @@ macro_rules! println {
 }
 "#,
 );
+
+/// [`ui`] beside a core that declares the library feature `type_ascription`, as
+/// `library/core/src/macros/mod.rs` does, for the tests that enable it.
+fn ui_ascription(name: &str, source: &str) -> String {
+    let fixture = format!("{ASCRIPTION_CORE}//- /{name} crate:other:main edition:2015 deps:core\n{source}");
+    let checked = checked_with(&fixture, "$DIR/", &compiletest(Mode::Other, &Options::default()));
+    normalized(&checked.stderr_with(Style { ui_testing: true, ..Style::default() }))
+}
+
+const ASCRIPTION_CORE: &str = r#"//- /core.rs crate:core edition:2024
+#![feature(decl_macro, staged_api)]
+#![stable(feature = "core", since = "1.6.0")]
+#[stable(feature = "core_prelude", since = "1.4.0")]
+pub mod prelude {
+    #[stable(feature = "prelude_2015", since = "1.55.0")]
+    pub mod rust_2015 {}
+}
+#[unstable(feature = "type_ascription", issue = "23416", reason = "placeholder syntax for type ascription")]
+pub macro type_ascribe($expr:expr, $ty:ty) {}
+"#;
 
 #[test]
 fn a_return_in_a_return() {
@@ -55,7 +79,7 @@ LL | #![deny(unreachable_code)]
 error: aborting due to 1 previous error
 
 "##;
-    assert_eq!(ui("expr_return.rs", "2015", source), stderr);
+    assert_eq!(ui_ascription("expr_return.rs", source), stderr);
 }
 
 #[test]
@@ -214,7 +238,7 @@ LL |     let x: [usize; 2] = [22, return];
 error: aborting due to 2 previous errors
 
 "##;
-    assert_eq!(ui("expr_array.rs", "2015", source), stderr);
+    assert_eq!(ui_ascription("expr_array.rs", source), stderr);
 }
 
 #[test]

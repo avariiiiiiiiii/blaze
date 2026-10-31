@@ -925,7 +925,9 @@ fn f() {}
                 let docs = attrs.iter().filter(|it| is_doc_str(it)).count();
                 (inline, segments, docs)
             });
-            assert_eq!(read, (1, 5, 1));
+            // The segments of `feature(no_core)` and `no_core` too, which a fixture crate without
+            // a core takes.
+            assert_eq!(read, (1, 7, 1));
         });
     }
 }

@@ -212,11 +212,12 @@ impl<'db> Type<'db> {
     }
 }
 
-/// The errors match checking finds in `def`, in the order rustc emits them.
-pub(crate) fn match_check_diagnostics<'db>(
+/// The errors match checking finds in `def`, in the order rustc emits them. `source_map` is
+/// asked for only when there is one to place.
+pub(crate) fn match_check_diagnostics<'db, 'm>(
     db: &'db Db,
     def: DefWithBodyId,
-    source_map: &BodySourceMap,
+    source_map: impl FnOnce() -> &'m BodySourceMap,
     type_owner: TypeOwnerId,
     acc: &mut Vec<AnyDiagnostic<'db>>,
 ) {
@@ -224,7 +225,7 @@ pub(crate) fn match_check_diagnostics<'db>(
     if check.errors.is_empty() {
         return;
     }
-    let syntax = Syntax { db, source_map };
+    let syntax = Syntax { db, source_map: source_map() };
     let interner = DbInterner::new_no_crate(db);
     let ty =
         |ty: &'db StoredTy| Type { owner: type_owner, ty: EarlyBinder::bind(interner, ty.as_ref()) };

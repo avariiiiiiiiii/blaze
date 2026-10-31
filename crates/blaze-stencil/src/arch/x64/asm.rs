@@ -179,6 +179,7 @@ pub fn movabs(buf: &mut Buf<'_>, dst: u8, value: u64) -> u32 {
 pub const ADD: u8 = 0;
 pub const AND: u8 = 4;
 pub const SUB: u8 = 5;
+pub const CMP: u8 = 7;
 
 /// `op r64, imm`: the imm8 form when it fits (`addq_mi_sxb`), else imm32.
 pub fn alu_imm(buf: &mut Buf<'_>, op: u8, dst: u8, value: i32) {
@@ -205,6 +206,38 @@ pub fn alu_imm32(buf: &mut Buf<'_>, op: u8, dst: u8, value: i32) {
 /// `add dst, src`, 64 bits (`addq_rm`).
 pub fn add(buf: &mut Buf<'_>, dst: u8, src: u8) {
     op_rr(buf, None, true, &[0x03], dst, src);
+}
+
+/// `or dst, src`, 64 bits (`orq_rm`).
+pub fn or(buf: &mut Buf<'_>, dst: u8, src: u8) {
+    op_rr(buf, None, true, &[0x0b], dst, src);
+}
+
+/// `and dst, src`, 64 bits (`andq_rm`).
+pub fn and(buf: &mut Buf<'_>, dst: u8, src: u8) {
+    op_rr(buf, None, true, &[0x23], dst, src);
+}
+
+/// `sbb dst, src`, 64 bits (`sbbq_rm`).
+pub fn sbb(buf: &mut Buf<'_>, dst: u8, src: u8) {
+    op_rr(buf, None, true, &[0x1b], dst, src);
+}
+
+/// `shl dst, imm8`, 64 bits.
+pub fn shl_imm(buf: &mut Buf<'_>, dst: u8, by: u8) {
+    rex(buf, true, 0, 0, dst);
+    buf.put1(0xc1);
+    buf.put1(modrm(3, 4, dst));
+    buf.put1(by);
+}
+
+/// `movzx dst32, byte [base + index]`; `base` is not `rbp` or `r13`.
+pub fn load_u8_index(buf: &mut Buf<'_>, dst: u8, base: u8, index: u8) {
+    debug_assert!(base & 7 != 5 && index != RSP);
+    rex(buf, false, dst, index, base);
+    buf.put(&[0x0f, 0xb6]);
+    buf.put1(modrm(0, dst, 4));
+    buf.put1(((index & 7) << 3) | (base & 7));
 }
 
 /// `cmp a, b`, 64 bits (`cmpq_rm`): the flags of `a - b`.
@@ -286,6 +319,20 @@ pub fn jcc(buf: &mut Buf<'_>, cc: u8) -> u32 {
 
 pub fn ret(buf: &mut Buf<'_>) {
     buf.put1(0xc3);
+}
+
+/// `ret imm16`: returns, then pops `bytes` of stack arguments (`retq_i`).
+pub fn ret_imm(buf: &mut Buf<'_>, bytes: u16) {
+    buf.put1(0xc2);
+    buf.put(&bytes.to_le_bytes());
+}
+
+/// `jmp rel32`; the offset of the rel32.
+pub fn jmp_rel32(buf: &mut Buf<'_>) -> u32 {
+    buf.put1(0xe9);
+    let at = buf.len();
+    buf.put4(0);
+    at
 }
 
 pub fn ud2(buf: &mut Buf<'_>) {

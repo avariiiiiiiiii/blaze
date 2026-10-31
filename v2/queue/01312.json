@@ -1,0 +1,23 @@
+{
+  "id": "01312",
+  "from_lane": "tests-misc",
+  "owner": "db",
+  "paths": [
+    "crates/hir/src/lib.rs"
+  ],
+  "what": "Adds to 01267 (same fix, one more symptom): blaze-lints map_filter_map misses the iter_mut().for_each finding because items_send asks Type::impls_trait(Send) of the item type &mut u64, refused by the args.references_error() guard for its ReError region (crates/hir/src/lib.rs:5172). Checking only non-region errors (HAS_NON_REGION_ERROR), as 01267 says, fixes this too; close with 01267. From tests-misc-lints round 8b.",
+  "state": "open",
+  "created": "2026-10-31T15:26:39Z",
+  "updated": "2026-10-31T15:26:39Z",
+  "taken_by": null,
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-10-31T15:26:39Z",
+      "by": "tests-misc",
+      "action": "add",
+      "note": ""
+    }
+  ]
+}

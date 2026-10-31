@@ -1,7 +1,7 @@
-"""Moves blaze's trait solver to a nightly: `vendor/rustc_type_ir`, `vendor/rustc_next_trait_solver`,
-`vendor/rustc_type_ir_macros` and `vendor/rustc_transmute` become rust-lang/rust's
-`compiler/<crate>` at that nightly's rustc commit, with blaze's patch series
-(`vendor/<crate>/PATCHES.md`) replayed on top
+"""Moves blaze's trait solver and format-string parser to a nightly: `vendor/rustc_type_ir`,
+`vendor/rustc_next_trait_solver`, `vendor/rustc_type_ir_macros`, `vendor/rustc_transmute` and
+`vendor/rustc_parse_format` become rust-lang/rust's `compiler/<crate>` at that nightly's rustc
+commit, with blaze's patch series (`vendor/<crate>/PATCHES.md`) replayed on top
 (`docs/v2/plan/design/compile-time.md`, change 18). `harness/toolchain_bump.py` runs it on every
 bump.
 
@@ -11,14 +11,15 @@ Input (inline JSON, a file's path, or `-`):
 - `nightly`: the nightly to move to, `nightly-YYYY-MM-DD`. It must be the one `harness/toolchain`
   pins.
 - `root`: the workspace; empty for the one holding this script.
-- `checkout`: a rust-lang/rust git checkout already at the nightly's commit, with the four
+- `checkout`: a rust-lang/rust git checkout already at the nightly's commit, with the five
   directories checked out; empty to fetch them (a sparse, blob-less clone cached under
   `$XDG_CACHE_HOME/blaze-solver-sync`).
 
 In order, each step stopping the sync with an error that names it:
 1. the nightly's rustc commit, from `static.rust-lang.org/dist/<date>/
    channel-rust-nightly-git-commit-hash.txt`;
-2. `compiler/{rustc_type_ir,rustc_next_trait_solver,rustc_type_ir_macros,rustc_transmute}` at that commit;
+2. `compiler/{rustc_type_ir,rustc_next_trait_solver,rustc_type_ir_macros,rustc_transmute,rustc_parse_format}`
+   at that commit;
 3. for each crate, upstream's `Cargo.toml` must be `vendor/<crate>/Cargo.toml.orig` byte for
    byte: blaze's `Cargo.toml` is written from it, so a changed one stops the sync until both are
    updated by hand;
@@ -45,7 +46,7 @@ from pathlib import Path
 from typed_input import fail, parse
 
 SCRIPT = "solver_sync.py"
-CRATES = ("rustc_type_ir", "rustc_next_trait_solver", "rustc_type_ir_macros", "rustc_transmute")
+CRATES = ("rustc_type_ir", "rustc_next_trait_solver", "rustc_type_ir_macros", "rustc_transmute", "rustc_parse_format")
 DIST = "https://static.rust-lang.org/dist"
 RUST = "https://github.com/rust-lang/rust"
 NIGHTLY = re.compile(r"nightly-(\d{4}-\d{2}-\d{2})")

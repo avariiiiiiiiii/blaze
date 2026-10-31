@@ -15,12 +15,15 @@
 //! - no allocation of a client's, a server's or the store's step is larger than
 //!   `cas_shared::wire_bound` of the bytes received: a length prefix is not room made for it;
 //! - an answer that decodes encodes back to the same bytes;
-//! - a fetch ends as its frame says, read in order: `Kept` only for a whole answer of its key
-//!   whose bytes hash to the content it names, and then the store reads those bytes; `Missing`
-//!   only for a whole answer of its key that says so; `Refused` for the rest, and for every
-//!   fetch after a frame that is not a whole answer of its key; damage is never other bytes;
-//! - a server sends whole frames that decode, answering each whole ask in order as
-//!   `Answer::of` its store does, all of them while every ask is one; it finds nothing corrupt;
+//! - a fetch ends as the first answer of its key says, answers coming in any order and filter
+//!   frames among them: `Kept` only for a whole answer whose bytes hash to the content it names,
+//!   and then the store reads those bytes; `Missing` only for a whole answer that says so;
+//!   `Refused` for the rest, and for every fetch still waiting at a frame that is neither a
+//!   whole filter nor a whole answer of a key still waiting; damage is never other bytes;
+//! - a server sends whole frames: first a full filter its store's every key is in, then answers
+//!   that decode, answering each whole ask in order as `Answer::of` its store does (its values
+//!   are all short, so none is held back for a send of its own), all of them while every ask is
+//!   one; it finds nothing corrupt;
 //! - round trip: frames a server's store sends, undamaged, are kept as the values it holds.
 
 #![forbid(unsafe_code)]
@@ -33,7 +36,7 @@ use blaze_cas::{
 };
 use blaze_core::{Address, Completion, Conn, Done, Effect, FileName, Tag};
 use blaze_fuzzer::Target;
-use blaze_ids::ContentId;
+use blaze_ids::{ContentId, fuse::Fuse8};
 
 #[path = "cas_shared.rs"]
 mod shared;
@@ -45,8 +48,9 @@ const TARGET: Target = Target {
     check,
     seeds,
     dictionary: &[
-        b"BLZASK\x01\x00",
-        b"BLZANS\x01\x00",
+        b"BLZASK\x03\x00",
+        b"BLZANS\x03\x00",
+        b"BLZANS\x03\x00\x02\x01",
         b"\x00\x00\x00\x40\x00\x00\x00\x00",
         b"\x52\x00\x00\x40\x00\x00\x00\x00",
         b"\x29\x00\x00\x00\x00\x00\x00\x00",
@@ -62,7 +66,10 @@ const SERVER_TAGS: u64 = 2 << 32;
 /// An answer's bytes before its value: header, which, key, kind, content hash, length.
 const VALUE_HEADER: u64 = 8 + 1 + 32 + 1 + 32 + 8;
 const ASK_LEN: usize = 8 + 32;
-const ASK_HEADER: &[u8; 8] = b"BLZASK\x01\x00";
+const ASK_HEADER: &[u8; 8] = b"BLZASK\x03\x00";
+const ANSWER_HEADER: &[u8; 8] = b"BLZANS\x03\x00";
+/// The byte after an answer frame's header that says it is a filter.
+const FILTER: u8 = 2;
 const FETCHES_MOST: u8 = 8;
 const RECEIVES_MOST: usize = 4096;
 
@@ -137,33 +144,49 @@ enum Expect {
     Refused,
 }
 
-/// How each fetch of `keys`, asked in order, ends when the server sends `stream`.
+/// How each fetch of `keys` (all different) ends when the server sends `stream`: its frames
+/// read in order, a filter taken, an answer matched to the fetch of its key; the fetches still
+/// waiting at the first frame that is neither (or at the end) are refused.
 fn expected(keys: &[Key], stream: &[u8]) -> Vec<Expect> {
+    let mut ends: Vec<Option<Expect>> = keys.iter().map(|_| None).collect();
     let mut at = 0;
-    let mut whole = true;
-    let mut out = Vec::new();
-    for key in keys {
-        let answer = whole.then(|| frame_at(stream, at)).flatten().map(|body| (body.len(), Answer::decode(body)));
-        let expect = match answer {
-            Some((len, Ok(Answer::Missing { key: it }))) if it == *key => {
-                at += 8 + len;
-                Expect::Missing
+    while let Some(body) = frame_at(stream, at) {
+        at += 8 + body.len();
+        if body.get(8) == Some(&FILTER) {
+            match filter_in(body) {
+                Some(_) => continue,
+                None => break,
             }
-            Some((len, Ok(Answer::Value { key: it, content, bytes, .. }))) if it == *key => {
-                at += 8 + len;
-                match shared::content_of(&bytes) == content {
-                    true => Expect::Kept(bytes),
-                    false => Expect::Refused,
-                }
-            }
-            _ => {
-                whole = false;
-                Expect::Refused
-            }
+        }
+        let (key, expect) = match Answer::decode(body) {
+            Ok(Answer::Missing { key }) => (key, Expect::Missing),
+            Ok(Answer::Value { key, content, bytes, .. }) => match shared::content_of(&bytes) == content {
+                true => (key, Expect::Kept(bytes)),
+                false => (key, Expect::Refused),
+            },
+            Err(_) => break,
         };
-        out.push(expect);
+        let Some(waiting) = keys.iter().position(|it| *it == key).filter(|&it| ends[it].is_none()) else { break };
+        ends[waiting] = Some(expect);
     }
-    out
+    ends.into_iter().map(|it| it.unwrap_or(Expect::Refused)).collect()
+}
+
+/// A filter frame's body, as a client takes it: whether it replaces the filters before it,
+/// and the filter; `None` for one it refuses.
+fn filter_in(body: &[u8]) -> Option<(bool, Fuse8)> {
+    let rest = body.strip_prefix(ANSWER_HEADER)?;
+    let (&[which, replaces], rest) = rest.split_first_chunk::<2>()?;
+    if which != FILTER || replaces > 1 {
+        return None;
+    }
+    let (_epoch, rest) = rest.split_first_chunk::<8>()?;
+    Some((replaces == 1, Fuse8::decode(rest).ok()?))
+}
+
+/// What a filter holds of `key`: its first eight bytes, as a `u64`.
+fn word(key: &Key) -> u64 {
+    u64::from_le_bytes(*key.0.0.first_chunk().expect("a key is 32 bytes"))
 }
 
 /// The body of the frame at `at`, when it is all there and not longer than an answer may be.
@@ -277,9 +300,10 @@ fn serve(asks: &[u8], piece: usize) {
     for (file, bytes) in served_files() {
         sim.change(file, bytes);
     }
-    let store = shared::open(&mut sim);
+    let mut store = shared::open(&mut sim);
     let mut server = Server::new(address(), SERVER_TAGS).expect("a server listens on a unix socket");
     let mut effects = Vec::new();
+    server.refresh(&mut store, &mut effects);
     server.start(&mut effects);
     let (mut at, mut sent, mut corrupt, mut parked) = (0, Vec::new(), Vec::new(), None);
     loop {
@@ -314,8 +338,14 @@ fn serve(asks: &[u8], piece: usize) {
         }
     }
     assert!(corrupt.is_empty(), "a server of a whole store finds nothing corrupt: {corrupt:?}");
+    let first = frame_at(&sent, 0).expect("a server sends a peer its filter first");
+    let Some((true, filter)) = filter_in(first) else { panic!("a server's first frame is a full filter") };
+    assert!(
+        served().iter().all(|value| filter.contains(word(&value.key))),
+        "a server's filter holds every key its store does"
+    );
     let mut answers = Vec::new();
-    let mut from = 0;
+    let mut from = 8 + first.len();
     while from < sent.len() {
         let body = frame_at(&sent, from).expect("a server sends whole frames");
         answers.push(Answer::decode(body).expect("a server sends answers that decode"));
@@ -355,6 +385,13 @@ fn value(n: u32, kind: Kind, bytes: &[u8]) -> Answer {
     Answer::Value { key: shared::key(n), kind, content: shared::content_of(bytes), bytes: bytes.to_vec() }
 }
 
+/// A filter frame of `keys`, as a server sends one.
+fn filter_frame(replaces: bool, keys: &[Key]) -> Vec<u8> {
+    let mut body = [&ANSWER_HEADER[..], &[FILTER, u8::from(replaces)], &0u64.to_le_bytes()].concat();
+    Fuse8::of(keys.iter().map(word).collect()).encode(&mut body);
+    [(body.len() as u64).to_le_bytes().as_slice(), &body].concat()
+}
+
 fn ask(key: Key) -> Vec<u8> {
     [&ASK_HEADER[..], &key.0.0].concat()
 }
@@ -371,6 +408,9 @@ fn seeds() -> Vec<Vec<u8>> {
         content: shared::content_of(b"not these"),
         bytes: b"these".to_vec(),
     });
+    let full = filter_frame(true, &[shared::key(0), shared::key(1)]);
+    let mut neither = filter_frame(false, &[shared::key(0)]);
+    neither[17] = 7;
     let client = |fetches: u8, piece: u16, stream: &[u8]| [&[0, fetches - 1][..], &piece.to_le_bytes(), stream].concat();
     let mut out = vec![
         client(1, 0, &missing),
@@ -385,6 +425,9 @@ fn seeds() -> Vec<Vec<u8>> {
         client(1, 0, &(1u64 << 30).to_le_bytes()),
         client(1, 0, &[(1u64 << 30).to_le_bytes().as_slice(), &[0; 64]].concat()),
         client(1, 0, b""),
+        client(2, 0, &[full.clone(), two.clone(), filter_frame(false, &[shared::key(2)]), one.clone()].concat()),
+        client(2, 5, &[full, one.clone(), neither, two.clone()].concat()),
+        client(1, 0, &[one.clone(), one.clone()].concat()),
     ];
     let asks: Vec<u8> = [0, 1, 2, u32::MAX - 1].into_iter().flat_map(|n| ask(shared::key(n))).collect();
     out.push([&[1, 0, 0][..], &asks].concat());

@@ -17,7 +17,6 @@ mod unicode;
 use std::borrow::Cow;
 
 use intern::Symbol;
-use ra_ap_rustc_lexer as rustc_lexer;
 use span::{Edition, Span, TextRange, TextSize};
 
 use crate::print::Op;

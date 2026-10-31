@@ -128,19 +128,22 @@ impl<'db> SourceAnalyzer<'db> {
         ParamEnvAndCrate { param_env, krate: self.resolver.krate() }
     }
 
+    /// The item whose generics the analyzed store's types are written in. Not the resolver's
+    /// innermost generic scope: a static's resolver has none, yet its types lower in it.
+    pub(crate) fn generic_def(&self, db: &'db Db) -> Option<GenericDefId> {
+        self.body_or_sig.as_ref().map(|it| match *it {
+            BodyOrSig::Body { def, .. } => def.generic_def(db),
+            BodyOrSig::VariantFields { def, .. } => match def {
+                VariantId::EnumVariantId(def) => def.loc(db).parent.into(),
+                VariantId::StructId(def) => def.into(),
+                VariantId::UnionId(def) => def.into(),
+            },
+            BodyOrSig::Sig { def, .. } => def,
+        })
+    }
+
     fn trait_environment(&self, db: &'db Db) -> ParamEnvAndCrate<'db> {
-        self.param_and(self.body_or_sig.as_ref().map_or_else(ParamEnv::empty, |body_or_sig| {
-            let def = match *body_or_sig {
-                BodyOrSig::Body { def, .. } => def.generic_def(db),
-                BodyOrSig::VariantFields { def, .. } => match def {
-                    VariantId::EnumVariantId(def) => def.loc(db).parent.into(),
-                    VariantId::StructId(def) => def.into(),
-                    VariantId::UnionId(def) => def.into(),
-                },
-                BodyOrSig::Sig { def, .. } => def,
-            };
-            db.trait_environment(def)
-        }))
+        self.param_and(self.generic_def(db).map_or_else(ParamEnv::empty, |def| db.trait_environment(def)))
     }
 
     fn resolve_impl_method_or_trait_def(
@@ -158,7 +161,7 @@ impl<'db> SourceAnalyzer<'db> {
         func: FunctionId,
         substs: GenericArgs<'db>,
     ) -> (Function, GenericArgs<'db>) {
-        let owner = match self.resolver.generic_def() {
+        let owner = match self.generic_def(db) {
             Some(it) => it,
             None => return (func.into(), substs),
         };
@@ -178,7 +181,7 @@ impl<'db> SourceAnalyzer<'db> {
         const_id: ConstId,
         subs: GenericArgs<'db>,
     ) -> (ConstId, GenericArgs<'db>) {
-        let owner = match self.resolver.generic_def() {
+        let owner = match self.generic_def(db) {
             Some(it) => it,
             None => return (const_id, subs),
         };

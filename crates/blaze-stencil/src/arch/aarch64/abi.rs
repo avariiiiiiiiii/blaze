@@ -36,11 +36,14 @@ pub(super) enum Place {
 /// Windows' (`windows_fastcall`, AArch64 Windows triples' default) is AAPCS64 to Cranelift.
 pub(super) fn check(conv: CallConv) -> Result<(), Error> {
     match conv {
-        CallConv::SystemV | CallConv::AppleAarch64 | CallConv::WindowsFastcall => Ok(()),
+        CallConv::SystemV
+        | CallConv::AppleAarch64
+        | CallConv::WindowsFastcall
+        | CallConv::Tail => Ok(()),
         // alloc: the error's message, once, as the function fails to compile.
         other => Err(Error::new(format!(
             "the {other} calling convention on AArch64: the glue passes values in `system_v`, \
-             `apple_aarch64` and `windows_fastcall` only"
+             `apple_aarch64`, `windows_fastcall` and `tail` only"
         ))),
     }
 }
@@ -48,7 +51,7 @@ pub(super) fn check(conv: CallConv) -> Result<(), Error> {
 /// Whether a `try_call` in `conv` has exception payload registers (`x0`, `x1`): Cranelift's
 /// `exception_payload_regs` gives Windows' none, and panics on its exception clobbers.
 pub(super) fn catches(conv: CallConv) -> bool {
-    matches!(conv, CallConv::SystemV | CallConv::AppleAarch64)
+    matches!(conv, CallConv::SystemV | CallConv::AppleAarch64 | CallConv::Tail)
 }
 
 /// Whether a value of `ty` goes in X registers (and how many) or in one V register.
@@ -66,6 +69,7 @@ fn classes(ty: ir::Type) -> Result<(bool, u8), Error> {
 /// Assigns places in the order of a signature's arguments or of its returns.
 struct Assign {
     apple: bool,
+    tail: bool,
     rets: bool,
     next_x: u8,
     next_v: u8,
@@ -75,10 +79,14 @@ struct Assign {
 
 impl Assign {
     fn new(conv: CallConv, rets: bool) -> Assign {
+        let tail = conv == CallConv::Tail;
         Assign {
             apple: conv == CallConv::AppleAarch64,
+            tail,
             rets,
-            next_x: 0,
+            // `tail` keeps `x0` for a return area pointer and `x1` for an indirect callee, in
+            // its arguments and its returns alike.
+            next_x: if tail { 2 } else { 0 },
             next_v: 0,
             next_stack: 0,
             remaining: 16,
@@ -88,6 +96,12 @@ impl Assign {
     fn next(&mut self, param: &ir::AbiParam) -> Result<Place, Error> {
         let ty = param.value_type;
         match param.purpose {
+            ArgumentPurpose::StructReturn if self.tail => {
+                return Err(Error::new(
+                    "a StructReturn parameter of a `tail` function, which Cranelift's AArch64 \
+                     backend does not pass",
+                ));
+            }
             // Cranelift gives it `x8` and counts it in no class.
             ArgumentPurpose::StructReturn => {
                 if ty != types::I64 {

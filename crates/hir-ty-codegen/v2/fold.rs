@@ -1274,8 +1274,13 @@ mod tests {
                 };
                 self.entity(Kind::Value, dfg.first_result(inst).as_u32());
                 let opcode = dfg.insts[inst].opcode();
+                // `f32const` and `f64const` are not polymorphic: no type suffix, as Cranelift
+                // prints them.
                 let ty = dfg.ctrl_typevar(inst);
-                self.text.push_str(&format!(" = {opcode}.{ty} #{}", self.constants.len()));
+                match ty.is_invalid() {
+                    true => self.text.push_str(&format!(" = {opcode} #{}", self.constants.len())),
+                    false => self.text.push_str(&format!(" = {opcode}.{ty} #{}", self.constants.len())),
+                }
                 self.constants.push(constant);
             }
 

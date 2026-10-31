@@ -52,6 +52,8 @@ pub fn takes(opcode: Opcode) -> bool {
             | Opcode::Nearest
             | Opcode::Trunc
             | Opcode::Fma
+            | Opcode::Swizzle
+            | Opcode::Shuffle
     )
 }
 
@@ -189,6 +191,7 @@ pub fn inst(cx: &mut Cx<'_, '_, X64>, inst: ir::Inst) -> Result<(), Error> {
         Opcode::Call | Opcode::CallIndirect | Opcode::TryCall | Opcode::TryCallIndirect => {
             call(cx, inst)
         }
+        Opcode::ReturnCall | Opcode::ReturnCallIndirect => return_call(cx, inst),
         Opcode::FuncAddr => {
             let InstructionData::FuncAddr { func_ref, .. } = data else {
                 return Err(Error::at(inst, "a `func_addr` of another format"));
@@ -258,6 +261,7 @@ pub fn inst(cx: &mut Cx<'_, '_, X64>, inst: ir::Inst) -> Result<(), Error> {
         Opcode::Ceil | Opcode::Floor | Opcode::Nearest | Opcode::Trunc | Opcode::Fma => {
             libcall_op(cx, inst)
         }
+        Opcode::Swizzle | Opcode::Shuffle => bytes_op(cx, inst),
         opcode => Err(Error::at(
             inst,
             // alloc: the error's message.
@@ -274,21 +278,29 @@ fn ret(cx: &mut Cx<'_, '_, X64>, inst: ir::Inst) -> Result<(), Error> {
     if args.len() != func.signature.returns.len() {
         return Err(Error::at(inst, "a `return` of other values than the signature's"));
     }
-    abi::rets(&func.signature, |k, param, place| {
-        let value = args[k];
-        match place {
-            Place::Gpr(reg) => to_gpr(cx, inst, reg, value, abi::extension(param)),
-            Place::Xmm(reg) => to_xmm(cx, inst, reg, value),
-            Place::Pair(Part::Gpr(lo), Part::Gpr(hi)) => {
-                let off = wide_slot(cx, inst, value)?;
-                asm::load(cx.buf, lo, slot(off));
-                asm::load(cx.buf, hi, slot(off + 8));
-                Ok(())
+    // In `tail`, the XMM values first: a constant goes to one through `r10`, which `tail`
+    // returns in.
+    let tail = func.signature.call_conv == CallConv::Tail;
+    for pass in 0..if tail { 2 } else { 1 } {
+        abi::rets(&func.signature, |k, param, place| {
+            if tail && (pass == 0) != matches!(place, Place::Xmm(_)) {
+                return Ok(());
             }
-            _ => Err(Error::at(inst, "a return value on the stack")),
-        }
-    })
-    .map_err(blame(inst))?;
+            let value = args[k];
+            match place {
+                Place::Xmm(reg) => to_xmm(cx, inst, reg, value),
+                Place::Gpr(reg) => to_gpr(cx, inst, reg, value, abi::extension(param)),
+                Place::Pair(Part::Gpr(lo), Part::Gpr(hi)) => {
+                    let off = wide_slot(cx, inst, value)?;
+                    asm::load(cx.buf, lo, slot(off));
+                    asm::load(cx.buf, hi, slot(off + 8));
+                    Ok(())
+                }
+                _ => Err(Error::at(inst, "a return value on the stack")),
+            }
+        })
+        .map_err(blame(inst))?;
+    }
     if let Some(off) = cx.frame.sret {
         asm::load(cx.buf, RAX, slot(off));
     }
@@ -336,7 +348,7 @@ fn call(cx: &mut Cx<'_, '_, X64>, inst: ir::Inst) -> Result<(), Error> {
     // A `memcpy` is a call site of no handlers, which a `try_call`'s record can't say.
     let site = func.dfg.insts[inst].exception_table().is_none();
     let win = sig.call_conv == CallConv::WindowsFastcall;
-    abi::args(sig, |i, _, place| match place {
+    let stack = abi::args(sig, |i, _, place| match place {
         Place::Struct { at, size } => memcpy(cx, inst, win, args[i], at, size, site),
         _ => Ok(()),
     })
@@ -420,6 +432,10 @@ fn call(cx: &mut Cx<'_, '_, X64>, inst: ir::Inst) -> Result<(), Error> {
     }
     let ret = cx.buf.len();
     cx.call_site(ret, inst);
+    if sig.call_conv == CallConv::Tail && stack > 0 {
+        // A `tail` callee popped its stack arguments: the outgoing area back (`callee_pop_size`).
+        asm::alu_imm(cx.buf, asm::SUB, RSP, stack as i32);
+    }
 
     abi::rets(sig, |k, _, place| {
         let Some(off) = result_slot(inst, cx.returned(inst, k))? else { return Ok(()) };
@@ -438,6 +454,111 @@ fn call(cx: &mut Cx<'_, '_, X64>, inst: ir::Inst) -> Result<(), Error> {
         Ok(())
     })
     .map_err(blame(inst))
+}
+
+/// `return_call` and `return_call_indirect` from a `tail` function to one (the frame's layout
+/// checked both), as Cranelift's `gen_call_args` (`is_tail_call`) and
+/// `emit_return_call_common_sequence` write them: the stack arguments into the top of the
+/// incoming argument area (`IncomingArg`, `pop` bytes above the saved `rbp` and return
+/// address), the callee to `r11`, the register arguments, the frame popped, the return
+/// address moved up to below the new arguments and `rsp` with it, then the jump. Every slot is
+/// read before the restores give `r12` back; the incoming area holds nothing the function
+/// still reads, its own stack arguments copied to slots by the prologue.
+fn return_call(cx: &mut Cx<'_, '_, X64>, inst: ir::Inst) -> Result<(), Error> {
+    let func = cx.func;
+    let (callee, sig_ref, args) = call_of(func, inst)?;
+    let sig = &func.dfg.signatures[sig_ref];
+    if args.len() != sig.params.len() {
+        return Err(Error::at(inst, "a return call with other arguments than its signature's"));
+    }
+    let frame = *cx.frame;
+    let new = abi::stack_args(sig).map_err(blame(inst))?;
+    let base = 16 + frame.pop as i32 - new as i32;
+    let to = |at_: u32| at(RBP, base + at_ as i32);
+
+    abi::args(sig, |i, param, place| {
+        let value = args[i];
+        match place {
+            Place::Stack(at_) => {
+                if param.value_type.bytes() > 8 {
+                    let off = wide_slot(cx, inst, value)?;
+                    copy(cx.buf, slot(off), to(at_));
+                    copy(cx.buf, slot(off + 8), to(at_ + 8));
+                } else {
+                    to_gpr(cx, inst, R10, value, abi::extension(param))?;
+                    asm::store(cx.buf, to(at_), R10);
+                }
+            }
+            Place::Pair(lo, hi) => {
+                let off = wide_slot(cx, inst, value)?;
+                for (k, part) in [lo, hi].into_iter().enumerate() {
+                    if let Part::Stack(at_) = part {
+                        copy(cx.buf, slot(off + 8 * k as u32), to(at_));
+                    }
+                }
+            }
+            Place::Struct { .. } | Place::Implicit { .. } => {
+                return Err(Error::at(inst, "a tail call's argument copied to the stack"));
+            }
+            Place::Gpr(_) | Place::Xmm(_) => {}
+        }
+        Ok(())
+    })
+    .map_err(blame(inst))?;
+
+    let near = match callee {
+        Callee::Direct(func_ref) => {
+            let ext = &func.dfg.ext_funcs[func_ref];
+            let name = cx.name(&ext.name).map_err(blame(inst))?;
+            if !ext.colocated {
+                load_ext_name(cx, R11, name, 0, false).map_err(blame(inst))?;
+            }
+            ext.colocated.then_some(name)
+        }
+        Callee::Indirect(value) => {
+            to_gpr(cx, inst, R11, value, None)?;
+            None
+        }
+    };
+
+    abi::args(sig, |i, param, place| {
+        let value = args[i];
+        match place {
+            Place::Gpr(reg) => to_gpr(cx, inst, reg, value, abi::extension(param))?,
+            Place::Xmm(reg) => to_xmm(cx, inst, reg, value)?,
+            Place::Pair(lo, hi) => {
+                let off = wide_slot(cx, inst, value)?;
+                for (k, part) in [lo, hi].into_iter().enumerate() {
+                    if let Part::Gpr(reg) = part {
+                        asm::load(cx.buf, reg, slot(off + 8 * k as u32));
+                    }
+                }
+            }
+            _ => {}
+        }
+        Ok(())
+    })
+    .map_err(blame(inst))?;
+
+    {
+        let (buf, side) = (&mut *cx.buf, &mut *cx.side);
+        frame::unframe(buf, &mut |at, rule| side.rule(at, rule), &frame);
+    }
+    let shrink = frame.pop - new;
+    if shrink > 0 {
+        asm::load(cx.buf, R10, at(RSP, 0));
+        asm::store(cx.buf, at(RSP, shrink as i32), R10);
+        asm::alu_imm32(cx.buf, ADD, RSP, shrink as i32);
+    }
+    match near {
+        Some(name) => {
+            let field = asm::jmp_rel32(cx.buf);
+            cx.buf.reloc(field, Reloc::X86CallPCRel4, name, -4);
+        }
+        None => asm::jmp_reg(cx.buf, R11),
+    }
+    cx.side.rule(cx.buf.len(), crate::code::Rule::RestoreState);
+    Ok(())
 }
 
 /// A StructArgument's copy as Cranelift's `gen_memcpy` makes it: `memcpy(rsp + to, value,
@@ -659,6 +780,76 @@ fn libcall_op(cx: &mut Cx<'_, '_, X64>, inst: ir::Inst) -> Result<(), Error> {
     Ok(())
 }
 
+/// `swizzle` and `shuffle` of `i8x16`, byte by byte through general registers. Without SSSE3
+/// Cranelift calls the `X86Pshufb` libcall for them (`lower_pshufb`), which no runtime blaze
+/// links provides; the bytes are the same. A lane takes byte `k` of `a` for an index `k` below
+/// 16, byte `k - 16` of `b` (`shuffle`'s second operand) below 32, and 0 for any other, which
+/// is what Cranelift's `paddusb` of 0x70 makes `pshufb` do for `swizzle`. Each half is built
+/// in `rax` and `rdx` from its last byte down before either is stored, so a result in an
+/// operand's slot reads no byte it wrote.
+fn bytes_op(cx: &mut Cx<'_, '_, X64>, inst: ir::Inst) -> Result<(), Error> {
+    let func = cx.func;
+    let data = func.dfg.insts[inst];
+    let ty = func.dfg.ctrl_typevar(inst);
+    if ty != types::I8X16 {
+        // alloc: the error's message.
+        return Err(Error::at(inst, format!("`{}` of {ty} on x86-64", data.opcode())));
+    }
+    let Some(dst) = result_slot(inst, cx.loc(func.dfg.first_result(inst)))? else {
+        return Ok(());
+    };
+    let args = func.dfg.inst_args(inst);
+    let (a, b) = (wide_slot(cx, inst, args[0])?, wide_slot(cx, inst, args[1])?);
+    let mask = match data {
+        InstructionData::Shuffle { imm, .. } => {
+            let mask = func.dfg.immediates.get(imm).map(|it| it.as_slice());
+            match mask {
+                Some(mask) if mask.len() == 16 => Some(mask),
+                _ => return Err(Error::at(inst, "a `shuffle` whose mask is not 16 bytes")),
+            }
+        }
+        _ => None,
+    };
+    let buf = &mut *cx.buf;
+    if mask.is_none() {
+        asm::lea(buf, R11, slot(a));
+    }
+    for (half, acc) in [RAX, RDX].into_iter().enumerate() {
+        asm::imm(buf, acc, 0);
+        for lane in (8 * half..8 * half + 8).rev() {
+            asm::shl_imm(buf, acc, 8);
+            match mask {
+                Some(mask) => {
+                    let from = match mask[lane] {
+                        k @ 0..16 => a + u32::from(k),
+                        k @ 16..32 => b + u32::from(k - 16),
+                        _ => continue,
+                    };
+                    asm::load_ext(buf, RCX, slot(from), 8, false);
+                }
+                None => {
+                    // `r10` is all ones when the index is below 16, else 0.
+                    asm::load_ext(buf, RCX, slot(b + lane as u32), 8, false);
+                    asm::alu_imm(buf, asm::CMP, RCX, 16);
+                    asm::sbb(buf, R10, R10);
+                    asm::alu_imm(buf, asm::AND, RCX, 15);
+                    asm::load_u8_index(buf, RCX, R11, RCX);
+                    asm::and(buf, RCX, R10);
+                }
+            }
+            asm::or(buf, acc, RCX);
+        }
+    }
+    asm::store(buf, slot(dst), RAX);
+    asm::store(buf, slot(dst + 8), RDX);
+    Ok(())
+}
+
+/// [`bytes_op`]'s most bytes: the `lea`; per half the zero, then per lane the shift, the
+/// lane's byte (at most the load, `cmp`, `sbb`, `and`, the indexed load and `and`) and the
+/// `or`; the two stores.
+const BYTES_OP: u32 = 8 + 2 * (5 + 8 * (4 + asm::MEM_MAX + 4 + 3 + 4 + 5 + 3 + 3)) + 2 * 8;
+
 fn libcall_of(opcode: Opcode, lane: ir::Type) -> Option<LibCall> {
     let f32 = lane == types::F32;
     if !f32 && lane != types::F64 {
@@ -721,6 +912,23 @@ pub fn bound(func: &ir::Function, target: &Target, inst: ir::Inst) -> u32 {
                 };
                 Ok(())
             });
+            // A `tail` callee's popped arguments taken back.
+            bytes + 7
+        }
+        Opcode::ReturnCall | Opcode::ReturnCallIndirect => {
+            let Ok((_, sig, _)) = call_of(func, inst) else { return 0 };
+            let sig = &func.dfg.signatures[sig];
+            let win = func.signature.call_conv == CallConv::WindowsFastcall;
+            // The callee, the epilogue but its `ret`, the return address moved and `rsp` with
+            // it, the jump.
+            let mut bytes = EXT_NAME.max(GPR) + frame::epilogue_bound(win) + 8 + 8 + 7 + 5;
+            let _ = abi::args(sig, |_, _, place| {
+                bytes += match place {
+                    Place::Stack(_) | Place::Pair(..) => 2 * (GPR + 8),
+                    place => place_bound(place),
+                };
+                Ok(())
+            });
             bytes
         }
         // The address and its store.
@@ -743,6 +951,7 @@ pub fn bound(func: &ir::Function, target: &Target, inst: ir::Inst) -> u32 {
             let args = func.dfg.inst_args(inst).len() as u32;
             ty.lane_count() * (args * XMM + LIBCALL + asm::MEM_MAX)
         }
+        Opcode::Swizzle | Opcode::Shuffle => BYTES_OP,
         _ => 0,
     }
 }

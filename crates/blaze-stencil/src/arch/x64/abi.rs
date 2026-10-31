@@ -1,17 +1,17 @@
-//! Where System V and Windows x64 put each argument and return value: Cranelift 0.137's
-//! `X64ABIMachineSpec::compute_arg_locs`, `get_intreg_for_arg`, `get_fltreg_for_arg`,
+//! Where System V, Windows x64 and `tail` put each argument and return value: Cranelift
+//! 0.137's `X64ABIMachineSpec::compute_arg_locs`, `get_intreg_for_arg`, `get_fltreg_for_arg`,
 //! `get_intreg_for_retval`, `get_fltreg_for_retval` and `get_ext_mode` (`isa/x64/abi.rs`),
 //! with `enable_llvm_abi_extensions` set as `hir-ty-codegen/target.rs` sets it, and
-//! `SigSet::from_func_sig`'s handling of `StructReturn` (`machinst/abi.rs`), for the two
-//! conventions the IR builder makes x86-64 code in (`system_v`, `windows_fastcall`). The
-//! assignment is a walk over the signature with nothing allocated.
+//! `SigSet::from_func_sig`'s handling of `StructReturn` (`machinst/abi.rs`): the conventions
+//! the IR builder makes x86-64 code in (`system_v`, `windows_fastcall`), and `tail`, which
+//! `return_call` needs. The assignment is a walk over the signature with nothing allocated.
 
 use cranelift_codegen::{
     ir::{self, ArgumentExtension, ArgumentPurpose, types},
     isa::CallConv,
 };
 
-use super::asm::{R8, R9, RAX, RCX, RDI, RDX, RSI};
+use super::asm::{R8, R9, R10, RAX, RCX, RDI, RDX, RSI};
 use crate::Error;
 
 /// One 8-byte part of an argument: in a general register or on the stack, this many bytes
@@ -44,11 +44,11 @@ pub enum Place {
 /// Whether `conv` is one the glue passes values in, as an error naming it otherwise.
 pub fn check(conv: CallConv) -> Result<(), Error> {
     match conv {
-        CallConv::SystemV | CallConv::WindowsFastcall => Ok(()),
+        CallConv::SystemV | CallConv::WindowsFastcall | CallConv::Tail => Ok(()),
         // alloc: the error's message.
         other => Err(Error::new(format!(
-            "the {other} calling convention on x86-64: the IR builder makes code in `system_v` \
-             and `windows_fastcall` only"
+            "the {other} calling convention on x86-64: the glue passes values in `system_v`, \
+             `windows_fastcall` and `tail` only"
         ))),
     }
 }
@@ -79,19 +79,28 @@ fn float_arg(win: bool, vreg: usize, idx: usize) -> Option<u8> {
     (i < count).then_some(i as u8)
 }
 
-fn int_ret(win: bool, gpr: usize) -> Option<u8> {
-    let regs: &[u8] = if win { &[RAX, RDX] } else { &[RAX, RDX, RCX] };
+/// `tail` returns in eight of each (`get_intreg_for_retval`, `get_fltreg_for_retval`), its
+/// second integer in `rcx`; `r11` is Cranelift's scratch.
+fn int_ret(win: bool, tail: bool, gpr: usize) -> Option<u8> {
+    let regs: &[u8] = match (win, tail) {
+        (_, true) => &[RAX, RCX, RDX, RSI, RDI, R8, R9, R10],
+        (true, false) => &[RAX, RDX],
+        (false, false) => &[RAX, RDX, RCX],
+    };
     regs.get(gpr).copied()
 }
 
-/// `xmm0` and `xmm1` on both: Cranelift returns a Rust float pair in them on Windows too.
-fn float_ret(vreg: usize) -> Option<u8> {
-    (vreg < 2).then_some(vreg as u8)
+/// `xmm0` and `xmm1` on System V and Windows (Cranelift returns a Rust float pair in them on
+/// Windows too), `xmm0` to `xmm7` in `tail`.
+fn float_ret(tail: bool, vreg: usize) -> Option<u8> {
+    (vreg < if tail { 8 } else { 2 }).then_some(vreg as u8)
 }
 
 /// Assigns places in the order of a signature's arguments or of its returns.
 struct Assign {
     win: bool,
+    /// `tail`: System V's arguments, its own return registers.
+    tail: bool,
     rets: bool,
     gpr: usize,
     vreg: usize,
@@ -107,16 +116,21 @@ impl Assign {
         let win = conv == CallConv::WindowsFastcall;
         // Windows' 32 bytes of shadow space for the first four arguments.
         let stack = if win && !rets { 32 } else { 0 };
-        Assign { win, rets, gpr: 0, vreg: 0, idx: 0, stack, copy }
+        let tail = conv == CallConv::Tail;
+        Assign { win, tail, rets, gpr: 0, vreg: 0, idx: 0, stack, copy }
     }
 
     fn int(&mut self) -> Option<u8> {
-        if self.rets { int_ret(self.win, self.gpr) } else { int_arg(self.win, self.gpr, self.idx) }
+        if self.rets {
+            int_ret(self.win, self.tail, self.gpr)
+        } else {
+            int_arg(self.win, self.gpr, self.idx)
+        }
     }
 
     fn float(&mut self) -> Option<u8> {
         if self.rets {
-            float_ret(self.vreg)
+            float_ret(self.tail, self.vreg)
         } else {
             float_arg(self.win, self.vreg, self.idx)
         }

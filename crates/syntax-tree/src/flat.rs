@@ -2946,7 +2946,6 @@ mod tests {
         let tree = Arc::new(builder.finish());
         assert!(tree.source().ptr_eq(&source));
         let at = tree.lazies().next().unwrap();
-        assert!(tree.part(at).source().ptr_eq(&source));
         let mut builder = FlatTreeBuilder::sourced(source.clone());
         to_flat(&shape, &mut builder, false);
         let full = builder.finish();
@@ -2963,6 +2962,7 @@ mod tests {
         assert_eq!(token.parent(), Some(body.clone()));
         let (of, n) = token.parent().unwrap().flat().map(|(it, n)| (it.clone(), n)).unwrap();
         assert!(Arc::ptr_eq(&of, &tree) && n == at);
+        assert!(tree.part(at).source().ptr_eq(&source));
     }
 
     #[test]
@@ -3241,8 +3241,9 @@ mod tests {
                     let _ = tree.part(at);
                 }
             }
-            // Each pick past the subtree of the one before, the first maybe the root.
-            let (mut picks, mut next) = (Vec::new(), rng.below(3) as u32);
+            // Each pick past the subtree of the one before, the first maybe the root: always one,
+            // as `splice_all` refuses none.
+            let (mut picks, mut next) = (Vec::new(), (rng.below(3) as u32).min(tree.len() - 1));
             while next < tree.len() && picks.len() < 6 {
                 picks.push(next);
                 next = tree.end(next) + rng.below(4) as u32;

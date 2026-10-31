@@ -48,6 +48,7 @@ pub use borrowed::{
     ApiErrorRef, BasisRef, BuildScriptRanRef, CachedRef, DiagnosticRef, FactReadRef, ResponseRef,
     SpanRef, TestResultRef, UnitOfRef, UnitStartedRef, UnitTargetRef,
 };
+pub use blaze_protocol::events::NodeKind;
 pub use intent::{Edit, Edited, EditedItem, How, Target};
 
 use blaze_core::Conn;
@@ -64,8 +65,9 @@ use serde::{Deserialize, Serialize};
 /// ([`UnitOf::id`], [`UnitStarted::package`], [`TestResult::executable`]); the fixed name sets
 /// as enums ([`TargetKind`], [`CrateType`], [`ArtifactKind`], [`Applicability`]), written by
 /// name as before. [`ResponseRef`] reads the same bytes. 15: [`Request::Pack`] and
-/// [`Response::Packed`]. 16: [`Worked::links`].
-pub const SCHEMA: u32 = 16;
+/// [`Response::Packed`]. 16: [`Worked::links`]. 17: [`Worked::steps_us`]. 18: [`Request::Doc`],
+/// [`Response::DocPage`] and [`Response::Documented`].
+pub const SCHEMA: u32 = 18;
 
 /// The most bytes a request the daemon reads may be: CBOR from a peer is decoded only up to
 /// this.
@@ -271,6 +273,13 @@ pub enum Request {
     /// expansion of the program recorded) as one file for blaze's in-browser compiler
     /// (`blaze_wasm_pack::Pack`); answered with [`Response::Packed`].
     Pack { view: ViewRef, program: String, targets: Targets },
+    /// `cargo doc`: the targets it documents checked as `targets` asks (`Targets::cargo`'s
+    /// command `doc`), then the HTML documentation of those crates and, unless `no_deps`, of
+    /// every library they depend on, written by blaze from the front end (`blaze-doc`), no
+    /// rustdoc run. `private` is `--document-private-items`. Answered with
+    /// [`Response::Documented`], then each file as a [`Response::DocPage`], which the client
+    /// writes, then rustdoc's warnings as [`Response::Diagnostic`]s.
+    Doc { view: ViewRef, targets: Targets, no_deps: bool, private: bool },
 }
 
 /// `blaze test --ub`: each selected test run under `hir_ty_ub::run_test`, nothing compiled.
@@ -341,6 +350,38 @@ pub enum Response {
         #[serde(with = "blaze_protocol::bytes")]
         pack: Vec<u8>,
     },
+    /// A file of a [`Request::Doc`]'s documentation: its path under [`Documented::dir`],
+    /// `/`-separated, and its bytes.
+    DocPage {
+        path: String,
+        #[serde(with = "blaze_protocol::bytes")]
+        page: Vec<u8>,
+    },
+    /// What a [`Request::Doc`] documents and where, before its first [`Response::DocPage`].
+    Documented(Documented),
+}
+
+/// What a [`Request::Doc`] documented.
+#[derive(Serialize, Deserialize, Clone, PartialEq, Eq, Debug)]
+pub struct Documented {
+    /// Where the pages go, absolute: cargo's `target/doc`, or `target/<triple>/doc` with
+    /// `--target`.
+    pub dir: String,
+    /// In the order cargo says `Documenting`: the crates asked for first.
+    pub crates: Vec<DocumentedCrate>,
+    pub pages: u64,
+    pub source_pages: u64,
+}
+
+#[derive(Serialize, Deserialize, Clone, PartialEq, Eq, Debug)]
+pub struct DocumentedCrate {
+    /// The crate's name, its directory under [`Documented::dir`].
+    pub name: String,
+    /// Its package as cargo's `Documenting` line names it: `serde v1.0.219`, then
+    /// `(/abs/path)` for a path package.
+    pub package: String,
+    /// Asked for, not a dependency documented with it: what `Generated` counts.
+    pub asked: bool,
 }
 
 #[derive(Serialize, Deserialize, Clone, PartialEq, Eq, Debug)]
@@ -560,6 +601,9 @@ pub struct Worked {
     pub compiled: u64,
     /// The plane's critical path of the request.
     pub critical_path_us: u64,
+    /// The measured run time of the request's nodes, summed by kind: each kind that ran at
+    /// all, in [`NodeKind::ALL`]'s order.
+    pub steps_us: Vec<(NodeKind, u64)>,
 }
 
 /// A dependency crate of [`Worked::served`].

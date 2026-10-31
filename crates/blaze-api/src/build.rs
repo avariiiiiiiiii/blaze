@@ -77,6 +77,9 @@ pub enum Work {
     /// Checked as [`Work::Check`] is, then [`crate::Response::Packed`] of package `program`
     /// ([`crate::Request::Pack`]).
     Pack { targets: Targets, program: String },
+    /// Checked as [`Work::Check`] is, then the documentation [`crate::Request::Doc`] asks
+    /// for: [`crate::Response::Documented`], then each file a [`crate::Response::DocPage`].
+    Doc { targets: Targets, no_deps: bool, private: bool },
     /// The edits applied to the view in the front end (`blaze_intent::apply`), reported as
     /// [`crate::Response::Edited`] before an `ok` finish; the session commits its ops. The
     /// trees the edits left are the front end's parses of the files they wrote.

@@ -1113,7 +1113,7 @@ macro_rules! m {
 }
 
 fn foo() -> i64 {
-    m!()
+    m! {}
 }
     "#,
         expect![[r#"

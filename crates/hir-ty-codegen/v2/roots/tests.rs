@@ -85,6 +85,34 @@ static KEPT: u8 = 0;
     assert!(roots.tests.is_empty());
 }
 
+/// A dependency's `#[used]` static is in the program only when the program's code names the
+/// dependency, as rustc loads only those, though cargo hands it every one.
+#[test]
+fn an_executable_keeps_what_only_the_dependencies_it_names_keep() {
+    let (db, _, roots) = roots(
+        r#"
+//- /main.rs crate:main deps:named,unnamed
+use named as _;
+fn main() {}
+//- /named.rs crate:named
+#[used]
+static NAMED: u8 = 0;
+//- /unnamed.rs crate:unnamed
+#[used]
+static UNNAMED: u8 = 0;
+"#,
+        RootKind::Executable,
+    );
+    let main = fixture::test_crate(db);
+    let dep = |name: &str| {
+        let deps = &main.data(db).dependencies;
+        deps.iter().find(|it| it.name.as_str() == name).expect("a dependency of the fixture").crate_id
+    };
+    let named = test_items::static_item(db, dep("named"), "NAMED");
+    assert_eq!(roots.statics, [HirStatic(named)]);
+    assert_eq!(&**hir_def::nameres::named::named_dependencies(db, main), [dep("named")]);
+}
+
 #[test]
 fn no_main_has_no_start() {
     let (db, frontend, roots) = roots(

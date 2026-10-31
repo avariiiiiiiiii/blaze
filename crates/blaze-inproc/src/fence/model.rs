@@ -678,6 +678,10 @@ const MOST_STATES: usize = 1 << 24;
 
 /// Explores every reachable state; `Err` is the trace to a violation.
 fn explore(config: Config) -> Result<Explored, String> {
+    explore_within(config, MOST_STATES)
+}
+
+fn explore_within(config: Config, most: usize) -> Result<Explored, String> {
     let initial = canonical(State::initial(&config), &config);
     let mut index: HashMap<State, u32, BuildHasherDefault<Fx>> = HashMap::default();
     let mut states: Vec<State> = vec![initial];
@@ -714,6 +718,7 @@ fn explore(config: Config) -> Result<Explored, String> {
         }
         for successor in next.drain(..) {
             let successor = canonical(successor, &config);
+            assert!(successor.threads.iter().all(|it| it.pc != Pc::Called), "a state kept a thread at Called");
             let to = *index.entry(successor).or_insert_with(|| {
                 states.push(successor);
                 parent.push(at);
@@ -722,8 +727,11 @@ fn explore(config: Config) -> Result<Explored, String> {
             });
             edges.push((at, to));
         }
-        if states.len() > MOST_STATES {
-            return Err(format!("{config:?}: past {MOST_STATES} states, too many to explore in a test"));
+        if states.len() > most {
+            return Err(format!(
+                "{config:?}: past {most} states ({} not yet stepped), too many to explore in a test",
+                stack.len()
+            ));
         }
     }
 
@@ -796,9 +804,19 @@ fn a_thread_dies_holding_its_slot_and_its_id_comes_back() {
     check(Config { spawn: true, reuse: true, abrupt: true, slots: 2, calls: 1, quiesces: 1, ..BASE });
 }
 
+const THREE_THREADS_TWO_SLOTS: Config = Config { threads: 3, slots: 2, calls: 1, quiesces: 1, ..BASE };
+
 #[test]
 fn three_threads_two_slots() {
-    check(Config { threads: 3, slots: 2, calls: 1, quiesces: 1, ..BASE });
+    check(THREE_THREADS_TWO_SLOTS);
+}
+
+/// The size of `three_threads_two_slots` with no limit, to set the limit by.
+#[test]
+#[ignore = "a measurement: unbounded memory and time, run in a VM"]
+fn three_threads_two_slots_unbounded() {
+    let explored = explore_within(THREE_THREADS_TWO_SLOTS, u32::MAX as usize - 1).unwrap_or_else(|it| panic!("{it}"));
+    println!("{} states, {} freed while a thread runs", explored.states, explored.freed_while_running);
 }
 
 fn caught(mutation: Mutation) {

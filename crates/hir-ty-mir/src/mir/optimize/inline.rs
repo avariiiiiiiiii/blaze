@@ -336,7 +336,9 @@ impl<'a, 'f, 'db> Inliner<'a, 'f, 'db> {
             normalize_ty(ctx, destination.as_ref().ty(body, &ctx.infcx, ctx.env).ty);
 
         let callee_options = self.callee_options(site.callee);
-        let generic = optimized(db, site.callee, callee_options)?;
+        // The callee's optimization inlines its own callees in turn, a query inside this one.
+        let generic =
+            stdx::ensure_sufficient_stack(|| optimized(db, site.callee, callee_options))?;
         is_inline_valid_on_body(db, site.callee, generic)?;
         if self.past_depth_limit() && generic.basic_blocks.len() > 1 {
             return None;

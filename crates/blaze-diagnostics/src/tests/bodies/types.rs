@@ -21,12 +21,33 @@ fn ui_core(name: &str, flags: &str, source: &str) -> String {
 /// [`ui_core`] of a file that makes an empty `Vec`: std's `Vec`, `Vec::new` and `vec![]` as std
 /// writes them, with its prelude's `Vec` and `vec!`.
 fn ui_vec(name: &str, flags: &str, source: &str) -> String {
+    ui_std(name, flags, VEC_STD, source)
+}
+
+/// [`ui_core`] with `std` as the crate's std, beside minicore.
+fn ui_std(name: &str, flags: &str, std: &str, source: &str) -> String {
     let fixture = format!(
-        "//- minicore: {flags}\n//- /std.rs crate:std\n{VEC_STD}//- /{name} crate:other:main edition:2015 deps:std\n{source}"
+        "//- minicore: {flags}\n//- /std.rs crate:std\n{std}//- /{name} crate:other:main edition:2015 deps:std\n{source}"
     );
     let checked = checked_with(&fixture, "$DIR/", &compiletest(Mode::Other, &Options::default()));
     normalized(&checked.stderr_with(Style { ui_testing: true, ..Style::default() }))
 }
+
+/// std's `String`, as its prelude has it.
+const STRING_STD: &str = r#"pub mod prelude {
+    pub mod rust_2015 {
+        pub use core::prelude::rust_2015::*;
+        pub use crate::string::String;
+    }
+}
+
+pub mod string {
+    pub struct String {
+        ptr: *mut u8,
+        len: usize,
+    }
+}
+"#;
 
 const VEC_STD: &str = r#"#![feature(rustc_attrs)]
 pub mod prelude {
@@ -629,7 +650,14 @@ fn main() {
 }
 ";
     let checked = checked(fixture);
-    assert_eq!(checked.messages(), ["E0277: the trait bound `Digest: Debug` is not satisfied"]);
+    assert_eq!(
+        checked.messages(),
+        [
+            "E0277: the trait bound `Digest: Debug` is not satisfied",
+            "aborting due to 1 previous error",
+            "For more information about this error, try `rustc --explain E0277`.",
+        ]
+    );
     let notes: Vec<&str> = checked.diags[0].children.iter().map(|it| it.message.as_str()).collect();
     assert!(notes.contains(&"required for `Wrapper<Digest>` to implement `Debug`"), "{notes:?}");
     assert!(notes.contains(&"required by a bound in `assert_failed`"), "{notes:?}");
@@ -982,7 +1010,7 @@ error: aborting due to 1 previous error
 
 For more information about this error, try `rustc --explain E0283`.
 ";
-    assert_eq!(ui_core("type-annotation-needed.rs", "from", source), stderr);
+    assert_eq!(ui_std("type-annotation-needed.rs", "from", STRING_STD, source), stderr);
 }
 
 #[test]

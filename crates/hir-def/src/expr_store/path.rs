@@ -1112,9 +1112,28 @@ impl<'a> Bindings<'a> {
     }
 }
 
+/// Bindings are equal by what they read: a bound's `for<..>` names and `use<..>` arguments are
+/// runs in each side's own columns, so two copies of one binding in different columns hold
+/// different runs.
 impl PartialEq for Bindings<'_> {
     fn eq(&self, other: &Self) -> bool {
-        self.len() == other.len() && self.iter().eq(other.iter())
+        let bound_eq = |a: &TypeBound, b: &TypeBound| match (*a, *b) {
+            (TypeBound::ForLifetime(a_names, a_path), TypeBound::ForLifetime(b_names, b_path)) => {
+                a_path == b_path && self.columns.names(a_names) == other.columns.names(b_names)
+            }
+            (TypeBound::Use(a_args), TypeBound::Use(b_args)) => {
+                self.columns.use_args(a_args) == other.columns.use_args(b_args)
+            }
+            (a, b) => a == b,
+        };
+        self.len() == other.len()
+            && self.iter().zip(other.iter()).all(|(a, b)| {
+                a.name == b.name
+                    && a.args == b.args
+                    && a.type_ref == b.type_ref
+                    && a.bounds.len() == b.bounds.len()
+                    && a.bounds.iter().zip(b.bounds).all(|(a, b)| bound_eq(a, b))
+            })
     }
 }
 
@@ -1123,7 +1142,23 @@ impl Eq for Bindings<'_> {}
 impl Hash for Bindings<'_> {
     fn hash<H: Hasher>(&self, state: &mut H) {
         state.write_usize(self.len());
-        self.iter().for_each(|binding| binding.hash(state));
+        for binding in self.iter() {
+            binding.name.hash(state);
+            binding.args.hash(state);
+            binding.type_ref.hash(state);
+            state.write_usize(binding.bounds.len());
+            for &bound in binding.bounds {
+                std::mem::discriminant(&bound).hash(state);
+                match bound {
+                    TypeBound::ForLifetime(names, path) => {
+                        self.columns.names(names).hash(state);
+                        path.hash(state);
+                    }
+                    TypeBound::Use(args) => self.columns.use_args(args).hash(state),
+                    TypeBound::Path(..) | TypeBound::Lifetime(_) | TypeBound::Error => bound.hash(state),
+                }
+            }
+        }
     }
 }
 

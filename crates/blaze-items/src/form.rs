@@ -727,8 +727,46 @@ impl<'db> Cx<'db> {
     /// The MIR of a function, static or constant with the closures and coroutines written in
     /// it; `None` for an item with no body.
     pub(crate) fn body(&self, id: ItemId) -> Option<Code> {
+        let def = self.body_owner(id)?;
+        Some(self.code_form(InferBodyId::DefWithBodyId(def)).code())
+    }
+
+    /// Why the MIR [`Cx::body`] reads of `id` failed to lower: the first error of its body, or of
+    /// a closure or coroutine written in it, in the order `body` meets them. For the error a
+    /// build stops with at [`Missed::NoMir`]; `None` when each lowers (the MIR that failed is
+    /// elsewhere in the item, an anonymous constant of a type).
+    pub(crate) fn mir_error(&self, id: ItemId) -> Option<String> {
         let db = self.db;
-        let def = match id {
+        let def = self.body_owner(id)?;
+        let body = match db.mir_body(InferBodyId::DefWithBodyId(def)) {
+            Ok(body) => body,
+            // alloc: the error a build stops with, once
+            Err(error) => return Some(format!("{error:?}")),
+        };
+        let mut scratch = Form::quiet();
+        let mut nested = Nests::default();
+        self.mir(&mut scratch, body, &mut nested);
+        let mut at = 0;
+        while at < nested.order.len() {
+            let next = nested.order[at];
+            at += 1;
+            let (what, body) = match next {
+                Nested::Closure(it) => ("a closure", db.mir_body_for_closure(it)),
+                Nested::Coroutine(it) => ("a coroutine", db.mir_body_for_coroutine(it)),
+            };
+            match body {
+                Ok(body) => self.mir(&mut scratch, body, &mut nested),
+                // alloc: as above
+                Err(error) => return Some(format!("{what} in it: {error:?}")),
+            }
+        }
+        None
+    }
+
+    /// The body `id` has, if it has one.
+    fn body_owner(&self, id: ItemId) -> Option<DefWithBodyId> {
+        let db = self.db;
+        Some(match id {
             ItemId::Function(it) if FunctionSignature::of(db, it).has_body() => {
                 DefWithBodyId::from(it)
             }
@@ -746,8 +784,7 @@ impl<'db> Cx<'db> {
             | ItemId::Impl(_)
             | ItemId::Alias(_)
             | ItemId::Macro(_) => return None,
-        };
-        Some(self.code_form(InferBodyId::DefWithBodyId(def)).code())
+        })
     }
 
     /// One closure's code alone, for it to be built alone.

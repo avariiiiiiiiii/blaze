@@ -2266,10 +2266,10 @@ mod scratch_tests {
         assert_eq!(fresh_only.expr_map.get(&pushed_twice), Some(&call.into()));
         let Expr::Call { args, .. } = fresh.expr(call) else { unreachable!() };
         assert!(matches!(fresh.expr(args[1]), Expr::Tuple { exprs } if exprs.len() == 2));
-        let tuple = fresh.type_refs().find(|(_, ty)| matches!(ty, TypeRef::Tuple(_))).unwrap();
-        assert!(matches!(tuple.1, TypeRef::Tuple(types) if types.len() == 2));
         let tuple_src = src(0, false, SyntaxKind::TUPLE_TYPE, 6, 9);
-        assert_eq!(fresh_map.types_map.get(&tuple_src), Some(&tuple.0));
+        let tuple = *fresh_map.types_map.get(&tuple_src).unwrap();
+        // `TypeRef::UNIT` is the empty tuple, allocated first; this is the pair of them.
+        assert!(matches!(fresh.type_ref(tuple), TypeRef::Tuple(types) if types.len() == 2));
     }
 
     #[test]

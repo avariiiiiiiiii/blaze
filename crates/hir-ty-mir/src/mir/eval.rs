@@ -3889,7 +3889,8 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
             _ => {
                 // alloc: error path
                 return Err(MirEvalError::UndefinedBehavior(format!(
-                    "invalid memory write at address {addr:?}"
+                    "invalid memory write at address {:#x}",
+                    addr.to_usize()
                 )));
             }
         }

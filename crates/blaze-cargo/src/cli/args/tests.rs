@@ -18,6 +18,17 @@ fn refused(words: &[&str]) -> String {
 }
 
 #[test]
+fn doc_reads_cargo_docs_flags_and_refuses_what_it_does_not_take() {
+    let asked = cargo(&["doc", "--open", "--no-deps", "--document-private-items", "-p", "a", "--lib"]);
+    assert!(asked.flags.open && asked.flags.no_deps && asked.flags.private && asked.flags.targeted);
+    assert_eq!(asked.flags.packages, ["a"]);
+    assert_eq!(asked.args, ["--open", "--no-deps", "--document-private-items", "-p", "a", "--lib"], "cargo's to read too");
+    assert!(refused(&["doc", "--tests"]).starts_with("error: unexpected argument '--tests' found"));
+    assert!(refused(&["doc", "stray"]).starts_with("error: unexpected argument 'stray' found"));
+    assert!(refused(&["check", "--open"]).starts_with("error: unexpected argument '--open' found"));
+}
+
+#[test]
 fn commands_and_their_aliases() {
     for (word, command) in [
         ("build", Command::Build),
@@ -29,6 +40,8 @@ fn commands_and_their_aliases() {
         ("test", Command::Test),
         ("t", Command::Test),
         ("bench", Command::Bench),
+        ("doc", Command::Doc),
+        ("d", Command::Doc),
     ] {
         assert_eq!(cargo(&[word]).command, Some(command), "{word}");
     }

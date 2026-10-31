@@ -9,7 +9,7 @@
 use std::{
     fmt::Write as _,
     io,
-    path::{Path, PathBuf},
+    path::Path,
 };
 
 use rustc_hash::{FxHashMap, FxHashSet};
@@ -47,6 +47,21 @@ pub struct Written {
     pub source_pages: usize,
 }
 
+/// One file of the documentation: its path under `doc/`, `/`-separated, and its bytes.
+#[derive(Debug)]
+pub struct Page {
+    pub path: String,
+    pub bytes: Vec<u8>,
+}
+
+/// Every file of the documentation but `crates.js` ([`crates_list`]), which also names the
+/// crates earlier runs documented in the same directory.
+#[derive(Debug, Default)]
+pub struct Pages {
+    pub files: Vec<Page>,
+    pub written: Written,
+}
+
 struct Statics {
     css: String,
     js: String,
@@ -59,37 +74,17 @@ fn hash(text: &str) -> String {
     format!("{:08x}", hasher.finish() as u32)
 }
 
-/// Writes every page of `model` under `out` (`target/doc`), in parallel.
-pub fn write(model: &Model, out: &Path) -> io::Result<Written> {
+/// Every page of `model`, made in parallel: item pages, each module's `sidebar-items.js`,
+/// source pages, each crate's `all.html` and search index, and the stylesheet and script.
+pub fn pages(model: &Model) -> Pages {
     use rayon::prelude::*;
     let statics = Statics {
         css: format!("static.files/blaze-{}.css", hash(CSS)),
         js: format!("static.files/blaze-{}.js", hash(JS)),
     };
-    std::fs::create_dir_all(out.join("static.files"))?;
-    std::fs::write(out.join(&statics.css), CSS)?;
-    std::fs::write(out.join(&statics.js), JS)?;
     let names: FxHashSet<&str> = model.crates.iter().map(|it| it.name.as_str()).collect();
-
-    // Every directory first, then the pages in parallel.
-    let mut dirs: FxHashSet<PathBuf> = FxHashSet::default();
-    dirs.insert(out.join("search-index"));
-    for krate in &model.crates {
-        for item in &krate.items {
-            if item.kind == Kind::Module {
-                dirs.insert(out.join(module_dir(krate, item)));
-            }
-        }
-        for file in &krate.sources {
-            let path = out.join("src").join(&krate.name).join(&file.path);
-            if let Some(parent) = path.parent() {
-                dirs.insert(parent.to_owned());
-            }
-        }
-    }
-    for dir in &dirs {
-        std::fs::create_dir_all(dir)?;
-    }
+    let page = |path: String, text: String| Page { path, bytes: text.into_bytes() };
+    let mut files = vec![page(statics.css.clone(), CSS.to_owned()), page(statics.js.clone(), JS.to_owned())];
 
     let jobs: Vec<(usize, usize)> = model
         .crates
@@ -97,31 +92,29 @@ pub fn write(model: &Model, out: &Path) -> io::Result<Written> {
         .enumerate()
         .flat_map(|(k, krate)| (0..krate.items.len()).map(move |i| (k, i)))
         .collect();
-    let pages = jobs
+    let items: Vec<Vec<Page>> = jobs
         .par_iter()
         .map(|&(k, i)| {
             let krate = &model.crates[k];
             let item = &krate.items[i];
             let writer = Writer::new(model, &names, &statics, k, page_dir(krate, item));
-            let html = writer.item_page(i);
-            std::fs::write(out.join(page_path(krate, item)), html)?;
+            let mut out = vec![page(page_path(krate, item), writer.item_page(i))];
             if item.kind == Kind::Module {
-                std::fs::write(
-                    out.join(module_dir(krate, item)).join("sidebar-items.js"),
-                    sidebar_items(krate, item),
-                )?;
+                let path = format!("{}/sidebar-items.js", module_dir(krate, item));
+                out.push(page(path, sidebar_items(krate, item)));
             }
-            Ok(1)
+            out
         })
-        .collect::<io::Result<Vec<usize>>>()?
-        .len();
+        .collect();
+    let pages = items.len();
+    files.extend(items.into_iter().flatten());
     let sources: Vec<(usize, usize)> = model
         .crates
         .iter()
         .enumerate()
         .flat_map(|(k, krate)| (0..krate.sources.len()).map(move |f| (k, f)))
         .collect();
-    let source_pages = sources
+    let source_files: Vec<Page> = sources
         .par_iter()
         .map(|&(k, f)| {
             let krate = &model.crates[k];
@@ -130,33 +123,48 @@ pub fn write(model: &Model, out: &Path) -> io::Result<Written> {
             dir.extend(file.path.split('/').map(str::to_owned));
             dir.pop();
             let writer = Writer::new(model, &names, &statics, k, dir);
-            let html = writer.source_page(f);
-            std::fs::write(
-                out.join("src").join(&krate.name).join(format!("{}.html", file.path)),
-                html,
-            )?;
-            Ok(1)
+            page(format!("src/{}/{}.html", krate.name, file.path), writer.source_page(f))
         })
-        .collect::<io::Result<Vec<usize>>>()?
-        .len();
-    model.crates.par_iter().enumerate().try_for_each(|(k, krate)| -> io::Result<()> {
-        let writer = Writer::new(model, &names, &statics, k, vec![krate.name.clone()]);
-        std::fs::write(out.join(&krate.name).join("all.html"), writer.all_items())?;
-        std::fs::write(
-            out.join("search-index").join(format!("{}.js", krate.name)),
-            search_index(krate),
-        )?;
-        Ok(())
-    })?;
-    write_crates_list(model, out)?;
-    Ok(Written { pages: pages + model.crates.len(), source_pages })
+        .collect();
+    let source_pages = source_files.len();
+    files.extend(source_files);
+    let per_crate: Vec<[Page; 2]> = model
+        .crates
+        .par_iter()
+        .enumerate()
+        .map(|(k, krate)| {
+            let writer = Writer::new(model, &names, &statics, k, vec![krate.name.clone()]);
+            [
+                page(format!("{}/all.html", krate.name), writer.all_items()),
+                page(format!("search-index/{}.js", krate.name), search_index(krate)),
+            ]
+        })
+        .collect();
+    files.extend(per_crate.into_iter().flatten());
+    Pages { files, written: Written { pages: pages + model.crates.len(), source_pages } }
 }
 
-/// `crates.js`: every crate documented under `out`, those of earlier runs kept.
-fn write_crates_list(model: &Model, out: &Path) -> io::Result<()> {
-    let path = out.join("crates.js");
-    let mut names: Vec<String> = std::fs::read_to_string(&path)
-        .ok()
+/// Writes every page of `model` under `out` (`target/doc`), and `crates.js`.
+pub fn write(model: &Model, out: &Path) -> io::Result<Written> {
+    let Pages { files, written } = pages(model);
+    for file in &files {
+        let path = out.join(&file.path);
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        std::fs::write(path, &file.bytes)?;
+    }
+    let earlier = std::fs::read_to_string(out.join("crates.js")).ok();
+    let names: Vec<&str> = model.crates.iter().map(|it| it.name.as_str()).collect();
+    let list = crates_list(earlier.as_deref(), |name| out.join(name).join("index.html").exists(), &names);
+    std::fs::write(out.join("crates.js"), list)?;
+    Ok(written)
+}
+
+/// `crates.js`: every crate of `names`, and those `earlier` (the file as it was) named that
+/// still have their pages (`kept`), sorted.
+pub fn crates_list(earlier: Option<&str>, kept: impl Fn(&str) -> bool, names: &[&str]) -> String {
+    let mut listed: Vec<String> = earlier
         .and_then(|text| {
             let start = text.find('[')?;
             let end = text.rfind(']')?;
@@ -164,18 +172,15 @@ fn write_crates_list(model: &Model, out: &Path) -> io::Result<()> {
         })
         .unwrap_or_default()
         .into_iter()
-        .filter(|name| out.join(name).join("index.html").exists())
+        .filter(|name| kept(name))
         .collect();
-    for krate in &model.crates {
-        if !names.contains(&krate.name) {
-            names.push(krate.name.clone());
+    for name in names {
+        if !listed.iter().any(|it| it == name) {
+            listed.push((*name).to_owned());
         }
     }
-    names.sort();
-    std::fs::write(
-        path,
-        format!("window.BLAZE_CRATES = {};\n", serde_json::to_string(&names).unwrap()),
-    )
+    listed.sort();
+    format!("window.BLAZE_CRATES = {};\n", serde_json::to_string(&listed).unwrap())
 }
 
 fn module_dir(krate: &CrateDoc, module: &Item) -> String {

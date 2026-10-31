@@ -22,11 +22,8 @@
 #![deny(unsafe_code)]
 #![cfg_attr(feature = "in-rust-tree", feature(rustc_private))]
 
-#[cfg(not(feature = "in-rust-tree"))]
-extern crate ra_ap_rustc_lexer as rustc_lexer;
 #[cfg(feature = "in-rust-tree")]
 extern crate rustc_driver as _;
-#[cfg(feature = "in-rust-tree")]
 extern crate rustc_lexer;
 
 pub mod cook;

@@ -372,7 +372,7 @@ fn plan_units<F: Files>(input: &PlanInput<'_, F>) -> Result<PlanOutput, LoadErro
     let primary: FxHashSet<&str> = input.roots.iter().map(|&at| units[at].pkg_id.as_str()).collect();
     let mut per_package: FxHashMap<&str, PackageFlags> =
         FxHashMap::with_capacity_and_hasher(input.packages.len(), Default::default());
-    let artifact_dir = !matches!(input.intent, Intent::Check { .. });
+    let artifact_dir = !matches!(input.intent, Intent::Check { .. } | Intent::Doc);
 
     let mut plans = Vec::with_capacity(units.len());
     for (at, it) in facts.iter().enumerate() {

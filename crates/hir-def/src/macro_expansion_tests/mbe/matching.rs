@@ -62,7 +62,7 @@ m!(/**/);
 "#,
         expect![[r#"
 macro_rules! m{ ($fmt:expr) => (); }
-/* error: expected Expr */
+/* error: unexpected end of macro invocation */
 "#]],
     );
 }

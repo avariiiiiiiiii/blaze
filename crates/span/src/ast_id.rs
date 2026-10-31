@@ -219,7 +219,7 @@ impl ErasedFileAstId {
 
     /// Whether the node is in a fn body, numbered by a walk of that body alone.
     #[inline]
-    fn in_body(self) -> bool {
+    pub fn in_body(self) -> bool {
         (self.0 >> (HASH_BITS + INDEX_BITS)) & 1 != 0
     }
 

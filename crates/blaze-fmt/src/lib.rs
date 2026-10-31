@@ -18,8 +18,6 @@
     clippy::rc_buffer
 )]
 
-extern crate ra_ap_rustc_lexer as rustc_lexer;
-
 use std::cell::RefCell;
 use std::cmp::min;
 use std::collections::HashMap;

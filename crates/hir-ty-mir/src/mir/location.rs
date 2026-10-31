@@ -536,7 +536,9 @@ mod tests {
             let call = parse.root().descendants().find(|it| it.kind() == SyntaxKind::MACRO_CALL);
             names_location(call.unwrap())
         };
-        assert!(call("const C: &str = concat!(line /* here */ !());"));
-        assert!(!call("const C: &str = concat!(line, column);"));
+        assert!(call("const C: &str = concat!(file /* here */ !());"));
+        assert!(!call("const C: &str = concat!(file, line);"));
+        // Their values are already in the expansion.
+        assert!(!call("const C: &str = concat!(line!(), column!());"));
     }
 }

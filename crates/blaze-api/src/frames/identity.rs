@@ -14,15 +14,15 @@ use serde::{Serialize, de::DeserializeOwned};
 use super::{decode, encode, encode_into};
 use crate::{
     ApiError, Applicability, Artifact, ArtifactKind, Basis, BuildScriptRan, Cached, Cargo,
-    CrateType, Diagnostic, Edit, Edited, EditedItem, Envelope, FactRead, FetchVerb, How, Level,
-    LinkHow, LinkKind, Linked, Memory, Mismatch, Ranked, Reach, ReachedItem, Request, Response, ResponseRef, Span,
+    CrateType, Diagnostic, Documented, DocumentedCrate, Edit, Edited, EditedItem, Envelope, FactRead, FetchVerb, How, Level,
+    LinkHow, LinkKind, Linked, Memory, Mismatch, NodeKind, Ranked, Reach, ReachedItem, Request, Response, ResponseRef, Span,
     ServedCrate, ServedPart, Status, Table, TagMemory, Target, TargetKind, Targets, TestOutcome,
     TestResult, Traced, Ub,
     UnitOf, UnitProfile, UnitStarted, UnitTarget, Verb, ViewRef, Worked,
 };
 
-const REQUESTS: usize = 24;
-const RESPONSES: usize = 28;
+const REQUESTS: usize = 25;
+const RESPONSES: usize = 30;
 
 const CHARS: [char; 9] = ['a', 'Z', '0', ' ', '-', '/', '\u{e9}', '\u{6c34}', '\u{1f525}'];
 
@@ -287,6 +287,7 @@ impl Gen {
             },
             21 => Request::Memory,
             22 => Request::Pack { view: self.view(0), targets: self.targets(), program: self.text() },
+            23 => Request::Doc { view: self.view(0), targets: self.targets(), no_deps: self.yes(), private: self.yes() },
             _ => Request::Stop,
         }
     }
@@ -517,6 +518,9 @@ impl Gen {
                 }),
                 compiled: self.wide(),
                 critical_path_us: self.wide(),
+                steps_us: self.many(depth, |g| {
+                    (NodeKind::ALL[(g.next() % NodeKind::ALL.len() as u64) as usize], g.wide())
+                }),
             }),
             8 => Response::TestResult(TestResult {
                 name: self.text(),
@@ -608,6 +612,13 @@ impl Gen {
                 committed_high_water: self.wide(),
             }),
             26 => Response::Packed { pack: self.bytes() },
+            27 => Response::DocPage { path: self.text(), page: self.bytes() },
+            28 => Response::Documented(Documented {
+                dir: self.text(),
+                crates: self.many(depth, |g| DocumentedCrate { name: g.text(), package: g.text(), asked: g.yes() }),
+                pages: self.wide(),
+                source_pages: self.wide(),
+            }),
             _ => {
                 Response::Of { response: Box::new(self.response(depth + 1)), candidate: self.u32() }  // alloc: test and fuzz reference only
             }
@@ -667,7 +678,8 @@ fn request_index(request: &Request) -> usize {
         Request::WillSave { .. } => 20,
         Request::Memory => 21,
         Request::Pack { .. } => 22,
-        Request::Stop => 23,
+        Request::Doc { .. } => 23,
+        Request::Stop => 24,
     }
 }
 
@@ -701,7 +713,9 @@ fn response_index(response: &Response) -> usize {
         Response::Announced { .. } => 24,
         Response::Memory(_) => 25,
         Response::Packed { .. } => 26,
-        Response::Of { .. } => 27,
+        Response::DocPage { .. } => 27,
+        Response::Documented(_) => 28,
+        Response::Of { .. } => 29,
     }
 }
 

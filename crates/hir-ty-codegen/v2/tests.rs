@@ -287,7 +287,9 @@ fn a_generic_is_shared_under_every_options_its_units_build_with() {
     let live = options(&Policy { mode: Mode::Live, ..policy(OptLevel::O3) });
     assert!(live.other.contains(at(Debug, false, false)), "{live:?}");
     assert!(live.other.contains(at(Release, false, false)), "{live:?}");
-    let tiered = options(&Policy { mode: Mode::Tiered, ..policy(OptLevel::O0) });
+    let mut tiered = Policy { mode: Mode::Tiered, ..policy(OptLevel::O0) };
+    tiered.toolchain.stencils = Some("test".to_owned());
+    let tiered = options(&tiered);
     assert!(tiered.other.contains(at(Debug, false, false)), "{tiered:?}");
     assert!(tiered.other.contains(at(Release, false, false)), "{tiered:?}");
     let o3 = options(&policy(OptLevel::O3));
@@ -598,15 +600,16 @@ fn a_functions_sanitizers_off_are_its_nearest_attributes() {
     assert_eq!(off(&sanitizing(Sanitizers::NONE, 2), &root("loud")), Sanitizers::NONE);
 }
 
-/// A function with a sanitizer off is another template than the same IR with it on.
+/// A function with a sanitizer off is another template than the same IR with it on, in one
+/// unit's settings (which a shape is of as well).
 #[test]
 fn what_is_unsanitized_is_in_the_shape() {
     let (db, frontend) = frontend(SANITIZED);
-    let quiet = frontend.root(function(&db, "quiet"));
+    let (quiet, loud) = (frontend.root(function(&db, "quiet")), frontend.root(function(&db, "loud")));
     let address = sanitizing(Sanitizers::ADDRESS, 0);
     let thread = sanitizing(Sanitizers::THREAD, 0);
-    assert_ne!(prepared(&frontend, &address, &quiet).0, prepared(&frontend, &thread, &quiet).0);
-    assert_eq!(prepared(&frontend, &thread, &quiet).0, shape(&frontend, &quiet));
+    assert_ne!(prepared(&frontend, &address, &quiet).0, prepared(&frontend, &address, &loud).0);
+    assert_eq!(prepared(&frontend, &thread, &quiet).0, prepared(&frontend, &thread, &loud).0);
 }
 
 /// Cranelift instruments for no sanitizer, so a unit with a set it would build is refused,

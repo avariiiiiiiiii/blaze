@@ -1175,6 +1175,7 @@ mod tests {
                 kind: MacroKind::Bang,
                 name: "m".to_owned(),
                 def_site: Some(at("d.rs", None)),
+                opaque: false,
             }),
         );
         let mut first = Diag::error(None, "x", expanded);

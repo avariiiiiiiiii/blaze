@@ -1,6 +1,6 @@
 //! Writing a running Mach-O image on macOS AArch64.
 //!
-//! As `crate::macos` writes code: a page that is not writable is never made writable, since
+//! A page that is not writable is never made writable, since
 //! a page of code that is writable is not runnable and a thread running on it would fault.
 //! A copy of its pages is written, given their protection, and mapped over them in one
 //! `mach_vm_remap`, then the instruction cache is invalidated (`sys_icache_invalidate`).

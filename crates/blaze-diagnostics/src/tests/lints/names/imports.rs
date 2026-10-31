@@ -137,6 +137,7 @@ fn hidden_glob_reexports() {
     let expected = include_str!("imports/hidden_glob_reexports.stderr");
     let fixture = format!(
         "//- /std.rs crate:std edition:2021 library\npub mod primitive {{ pub use u8; }}\n\
+         pub mod prelude {{ pub mod rust_2015 {{}} pub mod rust_2018 {{}} pub mod rust_2021 {{}} pub mod rust_2024 {{}} }}\n\
          //- /hidden_glob_reexports.rs crate:other:main edition:2015 deps:std\n{source}"
     );
     assert_eq!(ui_fixture(&fixture), expected);

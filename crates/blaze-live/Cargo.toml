@@ -13,10 +13,6 @@ categories = ["development-tools"]
 
 [dependencies]
 
-[features]
-# `fuzz_checks`, v1's checks of a decoded patch, for the fuzz target `live_patch`.
-fuzz = []
-
 # By path and with its lints written out, never `workspace = true`: blaze-live is built outside
 # this workspace too (demo/life, user programs, `tools/nix/life_launch.py`, `harness/tiers.py`),
 # where no root `Cargo.toml` is found. Keep the lints equal to the root's `[workspace.lints]`.

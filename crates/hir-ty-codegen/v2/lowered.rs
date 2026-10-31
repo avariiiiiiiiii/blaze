@@ -83,7 +83,7 @@ pub fn lowered(
                 convert::names(placed.frame(), key, unit.arch, &func, requests, placed)
             })
             // alloc: an error
-            .map_err(|e| failed(unit, format!("{instance:?}: {e}")))?;
+            .map_err(|e| failed(unit, hir_ty::attach_db(db, || format!("{instance:?}: {e}"))))?;
             Ok(Lowering::Ir { func, names, data })
         })
     })

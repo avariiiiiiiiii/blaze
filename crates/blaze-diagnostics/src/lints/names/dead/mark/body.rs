@@ -708,11 +708,15 @@ pub fn g<T: Tr, const N: usize>(x: u8) -> u8 {
                     let resolver = resolver_for_scope(db, owner, scopes.scope_for(expr));
                     let hygiene = store.expr_path_hygiene(expr);
                     let at = ExprOrPatId::ExprId(expr);
-                    if let Some(value) = infer.value_resolution(at) {
+                    let qualifier = infer.qualifier_resolution(at);
+                    // A type-relative path has its value recorded too, which no resolver finds.
+                    if let Some(value) = infer.value_resolution(at)
+                        && qualifier.is_none()
+                    {
                         assert_eq!(Some(value), resolver.resolve_path_in_value_ns_fully(db, path, hygiene), "{expr:?}");
                         values += 1;
                     }
-                    if let Some((ty, segments)) = infer.qualifier_resolution(at) {
+                    if let Some((ty, segments)) = qualifier {
                         assert_eq!(resolver.resolve_path_in_value_ns_fully(db, path, hygiene), None, "{expr:?}");
                         let found = resolver.resolve_path_in_type_ns(db, path).map(|(it, remaining, _)| (it, remaining));
                         assert_eq!(found, Some((ty, Some(segments as usize))), "{expr:?}");

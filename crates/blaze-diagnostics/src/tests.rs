@@ -17,7 +17,7 @@ use self::db::TestDB;
 use crate::{
     Files, Options,
     emit::{Sources, Style},
-    model::Diag,
+    model::{Breakage, Diag},
 };
 
 /// A fixture checked: its database, the names of its files and what rustc would say.
@@ -54,9 +54,23 @@ impl Checked {
         self.stderr_with(Style::default())
     }
 
+    /// The future-incompatibility report's diagnostics written as compiletest writes them
+    /// (`json.rs`, `extract_rendered`): the report's heading once, then each one's.
     pub(crate) fn stderr_with(&self, style: Style) -> String {
         let sources = self.sources();
-        self.diags.iter().map(|it| crate::emit::written(it, &sources, style)).collect()
+        let mut out = String::new();
+        let mut reported = false;
+        for diag in &self.diags {
+            if diag.breakage == Breakage::Reported {
+                if !reported {
+                    out.push_str("Future incompatibility report: ");
+                    reported = true;
+                }
+                out.push_str("Future breakage diagnostic:\n");
+            }
+            out.push_str(&crate::emit::written(diag, &sources, style));
+        }
+        out
     }
 
     /// The messages of the diagnostics, with their codes: `E0308: mismatched types`.
@@ -258,7 +272,7 @@ pub(crate) fn compiletest(mode: Mode, options: &Options) -> Options {
     let mut lints = options.lints.clone();
     opts.append(&mut lints.lints.opts);
     lints.lints.opts = opts;
-    Options { lints, keep_duplicates: true }
+    Options { lints, keep_duplicates: true, future_breakage_report: true }
 }
 
 /// compiletest's normalization of a UI test's output (`runtest.rs`, `normalize_output`) as far

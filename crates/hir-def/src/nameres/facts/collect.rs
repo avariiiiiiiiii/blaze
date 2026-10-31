@@ -937,12 +937,23 @@ fn inject_prelude<'db, S: Sink<'db>>(sink: &mut S) {
 /// macro's `$crate::std::...` (lewton 0.10's own `try!`), find it, and in later editions they do
 /// not. Plain paths reach the crate through the extern prelude in every edition: a dependency
 /// cargo passes `noprelude` (build-std's `--extern noprelude:std`) is put there by this item,
-/// as by any `extern crate` of the root, and the std prelude is injected after it.
+/// as by any `extern crate` of the root, and the std prelude is injected after it. `core` is in
+/// the extern prelude even when it is not the item's (rustc's `Resolver::new` adds `core` unless
+/// `no_core`, then `std` unless `no_std`), so a 2018 crate's `use core::..` finds build-std's
+/// `noprelude:core`.
 fn inject_std_extern_crate<'db, S: Sink<'db>>(cx: &CollectCx<'db, '_>, sink: &mut S) {
     let data = &sink.def_map().data;
     if data.no_core {
         return;
     }
+    let core = Name::new_symbol_root(sym::core);
+    if !sink.local_def_map().extern_prelude.contains_key(&core)
+        && let Some(dep) = cx.dep(&core)
+    {
+        let root = crate_def_map(cx.db, dep.crate_id).root_module_id();
+        sink.apply(DeclOp::ExternPrelude { name: core, root, extern_crate: None });
+    }
+    let data = &sink.def_map().data;
     let edition = data.edition;
     let name = match data.no_std {
         true => Name::new_symbol_root(sym::core),

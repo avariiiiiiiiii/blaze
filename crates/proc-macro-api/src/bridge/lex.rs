@@ -4,7 +4,7 @@
 //! as rustc does; offsets into the parsed string are not offsets into the source file.
 
 use intern::Symbol;
-use ra_ap_rustc_lexer::{self as lexer, DocStyle, LiteralKind, TokenKind};
+use rustc_lexer::{self as lexer, DocStyle, LiteralKind, TokenKind};
 use span::Span;
 use tt::{DelimiterKind, IdentIsRaw, Leaf, LitKind, Spacing};
 

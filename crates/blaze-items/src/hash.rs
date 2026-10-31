@@ -27,7 +27,7 @@
 //! an [`Unhashable`] naming the item: never a hash salted by where the item is, which two
 //! different edits could share.
 
-use std::{alloc::Allocator, fmt};
+use std::{alloc::Allocator, fmt, fmt::Write as _};
 
 use base_db::Db;
 use blaze_ids::{ContentId, Hasher};
@@ -60,15 +60,22 @@ pub struct Unhashable {
 }
 
 impl Unhashable {
-    /// The error a build stops with: the item by kind and path, and what could not be hashed.
+    /// The error a build stops with: the item by kind and path, what could not be hashed, and
+    /// for MIR that failed to lower, the error lowering it gave.
     pub fn describe(&self, db: &Db) -> String {
         // alloc: the message a build stops with, written once at the edge.
-        format!(
+        let mut said = format!(
             "blaze-items: {:?} `{}` has no hash: {}",
             self.item.kind(),
             key::path(db, self.item),
             self.what
-        )
+        );
+        if self.what == form::Missed::NoMir.what()
+            && let Some(error) = form::Cx::new(db).mir_error(self.item)
+        {
+            _ = write!(said, " ({error})");
+        }
+        said
     }
 }
 

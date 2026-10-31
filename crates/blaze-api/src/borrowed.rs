@@ -17,7 +17,7 @@ use serde::Deserialize;
 
 use crate::{
     ApiError, Applicability, Artifact, Basis, BuildScriptRan, Cached, CrateType, Diagnostic,
-    Edited, FactRead, FetchVerb, Level, Memory, Mismatch, Ranked, Reach, Response, Span, Status,
+    Documented, Edited, FactRead, FetchVerb, Level, Memory, Mismatch, Ranked, Reach, Response, Span, Status,
     Table, TargetKind, TestOutcome, TestResult, Traced, UnitOf, UnitStarted, UnitTarget, Verb,
     Worked,
 };
@@ -66,6 +66,12 @@ pub enum ResponseRef<'a> {
         #[serde(deserialize_with = "blaze_protocol::bytes::borrow")]
         pack: &'a [u8],
     },
+    DocPage {
+        path: &'a str,
+        #[serde(deserialize_with = "blaze_protocol::bytes::borrow")]
+        page: &'a [u8],
+    },
+    Documented(Documented),
 }
 
 /// [`Diagnostic`], read where it lies.
@@ -269,6 +275,8 @@ impl ResponseRef<'_> {
             ResponseRef::Announced { root } => Response::Announced { root },
             ResponseRef::Memory(it) => Response::Memory(it),
             ResponseRef::Packed { pack } => Response::Packed { pack: bytes(pack) },
+            ResponseRef::DocPage { path, page } => Response::DocPage { path: owned(path), page: bytes(page) },
+            ResponseRef::Documented(it) => Response::Documented(it),
         }
     }
 }

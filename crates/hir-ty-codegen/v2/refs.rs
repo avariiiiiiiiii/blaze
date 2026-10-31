@@ -155,7 +155,7 @@ fn memo<'db>(
     match walked {
         Ok(walked) => Ok(Some(walked)),
         // alloc: the error's message
-        Err(what) => Err(format!("the references of {instance:?}: {what}")),
+        Err(what) => Err(hir_ty::attach_db(db, || format!("the references of {instance:?}: {what}"))),
     }
 }
 

@@ -305,6 +305,32 @@ fn has_opaque(ty: Ty<'_>) -> bool {
     rustc_type_ir::TypeVisitable::visit_with(&ty, &mut Find).is_break()
 }
 
+/// Each type in `ty`, itself first, in `ty.walk()`'s order until `f` breaks. Unlike `walk`, it
+/// keeps no set of the types seen, which allocates once a type has more than eight: a type
+/// met twice is visited twice.
+fn each_ty<'db>(
+    ty: Ty<'db>,
+    f: impl FnMut(Ty<'db>) -> std::ops::ControlFlow<()>,
+) -> std::ops::ControlFlow<()> {
+    struct Each<F>(F);
+    impl<'db, F: FnMut(Ty<'db>) -> std::ops::ControlFlow<()>>
+        rustc_type_ir::TypeVisitor<hir_ty::next_solver::DbInterner<'db>> for Each<F>
+    {
+        type Result = std::ops::ControlFlow<()>;
+        fn visit_ty(&mut self, ty: Ty<'db>) -> Self::Result {
+            (self.0)(ty)?;
+            rustc_type_ir::TypeSuperVisitable::super_visit_with(&ty, self)
+        }
+    }
+    rustc_type_ir::TypeVisitable::visit_with(&ty, &mut Each(f))
+}
+
+/// Whether `f` holds of a type in `ty`, as [`each_ty`] visits them.
+fn any_ty<'db>(ty: Ty<'db>, mut f: impl FnMut(Ty<'db>) -> bool) -> bool {
+    each_ty(ty, |it| if f(it) { std::ops::ControlFlow::Break(()) } else { std::ops::ControlFlow::Continue(()) })
+        .is_break()
+}
+
 /// The parts of `actual` where `declared`, the same type but for its `impl Trait`s, has an
 /// `impl Trait`: the types those hide.
 fn hidden_types<'db>(declared: Ty<'db>, actual: Ty<'db>, out: &mut FVec<'_, Ty<'db>>) {
@@ -345,7 +371,7 @@ fn hidden_types<'db>(declared: Ty<'db>, actual: Ty<'db>, out: &mut FVec<'_, Ty<'
 /// Whether `ty` has a closure or a coroutine in it, whose signature RA does not keep
 /// higher-ranked: `|line: &String|` is `fn(&'1 String)` for one `'1`, not `for<'a>`.
 fn names_closure(ty: Ty<'_>) -> bool {
-    ty.walk().filter_map(|it| rustc_type_ir::inherent::GenericArg::as_type(&it)).any(|it| {
+    any_ty(ty, |it| {
         matches!(
             it.kind(),
             TyKind::Closure(..) | TyKind::CoroutineClosure(..) | TyKind::Coroutine(..)
@@ -1138,14 +1164,15 @@ impl<'a, 'db> Builder<'_, 'a, 'db> {
                     let Some(ty) = local_tys[local.into_raw().into_u32() as usize] else {
                         continue;
                     };
-                    for arg in ty.walk() {
-                        if let Some(ty) = rustc_type_ir::inherent::GenericArg::as_type(&arg)
-                            && let TyKind::Dynamic(_, object) = ty.kind()
+                    // Each object written, as `inputs` has each region written.
+                    _ = each_ty(ty, |ty| {
+                        if let TyKind::Dynamic(_, object) = ty.kind()
                             && let Some(at) = inputs.iter().position(|&it| it == object)
                         {
                             inputs.remove(at);
                         }
-                    }
+                        std::ops::ControlFlow::Continue(())
+                    });
                 }
             }
             inputs.dedup();
@@ -1180,12 +1207,9 @@ impl<'a, 'db> Builder<'_, 'a, 'db> {
             // infers (`recover_infer_ret_ty`), and an error where it cannot name it (a closure):
             // the error relates to nothing, and the return slot is checked as any other local,
             // its regions inferred. rust-analyzer recovers none, so it is the body's type here.
-            let recovered = signature.as_ref().is_some_and(|(_, output)| {
-                output.walk().any(|it| {
-                    rustc_type_ir::inherent::GenericArg::as_type(&it)
-                        .is_some_and(|ty| ty.is_ty_error())
-                })
-            });
+            let recovered = signature
+                .as_ref()
+                .is_some_and(|(_, output)| any_ty(*output, |ty| ty.is_ty_error()));
             let ty = match &signature {
                 Some((_, output)) if !opaque && !recovered => *output,
                 // The type an `impl Trait` hides is inferred, the lifetimes of its trait objects
@@ -1237,27 +1261,20 @@ impl<'a, 'db> Builder<'_, 'a, 'db> {
                 && !captures_parameter;
             // Of each `impl Trait` in it, `Box<impl Future>` too.
             let captures_lifetime = signature.as_ref().is_some_and(|(_, output)| {
-                output
-                    .walk()
-                    .filter_map(|it| rustc_type_ir::inherent::GenericArg::as_type(&it))
-                    .filter_map(|ty| match ty.kind() {
-                        TyKind::Alias(_, alias)
-                            if let rustc_type_ir::AliasTyKind::Opaque { def_id } = alias.kind =>
-                        {
-                            Some((def_id, alias))
-                        }
-                        _ => None,
+                any_ty(*output, |ty| {
+                    let TyKind::Alias(_, alias) = ty.kind() else { return false };
+                    let rustc_type_ir::AliasTyKind::Opaque { def_id: opaque } = alias.kind else {
+                        return false;
+                    };
+                    let Some(captured) =
+                        opaque_captures(self.ctx.frame, self.ctx.db, opaque, alias.args.len())
+                    else {
+                        return true;
+                    };
+                    alias.args.iter().zip(captured).any(|(arg, captured)| {
+                        captured && matches!(arg.kind(), GenericArgKind::Lifetime(_))
                     })
-                    .any(|(opaque, alias)| {
-                        let Some(captured) =
-                            opaque_captures(self.ctx.frame, self.ctx.db, opaque, alias.args.len())
-                        else {
-                            return true;
-                        };
-                        alias.args.iter().zip(captured).any(|(arg, captured)| {
-                            captured && matches!(arg.kind(), GenericArgKind::Lifetime(_))
-                        })
-                    })
+                })
             });
             let ty = rustc_type_ir::fold_regions(self.interner(), ty, |region, depth| {
                 if (opaque || recovered || signature.is_none())
@@ -2336,12 +2353,12 @@ impl<'a, 'db> Builder<'_, 'a, 'db> {
             .chain((!self.returns_opaque).then_some(&super::return_slot()))
         {
             let ty = self.regions.local_tys[local.into_raw().into_u32() as usize];
-            for arg in ty.walk() {
-                let Some(it) = rustc_type_ir::inherent::GenericArg::as_type(&arg) else {
-                    continue;
+            let db = self.ctx.db;
+            _ = each_ty(ty, |it| {
+                let TyKind::Adt(def, args) = it.kind() else {
+                    return std::ops::ControlFlow::Continue(());
                 };
-                let TyKind::Adt(def, args) = it.kind() else { continue };
-                for clause in GenericPredicates::query_all(self.ctx.db, def.def_id().into())
+                for clause in GenericPredicates::query_all(db, def.def_id().into())
                     .iter_instantiated(interner, args.as_slice())
                 {
                     let clause = clause.skip_norm_wip();
@@ -2352,7 +2369,8 @@ impl<'a, 'db> Builder<'_, 'a, 'db> {
                         clauses.push(clause);
                     }
                 }
-            }
+                std::ops::ControlFlow::Continue(())
+            });
         }
         self.clauses(&clauses, At { category: Category::Signature, span: MirSpan::Unknown }, true);
         self.scratch.clauses.give(clauses);
@@ -2387,10 +2405,8 @@ impl<'a, 'db> Builder<'_, 'a, 'db> {
             if seen.len() > 256 || !seen.insert(ty) {
                 continue;
             }
-            for arg in ty.walk() {
-                let Some(it) = rustc_type_ir::inherent::GenericArg::as_type(&arg) else {
-                    continue;
-                };
+            let db = self.ctx.db;
+            _ = each_ty(ty, |it| {
                 match it.kind() {
                     TyKind::Alias(_, alias)
                         if matches!(alias.kind, rustc_type_ir::AliasTyKind::Projection { .. }) =>
@@ -2401,10 +2417,9 @@ impl<'a, 'db> Builder<'_, 'a, 'db> {
                         }
                     }
                     TyKind::Adt(def, args) => {
-                        let clauses =
-                            GenericPredicates::query_all(self.ctx.db, def.def_id().into())
-                                .iter_instantiated(interner, args.as_slice())
-                                .map(|it| it.skip_norm_wip());
+                        let clauses = GenericPredicates::query_all(db, def.def_id().into())
+                            .iter_instantiated(interner, args.as_slice())
+                            .map(|it| it.skip_norm_wip());
                         for clause in clauses {
                             match clause.kind().skip_binder() {
                                 ClauseKind::Trait(predicate) => tys.extend(
@@ -2427,7 +2442,8 @@ impl<'a, 'db> Builder<'_, 'a, 'db> {
                     }
                     _ => (),
                 }
-            }
+                std::ops::ControlFlow::Continue(())
+            });
         }
         for trait_ref in trait_refs {
             self.prove(trait_ref, At { category: Category::Signature, span: MirSpan::Unknown });
@@ -6839,17 +6855,37 @@ pub(super) fn path_binding(
     body: &MirBody<'_>,
     expr: hir_def::hir::ExprId,
 ) -> Option<hir_def::hir::BindingId> {
-    use hir_def::resolver::{HasResolver, ValueNs};
-    let hir_def::hir::Expr::Path(path) = ctx.store.expr(expr) else { return None };
-    let db = ctx.db;
-    let owner = body.owner;
+    let hir_def::hir::Expr::Path(_) = ctx.store.expr(expr) else { return None };
+    let bindings = path_bindings(ctx.db, body.owner);
+    let at = bindings.binary_search_by_key(&expr, |&(it, _)| it).ok()?;
+    Some(bindings[at].1)
+}
+
+/// The variable each path of `owner`'s store names, by expression, of those that name one:
+/// resolved with one resolver moved into each path's scope and back, so a deep scope chain
+/// grows its stack once, and a query, so checking a body reads it without building one.
+#[blaze_query::tracked(returns(ref))]
+fn path_bindings<'db>(
+    db: &'db Db,
+    owner: InferBodyId<'db>,
+) -> Box<[(hir_def::hir::ExprId, hir_def::hir::BindingId)]> {
+    use hir_def::resolver::ValueNs;
+    let store_owner = owner.expression_store_owner(db);
+    let store = hir_def::expr_store::ExpressionStore::of(db, store_owner);
     let mut resolver = owner.resolver(db);
-    let _guard = resolver.update_to_inner_scope(db, owner.expression_store_owner(db), expr);
-    let hygiene = ctx.store.expr_path_hygiene(expr);
-    match resolver.resolve_path_in_value_ns_fully(db, path, hygiene)? {
-        ValueNs::LocalBinding(binding) => Some(binding),
-        _ => None,
+    let mut out = Vec::new();
+    for (expr, it) in store.exprs() {
+        let hir_def::hir::Expr::Path(path) = it else { continue };
+        let guard = resolver.update_to_inner_scope(db, store_owner, expr);
+        let resolved =
+            resolver.resolve_path_in_value_ns_fully(db, path, store.expr_path_hygiene(expr));
+        resolver.reset_to_guard(guard);
+        if let Some(ValueNs::LocalBinding(binding)) = resolved {
+            out.push((expr, binding)); // alloc: the query's result, once per owner
+        }
     }
+    out.sort_unstable_by_key(|&(expr, _)| expr);
+    out.into_boxed_slice()
 }
 
 pub(super) fn spells_generics(path: hir_def::expr_store::path::Path<'_>) -> bool {

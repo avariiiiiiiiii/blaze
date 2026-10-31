@@ -29,12 +29,12 @@ impl Hashes for ById {
         Ok(CodeHash(by_id("test code", body)))
     }
 
-    fn ty<'db>(&self, _: &'db Db, ty: Ty<'db>) -> Result<ContentId, String> {
-        Ok(by_id("test type", ty))
+    fn ty<'db>(&self, db: &'db Db, ty: Ty<'db>) -> Result<ContentId, String> {
+        Ok(hir_ty::attach_db(db, || by_id("test type", ty)))
     }
 
-    fn konst<'db>(&self, _: &'db Db, konst: Const<'db>) -> Result<ContentId, String> {
-        Ok(by_id("test const", konst))
+    fn konst<'db>(&self, db: &'db Db, konst: Const<'db>) -> Result<ContentId, String> {
+        Ok(hir_ty::attach_db(db, || by_id("test const", konst)))
     }
 
     fn span(&self, _: &Db, owner: DefWithBodyId, span: MirSpan) -> Result<SpanRef, String> {

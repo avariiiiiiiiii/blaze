@@ -19,7 +19,8 @@ use syntax::{
 
 use crate::{
     Appended, DocCommentDesugarMode, FlatConverter, Inserted, Removed, SpanMapper, SrcToken,
-    TokenConverter, convert_doc_comment, convert_tokens_kept, punct_char,
+    TokenConverter, convert_doc_comment, convert_tokens_kept, float_pieces, may_continue_float,
+    punct_char, split_float,
 };
 
 /// [`crate::to_parser_input`] as it was.
@@ -232,6 +233,10 @@ where
 
 struct Converter<SpanMap, OnEvent, A: Allocator + Clone> {
     current: Option<SyntaxToken>,
+    /// The float in the node that the parser split and `current` is the first piece of.
+    float: Option<TextRange>,
+    /// Whether `current` ends a token of the source's lexing.
+    ends_token: bool,
     current_leaves: SmallVec<[tt::Leaf; 4]>,
     preorder: PreorderWithTokens,
     range: TextRange,
@@ -260,6 +265,8 @@ where
     ) -> Self {
         let mut converter = Converter {
             current: None,
+            float: None,
+            ends_token: false,
             preorder: node.preorder_with_tokens(),
             range: node.text_range(),
             punct_offset: None,
@@ -272,7 +279,50 @@ where
             on_event: on_enter,
         };
         converter.current = converter.next_token();
+        converter.settle(Some(converter.range.start()));
         converter
+    }
+
+    /// The text of `float`, which `first` is the first piece of.
+    fn float_text(&self, first: &SyntaxToken, float: TextRange) -> String {
+        // clone: a token handle, to walk from.
+        std::iter::successors(Some(first.clone()), |it| it.next_token())
+            .take_while(|it| it.text_range().start() < float.end())
+            .map(|it| it.text().to_owned())
+            .collect()
+    }
+
+    /// `crate::ViewConverter::settle`, the window made of the tokens' texts.
+    fn settle(&mut self, boundary: Option<TextSize>) {
+        self.float = None;
+        self.ends_token = false;
+        let Some(token) = self.current.clone() else { return };
+        let range = token.text_range();
+        let prev = || token.prev_token().map(|it| (it.kind(), it.text_range()));
+        if boundary != Some(range.start()) && may_continue_float(token.kind(), range, prev()) {
+            return;
+        }
+        self.ends_token = true;
+        if token.kind() != INT_NUMBER {
+            return;
+        }
+        let next = std::iter::successors(token.next_token(), |it| it.next_token())
+            .map(|it| (it.kind(), it.text_range()));
+        let Some(ends) = float_pieces(range, next) else { return };
+        let mut window = String::new();
+        for it in std::iter::successors(Some(token), |it| it.next_token()) {
+            if it.text_range().start() < ends[1] {
+                window.push_str(it.text());
+            } else if let Some(char) = it.text().chars().next() {
+                window.push(char);
+                break;
+            }
+        }
+        match split_float(range, ends, &window) {
+            Some(float) if self.range.contains_range(float) => self.float = Some(float),
+            Some(_) => self.ends_token = false,
+            None => {}
+        }
     }
 
     fn next_token(&mut self) -> Option<SyntaxToken> {
@@ -317,6 +367,7 @@ where
 enum SynToken {
     Ordinary(SyntaxToken),
     Punct { token: SyntaxToken, offset: usize },
+    Float(String),
     Leaf(tt::Leaf),
 }
 
@@ -324,7 +375,7 @@ impl SynToken {
     fn token(&self) -> &SyntaxToken {
         match self {
             SynToken::Ordinary(it) | SynToken::Punct { token: it, offset: _ } => it,
-            SynToken::Leaf(_) => unreachable!(),
+            SynToken::Float(_) | SynToken::Leaf(_) => unreachable!(),
         }
     }
 }
@@ -338,6 +389,7 @@ impl<SpanMap, OnEvent, A: Allocator + Clone> SrcToken<Converter<SpanMap, OnEvent
             SynToken::Punct { token, offset: i } => {
                 SyntaxKind::from_char(punct_char(token.text(), *i).unwrap()).unwrap()
             }
+            SynToken::Float(_) => FLOAT_NUMBER,
             SynToken::Leaf(_) => {
                 never!();
                 SyntaxKind::ERROR
@@ -346,7 +398,7 @@ impl<SpanMap, OnEvent, A: Allocator + Clone> SrcToken<Converter<SpanMap, OnEvent
     }
     fn to_char(&self, _ctx: &Converter<SpanMap, OnEvent, A>) -> Option<char> {
         match self {
-            SynToken::Ordinary(_) => None,
+            SynToken::Ordinary(_) | SynToken::Float(_) => None,
             SynToken::Punct { token: it, offset: i } => punct_char(it.text(), *i),
             SynToken::Leaf(_) => None,
         }
@@ -354,6 +406,7 @@ impl<SpanMap, OnEvent, A: Allocator + Clone> SrcToken<Converter<SpanMap, OnEvent
     fn to_text<'a>(&'a self, _ctx: &'a Converter<SpanMap, OnEvent, A>) -> &'a str {
         match self {
             SynToken::Ordinary(token) | SynToken::Punct { token, offset: _ } => token.text(),
+            SynToken::Float(text) => text,
             SynToken::Leaf(_) => {
                 never!();
                 ""
@@ -362,7 +415,7 @@ impl<SpanMap, OnEvent, A: Allocator + Clone> SrcToken<Converter<SpanMap, OnEvent
     }
     fn as_leaf(&self) -> Option<&tt::Leaf> {
         match self {
-            SynToken::Ordinary(_) | SynToken::Punct { .. } => None,
+            SynToken::Ordinary(_) | SynToken::Punct { .. } | SynToken::Float(_) => None,
             SynToken::Leaf(it) => Some(it),
         }
     }
@@ -406,7 +459,18 @@ where
             return None;
         }
 
+        if let Some(float) = self.float {
+            let text = self.float_text(&curr, float);
+            self.current = self.next_token();
+            while self.current.as_ref().is_some_and(|it| it.text_range().start() < float.end()) {
+                self.current = self.next_token();
+            }
+            self.settle(Some(float.end()));
+            self.punct_offset = None;
+            return Some((SynToken::Float(text), float));
+        }
         self.current = self.next_token();
+        self.settle(self.ends_token.then_some(curr.text_range().end()));
         let token = if curr.kind().is_punct() {
             // clone: a token handle, for the token returned as well as the one kept.
             self.punct_offset = Some((curr.clone(), 0.into()));
@@ -435,6 +499,9 @@ where
         let curr = self.current.as_ref()?;
         if !self.range.contains_range(curr.text_range()) {
             return None;
+        }
+        if let Some(float) = self.float {
+            return Some(SynToken::Float(self.float_text(curr, float)));
         }
         // clone: a token handle, for the token returned.
         let curr = curr.clone();

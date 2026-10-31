@@ -86,7 +86,9 @@ pub(super) fn check_pass_and_stdio(
     let _tracing = setup_tracing();
     let fx = fixture::db(ra_fixture);
     let file_ids = fx.files().to_vec();
-    let db = fx.into_db();
+    let mut db = fx.into_db();
+    // As a build does, for `Location::caller` and `file!()`.
+    crate::mir::location::name_sources(&mut db, "fixture", |_, _| Some("main.rs".to_owned()));
     crate::attach_db(&db, || {
         let file_id = *file_ids.last().unwrap();
         let x = eval_main(&db, file_id);
@@ -1123,7 +1125,7 @@ fn getrandom_syscall(arch: &str, number: i64) -> String {
     format!(
         r#"
 //- minicore: option
-//- /main.rs cfg:target_arch={arch}
+//- /main.rs cfg:target_os=linux,target_arch={arch}
 
 extern "C" {{
     pub unsafe extern "C" fn syscall(num: i64, ...) -> i64;
@@ -1161,6 +1163,7 @@ fn syscall_numbers_are_the_targets() {
     check_error_with(
         r#"
 //- minicore: option
+//- /main.rs cfg:target_os=linux
 extern "C" {
     pub unsafe extern "C" fn syscall(num: i64, ...) -> i64;
 }
@@ -1169,7 +1172,7 @@ fn main() {
     syscall(318, &mut x, 4usize, 0);
 }
 "#,
-        |e| matches!(e, MirEvalError::InternalError(s) if s.contains("target_arch")),
+        |e| matches!(e, MirEvalError::NotSupported(s) if s.contains("target_arch")),
     );
 }
 
@@ -1244,6 +1247,7 @@ fn posix_tls() {
     check_pass(
         r#"
 //- minicore: option
+//- /main.rs cfg:target_os=linux,target_arch=x86_64
 
 type pthread_key_t = u32;
 type c_void = u8;

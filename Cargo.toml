@@ -14,6 +14,8 @@ exclude = [
     "vendor/hegeltest-macros",
     # Patched below; its own tests need dev-dependencies blaze has no use for.
     "vendor/sonic-rs",
+    # Its own tests need dev-dependencies blaze has no use for (vendor/blake3-servil/SOURCE.md).
+    "vendor/blake3-servil",
 ]
 resolver = "2"
 
@@ -104,10 +106,12 @@ blaze-source = { path = "crates/blaze-source" }
 blaze-units = { path = "crates/blaze-units" }
 blaze-lower = { path = "crates/blaze-lower" }
 blaze-wasm-pack = { path = "crates/blaze-wasm-pack" }
+blaze-doc = { path = "crates/blaze-doc" }
 blaze-fuzz = { path = "crates/blaze-fuzz" }
 blaze-core = { path = "crates/blaze-core" }
 blaze-graph = { path = "crates/blaze-graph" }
 blaze-image = { path = "crates/blaze-image" }
+blaze-profile = { path = "crates/blaze-profile" }
 blaze-protocol = { path = "crates/blaze-protocol" }
 blaze-ui = { path = "crates/blaze-ui" }
 # v2 (docs/v2/plan/reference/crates.md)
@@ -162,8 +166,10 @@ test-utils = { path = "crates/test-utils", version = "0.0.0" }
 tt = { path = "crates/tt", version = "0.0.0" }
 edition = { path = "crates/edition", version = "0.0.0" }
 
-ra-ap-rustc_lexer = { version = "0.179", default-features = false }
-ra-ap-rustc_parse_format = { version = "0.179", default-features = false }
+# The pinned nightly's lexer and format-string parser, re-vendored on every bump
+# (harness/toolchain_bump.py).
+rustc_lexer = { path = "crates/rustc_lexer" }
+rustc_parse_format = { path = "vendor/rustc_parse_format", version = "0.0.0" }
 ra-ap-rustc_index = { version = "0.179", default-features = false }
 # rustc's layout code, from the tag of the stable in `harness/toolchain`.
 rustc_abi = { path = "crates/rustc_abi", version = "0.0.0", default-features = false }
@@ -190,15 +196,15 @@ blake3 = { version = "1.8", default-features = false, features = ["std", "neon"]
 # backend on x86-64 Linux and AArch64 Linux and macOS (docs/v2/plan/process/decisions.md).
 # Its kernels are chosen at run time; `std` alone, and its pool's threads start only in
 # `initialize_multithreaded`, which blaze never calls.
-blake3-servil = { git = "https://github.com/johnservil/BLAKE3", rev = "c6bd679a0911cc233cb28297f2b25875381215a1", default-features = false, features = ["std"] }
+blake3-servil = { path = "vendor/blake3-servil", default-features = false, features = ["std"] }
 camino = "1.2.6"
 # The Cranelift hir-ty-codegen compiles with.
 # `=`: the version of vendor/cranelift-codegen, which every crate here that needs it must match.
-cranelift-codegen = "=0.137.0"
-cranelift-frontend = "=0.137.0"
+cranelift-codegen = "=0.137.1"
+cranelift-frontend = "=0.137.1"
 # The reference interpreter and CLIF reader blaze-stencil's tests check each stencil with.
-cranelift-interpreter = "=0.137.0"
-cranelift-reader = "=0.137.0"
+cranelift-interpreter = "=0.137.1"
+cranelift-reader = "=0.137.1"
 # `vendor/llvm-sys` by the patch above.
 llvm-sys = "231"
 crossbeam-channel = "0.5.17"
@@ -307,8 +313,8 @@ blaze-registry = { path = "crates/blaze-registry" }
 cargo-platform = "0.3.3"
 cargo-util-schemas = "=0.14.3"
 cov-mark = "2.2.0"
-cranelift-module = "=0.137.0"
-cranelift-object = "=0.137.0"
+cranelift-module = "=0.137.1"
+cranelift-object = "=0.137.1"
 diff = "=0.1.13"
 dissimilar = "1.0.11"
 drop_bomb = "0.1.5"

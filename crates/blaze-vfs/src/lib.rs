@@ -51,7 +51,7 @@ use crate::{
 pub use blaze_image::Corrupt;
 
 pub use crate::{
-    image::{Bytes, ImageError, ImageMark, ImageUse},
+    image::{Bytes, DisksUnused, ImageError, ImageMark, ImageUse},
     outside::{Cover, Outside, cover, generation, unchanged_since, want},
     reader::{Pinned, Reader},
     section::Section,

@@ -46,6 +46,10 @@ use crate::{
     },
 };
 
+/// Tokens a descent into macros holds, with their contexts: inline up to the few a span
+/// usually maps to, so a warm descent allocates nothing.
+pub(super) type DescentTokens<'db> = smallvec::SmallVec<[(Token<'db>, SyntaxContext); 4]>;
+
 /// A view a def is found from.
 pub trait ToDef<'db>: AstNode<'db> + Copy {
     type Def;
@@ -513,7 +517,7 @@ impl<'db> ViewCtx<'db, '_> {
         &mut self,
         macro_file: MacroCallId,
         span: Span,
-        out: &mut Vec<(Token<'db>, SyntaxContext)>,
+        out: &mut DescentTokens<'db>,
     ) -> Option<u32> {
         let db = self.db();
         let info = self.s2d.cache.get_or_insert_expansion(db, macro_file);

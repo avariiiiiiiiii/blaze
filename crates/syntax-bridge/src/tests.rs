@@ -550,28 +550,32 @@ fn assert_same_as_reference(
 /// Every view a caller can take of `tree`, at every depth: what is left from each token tree
 /// on (all of them for a small tree, the last 8 of a level for a large one, whose views are
 /// long), and each run of up to 4 token trees, a matcher's window, which ends inside the tree
-/// (never inside a lifetime).
+/// (never inside a lifetime). None starts inside a lifetime either.
 fn every_view(tree: &tt::TopSubtree) -> Vec<tt::TokenTreesView<'_>> {
     fn level<'a>(iter: tt::iter::TtIter<'a>, small: bool, out: &mut Vec<tt::TokenTreesView<'a>>) {
+        let is_quote = |it: &Option<TtElement<'_>>| {
+            matches!(it, Some(TtElement::Leaf(Leaf::Punct(Punct { char: '\'', .. }))))
+        };
         let n = iter.clone().count();
         let mut at = iter;
+        // A lifetime's `'` and its name are one token: no view starts or ends between them.
+        let mut after_quote = false;
         for i in 0..=n {
-            if small || n - i <= 8 {
-                out.push(at.remaining());
-            }
-            let start = at.savepoint();
-            let mut end = at.clone();
-            for _ in 0..4.min(n - i) {
-                // A lifetime's `'` and its name are one token: no window ends between them.
-                let quote = matches!(
-                    end.next(),
-                    Some(TtElement::Leaf(Leaf::Punct(Punct { char: '\'', .. })))
-                );
-                if !quote {
-                    out.push(end.from_savepoint(start));
+            if !after_quote {
+                if small || n - i <= 8 {
+                    out.push(at.remaining());
+                }
+                let start = at.savepoint();
+                let mut end = at.clone();
+                for _ in 0..4.min(n - i) {
+                    if !is_quote(&end.next()) {
+                        out.push(end.from_savepoint(start));
+                    }
                 }
             }
-            match at.next() {
+            let next = at.next();
+            after_quote = is_quote(&next);
+            match next {
                 Some(TtElement::Subtree(_, inner)) => level(inner, small, out),
                 Some(TtElement::Leaf(_)) => (),
                 None => break,

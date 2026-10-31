@@ -37,7 +37,8 @@ use crate::{
 pub enum ImplTraitLowering<'l> {
     /// An opaque type of its bounds (`TypeRef::ImplTrait`): a return type, an alias.
     Opaque,
-    /// Not allowed here: an error type, its bounds dropped.
+    /// Not allowed here (a field, a `let`, a path's generic argument in a body): kept as
+    /// written, a `TypeRef::ImplTrait`, for the type lowering to refuse with E0562.
     Error,
     /// An argument's: a new type parameter of the generics being collected, its bounds that
     /// parameter's where predicates.
@@ -56,15 +57,11 @@ impl ImplTraitLowering<'_> {
         bounds: ListMark,
     ) -> TypeRefId {
         match self {
-            ImplTraitLowering::Opaque => {
+            ImplTraitLowering::Opaque | ImplTraitLowering::Error => {
                 let id = ec.with_lists(bounds, |ec, lists| {
                     ec.store.alloc_type_ref(TypeRef::ImplTrait(lists.bounds_since(bounds)))
                 });
                 ec.map_type_ref(id, ptr, false)
-            }
-            ImplTraitLowering::Error => {
-                ec.store.truncate_to(bounds);
-                ec.alloc_type_ref(TypeRef::Error, ptr)
             }
             ImplTraitLowering::Argument { type_or_consts, where_predicates, parent } => {
                 let param = TypeParamData {

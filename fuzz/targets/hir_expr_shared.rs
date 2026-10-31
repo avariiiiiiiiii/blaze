@@ -90,7 +90,7 @@ pub fn store(build: &mut Build) -> StoreCols {
     let path_slots = build.column::<u32>(&[], true);
     let lifetimes = build.column::<[u32; 2]>(&[], false);
     let binding_owners = build.column::<u32>(&[], true);
-    let block_scopes = build.column::<u64>(&[1 | 3 << 32], true);
+    let block_scopes = build.column::<u64>(&[1], true);
     let macro_calls = build.column::<u64>(&[], true);
     let ident_hygiene = build.column::<[u32; 2]>(&[[1, ctx], [PAT_BIT, ctx]], true);
     let block_editions = build.column::<[u32; 2]>(&[[3, Edition::CURRENT as u32]], true);

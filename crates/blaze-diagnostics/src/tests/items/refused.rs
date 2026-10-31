@@ -27,7 +27,7 @@ fn a_visibility_that_names_no_ancestor_module() {
     let not_module = "struct S;\nmod m { pub(in crate::S) fn f() {} }\nfn main() {}\n";
     refused("2021", not_module, "E0577: expected module, found struct `crate::S`");
     let nothing = "mod m { pub(in crate::nothing) fn f() {} }\nfn main() {}\n";
-    refused("2021", nothing, "E0433: failed to resolve");
+    refused("2021", nothing, "E0433: cannot find `nothing` in `crate`");
     let relative = "mod m { pub(in m) fn f() {} }\nfn main() {}\n";
     refused("2018", relative, "relative paths are not supported in visibilities in 2018 edition or later");
 }

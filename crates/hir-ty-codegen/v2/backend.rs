@@ -267,7 +267,7 @@ impl Backends<'_> {
             let function = built_function(db, homes, hashes, unit, spec, (instance, inlined), refs, frame)?;
             let shape = shape::of(unit, &function, frame)
                 // alloc: an error
-                .map_err(|what| failed(unit, format!("{instance:?}: {what}")))?;
+                .map_err(|what| failed(unit, hir_ty::attach_db(db, || format!("{instance:?}: {what}"))))?;
             let prepared = match unit.backend {
                 // alloc: the prepared function, kept by the driver until its emit
                 Backend::Cranelift { .. } => Prepared::Cranelift(Box::new(function)),
@@ -296,7 +296,7 @@ pub(super) fn built_function(
     frame: &Frame,
 ) -> Result<Function, CodegenError> {
     // alloc: an error
-    let fail = |what: String| failed(unit, format!("{instance:?}: {what}"));
+    let fail = |what: String| failed(unit, hir_ty::attach_db(db, || format!("{instance:?}: {what}")));
     let build = Build::of(spec);
     if build.inlines && !inlined {
         // alloc: an error

@@ -11,11 +11,7 @@
 #![feature(allocator_api, allocator_ext)]
 #![deny(unsafe_code)]
 
-#[cfg(feature = "in-rust-tree")]
 extern crate rustc_parse_format;
-
-#[cfg(not(feature = "in-rust-tree"))]
-extern crate ra_ap_rustc_parse_format as rustc_parse_format;
 
 pub extern crate rustc_abi;
 pub extern crate rustc_abi as layout;

@@ -270,3 +270,54 @@ fn run_becomes_its_program() {
     assert_eq!(then, Then::Exit(101));
     assert!(err.starts_with("error: `cargo run` could not determine which binary to run."), "{err}");
 }
+
+#[test]
+fn doc_writes_its_pages_and_says_what_cargo_doc_says() {
+    let dir = std::env::temp_dir().join(format!("blaze-cli-doc-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(dir.join("old")).unwrap();
+    std::fs::write(dir.join("old/index.html"), "").unwrap();
+    std::fs::write(dir.join("crates.js"), "window.BLAZE_CRATES = [\"gone\",\"old\"];\n").unwrap();
+    let documented = |dir: &std::path::Path| {
+        let crates = vec![
+            blaze_api::DocumentedCrate { name: "foo".into(), package: "foo v0.1.0 (/w/foo)".into(), asked: true },
+            blaze_api::DocumentedCrate { name: "dep".into(), package: "dep v1.0.0".into(), asked: false },
+        ];
+        Response::Documented(blaze_api::Documented { dir: dir.display().to_string(), crates, pages: 2, source_pages: 0 })
+    };
+    let built = || Response::Built { members: 1, artifacts: Vec::new(), profile: "`dev` profile [unoptimized + debuginfo]".to_owned() };
+    let responses = vec![
+        built(),
+        documented(&dir),
+        Response::DocPage { path: "foo/index.html".into(), page: b"<html>foo</html>".to_vec() },
+        Response::DocPage { path: "dep/index.html".into(), page: b"dep".to_vec() },
+        Response::Done { ok: true },
+    ];
+    let (then, out, err) = driven(&mut FakeApi::answering(responses.clone()), &["blaze", "doc"], &mut Fake::default());
+    assert_eq!(then, Then::Exit(0));
+    assert_eq!(out, "");
+    let lines: Vec<&str> = err.lines().collect();
+    assert_eq!(lines[..2], [" Documenting foo v0.1.0 (/w/foo)", " Documenting dep v1.0.0"], "{err}");
+    assert!(lines[2].starts_with("    Finished `dev` profile [unoptimized + debuginfo] target(s) in "), "{err}");
+    assert_eq!(lines[3], format!("   Generated {}", dir.join("foo/index.html").display()), "{err}");
+    assert_eq!(std::fs::read_to_string(dir.join("foo/index.html")).unwrap(), "<html>foo</html>");
+    assert_eq!(std::fs::read_to_string(dir.join("dep/index.html")).unwrap(), "dep");
+    let listed = std::fs::read_to_string(dir.join("crates.js")).unwrap();
+    assert_eq!(listed, "window.BLAZE_CRATES = [\"dep\",\"foo\",\"old\"];\n", "an earlier crate whose pages are gone is not listed");
+
+    let (_, _, quiet) = driven(&mut FakeApi::answering(responses), &["blaze", "doc", "-q"], &mut Fake::default());
+    assert_eq!(quiet, "", "cargo's status lines are silent under -q");
+
+    let out_of_it = dir.join("inner");
+    let escaping = vec![
+        built(),
+        documented(&out_of_it),
+        Response::DocPage { path: "../escaped.html".into(), page: b"x".to_vec() },
+        Response::Done { ok: true },
+    ];
+    let (then, _, err) = driven(&mut FakeApi::answering(escaping), &["blaze", "doc"], &mut Fake::default());
+    assert_eq!(then, Then::Exit(FAILED));
+    assert!(err.contains("the daemon sent the page `../escaped.html`, which is not under"), "{err}");
+    assert!(!dir.join("escaped.html").exists(), "nothing is written outside the documentation's directory");
+    std::fs::remove_dir_all(&dir).unwrap();
+}

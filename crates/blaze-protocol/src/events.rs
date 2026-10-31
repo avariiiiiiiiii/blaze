@@ -407,6 +407,50 @@ pub enum NodeKind {
     Test,
 }
 
+impl NodeKind {
+    /// Every kind, in declaration order: `ALL[kind as usize] == kind`.
+    pub const ALL: [NodeKind; 12] = [
+        NodeKind::Manifest,
+        NodeKind::Fetch,
+        NodeKind::Script,
+        NodeKind::ScriptRun,
+        NodeKind::Macro,
+        NodeKind::Std,
+        NodeKind::Names,
+        NodeKind::Bodies,
+        NodeKind::Codegen,
+        NodeKind::Store,
+        NodeKind::Link,
+        NodeKind::Test,
+    ];
+
+    /// The word a `timeline-us:` line names it by.
+    pub const fn name(self) -> &'static str {
+        match self {
+            NodeKind::Manifest => "manifest",
+            NodeKind::Fetch => "fetch",
+            NodeKind::Script => "script",
+            NodeKind::ScriptRun => "script-run",
+            NodeKind::Macro => "macro",
+            NodeKind::Std => "std",
+            NodeKind::Names => "names",
+            NodeKind::Bodies => "bodies",
+            NodeKind::Codegen => "codegen",
+            NodeKind::Store => "store",
+            NodeKind::Link => "link",
+            NodeKind::Test => "test",
+        }
+    }
+}
+
+const _: () = {
+    let mut at = 0;
+    while at < NodeKind::ALL.len() {
+        assert!(NodeKind::ALL[at] as usize == at);
+        at += 1;
+    }
+};
+
 /// Where a node of the build's graph is. A node only moves down this list, from `Waiting`
 /// to one of the last five.
 // clone: the plane hands each subscriber the state a node moved to.

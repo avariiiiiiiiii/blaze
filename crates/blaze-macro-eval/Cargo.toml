@@ -15,7 +15,7 @@ doctest = false
 
 [dependencies]
 cranelift-codegen.workspace = true
-ra-ap-rustc_lexer.workspace = true
+rustc_lexer.workspace = true
 rustc-hash.workspace = true
 unicode-normalization.workspace = true
 

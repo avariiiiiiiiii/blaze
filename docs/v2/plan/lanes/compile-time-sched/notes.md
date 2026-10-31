@@ -76,6 +76,50 @@ The brief asked the count to come from the events; v2's daemon writes no per-fun
 (v1's `Event::Functions` was its build page), so the test counts at the backend and in each
 build's `Stats`.
 
+## Program builds admitted by the memory budget (queue 01101, 2026-10-31)
+
+Main's #1539 and #1568 (the deleted `blaze-engine/src/admit.rs`): a worker's program builds
+share its memory budget, and one not yet measured runs alone and is measured. v2 had the
+plane's admission but not that rule. Every unit's compile was a `kinds::COMPILE` node with no
+key, so all of them were predicted by one per-kind estimate, 64 MiB before any was seen. That
+estimate came from `arena::measure`, which counts only the task's own thread, while a
+program's codegen runs on rayon's threads and its link on blaze-link's. On a cold runner,
+therefore, as many program builds as there are work threads could start together, each
+predicted far under what it holds: v1's failure in #1550 (14.5 GB resident, 23 GB swapped).
+The process-wide `held` gate stops only new starts, not builds already under way growing
+together.
+
+Now, as docs/memory-budget.md's plan has it:
+
+- **One kind and one key per program.** A unit that builds a program its client runs (a
+  binary, test, bench, example or `cdylib`; `serve::unit::program_key`) is a
+  `kinds::PROGRAM` node, pushed with `Plane::push_program` and its program's key. The key is
+  the package, target, profile, platform, target kinds and mode. The history learns by that
+  key; the plane's node has none, so nothing is single-flighted or memoized by it. Build
+  scripts and proc macros stay `COMPILE`: many and small, and v1 did not admit them this way
+  either.
+- **Never measured: alone.** With a budget, a program the history has no record of (or one
+  measured to hold all of it) is predicted the whole budget. The plane (`pick`) starts a task
+  predicted the whole budget once no task granted memory runs, whatever the process holds
+  besides, and while it runs nothing granted memory fits.
+- **Measured alone, across every thread.** As it starts, `arena::high_water_from_now` begins
+  a watch of the process's high-water mark. That is a `fetch_max` in the allocator's cold
+  flush path, once per 256 KiB of a thread's drift, so a watch costs an allocation nothing.
+  When the task ends, it learns the rise.
+- **Measured beside others, never lowered.** Its thread's own peak misses its compiles, so it
+  learns at least its prediction, and a record made alone is not worn down by runs that
+  cannot see it.
+
+Tests: `plane_tests::a_task_predicted_the_whole_budget_runs_alone`,
+`arena::tests::a_watch_sees_what_every_thread_held_at_most` and
+`serve::plane::tests::a_program_is_admitted_by_its_own_measure_and_one_never_measured_runs_alone`.
+
+What is still open: a task's peak beside others is still only its own thread's
+(`arena::measure`). Attributing to a task what the threads it hands work to hold would take
+a scope that rayon jobs enter, at blaze-codegen's `until_stopped` and blaze-link's parallel
+sites; that is lane core's allocator. Until then a program's record changes only when it
+runs alone again (after the record is evicted) or holds more than predicted on its own thread.
+
 ## Left open
 
 - **Release summaries.** A release build still prepares and summarizes every function the store

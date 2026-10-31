@@ -6,7 +6,7 @@
 
 use hegel::TestCase;
 use hegel::generators as gs;
-use ra_ap_rustc_lexer::{Base, Cursor, FrontmatterAllowed, LiteralKind, TokenKind};
+use rustc_lexer::{Base, Cursor, FrontmatterAllowed, LiteralKind, TokenKind};
 use rustc_literal_escaper::{Mode, check_for_errors};
 
 use super::*;
@@ -118,7 +118,7 @@ mod macro_eval {
     }
 
     fn raw_message(src: &str, prefix_len: u32) -> String {
-        match ra_ap_rustc_lexer::validate_raw_str(src, prefix_len) {
+        match rustc_lexer::validate_raw_str(src, prefix_len) {
             Err(RawStrError::InvalidStarter { bad_char }) => {
                 let mut message =
                     String::from("found invalid character; only `#` is allowed in raw string delimitation: ");

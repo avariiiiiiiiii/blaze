@@ -59,6 +59,10 @@ pub mod kinds {
     /// `blaze test --ub`: the tests selected, and one test evaluated.
     pub const UB_TESTS: TaskKind = TaskKind(0x1_0007);
     pub const EVALUATE: TaskKind = TaskKind(0x1_0008);
+    /// A program's build: the codegen and link of a binary, test, bench, example or `cdylib`.
+    /// One its predictor has not measured is predicted the whole budget and runs alone
+    /// ([`super::Predict::measured`]).
+    pub const PROGRAM: TaskKind = TaskKind(0x1_0009);
 }
 
 /// The subsystem whose memory a task of `kind` holds: whose budget holds it back.
@@ -71,7 +75,7 @@ pub mod kinds {
 pub const fn tag_of(kind: TaskKind) -> Tag {
     match kind {
         kinds::FETCH => Tag::Store,
-        kinds::LIBRARY | kinds::COMPILE | kinds::REACH => Tag::Codegen,
+        kinds::LIBRARY | kinds::COMPILE | kinds::REACH | kinds::PROGRAM => Tag::Codegen,
         kinds::LOWER | kinds::UB_TESTS | kinds::EVALUATE => Tag::Mir,
         kinds::WALK | TaskKind(4) => Tag::Query,
         TaskKind(1..=3) | TaskKind(5..=6) => Tag::Vfs,
@@ -357,6 +361,11 @@ pub trait Predict: Send {
     fn observe(&mut self, kind: TaskKind, key: Option<crate::Key>, ran_ns: u64, peak: u64);
     /// What it learned, as bytes for the daemon's image.
     fn encode(&self) -> Vec<u8>;
+    /// Whether it has measured a task of `kind` with `key` itself, not only others of its
+    /// kind. A predictor that keeps no keys says every task is.
+    fn measured(&self, _kind: TaskKind, _key: Option<crate::Key>) -> bool {
+        true
+    }
 }
 
 /// Today's predictor: peaks by kind, costs left as the specs give them.
@@ -662,6 +671,7 @@ mod tests {
             (0x1_0001, Tag::Store),
             (0x1_0004, Tag::Codegen),
             (0x1_0008, Tag::Mir),
+            (0x1_0009, Tag::Codegen),
             (0, Tag::Other),
             (0x7000, Tag::Other),
             (u32::MAX, Tag::Other),

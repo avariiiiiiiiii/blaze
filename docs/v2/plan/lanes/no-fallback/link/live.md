@@ -49,12 +49,12 @@ coordinator; its fallbacks are listed below as dead rather than fixed.
 | `crates/blaze-stencil/src/tier/instrument.rs:80` | rule | an entry block with no instruction has no source location to copy: the default location | stays |
 | `crates/blaze-stencil/src/tier/runner.rs:84` | rule | a poisoned mutex taken as it is | stays |
 | `crates/blaze-stencil/gen/*.rs` | rule | the build script's `unwrap_or_else(panic!)`: each failure stops the build naming the stencil | stays |
-| `crates/blaze-live/src/linux.rs:615`, `windows.rs:518` | dead | v1: a patch that does not decode, or a file that can't be read, is dropped silently | deleted with v1 (queued) |
-| `crates/blaze-live/src/macos.rs:562` | dead | v1: a patch that does not decode is an `eprintln!` | deleted with v1 (queued) |
-| `crates/blaze-live/src/linux.rs:565`, `macos.rs:509` | dead | v1: a wake socket that can't be bound falls back to polling every 30 ms | deleted with v1 (queued) |
-| `crates/blaze-live/src/linux.rs:592`, `windows.rs:480` | dead | v1: an executable linked again that can't be read is ignored | deleted with v1 (queued) |
-| `crates/blaze-live/src/linux.rs:168`, `macos.rs:206`, `windows.rs:156` `take` | dead | v1: a patch with an older sequence is dropped with no outcome | deleted with v1 (queued) |
-| `crates/blaze-live/src/format.rs:260` | dead | v1: a patch with no count of statics' first values is read as having none | deleted with v1 (queued) |
-| `crates/blaze-live/src/sample.rs:187`, `:200` | dead | v1's sampler: an unreadable or malformed request is "not asked"; a profile that can't be written is an `eprintln!` | deleted with v1 (queued) |
-| `crates/blaze-live/src/lib.rs:246` `tiers` | dead | an unreadable or malformed `tiers` file is `None`, the same as "not tiering"; nothing in v2 writes the file | deleted with v1 (queued) |
-| `crates/blaze-live/src/lib.rs:257` `edit` | dead | v1's daemon protocol; no v2 daemon reads it | deleted with v1 (queued) |
+| `crates/blaze-live/src/linux.rs:615`, `windows.rs:518` | dead | v1: a patch that does not decode, or a file that can't be read, is dropped silently | deleted with v1 (2026-10-31, queue 01110) |
+| `crates/blaze-live/src/macos.rs:562` | dead | v1: a patch that does not decode is an `eprintln!` | deleted with v1 (2026-10-31, queue 01110) |
+| `crates/blaze-live/src/linux.rs:565`, `macos.rs:509` | dead | v1: a wake socket that can't be bound falls back to polling every 30 ms | deleted with v1 (2026-10-31, queue 01110) |
+| `crates/blaze-live/src/linux.rs:592`, `windows.rs:480` | dead | v1: an executable linked again that can't be read is ignored | deleted with v1 (2026-10-31, queue 01110) |
+| `crates/blaze-live/src/linux.rs:168`, `macos.rs:206`, `windows.rs:156` `take` | dead | v1: a patch with an older sequence is dropped with no outcome | deleted with v1 (2026-10-31, queue 01110) |
+| `crates/blaze-live/src/format.rs:260` | dead | v1: a patch with no count of statics' first values is read as having none | deleted with v1 (2026-10-31, queue 01110) |
+| `crates/blaze-live/src/sample.rs:187`, `:200` | dead | v1's sampler: an unreadable or malformed request is "not asked"; a profile that can't be written is an `eprintln!` | deleted with v1 (2026-10-31, queue 01110) |
+| `crates/blaze-live/src/lib.rs:246` `tiers` | dead | an unreadable or malformed `tiers` file is `None`, the same as "not tiering"; nothing in v2 writes the file | deleted with v1 (2026-10-31, queue 01110) |
+| `crates/blaze-live/src/lib.rs:257` `edit` | dead | v1's daemon protocol; no v2 daemon reads it | deleted with v1 (2026-10-31, queue 01110) |

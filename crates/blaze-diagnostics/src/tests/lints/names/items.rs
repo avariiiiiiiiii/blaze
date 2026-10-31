@@ -124,10 +124,12 @@ macro_rules! todo {
 pub mod prelude {
     pub mod rust_2015 {
         pub use crate::{todo, unreachable};
+        pub use core::marker::Sized;
         pub use core::option::Option::{self, None, Some};
     }
     pub mod rust_2021 {
         pub use crate::{todo, unreachable};
+        pub use core::marker::Sized;
         pub use core::option::Option::{self, None, Some};
     }
 }
@@ -401,10 +403,10 @@ fn main() {}
     let messages = checked(&fixture).messages();
     let named = "hiding a lifetime that's named elsewhere is confusing";
     let eliding = "eliding a lifetime that's named elsewhere is confusing";
-    assert_eq!(messages, [eliding, named], "{messages:?}");
+    assert_eq!(messages, [eliding, named, "2 warnings emitted"], "{messages:?}");
     let options = compiletest(Mode::Other, &Options::default());
     let kept = checked_with(&fixture, "$DIR/", &options).messages();
-    assert_eq!(kept, [eliding, named, named], "{kept:?}");
+    assert_eq!(kept, [eliding, named, named, "3 warnings emitted"], "{kept:?}");
 }
 
 /// `tests/ui/async-await/track-caller/panic-track-caller.rs`'s `nofeat` revision, of a free

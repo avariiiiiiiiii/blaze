@@ -59,6 +59,7 @@ pub use self::facts::kinds;
 pub mod frozen;
 pub use hir_expand::proc_macro::may_have_session_macros;
 mod mod_resolution;
+pub mod named;
 mod path_resolution;
 mod trait_items;
 pub mod proc_macro;
@@ -932,7 +933,7 @@ impl DefMap {
                 delta::reads::note(id, None);
                 own.get(&id).or_else(|| outside.get(&id))
             }
-            ModulesSlot::Published(resolution) => delta::published_modules(db, *resolution).get(&id),
+            ModulesSlot::Published(resolution) => delta::published_module(db, *resolution, id),
             ModulesSlot::Collected(modules) => {
                 <Modules<'a> as blaze_query::db::FromId>::from_id(*modules).module(db, id).as_ref()
             }

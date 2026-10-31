@@ -52,7 +52,8 @@ const EVERY_LEVEL: BodyOptions = BodyOptions {
 const UB_CHECKED: BodyOptions =
     BodyOptions { lang: OptionsSet::of(&[LANG]), other: OptionsSet::of(&[DEBUG_CHECKED]) };
 
-const MINICORE: &str = "sized, copy, clone, drop, size_of, unsize, coerce_unsized, fn";
+const MINICORE: &str =
+    "sized, copy, clone, drop, size_of, unsize, coerce_unsized, dispatch_from_dyn, fn";
 
 /// One program for every case: the generic functions, and the types and constants they are
 /// instantiated with, by type aliases. `P`, `Q` and `S` are one `u32` each, so pointers to them

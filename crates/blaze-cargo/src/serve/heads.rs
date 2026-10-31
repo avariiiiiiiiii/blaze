@@ -123,6 +123,7 @@ pub fn named(request: &Request) -> Vec<&str> {
         | Request::Trace { view, .. }
         | Request::Tables { view }
         | Request::Pack { view, .. }
+        | Request::Doc { view, .. }
         | Request::WillTest { view, .. } => view_heads(view, &mut heads),
         Request::WillSave { head, .. } if is_checkout(head) => heads.push(head),
         Request::Diff { from, to } | Request::Reach { from, to, .. } => {
@@ -149,6 +150,7 @@ pub fn runs_user_code(request: &Request) -> bool {
             | Request::BestOf { .. }
             | Request::Verify { .. }
             | Request::Pack { .. }
+            | Request::Doc { .. }
             | Request::WillTest { .. }
             | Request::WillSave { .. }
     )

@@ -16,8 +16,9 @@
 
 use std::{
     collections::{BTreeMap, VecDeque},
+    fmt,
     panic::{AssertUnwindSafe, catch_unwind},
-    sync::Arc,
+    sync::{Arc, Mutex, PoisonError},
     time::{Duration, Instant},
 };
 
@@ -111,6 +112,8 @@ pub enum Happened<T> {
     Post { task: Posting, again: bool },
     /// A loop task to start now.
     Run { id: NodeId },
+    /// A thread task panicked, before its node settles failed with the panic as its `why`.
+    Panicked { id: NodeId, panic: Panic },
     /// A node settled: done (`why` none) or not (failed, skipped or cancelled, saying why).
     Settled { id: NodeId, ok: bool, why: Option<String> },
     /// Every node of the request settled and it was closed; what it did, taken before the
@@ -132,7 +135,7 @@ pub struct Ran<T> {
 
 pub enum Ended<T> {
     Did(Did<T>),
-    Panicked(String),
+    Panicked(Panic),
     /// A task of a batch that reads gave way, on the thread group `group`: the loop posts it
     /// again with new readers. Others are posted again where they ran.
     GaveWay { group: Option<u32> },
@@ -265,10 +268,64 @@ fn run_measured<W: Work>(
     }
 }
 
+/// A thread task's panic: what it was raised with, and where.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Panic {
+    /// `None` for a payload that is no text.
+    pub message: Option<String>,
+    /// The thread and `file:line:column` it was raised at, as [`record_panics`]' hook saw it.
+    /// `None` where no hook records them, as under the simulation; a task's panic re-raised
+    /// from a pool's thread (rayon's) is where it was first raised.
+    pub at: Option<String>,
+}
+
+impl fmt::Display for Panic {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("panicked")?;
+        if let Some(at) = &self.at {
+            write!(f, " at {at}")?;
+        }
+        match &self.message {
+            Some(message) => write!(f, ": {message}"),
+            None => f.write_str(" with no message"),
+        }
+    }
+}
+
+/// The panics the hook saw and no task took yet, oldest first: (message, where).
+static RAISED: Mutex<VecDeque<(Option<String>, String)>> = Mutex::new(VecDeque::new());
+
+/// How many panics [`RAISED`] holds: a panic no task catches (a thread's own) is dropped
+/// once this many are newer.
+const RAISED_KEPT: usize = 64;
+
+/// Has every panic of the process recorded where it was raised, for the task that catches it
+/// ([`Panic::at`]), then printed as before. Once, as the daemon starts.
+pub fn record_panics() {
+    let printed = std::panic::take_hook();
+    // alloc: the process's one panic hook
+    std::panic::set_hook(Box::new(move |info| {
+        if let Some(location) = info.location() {
+            let thread = std::thread::current();
+            let at = format!("{location} on thread {}", thread.name().unwrap_or("<unnamed>")); // alloc: a panic, once
+            let message = info.payload_as_str().map(str::to_owned); // alloc: a panic, once
+            let mut raised = RAISED.lock().unwrap_or_else(PoisonError::into_inner);
+            if raised.len() == RAISED_KEPT {
+                raised.pop_front();
+            }
+            raised.push_back((message, at));
+        }
+        printed(info);
+    }));
+}
+
+/// The panic `payload` caught, with where the hook saw the newest one of its message raised.
 // dyn: a panic payload, read once per panicked task
-fn panicked(panic: &(dyn std::any::Any + Send)) -> String {
-    let what = stdx::panic_text(panic).unwrap_or("a panic with no message");
-    format!("panicked: {what}")
+fn panicked(payload: &(dyn std::any::Any + Send)) -> Panic {
+    let message = stdx::panic_text(payload).map(str::to_owned); // alloc: a panic, once
+    let mut raised = RAISED.lock().unwrap_or_else(PoisonError::into_inner);
+    let at = raised.iter().rposition(|(it, _)| *it == message).and_then(|place| raised.remove(place)).map(|(_, at)| at);
+    Panic { message, at }
 }
 
 fn post_work<W: Work>(task: Posting, work: Arc<W>, readers: W::Readers, done: Sender<Ran<W::Value>>) {
@@ -406,6 +463,9 @@ pub struct Plane<W: Work, P: Predict> {
     now_ns: u64,
     /// When each loop task that runs started.
     loops: BTreeMap<NodeId, u64>,
+    /// Each program's build that runs alone, never measured ([`Plane::push_program`]): what
+    /// the process held as it started, for the most it held while it ran.
+    alone: BTreeMap<NodeId, u64>,
 }
 
 pub(crate) fn ns(at: Duration) -> u64 {
@@ -426,6 +486,7 @@ impl<W: Work, P: Predict> Plane<W, P> {
             said: Vec::new(),
             now_ns: 0,
             loops: BTreeMap::new(),
+            alone: BTreeMap::new(),
         })
     }
 
@@ -474,6 +535,53 @@ impl<W: Work, P: Predict> Plane<W, P> {
         fresh.tasks.push(task);
         fresh.keys.push(node.key);
         fresh.nodes.push(node)
+    }
+
+    /// The next node of `fresh`, the build of a program ([`kinds::PROGRAM`]: its codegen and
+    /// link), task `arg` of the batch's work. It is predicted and taught by `program`, the
+    /// program's key, which the plane never sees: the node has no key, so nothing single-flights
+    /// or memoizes it by that. With a budget, a program the predictor has not measured, or one
+    /// measured to hold all of it, is predicted the whole budget and runs alone, its peak then
+    /// what the whole process held beyond its start (docs/memory-budget.md).
+    ///
+    /// # Panics
+    ///
+    /// As [`Plane::push`], and when `node` has a key.
+    pub fn push_program(&self, fresh: &mut Fresh, mut node: NodeRef<'_>, arg: u32, program: Key) -> NodeId {
+        assert!((fresh.tasks.len() as u32) < fresh.count, "a batch of {} nodes given another", fresh.count);
+        assert!(node.key.is_none(), "program build {} is given a key of the plane's", node.name);
+        let kind = kinds::PROGRAM;
+        let Prediction { cost, peak } = self.predict.predict(kind, Some(program));
+        node.memory = node.memory.max(peak);
+        if let Some(cost) = cost {
+            node.cost = cost;
+        }
+        if let Some(budget) = self.budget()
+            && (!self.predict.measured(kind, Some(program)) || node.memory >= budget.bytes)
+        {
+            node.memory = budget.bytes;
+        }
+        fresh.tasks.push(Task::Thread { kind, arg });
+        fresh.keys.push(Some(program));
+        fresh.nodes.push(node)
+    }
+
+    /// Whether the build of program `key` that starts now runs alone, never measured: its
+    /// peak is then the whole process's ([`Plane::push_program`]).
+    fn watched(&self, kind: TaskKind, key: Option<Key>) -> bool {
+        kind == kinds::PROGRAM && self.budget().is_some() && !self.predict.measured(kind, key)
+    }
+
+    /// What a thread task of `kind` that ended teaches its key, from `peak`, what its thread
+    /// held at most: a program's build that ran alone, the most the process held beyond its
+    /// start; one that ran beside others, never less than it was predicted, since its thread
+    /// does not see what the threads it hands its compiles to hold.
+    fn learned(&mut self, id: NodeId, kind: TaskKind, key: Option<Key>, peak: u64) -> u64 {
+        match self.alone.remove(&id) {
+            Some(start) => peak.max(arena::high_water().saturating_sub(start)),
+            None if kind == kinds::PROGRAM => peak.max(self.predict.predict(kind, key).peak),
+            None => peak,
+        }
     }
 
     fn reserve(&mut self, count: u32) -> NodeId {
@@ -606,6 +714,7 @@ impl<W: Work, P: Predict> Plane<W, P> {
 
     /// A thread task of [`Happened::Post`] the loop has no readers for: it ends failed.
     pub fn refuse(&mut self, at: Duration, task: Posting, why: String) {
+        self.alone.remove(&task.id);
         let input = PlaneInput::Done { at_ns: ns(at), id: task.id, outcome: Outcome::Failed { why }, added: Vec::new(), group: None, peak: 0 };
         self.step(input).unwrap_or_else(|error| panic!("the plane refused the end of task {}: {error}", task.id));
     }
@@ -628,9 +737,14 @@ impl<W: Work, P: Predict> Plane<W, P> {
                     self.happened.push(Happened::Did { id, value });
                     outcome
                 }
-                Ended::Panicked(why) => Outcome::Failed { why },
+                Ended::Panicked(panic) => {
+                    let why = panic.to_string(); // alloc: a panic, once
+                    self.happened.push(Happened::Panicked { id, panic });
+                    Outcome::Failed { why }
+                }
             };
             let key = self.key(id);
+            let peak = self.learned(id, task.kind, key, peak);
             self.predict.observe(task.kind, key, ran_ns, peak);
             let input = PlaneInput::Done { at_ns: ns(at), id, outcome, added: Vec::new(), group: None, peak };
             self.step(input).unwrap_or_else(|error| panic!("the plane refused the end of task {id}: {error}"));
@@ -690,23 +804,16 @@ impl<W: Work, P: Predict> Plane<W, P> {
                     };
                     self.happened.push(Happened::Settled { id, ok, why });
                 }
-                PlaneOutput::Run { id, pool, near, critical } => match self.task(id) {
-                    Some((batch, Task::Thread { kind, arg })) => {
-                        let task = Posting { id, pool, near, critical, kind, arg, reads: batch.reads };
-                        if batch.reads {
-                            self.happened.push(Happened::Post { task, again: false });
-                        } else {
-                            let work = batch.work.clone().expect("checked by add");
-                            self.happened.push(Happened::Started { id });
-                            self.runner.post(task, work, W::Readers::default());
-                        }
+                PlaneOutput::Run { id, pool, near, critical } => {
+                    let watch = match self.task(id) {
+                        Some((_, Task::Thread { kind, .. })) => self.watched(kind, self.key(id)),
+                        _ => false,
+                    };
+                    if watch {
+                        self.alone.insert(id, arena::high_water_from_now());
                     }
-                    Some((_, Task::Loop { .. })) => {
-                        self.loops.insert(id, self.now_ns);
-                        self.happened.push(Happened::Run { id });
-                    }
-                    Some((_, Task::Gone)) | None => panic!("the plane runs node {id}, which the daemon gave no task"),
-                },
+                    self.run(id, pool, near, critical);
+                }
                 PlaneOutput::Finished { request, ok } => {
                     let stats = self
                         .graph
@@ -721,6 +828,27 @@ impl<W: Work, P: Predict> Plane<W, P> {
                 // allows: none is stopped mid-run.
                 PlaneOutput::Yield { .. } => {}
             }
+        }
+    }
+
+    /// The node the plane runs: its thread task posted, or its loop task handed to the loop.
+    fn run(&mut self, id: NodeId, pool: Pool, near: Option<u32>, critical: bool) {
+        match self.task(id) {
+            Some((batch, Task::Thread { kind, arg })) => {
+                let task = Posting { id, pool, near, critical, kind, arg, reads: batch.reads };
+                if batch.reads {
+                    self.happened.push(Happened::Post { task, again: false });
+                } else {
+                    let work = batch.work.clone().expect("checked by add");
+                    self.happened.push(Happened::Started { id });
+                    self.runner.post(task, work, W::Readers::default());
+                }
+            }
+            Some((_, Task::Loop { .. })) => {
+                self.loops.insert(id, self.now_ns);
+                self.happened.push(Happened::Run { id });
+            }
+            Some((_, Task::Gone)) | None => panic!("the plane runs node {id}, which the daemon gave no task"),
         }
     }
 }
@@ -792,6 +920,30 @@ mod tests {
             assert_eq!(runner.running(), 0);
             assert!(!runner.ready());
         }
+    }
+
+    #[test]
+    fn a_task_that_panics_ends_with_its_message_and_where_it_was_raised_on_another_thread() {
+        record_panics();
+        let work = Arc::new(Each(|_| -> Option<Did<u32>> {
+            let raised = std::thread::Builder::new()
+                .name("plane-test-raiser".to_owned())
+                .spawn(|| -> Option<Did<u32>> { panic!("plane-test: the task's panic") })
+                .expect("a thread")
+                .join()
+                .expect_err("the thread panics");
+            std::panic::resume_unwind(raised)
+        }));
+        let task = Posting { id: NodeId(9), pool: Pool::Work, near: None, critical: false, kind: kinds::COMPILE, arg: 0, reads: false };
+        let mut runner = Inline::new(5);
+        runner.post(task, work, ());
+        let mut ran = Vec::new();
+        runner.take(&mut ran);
+        let [Ran { ended: Ended::Panicked(panic), .. }] = ran.as_slice() else { panic!("the task ends panicked") };
+        assert_eq!(panic.message.as_deref(), Some("plane-test: the task's panic"));
+        let at = panic.at.as_deref().expect("the hook saw where it was raised");
+        assert!(at.contains("serve/plane.rs:") && at.ends_with(" on thread plane-test-raiser"), "{at}");
+        assert_eq!(panic.to_string(), format!("panicked at {at}: plane-test: the task's panic"));
     }
 
     #[test]
@@ -885,5 +1037,52 @@ mod tests {
         plane.ended(Duration::from_millis(5), looped, Outcome::Built);
         let last = observed.lock().unwrap().last().copied();
         assert_eq!(last, Some((loops::SCRIPT_RUN, None, 5_000_000, 0)));
+    }
+
+    /// Runs `plane` until each of `ids` settled, saying which did well.
+    fn settle<W: Work, P: Predict>(plane: &mut Plane<W, P>, ids: &[NodeId]) -> Vec<(NodeId, bool)> {
+        let (mut happened, mut settled) = (Vec::new(), Vec::new());
+        while settled.len() < ids.len() {
+            plane.poll(Duration::ZERO);
+            plane.happened(&mut happened);
+            for it in happened.drain(..) {
+                if let Happened::Settled { id, ok, .. } = it
+                    && ids.contains(&id)
+                {
+                    settled.push((id, ok));
+                }
+            }
+        }
+        settled.sort_by_key(|it| it.0);
+        settled
+    }
+
+    /// A program's build is taught by its program's key and never single-flighted by it: two
+    /// builds of one program both run. One the history has not measured runs alone and is
+    /// measured, after which the program is predicted by what it held.
+    #[test]
+    fn a_program_is_admitted_by_its_own_measure_and_one_never_measured_runs_alone() {
+        let budget = Budget { bytes: 1 << 30, from: "the test's budget".to_owned() };
+        let config = PlaneConfig { io: 1, work: 2, budget: Some(budget), starve_after: 8 };
+        let history = blaze_history::History::new(blaze_history::Config::default());
+        let mut plane = Plane::new(config, history, Runner::Inline(Inline::new(4))).unwrap();
+        let (program, other) = (Key([5; 32]), Key([6; 32]));
+        let node = |name| NodeRef { kind: NodeKind::Codegen, name, deps: &[], pool: Pool::Work, cost: 1, key: None, memory: 0 };
+        assert!(!plane.predict().measured(kinds::PROGRAM, Some(program)));
+        assert!(plane.watched(kinds::PROGRAM, Some(program)));
+        assert!(!plane.watched(kinds::COMPILE, Some(program)), "only a program's build runs alone");
+
+        let request = plane.open(Duration::ZERO, true, false);
+        let mut fresh = plane.fresh(2, 16, 0);
+        let first = plane.push_program(&mut fresh, node("app"), 0, program);
+        let again = plane.push_program(&mut fresh, node("app again"), 1, program);
+        plane.add(Duration::ZERO, request, fresh, Some(Each(built)), false).unwrap();
+        assert_eq!(settle(&mut plane, &[first, again]), [(first, true), (again, true)]);
+        assert!(plane.alone.is_empty(), "every watch ends with its task");
+        assert!(plane.predict().measured(kinds::PROGRAM, Some(program)));
+        assert!(!plane.watched(kinds::PROGRAM, Some(program)), "measured, it runs beside others");
+        assert!(plane.watched(kinds::PROGRAM, Some(other)), "another program is not measured by it");
+        let record = plane.predict().record(kinds::PROGRAM, &program).expect("its runs teach its key");
+        assert_eq!(record.seen, 2);
     }
 }

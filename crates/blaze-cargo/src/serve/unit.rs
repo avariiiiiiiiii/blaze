@@ -31,6 +31,7 @@ mod checks;
 mod codegen;
 mod compile;
 mod deps;
+mod doc;
 mod error;
 mod files;
 mod graph;
@@ -731,6 +732,28 @@ pub(crate) fn checks_only(goal: Goal, unit: &Unit) -> bool {
     goal == Goal::Check || matches!(unit.mode, Mode::Check)
 }
 
+/// The key a program's build is predicted and taught by (`plane::Plane::push_program`), when
+/// `unit` builds a program its client runs: a binary, test, bench, example or `cdylib`. A
+/// build script and a proc macro are not: many and small, they are admitted as any compile.
+/// The same program of the same profile and platform has the same key in every build and
+/// daemon.
+pub(crate) fn program_key(unit: &Unit) -> Option<blaze_graph::Key> {
+    if unit.target.is_custom_build() || !matches!(unit.mode, Mode::Build | Mode::Test) {
+        return None;
+    }
+    if !matches!(codegen::makes(unit), Ok(codegen::Makes::Executable | codegen::Makes::Shared { proc_macro: false })) {
+        return None;
+    }
+    let mut hasher = blaze_ids::Hasher::new("blaze v2 program build 1");
+    let platform = unit.platform.as_deref().unwrap_or("");
+    let parts = [unit.pkg_id.as_str(), &unit.target.name, &unit.profile.name, platform];
+    for part in parts.into_iter().chain(unit.target.kind.iter().map(String::as_str)) {
+        hasher.update(&(part.len() as u64).to_le_bytes()).update(part.as_bytes());
+    }
+    hasher.update(&[unit.mode as u8]);
+    Some(blaze_graph::Key(hasher.finish().0))
+}
+
 /// A job's front as the loop holds it.
 pub struct JobFront(pub(crate) Arc<Job>);
 
@@ -831,6 +854,21 @@ impl Front<Real> for JobFront {
             return Err(ApiError::new(what, None).into());
         };
         cancellable(|| pack::pack(&self.0, lowered, program))?.map_err(Failed::Error)
+    }
+
+    fn doc(&self, mut writer: UnitWriter, no_deps: bool, private: bool) -> Result<Vec<Response>, Failed> {
+        if self.0.cancelled() {
+            return Err(Failed::Again);
+        }
+        if !writer.apply()? {
+            let what = "the documentation is made with no task reading the front end, and one still does";
+            return Err(ApiError::new(what, None).into());
+        }
+        let Some(lowered) = Arc::get_mut(&mut writer.front) else {
+            let what = "the documentation is made with no task reading the front end, and one still does";
+            return Err(ApiError::new(what, None).into());
+        };
+        cancellable(|| doc::doc(&self.0, lowered, no_deps, private))?.map_err(Failed::Error)
     }
 }
 

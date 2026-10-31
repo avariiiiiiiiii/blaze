@@ -79,7 +79,12 @@ pub(super) fn bound(func: &ir::Function, target: &Target, inst: ir::Inst) -> u32
         Opcode::Call | Opcode::CallIndirect | Opcode::TryCall | Opcode::TryCallIndirect => {
             let rets = frame::call_signature(func, inst)
                 .map_or(0, |sig| func.dfg.signatures[sig].returns.len() as u32);
-            args * MOVE_MAX + CALLEE_MAX + rets * RESULT_MAX
+            // A `tail` callee's popped arguments taken back.
+            args * MOVE_MAX + CALLEE_MAX + inst::ADD_ANY_MAX + rets * RESULT_MAX
+        }
+        // The arguments, the callee, the epilogue but its `ret`, `sp` up, the jump.
+        Opcode::ReturnCall | Opcode::ReturnCallIndirect => {
+            args * MOVE_MAX + NAME_MAX + frame::UNFRAME_MAX + inst::ADD_ANY_MAX + 4
         }
         Opcode::BrTable => {
             let Data::BranchTable { table, .. } = func.dfg.insts[inst] else { return 0 };
@@ -138,14 +143,15 @@ pub(super) fn prologue<'f, 'm>(cx: &mut impl Ctx<'f, 'm>) -> Result<(), Error> {
     }
     abi::args(&func.signature, |i, _, place| {
         let loc = cx.loc(params[i]);
-        param(cx.buf(), place, loc)
+        param(cx.buf(), frame.grow, place, loc)
     })?;
     count(cx.buf(), CALLS);
     Ok(())
 }
 
-/// Stores the parameter at `place` to `loc`; a stack one is above the frame record.
-fn param(buf: &mut Buf<'_>, place: Place, loc: Loc) -> Result<(), Error> {
+/// Stores the parameter at `place` to `loc`; a stack one is above the frame record, which a
+/// grown frame moved `grow` bytes down.
+fn param(buf: &mut Buf<'_>, grow: u32, place: Place, loc: Loc) -> Result<(), Error> {
     let off = match loc {
         Loc::Dead => return Ok(()),
         Loc::Slot(off) => off,
@@ -160,7 +166,7 @@ fn param(buf: &mut Buf<'_>, place: Place, loc: Loc) -> Result<(), Error> {
             inst::ldst(buf, inst::STRX, lo, X20, off, X16);
             inst::ldst(buf, inst::STRX, hi, X20, off + 8, X16);
         }
-        Place::Stack(at, ty) => copy(buf, (FP, 16 + at), (X20, off), ty.bytes()),
+        Place::Stack(at, ty) => copy(buf, (FP, 16 + grow + at), (X20, off), ty.bytes()),
     }
     Ok(())
 }
@@ -206,11 +212,7 @@ pub(super) fn inst<'f, 'm>(cx: &mut impl Ctx<'f, 'm>, inst: ir::Inst) -> Result<
         Opcode::Call | Opcode::CallIndirect | Opcode::TryCall | Opcode::TryCallIndirect => {
             call(cx, inst)
         }
-        Opcode::ReturnCall | Opcode::ReturnCallIndirect => Err(Error::at(
-            inst,
-            "a tail call: Cranelift's AArch64 backend makes them only between functions of the \
-             `tail` convention, which the glue does not pass values in",
-        )),
+        Opcode::ReturnCall | Opcode::ReturnCallIndirect => return_call(cx, inst),
         Opcode::BrTable => br_table(cx, inst),
         Opcode::Trap => {
             cx.buf().put4(inst::UDF);
@@ -477,11 +479,100 @@ fn call<'f, 'm>(cx: &mut impl Ctx<'f, 'm>, inst: ir::Inst) -> Result<(), Error> 
     }
     let at = cx.buf().len();
     cx.call_site(at, inst);
+    if sig.call_conv == CallConv::Tail && outgoing > 0 {
+        // A `tail` callee popped its stack arguments: the outgoing area back (`callee_pop_size`).
+        inst::add_any(cx.buf(), SP, SP, u64::from(outgoing), true, X16);
+    }
     abi::rets(sig, |k, _, place| {
         let loc = cx.returned(inst, k);
         store(cx.buf(), inst, place, loc)
     })
     .map_err(|e| Error::at(inst, e.what))
+}
+
+/// `return_call` and `return_call_indirect` from a `tail` function to one (the frame's layout
+/// checked both), as Cranelift's `gen_call_args` (`is_tail_call`) and
+/// `emit_return_call_common_sequence` write them: the stack arguments into the top of the
+/// incoming argument area (`IncomingArg`, `pop` bytes above the frame record), the register
+/// arguments, the callee to `x17`, the frame popped, `sp` up to the new arguments, then `b` or
+/// `br x17`. Every slot is read before the restores give `x20` back; the incoming area holds
+/// nothing the function still reads, its own stack arguments copied to slots by the prologue.
+fn return_call<'f, 'm>(cx: &mut impl Ctx<'f, 'm>, inst: ir::Inst) -> Result<(), Error> {
+    let (func, target, frame) = (cx.func(), cx.target(), cx.frame());
+    let sig = frame::return_call_signature(func, inst)?
+        .ok_or_else(|| Error::at(inst, "a return call with no signature"))?;
+    let sig = &func.dfg.signatures[sig];
+    let all = func.dfg.inst_args(inst);
+    let (callee, args) = match func.dfg.insts[inst] {
+        Data::Call { func_ref, .. } => {
+            let ext = &func.dfg.ext_funcs[func_ref];
+            (Callee::Named { name: cx.name(&ext.name)?, near: ext.colocated }, all)
+        }
+        _ => {
+            let (callee, args) = all
+                .split_first()
+                .ok_or_else(|| Error::at(inst, "an indirect return call with no callee"))?;
+            (Callee::Value(*callee), args)
+        }
+    };
+    if args.len() != sig.params.len() {
+        return Err(Error::at(inst, "a return call of other arguments than its signature's"));
+    }
+    let new = abi::stack_args(sig).map_err(|e| Error::at(inst, e.what))?;
+    let base = 16 + frame.pop - new;
+    abi::args(sig, |i, _, place| {
+        let Place::Stack(at, ty) = place else { return Ok(()) };
+        match cx.loc(args[i]) {
+            Loc::Slot(off) => copy(cx.buf(), (X20, off), (FP, base + at), ty.bytes()),
+            Loc::Const(v) if ty.bytes() == 16 => {
+                for (half, bits) in [(0, v as u64), (8, (v >> 63) as u64)] {
+                    inst::mov_imm(cx.buf(), X17, bits);
+                    inst::ldst(cx.buf(), inst::STRX, X17, FP, base + at + half, X16);
+                }
+            }
+            Loc::Const(v) => {
+                inst::mov_imm(cx.buf(), X17, extended(v, ty, None));
+                inst::ldst(cx.buf(), inst::str_int(ty.bytes() as u8), X17, FP, base + at, X16);
+            }
+            Loc::Dead => return Err(Error::at(inst, "an argument with no slot")),
+        }
+        Ok(())
+    })
+    .map_err(|e| Error::at(inst, e.what))?;
+    abi::args(sig, |i, param, place| {
+        if matches!(place, Place::Stack(..)) {
+            return Ok(());
+        }
+        let loc = cx.loc(args[i]);
+        load(cx.buf(), inst, place, loc, abi::extension(sig.call_conv, param, place))
+    })
+    .map_err(|e| Error::at(inst, e.what))?;
+    let near = match callee {
+        Callee::Named { name, near: true } => Some(name),
+        Callee::Named { name, near: false } => {
+            load_name(cx.buf(), target, X17, name, false, 0);
+            None
+        }
+        Callee::Value(value) => {
+            let loc = cx.loc(value);
+            load_loc(cx.buf(), inst, X17, loc, types::I64, None)?;
+            None
+        }
+    };
+    let buf = cx.buf();
+    frame::unframe(buf, frame);
+    if frame.pop > new {
+        inst::add_any(buf, SP, SP, u64::from(frame.pop - new), false, X16);
+    }
+    match near {
+        Some(name) => {
+            let at = buf.len();
+            buf.reloc(at, Reloc::Arm64Call, name, 0);
+            buf.put4(inst::b(0));
+        }
+        None => buf.put4(inst::br(X17)),
+    }
+    Ok(())
 }
 
 /// A `try_call`'s landing pad: the exception payload (`x0`, `x1`) to its slots.

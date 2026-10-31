@@ -153,7 +153,8 @@ fn fde_instructions_are_where_indexing_found_them() {
     let mut inputs = Vec::new();
     for len in [0, 16, 4096] {
         let mut fde = FrameDescriptionEntry::new(Address::Constant(0), len);
-        fde.add_instruction(1, CallFrameInstruction::CfaOffset(16));
+        // A multiple of every ISA's code alignment factor (AArch64's is 4): gimli refuses others.
+        fde.add_instruction(4, CallFrameInstruction::CfaOffset(16));
         let mut table = FrameTable::default();
         let id = table.add_cie(cie.clone());
         table.add_fde(id, fde);

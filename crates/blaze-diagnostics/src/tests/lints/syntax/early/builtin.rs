@@ -375,7 +375,7 @@ LL |     let _y = -(-(-x));
 warning: 3 warnings emitted
 
 "#;
-    assert_eq!(ui_core("lint-double-negations.rs", "2015", "unary_ops", source), stderr);
+    assert_eq!(ui_core("lint-double-negations.rs", "2015", "unary_ops, builtin_impls", source), stderr);
 }
 
 #[test]

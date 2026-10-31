@@ -929,7 +929,7 @@ fn test() {
     m!(S)
     m!(S<i32>)
     m!(S<S<i32>>)
-    m!(S<{ module::CONST < 42 }>)
+    m!(S<{ module::CONST < 42 }>);
 }
 "#,
         expect![[r#"
@@ -943,7 +943,7 @@ fn test() {
     let S:: < {
         module::CONST<42
     }
-    >;
+    >;;
 }
 "#]],
     );

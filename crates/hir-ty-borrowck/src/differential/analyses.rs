@@ -89,7 +89,7 @@ fn e0597() {
 
 /// `check`'s tests' bodies with no error.
 const CHECK_CLEAN: &str = r#"
-//- minicore: sized, copy, clone, fn
+//- minicore: sized, copy, clone, fn, index, slice
 struct Point { x: u32, y: u32 }
 struct Stack { items: [u32; 4], len: usize }
 enum Shape { Circle(Point), Square(u32), Empty }
@@ -252,7 +252,10 @@ fn compare_fixture(fixture: &str) -> Vec<Compared> {
         let mut compared = Vec::new();
         for (name, def) in budget::functions(&db) {
             let checked = borrowck_in_mode(&db, def, Mode::Nll);
-            if checked.skipped.is_some() || checked.not_checked.is_some() {
+            let body = hir_def::expr_store::Body::of(&db, def);
+            // A function without a body, as minicore's intrinsics, has no MIR, as in rustc.
+            let bodyless = matches!(body.expr(body.root_expr()), hir_def::hir::Expr::Missing);
+            if bodyless || checked.skipped.is_some() || checked.not_checked.is_some() {
                 continue;
             }
             compare_owner(&db, &name, def, &mut compared);

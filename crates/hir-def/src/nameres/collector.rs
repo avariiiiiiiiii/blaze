@@ -1180,9 +1180,19 @@ impl<'db> DefCollector<'db> {
     /// through the extern prelude in every edition, which `seed_with_top_level` fills; a
     /// dependency cargo passes `noprelude` (build-std's `--extern noprelude:std`) is put there by
     /// this item, as by any `extern crate` of the root, and the std prelude is injected after it.
+    /// `core` is in the extern prelude even when it is not the item's (rustc's `Resolver::new`
+    /// adds `core` unless `no_core`, then `std` unless `no_std`), so a 2018 crate's `use core::..`
+    /// finds build-std's `noprelude:core`.
     fn inject_std_extern_crate(&mut self) {
         if self.def_map.data.no_core {
             return;
+        }
+        let core = Name::new_symbol_root(sym::core);
+        if !self.local_def_map().extern_prelude.contains_key(&core)
+            && let Some(dep) = self.deps.get(&core)
+        {
+            let krate_root = crate_def_map(self.db, dep.crate_id).root_module_id();
+            self.local_def_map.extern_prelude.insert(core, (krate_root, None));
         }
         let name = match self.def_map.data.no_std {
             true => Name::new_symbol_root(sym::core),

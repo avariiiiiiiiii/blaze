@@ -29,7 +29,7 @@ use hir_expand::{
     builtin::EagerExpander,
 };
 use hir_ty::next_solver::{CallableIdWrapper, DbInterner, Ty, TyKind, infer::select::EvaluationResult};
-use ra_ap_rustc_parse_format::{ParseMode, Parser, Piece};
+use rustc_parse_format::{ParseMode, Parser, Piece};
 use rustc_type_ir::inherent::IntoKind as _;
 use span::FileId;
 use syntax::{

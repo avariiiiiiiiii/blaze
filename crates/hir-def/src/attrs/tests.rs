@@ -1796,6 +1796,50 @@ pub struct U;
         assert_eq!(stability(&db, t), None, "a crate without `staged_api` has none");
     }
 
+    #[test]
+    fn a_core_without_staged_api_is_not_forced_unstable() {
+        let db = fixture::db("//- /lib.rs crate:core\npub struct S;\n").into_db();
+        assert_eq!(stability(&db, def(&db, "S")), None, "a fixture's `core` is not `rustc_private`");
+    }
+
+    /// The item `name` declared in any block of `function`'s body, nested or from a macro.
+    fn in_some_block(db: &TestDB, function: StabilityDef, name: &str) -> StabilityDef {
+        let StabilityDef::Def(AttrDefId::FunctionId(function)) = function else {
+            panic!("not a function")
+        };
+        let body = Body::of(db, DefWithBodyId::FunctionId(function));
+        let found = body.blocks(db).find_map(|(_, def_map)| {
+            let scope = def_map.module(db, def_map.root).scope(db);
+            let (_, per_ns) = scope.entries().find(|(it, _)| it.as_str() == name)?;
+            per_ns.take_types()
+        });
+        attr_def(found.unwrap_or_else(|| panic!("no `{name}` in a block"))).into()
+    }
+
+    #[test]
+    fn a_block_in_a_block_or_in_a_macro_call_of_a_macro_call_is_in_its_function() {
+        let db = fixture::db(
+            r#"
+macro_rules! inner { () => { { pub struct InMacro; } } }
+macro_rules! outer { () => { inner!() } }
+#[deprecated = "f"]
+pub fn f() {
+    pub struct Outer;
+    { pub struct Inner; { pub struct Innermost; } }
+}
+#[deprecated = "g"]
+pub fn g() { outer!() }
+"#,
+        )
+        .into_db();
+        let f = def(&db, "f");
+        for name in ["Outer", "Inner", "Innermost"] {
+            assert_eq!(origin(&db, in_some_block(&db, f, name)), Some(f), "{name}");
+        }
+        let g = def(&db, "g");
+        assert_eq!(origin(&db, in_some_block(&db, g, "InMacro")), Some(g));
+    }
+
     fn feature(db: &TestDB, def: StabilityDef) -> Option<&str> {
         stability(db, def).map(|it| it.feature.as_str())
     }

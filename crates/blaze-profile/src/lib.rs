@@ -662,6 +662,15 @@ pub fn write_part() {
     }
 }
 
+/// Drops what the process recorded since the last call to [`write_part`], unwritten: a
+/// daemon's share of a build that asked for no profile, which belongs in no profile's
+/// directory.
+pub fn discard() {
+    if on() {
+        drop(take());
+    }
+}
+
 /// Where the time from `start_us` to `end_us` went: each moment is the deepest step's under
 /// way then, and a moment no step has is unaccounted. In the order the steps first had
 /// time; the rows add up to the whole.
@@ -975,6 +984,11 @@ mod tests {
         _ = std::fs::remove_dir_all(&dir);
         install();
         start(&dir);
+        {
+            let _dropped = tracing::info_span!(target: "blaze", "dropped").entered();
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        discard();
         step(Some("Codegen".to_owned()));
         {
             let _outer =
@@ -1003,6 +1017,7 @@ mod tests {
             row.split('\t').nth(3).unwrap().parse().unwrap()
         };
         assert!(cpu_ms("outer") > 0.5 && cpu_ms("outer") < cpu_ms("inner"), "{phases}");
+        assert!(!phases.lines().any(|it| it.starts_with("dropped\t")), "{phases}");
         let functions = std::fs::read_to_string(dir.join("functions.tsv")).unwrap();
         assert!(functions.lines().any(|it| it.ends_with("\touter\tapp::main")), "{functions}");
         let passes = std::fs::read_to_string(dir.join("passes.tsv")).unwrap();

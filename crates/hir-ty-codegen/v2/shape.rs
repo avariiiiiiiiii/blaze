@@ -10,7 +10,7 @@
 
 use std::hash::{Hash as _, Hasher};
 
-use blaze_codegen::{Unit, backend::Shape};
+use blaze_codegen::{Backend, Unit, backend::Shape};
 use blaze_format::cursor::Put;
 use blaze_mem::Frame;
 use cranelift_codegen::ir::{self, UserExternalName};
@@ -24,7 +24,7 @@ use crate::{
     fragment::{self, DataRequest, Hint, RelocName, Requests},
 };
 
-const VERSION: u8 = 8;
+const VERSION: u8 = 9;
 
 /// Where data is in a shape, as the names of its IR have it.
 mod namespace {
@@ -89,7 +89,11 @@ pub(crate) fn of(unit: &Unit, function: &Function, frame: &Frame) -> Result<Shap
                 for slot in &pending.named {
                     out.u32(slot.as_u32());
                 }
-                pending.wants.pointees.hash(&mut out);
+                // Only LLVM is told what parameters point to (`dereferenceable`, `align`):
+                // Cranelift's code is the same for `&A` and `&B`, so its shape is too.
+                if matches!(unit.backend, Backend::Llvm { .. }) {
+                    pending.wants.pointees.hash(&mut out);
+                }
             }
             Built::Assembled(code, _) => {
                 out.u8(part::ASM);

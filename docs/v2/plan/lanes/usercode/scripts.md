@@ -134,7 +134,7 @@ evaluator for build scripts over a second, host-lowered std, plus models for `Co
 `env::vars`, all just to print about 200 constant lines.
 
 The second design is the one taken: each script is ported, pinned by the BLAKE3 hash of every file
-it is made of (`PINNED`, the way `probe::STD_SCRIPT` pins std's). `identify` checks the files
+it is made of (`PINNED`). `identify` checks the files
 through the VFS, and `printed` writes what the script prints, line for line and in its order,
 from the run's own environment (`blaze_build_script::env`, as cargo starts it). A script whose
 bytes differ, or a std package whose script has no port, is an error naming the file, its hash
@@ -153,7 +153,10 @@ and its `OUT_DIR` is empty, which is what each of the four leaves. `BLAZE_ELIDE=
 The cost is that the ports are a table to keep current. When a nightly bump changes a script,
 the bump fails at `every_pinned_file_is_the_checkouts`
 (`crates/blaze-units/src/stdlib/scripts/tests.rs`) before any build does, and the script is
-ported again. std's vendored scripts change a few times a year.
+ported again. std's vendored scripts change a few times a year. blaze's rustc stand-in reads the
+same port: `probe::std_script` (`crates/blaze-engine/src/as_rustc/probe.rs`) identifies std's
+script and sets the cfgs and variables `printed` gives for the probe's target, so a bump ports
+std's script once.
 
 Request 00710 said std's build-script units are host units with no edge to std roots, and that
 how one links a std is the daemon's. The first part still holds: `merge_std` is unchanged, and

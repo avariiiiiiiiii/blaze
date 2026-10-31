@@ -703,7 +703,10 @@ fn apply<'ctx>(
                 ty.const_int(value, false).into()
             }
             BasicTypeEnum::PointerType(ty) if u32::from(bits) == pointer => {
-                context.custom_width_int_type(u32::from(bits)).const_int(value, false).const_to_pointer(ty).into()
+                let int = std::num::NonZero::new(u32::from(bits))
+                    .and_then(|bits| context.custom_width_int_type(bits).ok())
+                    .ok_or(Unhandled::Shape("a pointer constant of a width LLVM has no integer of"))?;
+                int.const_int(value, false).const_to_pointer(ty).into()
             }
             _ => return Err(Unhandled::Shape("a constant of another type than its parameter")),
         };

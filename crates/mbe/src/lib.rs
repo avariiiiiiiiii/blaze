@@ -10,9 +10,6 @@
 #![feature(allocator_api, allocator_ext)]
 #![forbid(unsafe_code)]
 
-#[cfg(not(feature = "in-rust-tree"))]
-extern crate ra_ap_rustc_lexer as rustc_lexer;
-#[cfg(feature = "in-rust-tree")]
 extern crate rustc_lexer;
 
 mod expander;

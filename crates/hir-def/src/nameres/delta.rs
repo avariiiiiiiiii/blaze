@@ -43,8 +43,8 @@ use hir_expand::name::Name;
 use rustc_hash::{FxHashMap, FxHashSet};
 
 pub(in crate::nameres) use self::publish::{
-    input_children, input_legacy_macro, input_name, input_scope, input_traits, published, published_modules,
-    published_records,
+    input_children, input_legacy_macro, input_name, input_scope, input_traits, published, published_module,
+    published_modules, published_records,
 };
 pub(in crate::nameres) use self::state::State;
 use self::{

@@ -823,3 +823,18 @@ fn an_anonymous_constant_key_resolves_to_its_root() {
         assert_eq!(found, Some(Resolved::AnonConst { store, expr }));
     }
 }
+
+/// A body whose MIR fails to lower has no hash, and the error a build stops with says why
+/// lowering failed, not only that it did.
+#[test]
+fn mir_that_fails_to_lower_is_named_in_the_error() {
+    let (db, _) = single("fn f() -> u32 { g() }\n");
+    let id = item(&db, "f");
+    let err = hashes(&db, id).expect_err("`f` calls a name that does not resolve");
+    assert_eq!(err.what, "MIR that failed to lower", "{}", err.describe(&db));
+    let ItemId::Function(func) = id else { panic!("`f` is {id:?}") };
+    let owner = hir_ty::InferBodyId::DefWithBodyId(DefWithBodyId::from(func));
+    let lowering = hir_ty::db::HirDatabase::mir_body(&db, owner).expect_err("`f`'s MIR fails to lower");
+    let said = err.describe(&db);
+    assert!(said.ends_with(&format!("MIR that failed to lower ({lowering:?})")), "{said}");
+}

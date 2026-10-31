@@ -98,6 +98,8 @@ pub struct Shown {
     pub verbose: u32,
     /// stderr is colored.
     pub color: bool,
+    /// `BLAZE_STATS` is set: the request's run time by kind goes to stderr too.
+    pub stats: bool,
 }
 
 /// What one unit's diagnostics came to.
@@ -287,6 +289,19 @@ impl<'a, O: Write, E: Write> Printer<'a, O, E> {
         self.shown
     }
 
+    /// One of cargo's status lines that no response is (`doc`'s `Documenting`), held as the
+    /// others are; none under `-q`.
+    pub fn status(&mut self, word: &str, what: &str) -> io::Result<()> {
+        if self.shown.quiet {
+            return Ok(());
+        }
+        self.to(false)?;
+        say::status_word(&mut self.line, word, self.shown.color);
+        self.line.push_str(what);
+        self.line.push('\n');
+        Ok(())
+    }
+
     /// One response of the build, read where it lies, its lines held until [`Printer::flush`].
     pub fn on(&mut self, response: ResponseRef<'_>) -> io::Result<()> {
         match response {
@@ -369,6 +384,9 @@ impl<'a, O: Write, E: Write> Printer<'a, O, E> {
                 }
                 self.to(false)?;
                 blaze_ui::api::link_lines(&mut self.line, &worked.links);
+                if self.shown.stats {
+                    blaze_ui::api::timeline_line(&mut self.line, &worked.steps_us);
+                }
             }
             ResponseRef::Error(error) => {
                 self.to(false)?;

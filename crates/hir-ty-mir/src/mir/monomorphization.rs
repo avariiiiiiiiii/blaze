@@ -55,6 +55,9 @@ struct Filler<'db> {
     /// global allocator because the solver's `BoundVarReplacer` takes a `&mut Vec`; it stays
     /// unallocated for a body whose types have no binders.
     universes: Vec<Option<UniverseIndex>>,
+    /// How many aliases the fold is normalizing inside of, which rustc's `AssocTypeNormalizer`
+    /// stops past the crate's `recursion_limit` with an error.
+    depth: usize,
 }
 
 impl<'db> FallibleTypeFolder<DbInterner<'db>> for Filler<'db> {
@@ -80,19 +83,26 @@ impl<'db> FallibleTypeFolder<DbInterner<'db>> for Filler<'db> {
         }
 
         match ty.kind() {
-            TyKind::Alias(..) => {
-                // First instantiate params.
-                let ty = ty.try_super_fold_with(self)?;
-                let ty = self.impl_opaque(ty);
-                if let Some(hidden) = self.hidden_with_opaques(ty) {
-                    return self.try_fold_ty(hidden);
+            TyKind::Alias(_, alias) => {
+                let limit = self.infcx.interner.recursion_limit();
+                if self.depth >= limit {
+                    // A type's `Debug` reads the attached database. The alias is as deep as
+                    // the limit, so only its start is kept.
+                    let mut shown = hir_ty::attach_db(self.infcx.interner.db, || {
+                        format!("{:?} {ty:?}", alias.kind) // alloc: error path
+                    });
+                    if let Some((cut, _)) = shown.char_indices().nth(2000) {
+                        shown.truncate(cut);
+                        shown.push_str("...");
+                    }
+                    return Err(MirLowerError::NotSupported(format!(
+                        "reached the recursion limit ({limit}) normalizing {shown}" // alloc: error path
+                    )));
                 }
-
-                let ty = self.normalized(ty)?;
-                // Normalization could introduce infer vars (for example, if the alias cannot be normalized),
-                // and we must not have infer vars in the body.
-                let ty = ty.replace_infer_with_error(self.infcx.interner);
-                ty.try_super_fold_with(self)
+                self.depth += 1;
+                let ty = stdx::ensure_sufficient_stack(|| self.normalize_alias(ty));
+                self.depth -= 1;
+                ty
             }
             TyKind::Param(param) => {
                 let ty = self
@@ -135,6 +145,22 @@ impl<'db> FallibleTypeFolder<DbInterner<'db>> for Filler<'db> {
 }
 
 impl<'db> Filler<'db> {
+    /// The alias `ty` with its arguments filled, normalized, and what it normalized to filled.
+    fn normalize_alias(&mut self, ty: Ty<'db>) -> Result<Ty<'db>, MirLowerError<'db>> {
+        // First instantiate params.
+        let ty = ty.try_super_fold_with(self)?;
+        let ty = self.impl_opaque(ty);
+        if let Some(hidden) = self.hidden_with_opaques(ty) {
+            return self.try_fold_ty(hidden);
+        }
+
+        let ty = self.normalized(ty)?;
+        // Normalization could introduce infer vars (for example, if the alias cannot be normalized),
+        // and we must not have infer vars in the body.
+        let ty = ty.replace_infer_with_error(self.infcx.interner);
+        ty.try_super_fold_with(self)
+    }
+
     /// `alias` as what it is an alias of. One that names the lifetimes of a binder around it,
     /// like `D::Data<'a>` in `for<'a> fn(&'a mut T) -> D::Data<'a>`, is normalized with
     /// placeholders in their place, which are put back afterwards.
@@ -165,7 +191,7 @@ impl<'db> Filler<'db> {
         let interner = DbInterner::new_with(db, env.krate);
         let infcx = interner.infer_ctxt().build(TypingMode::PostAnalysis);
         // alloc: none until a binder is entered; the solver's replacer takes a `&mut Vec`
-        Self { infcx, trait_env: env, subst, universes: Vec::new() }
+        Self { infcx, trait_env: env, subst, universes: Vec::new(), depth: 0 }
     }
 
     /// The `impl Trait` a trait method returns is the one of the impl's method once the

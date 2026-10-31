@@ -504,3 +504,37 @@ pub mod prelude {
     check_db(db, "a noprelude std", &Exempt::NONE, false, &mut failures);
     assert!(failures.is_empty(), "{failures}");
 }
+
+/// A `core` cargo passes `noprelude` beside `std` is in the extern prelude too, as rustc's
+/// resolver puts `core` there for every crate but a `no_core` one: anyhow's build probe, an
+/// edition 2018 crate, starts with `use core::error::{self, Error};`.
+#[test]
+fn a_noprelude_core_is_in_the_extern_prelude_beside_std() {
+    let loaded = Loaded::new(
+        r#"
+//- /main.rs crate:main edition:2018 deps:std,core extern-prelude:
+use core::error::Error;
+//- /std.rs crate:std deps:core
+pub mod prelude {
+    pub mod v1 { pub enum Option<T> { None, Some(T) } }
+    pub mod rust_2015 { pub use super::v1::*; }
+    pub mod rust_2018 { pub use super::v1::*; }
+    pub mod rust_2021 { pub use super::v1::*; }
+    pub mod rust_2024 { pub use super::v1::*; }
+}
+//- /core.rs crate:core
+pub mod error { pub trait Error {} }
+"#,
+    );
+    let main = loaded.krate();
+    let db = &loaded.db;
+    let pair = crate_local_def_map(db, main);
+    let prelude: Vec<String> =
+        pair.local(db).extern_prelude().map(|(it, _)| it.as_str().to_owned()).collect();
+    assert_eq!(prelude, ["core", "std"], "rustc's order: `core`, then `std`");
+    let map = pair.def_map(db);
+    assert!(map.module(db, map.root).scope(db).type_(&name("Error")).is_some(), "`Error` is imported");
+    let mut failures = String::new();
+    check_db(db, "a noprelude core", &Exempt::NONE, false, &mut failures);
+    assert!(failures.is_empty(), "{failures}");
+}

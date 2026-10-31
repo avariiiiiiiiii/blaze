@@ -20,7 +20,7 @@ use syntax::{
 
 use super::{
     Semantics, ToDef,
-    source_to_def::{ViewCtx, macro_call_to_macro_id},
+    source_to_def::{DescentTokens, ViewCtx, macro_call_to_macro_id},
 };
 use crate::{
     Callable, Field, Function, GenericSubstitution, ItemInNs, Label, LifetimeParam, Local, Macro,
@@ -292,12 +292,11 @@ impl<'db> Semantics<'db> {
         let db = self.db;
         let span = file_id.span_map(db).span_for_range(token.text_range());
 
-        // alloc: the walk's three stacks, on the cold descend path (rename, IDE-like tools).
+        // The walk's three stacks, inline: the groups of tokens mapped down, the tokens left to
+        // descend, and the tokens of the step being taken.
         let mut groups: SmallVec<[(HirFileId, u32); 4]> = SmallVec::new();
-        // alloc: the tokens left to descend, grown only past a macro call.
-        let mut pending: Vec<(Token<'db>, SyntaxContext)> = Vec::new();
-        // alloc: the tokens of the step being taken, as `pending`.
-        let mut current: Vec<(Token<'db>, SyntaxContext)> = Vec::new();
+        let mut pending = DescentTokens::new();
+        let mut current = DescentTokens::new();
 
         let include = file_id
             .file_id()
@@ -339,13 +338,13 @@ impl<'db> Semantics<'db> {
         expansion: HirFileId,
         token: Token<'db>,
         span: Span,
-        tokens: &mut Vec<(Token<'db>, SyntaxContext)>,
+        tokens: &mut DescentTokens<'db>,
         groups: &mut SmallVec<[(HirFileId, u32); 4]>,
-        pending: &mut Vec<(Token<'db>, SyntaxContext)>,
+        pending: &mut DescentTokens<'db>,
     ) -> Option<()> {
         let db = self.db;
         // A token inside `range` (the call just descended into) is mapped by that call already.
-        let filter_duplicates = |tokens: &mut Vec<(Token<'db>, SyntaxContext)>, range: TextRange| {
+        let filter_duplicates = |tokens: &mut DescentTokens<'db>, range: TextRange| {
             tokens.retain(|(t, _)| !range.contains_range(t.text_range()))
         };
 
@@ -465,7 +464,7 @@ impl<'db> Semantics<'db> {
 fn map_down<'db>(
     ctx: &mut ViewCtx<'db, '_>,
     groups: &mut SmallVec<[(HirFileId, u32); 4]>,
-    pending: &mut Vec<(Token<'db>, SyntaxContext)>,
+    pending: &mut DescentTokens<'db>,
     span: Span,
     macro_file: MacroCallId,
 ) -> Option<()> {

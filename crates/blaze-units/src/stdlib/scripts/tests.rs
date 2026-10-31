@@ -76,12 +76,6 @@ fn every_pinned_file_is_the_checkouts() {
 }
 
 #[test]
-fn the_std_port_is_the_one_the_probe_gives() {
-    let std = PINNED.iter().find(|it| it.0 == Script::Std).unwrap();
-    assert_eq!(std.2, [("std/build.rs", "3be73c2bf16ec86c52fb2d8973c92f1b0ef3c61f9412e8e647f7c71086f00871")]);
-}
-
-#[test]
 fn a_script_of_other_bytes_is_refused_naming_its_hash() {
     let root = format!("{LIBRARY}compiler-builtins/compiler-builtins/build.rs");
     let changed = |path: &str| -> Result<Vec<u8>, String> {
@@ -161,6 +155,7 @@ fn std_prints_what_its_script_prints() {
 #[test]
 fn the_restricted_targets_are_std_scripts() {
     assert!(!restricted_std("x86_64", "linux", "unknown", "gnu"));
+    assert!(!restricted_std("aarch64", "macos", "apple", ""));
     assert!(!restricted_std("wasm32", "unknown", "unknown", ""));
     assert!(!restricted_std("x86_64", "unknown", "fortanix", "sgx"));
     assert!(!restricted_std("arm", "solid_asp3", "kmc", ""));

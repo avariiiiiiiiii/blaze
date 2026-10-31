@@ -1196,25 +1196,61 @@ impl<'db> Look<'_, '_, 'db> {
             };
             return self.typed(name, ty, reduction, checked && matches!(op, BinOp::Add | BinOp::Mul));
         }
-        if let ([], [block]) | ([_], [block]) = (statements.as_slice(), terminators.as_slice())
-            && let Some(TerminatorKind::Call { func, args, destination, .. }) =
-                m.blocks[*block].terminator.as_ref().map(|it| &it.kind)
-        {
-            // `local = min(local, e)` / `local.max(e)`, the result straight into `local` or
-            // through one temporary.
-            if let Some(reduction) = self.min_max(func)
-                && args.len() == 2
-                && args.iter().filter(|it| bare(it, local)).count() == 1
-                && destination.projection.as_slice().is_empty()
-            {
-                let into = destination.local == local
-                    || statements.first().is_some_and(|kind| {
-                        matches!(assigned(kind, local), Some(Rvalue::Use(it)) if bare(it, destination.local))
-                    });
-                if into {
-                    return self.typed(name, ty, reduction, false);
+        // `local = min(local, e)` / `local.max(e)`: `local` passed as it is or read into a
+        // temporary only the call takes (rustc's `as_call_operand`), the result straight into
+        // `local` or through a temporary only `local` takes.
+        let min_max = 'min_max: {
+            let private = |temp: LocalId| !self.outer(temp) && self.occurrences(temp).len() == 2;
+            let (mut read, mut written) = (None, None);
+            for &kind in &statements {
+                match kind {
+                    StatementKind::Assign(place, Rvalue::Use(it))
+                        if place.local != local
+                            && place.projection.as_slice().is_empty()
+                            && bare(it, local) =>
+                    {
+                        if read.replace(place.local).is_some() {
+                            break 'min_max None;
+                        }
+                    }
+                    _ => match assigned(kind, local) {
+                        Some(Rvalue::Use(Operand {
+                            kind: OperandKind::Copy(from) | OperandKind::Move(from),
+                            ..
+                        })) if written.is_none() && from.projection.as_slice().is_empty() => {
+                            written = Some(from.local);
+                        }
+                        _ => break 'min_max None,
+                    },
                 }
             }
+            let block = match (terminators.as_slice(), read) {
+                ([block], _) => *block,
+                ([], Some(temp)) => match self.occurrences(temp).iter().find(|it| it.1.is_none()) {
+                    Some(&(block, _)) => block,
+                    None => break 'min_max None,
+                },
+                _ => break 'min_max None,
+            };
+            let Some(TerminatorKind::Call { func, args, destination, .. }) =
+                m.blocks[block].terminator.as_ref().map(|it| &it.kind)
+            else {
+                break 'min_max None;
+            };
+            let passed = read.unwrap_or(local);
+            let into = match written {
+                None => destination.local == local,
+                Some(temp) => destination.local == temp && private(temp),
+            };
+            let shape = args.len() == 2
+                && args.iter().filter(|it| bare(it, passed)).count() == 1
+                && read.is_none_or(|it| private(it))
+                && destination.projection.as_slice().is_empty()
+                && into;
+            if shape { self.min_max(func) } else { None }
+        };
+        if let Some(reduction) = min_max {
+            return self.typed(name, ty, reduction, false);
         }
         if let [StatementKind::Assign(borrow, Rvalue::Ref(_, place))] = statements.as_slice()
             && terminators.is_empty()

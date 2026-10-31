@@ -15,7 +15,7 @@
 
 use std::{num::NonZero, ops::ControlFlow, sync::LazyLock};
 
-use base_db::{Db, Crate, CrateOrigin};
+use base_db::{Db, Crate, CrateOrigin, LangCrateOrigin};
 use hir_expand::{AstId, HirFileId, InFile, Lookup, attrs::expand_cfg_attr_view, name::Name};
 use intern::Symbol;
 use la_arena::{Idx, RawIdx};
@@ -315,9 +315,15 @@ fn stability_from(db: &Db, def: StabilityDef) -> Option<StabilityFrom> {
 /// Whether `krate` is built with `-Zforce-unstable-if-unmarked`: cargo's `-Zbuild-std` passes
 /// it to every unit of the standard library's graph, the crates load-cargo gives a
 /// `CrateOrigin::Lang` origin, and blaze refuses it anywhere else (`blaze-cargo`'s
-/// `unstable.rs`).
+/// `unstable.rs`). The flag only changes a crate without `staged_api`, and the real `core`,
+/// `alloc`, `std`, `proc_macro` and `test` always have it: of the standard library's graph
+/// only its dependencies can be unmarked, so a `core` without it (a test fixture's) is not
+/// forced.
 fn forces_unstable(db: &Db, krate: Crate) -> bool {
-    matches!(krate.data(db).origin, CrateOrigin::Lang(_))
+    matches!(
+        krate.data(db).origin,
+        CrateOrigin::Lang(LangCrateOrigin::Dependency | LangCrateOrigin::Other)
+    )
 }
 
 /// What a definition's own attributes say.
@@ -689,14 +695,22 @@ fn in_module(db: &Db, module: ModuleId) -> Option<StabilityDef> {
 #[blaze_query::tracked(returns(copy), mem_tag = Nameres)]
 fn block_owner<'db>(db: &'db Db, block: BlockIdLt<'db>) -> StabilityDef {
     let ast_id = block.ast_id(db);
-    let module = block.module(db);
-    InFile::new(ast_id.file_id, ast_id.to_view(db).syntax())
+    let no_owner = || -> ! { panic!("no definition of its module holds the block at {ast_id:?} with items") };
+    let node = InFile::new(ast_id.file_id, ast_id.to_view(db).syntax())
         .parent_ancestors_with_macros_view(db)
         .find(|it| is_definition(it.value.kind()))
-        .and_then(|node| definition_at(db, module, node))
-        .unwrap_or_else(|| {
-            panic!("no definition of its module holds the block at {ast_id:?} with items")
-        })
+        .unwrap_or_else(|| no_owner());
+    let mut module = block.module(db);
+    loop {
+        if let Some(found) = definition_at(db, module, node) {
+            return found;
+        }
+        // The module of a block in a block of the same definition is the outer block's.
+        match module.block(db) {
+            Some(outer) if module.is_block_module(db) => module = outer.module(db),
+            _ => no_owner(),
+        }
+    }
 }
 
 fn is_definition(kind: SyntaxKind) -> bool {

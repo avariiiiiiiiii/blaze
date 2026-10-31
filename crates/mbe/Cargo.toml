@@ -17,7 +17,7 @@ cov-mark.workspace = true
 rustc-hash.workspace = true
 smallvec.workspace = true
 arrayvec.workspace = true
-ra-ap-rustc_lexer.workspace = true
+rustc_lexer.workspace = true
 bitflags.workspace = true
 
 # local deps

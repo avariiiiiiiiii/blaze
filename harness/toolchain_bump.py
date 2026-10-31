@@ -21,9 +21,9 @@ A bump, in order (each step names itself when it fails, and stops there):
  3. re-vendors from rust-lang/rust at the new commit: crates/rustc_abi/src is
     compiler/rustc_abi/src and crates/rustc_lexer/src is compiler/rustc_lexer/src, copied as
     they are;
- 3a. moves the trait solver (`tools/v2/solver_sync.py`): vendor/rustc_type_ir,
-    vendor/rustc_next_trait_solver, vendor/rustc_type_ir_macros and vendor/rustc_transmute become upstream's crates at
-    the new commit with `PATCHES.md`'s series replayed (exact context, no fuzz); a patch that no
+ 3a. moves the trait solver and the format-string parser (`tools/v2/solver_sync.py`):
+    vendor/rustc_type_ir, vendor/rustc_next_trait_solver, vendor/rustc_type_ir_macros,
+    vendor/rustc_transmute and vendor/rustc_parse_format become upstream's crates at the new commit with `PATCHES.md`'s series replayed (exact context, no fuzz); a patch that no
     longer applies, or a changed upstream `Cargo.toml`, stops the bump and names it;
  4. merges the new nightly's standard library into library/ (`library.py merge`): upstream's
     changes since library/UPSTREAM's nightly, applied three-way, so blaze's own changes to it

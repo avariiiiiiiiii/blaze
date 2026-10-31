@@ -391,7 +391,7 @@ impl<'db> HirFrontend<'db> {
             Ok(key) => Ok(Hasher::new(SHARED_ARGS_DOMAIN).id(&key.0).finish()),
             Err(why) if per_instance(why) => args_of(db, &self.hashes, kind),
             // alloc: the error's message
-            Err(why) => Err(format!("no share key for {instance:?}: {why}")),
+            Err(why) => Err(hir_ty::attach_db(db, || format!("no share key for {instance:?}: {why}"))),
         }
     }
 

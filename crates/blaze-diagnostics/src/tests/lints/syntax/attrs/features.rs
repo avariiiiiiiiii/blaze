@@ -4,7 +4,7 @@
 use crate::{
     Options,
     emit::Style,
-    tests::{Mode, checked_with, compiletest, normalized, ui},
+    tests::{Mode, checked_with, compiletest, normalized, ui, ui_core_as},
 };
 
 /// [`crate::tests::ui`] of the revision of a UI test of edition 2015 that compiletest gives
@@ -196,7 +196,10 @@ LL | #![forbid(unstable_features)]
 error: aborting due to 1 previous error
 
 "#;
-    assert_eq!(ui("feature-gate-feature-gate.rs", "2015", source), expected);
+    // A core, as rustc has std: a fixture with none takes `#![feature(no_core)]`, which the lint
+    // would name too.
+    let stderr = ui_core_as(Mode::Other, "feature-gate-feature-gate.rs", "2015", "sized", source, &Options::default());
+    assert_eq!(stderr, expected);
 }
 
 #[test]

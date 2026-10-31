@@ -634,6 +634,22 @@ impl Front<Fake> for FakeFront {
             None => Err(ApiError::new("a task still reads the front end", None).into()),
         }
     }
+
+    /// One page naming the build scripts' runs its front end had applied, read with the front
+    /// end exclusive, as the real documentation sets `cfg(doc)`.
+    fn doc(&self, mut writer: FakeWriter, no_deps: bool, private: bool) -> Result<Vec<Response>, Failed> {
+        assert_eq!(self.goal, Goal::Check, "the documentation only checks its units");
+        writer.apply()?;
+        let Some(inputs) = Arc::get_mut(&mut writer.inputs) else {
+            return Err(ApiError::new("a task still reads the front end", None).into());
+        };
+        let page = format!("{no_deps} {private} {:?}", inputs.runs).into_bytes();
+        let crates = vec![blaze_api::DocumentedCrate { name: "app".into(), package: "app v0.1.0 (/w)".into(), asked: true }];
+        Ok(vec![
+            Response::Documented(blaze_api::Documented { dir: "/w/target/doc".into(), crates, pages: 1, source_pages: 0 }),
+            Response::DocPage { path: "app/index.html".into(), page },
+        ])
+    }
 }
 
 fn options() -> Options {
@@ -999,6 +1015,30 @@ fn a_pack_is_made_once_its_check_is_built_with_every_scripts_run_applied() {
 }
 
 #[test]
+fn the_documentation_is_made_once_its_check_is_built_with_every_scripts_run_applied() {
+    let mut sim = Sim::new(42, Faults::default());
+    checkout(&mut sim, "[package]\n");
+    let steps = Arc::new(Fake::default());
+    let mut daemon = start(sim, &steps, 42);
+    let mut client = dial(&mut daemon);
+    let doc = Request::Doc { view: ViewRef::Head("/w".into()), targets: agent(), no_deps: true, private: false };
+    let id = client.send(&mut daemon, doc);
+    let got = client.wait(&mut daemon, id);
+    let at = |what: fn(&Response) -> bool| got.iter().position(what);
+    let built = at(|it| matches!(it, Response::Built { .. }));
+    let documented = at(|it| matches!(it, Response::Documented(_)));
+    let page = at(|it| matches!(it, Response::DocPage { .. }));
+    assert!(built.is_some() && built < documented && documented < page, "`Built`, `Documented`, then its pages: {got:#?}");
+    let made = Response::DocPage { path: "app/index.html".into(), page: b"true false [2]".to_vec() };
+    assert!(got.contains(&made), "app's build script ran first, and the request's flags came through: {got:#?}");
+    assert_eq!(got.last(), Some(&Response::Done { ok: true }));
+
+    let id = client.send(&mut daemon, Request::Check { view: ViewRef::Head("/w".into()), targets: agent() });
+    let after = client.wait(&mut daemon, id);
+    assert_eq!(after.last(), Some(&Response::Done { ok: true }), "the head builds after its documentation");
+}
+
+#[test]
 fn tests_under_the_evaluator_are_each_evaluated_and_one_failing_fails_the_job() {
     let mut sim = Sim::new(9, Faults::default());
     checkout(&mut sim, "[package]\n");
@@ -1309,11 +1349,12 @@ fn every_request_ends_once_over_many_seeds() {
                 },
                 _ => ViewRef::Head("agents/none".into()),
             };
-            let request = match rng.below(5) {
+            let request = match rng.below(6) {
                 0 => Request::Check { view, targets: agent() },
                 1 => Request::Build { view, targets: agent() },
                 2 => Request::Test { view, targets: agent(), filter: Vec::new(), all: false, args: Vec::new(), ub: None },
                 3 => Request::Pack { view, targets: agent(), program: "app".into() },
+                4 => Request::Doc { view, targets: agent(), no_deps: false, private: true },
                 _ => Request::Run { view, targets: agent(), bin: None, args: Vec::new() },
             };
             let id = clients[client].send(&mut daemon, request);

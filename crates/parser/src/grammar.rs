@@ -363,13 +363,22 @@ fn name_any_identifier(p: &mut Parser<'_>) {
     m.complete(p, NAME);
 }
 
+/// An error at a name that is missing; a `}` there is left to close the block around it.
+fn err_name(p: &mut Parser<'_>, message: &'static str) {
+    if p.at(T!['}']) {
+        p.error(message);
+    } else {
+        p.err_and_bump(message);
+    }
+}
+
 fn name_ref_or_self(p: &mut Parser<'_>) {
     if matches!(p.current(), T![ident] | T![self]) {
         let m = p.start();
         p.bump_any();
         m.complete(p, NAME_REF);
     } else {
-        p.err_and_bump("expected identifier or `self`");
+        err_name(p, "expected identifier or `self`");
     }
 }
 
@@ -379,7 +388,7 @@ fn name_ref_or_upper_self(p: &mut Parser<'_>) {
         p.bump_any();
         m.complete(p, NAME_REF);
     } else {
-        p.err_and_bump("expected identifier or `Self`");
+        err_name(p, "expected identifier or `Self`");
     }
 }
 
@@ -392,7 +401,7 @@ fn name_ref_mod_path(p: &mut Parser<'_>) {
         p.bump_any();
         m.complete(p, NAME_REF);
     } else {
-        p.err_and_bump("expected identifier, `self`, `super`, `crate`, or `Self`");
+        err_name(p, "expected identifier, `self`, `super`, `crate`, or `Self`");
     }
 }
 
@@ -405,7 +414,7 @@ fn name_ref_mod_path_or_index(p: &mut Parser<'_>) {
         p.bump_any();
         m.complete(p, NAME_REF);
     } else {
-        p.err_and_bump("expected integer, identifier, `self`, `super`, `crate`, or `Self`");
+        err_name(p, "expected integer, identifier, `self`, `super`, `crate`, or `Self`");
     }
 }
 

@@ -3741,10 +3741,9 @@ impl<'db> ExprCollector<'db> {
             ast::Pat::MacroPat(pat) => {
                 self.collect_macro_pat_with(pat, |this, pat| this.collect_ty_pat(pat))
             }
-            _ => {
-                // FIXME: Emit an error.
-                self.alloc_pat(Pat::Missing, ptr)
-            }
+            // rustc's "pattern not supported in pattern types": the type lowering reports
+            // anything but a range, an or-pattern and `!null`; `Missing` is a parse error's.
+            _ => self.alloc_pat(Pat::Wild, ptr),
         }
     }
 

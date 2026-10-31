@@ -92,9 +92,9 @@ loop {
 ```
 
 Start it with `blaze run`. In another terminal, build after each edit with
-`blaze build` (or the `watchexec` line above). The next `poll` swaps in the functions that
-changed, usually in under a millisecond, and prints
-`blaze: edit ... applied: 1 functions in 745.4µs`. An edit that changes a type the program is
+`blaze build` (or the `watchexec` line above). The next `poll` switches to the functions that
+changed in one atomic store of the program's jump table, with no thread stopped, and prints
+`blaze: generation ... applied: 1 functions`. An edit that changes a type the program is
 holding, such as a struct's fields, can't be applied to data that already exists, so `poll` asks
 for a restart instead.
 

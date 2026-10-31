@@ -384,8 +384,10 @@ fn parent_with_macros<'db>(
     match node.value.parent() {
         Some(parent) => Some(node.with_value(parent)),
         None => {
+            // A call that is its own file's root (`panic!` expands to the bare call
+            // `panic_2021!(..)`) is in the expansion of the call above it.
             let item = node.file_id.macro_file()?.loc(db).to_node_item_view(db);
-            Some(item.with_value(view::AstNode::syntax(&item.value).parent()?))
+            parent_with_macros(db, item.map(|it| view::AstNode::syntax(&it)))
         }
     }
 }

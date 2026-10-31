@@ -852,7 +852,7 @@ fn landing_pads_store_the_payload() {
 }
 
 #[test]
-fn tail_calls_and_other_conventions_are_errors() {
+fn tail_calls_outside_tail_and_other_conventions_are_errors() {
     let func = build(sig(CallConv::SystemV, &[], &[]), |b, _| {
         let f = import(b, 1, sig(CallConv::Tail, &[], &[]), true);
         b.ins().return_call(f, &[]);
@@ -860,8 +860,31 @@ fn tail_calls_and_other_conventions_are_errors() {
     let inst =
         func.layout.first_inst(func.layout.entry_block().expect("a block")).expect("an inst");
     let error = Aarch64::frame(&func, &LINUX, AREA).map(drop).map_err(|e| e.inst);
-    assert_eq!(error, Err(Some(inst)), "the frame's outgoing arguments refuse the call");
-    assert!(Aarch64::frame(&leaf(CallConv::Tail), &LINUX, AREA).is_err());
+    assert_eq!(error, Err(Some(inst)), "a `system_v` function's return call is refused");
+    assert!(Aarch64::frame(&leaf(CallConv::Tail), &LINUX, AREA).is_ok());
+    assert!(Aarch64::frame(&leaf(CallConv::Winch), &LINUX, AREA).is_err());
+}
+
+#[test]
+fn a_return_call_of_more_stack_arguments_grows_the_frame_as_cranelift_does() {
+    // Eight `i64`s from `x2`: two on the stack, 16 bytes the function was not given.
+    let func = build(sig(CallConv::Tail, &[], &[]), |b, _| {
+        let f = import(b, 1, sig(CallConv::Tail, &[I64; 8], &[]), true);
+        let args: Vec<_> = (0..8).map(|i| b.ins().iconst(I64, i)).collect();
+        b.ins().return_call(f, &args);
+    });
+    let out = whole(&func, &LINUX);
+    assert_eq!((out.frame.pop, out.frame.grow), (16, 16));
+    // `sub sp, sp, #16`, `ldr x29, [sp, #16]`, `stp x29, x30, [sp]`, `mov x29, sp`.
+    let grow = [0xd100_43ff, 0xf940_0bfd, 0xa900_7bfd, 0x9100_03fd];
+    let has = |words: &[u32]| words.windows(4).any(|w| w == grow);
+    assert!(has(&out.words[..out.prologue as usize / 4]), "the glue's prologue grows");
+    assert!(has(&cranelift(&func, &LINUX).words), "Cranelift's prologue grows the same way");
+    // The new arguments fill the area, so no `add sp` before the colocated `b`.
+    let call = out.span(ir::Opcode::ReturnCall, &func);
+    assert_eq!(call[call.len() - 1], 0x1400_0000);
+    let reloc = out.relocs.last().expect("the callee's relocation");
+    assert_eq!((reloc.kind, reloc.at / 4), (Reloc::Arm64Call, (out.words.len() - 8 - 1) as u32));
 }
 
 #[test]

@@ -30,9 +30,11 @@
 //! a task with memory starts while another, ready in the same pool, does not fit, that one is
 //! passed over; the first passed over [`PlaneConfig::starve_after`] times holds back every task
 //! with memory, of every pool and request, until it starts, so a large task is never starved
-//! ([`Plane::holding`]). A task whose prediction alone is more than the budget fails before it
-//! starts, saying so; so does one that cannot fit while nothing runs. Nothing is retried with
-//! less at once.
+//! ([`Plane::holding`]). A task predicted the whole budget runs alone: it starts once no task
+//! granted memory runs, whatever the process holds besides, and while it runs no other task
+//! granted memory fits (a program never measured, `admission::kinds::PROGRAM`). A task whose
+//! prediction alone is more than the budget fails before it starts, saying so; so does one
+//! that cannot fit while nothing runs. Nothing is retried with less at once.
 //!
 //! A request may be cancelled ([`Plane::cancel`]): what of it has not started is skipped, what
 //! runs is let finish, and it finishes failed. A plane lives as long as the daemon: a request
@@ -536,6 +538,9 @@ pub struct RequestStats {
     /// the step that said a node's `Run` to the step of its `Done`. A cached or joined node's
     /// own time is 0 here; one skipped ends no chain.
     pub critical_path_ns: u64,
+    /// Its nodes' measured run times, as in [`RequestStats::critical_path_ns`], summed by
+    /// kind: `steps_ns[kind as usize]`, in [`NodeKind::ALL`]'s order.
+    pub steps_ns: [u64; NodeKind::ALL.len()],
 }
 
 /// No node, edge or place: the end of a list, a node in no ready heap.
@@ -679,6 +684,7 @@ struct NodeCold {
     name_len: u32,
     pool: Pool,
     flags: u8,
+    kind: NodeKind,
 }
 
 const _: () = assert!(size_of::<NodeCold>() == 64);
@@ -1609,6 +1615,7 @@ impl<M: Memo> Plane<M> {
                 name_len: 0,
                 pool,
                 flags: 0,
+                kind,
             });
             self.states.push(NodeState::Waiting);
             self.keys.push(Key([0; 32]));
@@ -1694,6 +1701,7 @@ impl<M: Memo> Plane<M> {
             name_len: self.requests[r as usize].names.len() as u32 - name_at,
             pool,
             flags: if key.is_some() { KEYED } else { 0 },
+            kind,
         };
         self.keys[m] = key.unwrap_or(Key([0; 32]));
         self.states[m] = NodeState::Waiting;
@@ -1913,6 +1921,8 @@ impl<M: Memo> Plane<M> {
         let before = request.deps(&cold).iter().map(|it| self.cold[it.dep as usize].path_ns).max();
         let path = own.saturating_add(before.unwrap_or(0));
         request.stats.critical_path_ns = request.stats.critical_path_ns.max(path);
+        let step = &mut request.stats.steps_ns[cold.kind as usize];
+        *step = step.saturating_add(own);
         self.cold[m].path_ns = path;
         self.cold[m].done_at = at;
         self.cold[m].flags |= DONE;
@@ -2333,6 +2343,10 @@ impl<M: Memo> Plane<M> {
     /// of it that did not fit, before that one, are added to `passed`. Only with a budget.
     fn pick(&mut self, r: u32, p: usize, passed: &mut Vec<TaskHandle>) -> Pick {
         let free = self.memory_free().expect("a budget");
+        // A task predicted the whole budget runs alone: once nothing granted memory runs,
+        // whatever the process holds besides, and while it runs nothing granted memory fits.
+        let whole = self.config.budget.as_ref().expect("a budget").bytes;
+        let alone = self.granted == 0;
         let nothing_runs = self.running == [0, 0];
         let hold = self.hold();
         // An idle request's task passed over holds back no other.
@@ -2360,7 +2374,7 @@ impl<M: Memo> Plane<M> {
                         break;
                     }
                 }
-                _ if memory <= free => {
+                _ if memory <= free || (memory == whole && alone) => {
                     picked = me;
                     break;
                 }

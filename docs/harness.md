@@ -339,7 +339,9 @@ store of its own with a home of its own, and a store shared or warm across homes
   outcome is `unmeasured`.
 - v2 answers them through the command line's forms of the agent API: the `blaze-work` line
   each build, test and run prints under `--message-format=json` (what it reran, compiled and
-  found, how it linked, its critical path), `blaze codegen-inputs --format=json`, `blaze trace
+  found, how it linked, its critical path, its run time by node kind as `steps_us`; under
+  `BLAZE_STATS` the same as a `timeline-us:` line on stderr in every format),
+  `blaze codegen-inputs --format=json`, `blaze trace
   --out PATH` and `blaze tables --format=json`. An answer missing or unreadable is an error
   naming the command.
 - On v2, `unmeasured` fails too.

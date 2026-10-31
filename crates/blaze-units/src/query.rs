@@ -197,6 +197,9 @@ pub enum Command {
     Bench,
     /// Builds what `build` does, and the client runs it.
     Run,
+    /// Checks what `doc` documents, and the daemon writes its pages from the front end
+    /// (`blaze-doc`): no rustdoc runs.
+    Doc,
 }
 
 impl Command {
@@ -208,6 +211,7 @@ impl Command {
             "run" | "r" => Some(Command::Run),
             "test" | "t" => Some(Command::Test),
             "bench" => Some(Command::Bench),
+            "doc" | "d" => Some(Command::Doc),
             _ => None,
         }
     }
@@ -220,13 +224,14 @@ impl Command {
             Command::Run => "run",
             Command::Test => "test",
             Command::Bench => "bench",
+            Command::Doc => "doc",
         }
     }
 
     /// The profile cargo builds with when none is named.
     pub fn profile(self) -> &'static str {
         match self {
-            Command::Build | Command::Check | Command::Run => "dev",
+            Command::Build | Command::Check | Command::Run | Command::Doc => "dev",
             Command::Test => "test",
             Command::Bench => "bench",
         }

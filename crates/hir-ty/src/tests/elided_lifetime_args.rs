@@ -11,9 +11,9 @@ use hir_def::{
     signatures::FunctionSignature,
 };
 use hir_expand::fixture;
-use rustc_type_ir::TypeVisitableExt;
+use rustc_type_ir::{TypeVisitableExt, inherent::IntoKind as _};
 
-use crate::{InferBodyId, InferenceResult};
+use crate::{InferBodyId, InferenceResult, next_solver::TyKind};
 
 const FIXTURE: &str = r#"
 //- minicore: sized
@@ -51,6 +51,11 @@ fn type_args_with_no_lifetime_args_infer_the_lifetimes() {
         let infer = InferenceResult::of(&db, InferBodyId::DefWithBodyId(def));
         assert!(infer.diagnostics().is_empty(), "{:?}", infer.diagnostics());
         let ty = infer.type_of_expr_or_pat(ExprOrPatId::ExprId(path)).expect("the path's type");
-        assert!(!ty.references_error(), "`S::<Mode>::size` is {ty:?}");
+        // Writeback makes every region variable `'{region error}`, inferred ones too.
+        let TyKind::FnDef(_, args) = ty.kind() else { panic!("`S::<Mode>::size` is {ty:?}") };
+        let args = args.skip_binder();
+        assert_eq!(args.len(), 3, "`S::<Mode>::size` is {ty:?}");
+        assert!(args.types().all(|it| !it.references_error()), "`S::<Mode>::size` is {ty:?}");
+        assert!(args.types().next().is_some_and(|it| it.as_adt().is_some()), "`S::<Mode>::size` is {ty:?}");
     });
 }

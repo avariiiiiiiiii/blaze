@@ -18,7 +18,7 @@
 
 use std::cell::Cell;
 
-use parser::{Edition, LexedStr, Reparser};
+use parser::{Edition, LexedStr, OutlineStep, Reparser, Step};
 use syntax_tree::{FlatTree, Language, Splice, Text};
 
 use crate::{
@@ -127,18 +127,23 @@ pub(crate) fn reparse_all(
         let mut group = Group { delete: first.0, shift, grown: grown(first) };
         next += 1;
         let unit = loop {
-            let unit = group.edit(tree, new_source, edition, outline.is_some()).unit()?;
-            if units.last().is_some_and(|it: &Unit| it.reach.end() >= unit.reach.start()) {
+            let after = groups.last().map_or(TextSize::new(0), |it: &Group| it.delete.end());
+            let before = edits.get(next).map_or(TextSize::of(&**tree.source()), |it| it.0.start());
+            let bounds = TextRange::new(after, before);
+            let attempt = group.edit(tree, new_source, bounds, edition, outline.is_some());
+            let unit = attempt.unit();
+            let reach = attempt.reach.get();
+            if units.last().is_some_and(|it: &Unit| it.reach.end() >= reach.start()) {
                 units.pop();
                 group = groups.pop().expect("a group for every unit").joined(group);
                 continue;
             }
-            if let Some(edit) = edits.get(next).filter(|it| it.0.start() <= unit.reach.end()) {
+            if let Some(edit) = edits.get(next).filter(|it| it.0.start() <= reach.end()) {
                 group = group.joined(Group { delete: edit.0, shift: 0, grown: grown(edit) });
                 next += 1;
                 continue;
             }
-            break unit;
+            break unit?;
         };
         shift = group.shift + group.grown;
         units.push(unit);
@@ -168,17 +173,20 @@ impl Group {
         Group { delete, shift: self.shift, grown: self.grown + after.grown }
     }
 
+    /// The group's edit, `bounds` the old text around it that holds no other edit.
     fn edit<'a>(
         &self,
         tree: &'a FlatTree,
         new_source: &'a Text,
+        bounds: TextRange,
         edition: Edition,
         outline: bool,
     ) -> Edit<'a> {
         let start = u32::from(self.delete.start()) as i64 + self.shift;
         let end = u32::from(self.delete.end()) as i64 + self.shift + self.grown;
         let insert = &new_source[start as usize..end as usize];
-        Edit::new(tree, self.delete, insert, new_source, self.shift, edition, outline)
+        let edit = Edit::new(tree, self.delete, insert, new_source, self.shift, edition, outline);
+        Edit { bounds, ..edit }
     }
 }
 
@@ -260,6 +268,9 @@ struct Edit<'a> {
     /// How many bytes longer the text before `delete` is in `new_source`: the other edits'
     /// made with it.
     shift: i64,
+    /// The old text holding no other edit made with it: the new text of an element outside
+    /// it is not known from this edit alone.
+    bounds: TextRange,
     edition: Edition,
     outline: bool,
     /// The old text the checks have read so far.
@@ -277,7 +288,8 @@ impl<'a> Edit<'a> {
         outline: bool,
     ) -> Edit<'a> {
         let reach = Cell::new(delete);
-        Edit { tree, delete, insert, new_source, shift, edition, outline, reach }
+        let bounds = TextRange::up_to(TextSize::of(&**tree.source()));
+        Edit { tree, delete, insert, new_source, shift, bounds, edition, outline, reach }
     }
 }
 
@@ -300,7 +312,7 @@ impl Edit<'_> {
     fn parsed(&self, at: u32, with: Option<FlatTree>, errors: Vec<SyntaxError>) -> Option<Unit> {
         let range = self.tree.range(at);
         self.reads(range);
-        let (new_range, reach) = (self.new_range(range), self.reach.get());
+        let (new_range, reach) = (self.new_range(range)?, self.reach.get());
         Some(Unit { at, with, errors, range, new_range, reach })
     }
 
@@ -309,15 +321,20 @@ impl Edit<'_> {
         self.tree.is_token(at) || self.tree.is_lazy(at)
     }
 
-    /// Where the old `range`, which holds the edit, is in the new text.
-    fn new_range(&self, range: TextRange) -> TextRange {
+    /// Where the old `range`, which holds the edit, is in the new text: `None` when it is not
+    /// in [`Edit::bounds`], and the checks read it, the edit it holds too being one with this.
+    fn new_range(&self, range: TextRange) -> Option<TextRange> {
+        if !self.bounds.contains_range(range) {
+            self.reads(range);
+            return None;
+        }
         let start = TextSize::new((u32::from(range.start()) as i64 + self.shift) as u32);
-        TextRange::at(start, range.len() + TextSize::of(self.insert) - self.delete.len())
+        Some(TextRange::at(start, range.len() + TextSize::of(self.insert) - self.delete.len()))
     }
 
     /// The text of the old `range`, which holds the edit, after it.
-    fn new_text(&self, range: TextRange) -> &str {
-        &self.new_source[self.new_range(range)]
+    fn new_text(&self, range: TextRange) -> Option<&str> {
+        Some(&self.new_source[self.new_range(range)?])
     }
 
     fn token(&self) -> Option<Unit> {
@@ -338,7 +355,7 @@ impl Edit<'_> {
         {
             return None;
         }
-        let new_text = self.new_text(range);
+        let new_text = self.new_text(range)?;
         let (new_kind, new_err) = LexedStr::single_token(self.edition, new_text)?;
         let contextual =
             |text: &str| SyntaxKind::from_contextual_keyword(text, self.edition).is_some();
@@ -404,7 +421,9 @@ impl Edit<'_> {
         // In an outline, what is in a `fn` body that is not lazy is parsed in full: the
         // ancestors below the outermost body.
         let outermost = ancestors().enumerate().filter(|&(_, it)| self.is_fn_body(it)).last();
-        ancestors().enumerate().find_map(|(i, at)| {
+        // An ancestor holding another edit is parsed again with it, as is every one above it.
+        let in_bounds = |&(_, at): &(usize, u32)| self.new_range(tree.range(at)).is_some();
+        ancestors().enumerate().take_while(in_bounds).find_map(|(i, at)| {
             let in_full = !self.outline || outermost.is_some_and(|(body, _)| i < body);
             let kind = self.kind(at);
             if !in_full && self.is_fn_body(at) {
@@ -430,7 +449,7 @@ impl Edit<'_> {
     /// leave it unparsed (`braced`), which it did or the full parse of the body would have
     /// to be checked too.
     fn body(&self, at: u32) -> Option<Unit> {
-        let range = self.new_range(self.tree.range(at));
+        let range = self.new_range(self.tree.range(at))?;
         let text = &self.new_source[range];
         let lexed = LexedStr::new(self.edition, text);
         if !braced(&lexed, self.edition)
@@ -448,7 +467,7 @@ impl Edit<'_> {
 
     fn block(&self, at: u32, reparser: Reparser, in_full: bool) -> Option<Unit> {
         let kind = self.kind(at);
-        let range = self.new_range(self.tree.range(at));
+        let range = self.new_range(self.tree.range(at))?;
         let lexed = LexedStr::new(self.edition, &self.new_source[range]);
         // An expression's parse looks into the block or list after it (a `{` after a path is
         // a struct literal's when an identifier and a `:` follow); a list of items, fields or
@@ -477,11 +496,12 @@ impl Edit<'_> {
         let tree = self.tree;
         let kind = self.kind(at);
         let range = tree.range(at);
-        let new = self.new_range(range);
+        let new = self.new_range(range)?;
         let lexed = LexedStr::new(self.edition, &self.new_source[new]);
         // Trivia after an item are its parent's; a parse of the item alone would take them.
         if lexed.is_empty()
             || lexed.kind(lexed.len() - 1).is_trivia()
+            || !self.same_leading_trivia(at, &lexed)
             || !self.same_start(at, &lexed)
             || !self.lexes_alone(at, &lexed)
         {
@@ -516,10 +536,34 @@ impl Edit<'_> {
         if first != kind || n_tokens != tokens {
             return None;
         }
+        // A node entered after the item's last token (an empty `ERROR` at the end of the
+        // text) is entered past the trivia after the item in the file, and takes them.
+        let enters_after_tokens = output.steps().fold(false, |entered, step| match step {
+            OutlineStep::Step(Step::Enter { .. }) => true,
+            OutlineStep::Step(Step::Token { .. } | Step::FloatSplit { .. })
+            | OutlineStep::Lazy { .. } => false,
+            OutlineStep::Step(Step::Exit | Step::Error { .. }) => entered,
+        });
+        if enters_after_tokens {
+            return None;
+        }
         // clone: a count of the new text, which the node's tree shares
         let source = self.new_source.clone();
         let (with, errors) = build_node(source, new, &lexed, &output, self.edition, kind)?;
         self.parsed(at, Some(with), errors)
+    }
+
+    /// Whether item `at`'s new text `new` starts with the trivia its old text does: the same
+    /// kinds, and whitespace of the same text. Whitespace before an item is its parent's, and
+    /// a comment before it is the item's or its parent's by the new lines after it, so a parse
+    /// of the item alone places them as the whole parse does only when these are unchanged; the
+    /// text of a comment may change.
+    fn same_leading_trivia(&self, at: u32, new: &LexedStr<'_>) -> bool {
+        if !new.kind(0).is_trivia() {
+            return true;
+        }
+        let old = LexedStr::new(self.edition, &self.tree.source()[self.tree.range(at)]);
+        leading_trivia(&old).eq(leading_trivia(new))
     }
 
     /// Whether node `at`'s first [`LOOKAHEAD`] tokens are those of `new`, its new text. When the
@@ -599,6 +643,15 @@ fn first_tokens<'a>(lexed: &'a LexedStr<'_>) -> impl Iterator<Item = (SyntaxKind
         .filter(|&it| !lexed.kind(it).is_trivia())
         .take(LOOKAHEAD)
         .map(|it| (lexed.kind(it), lexed.text(it)))
+}
+
+/// The trivia `lexed` starts with: each one's kind, and a whitespace's text.
+fn leading_trivia<'a>(
+    lexed: &'a LexedStr<'_>,
+) -> impl Iterator<Item = (SyntaxKind, Option<&'a str>)> + 'a {
+    (0..lexed.len())
+        .take_while(|&it| lexed.kind(it).is_trivia())
+        .map(|it| (lexed.kind(it), (lexed.kind(it) == WHITESPACE).then(|| lexed.text(it))))
 }
 
 /// Whether `lexed` is a `{ ... }` that parses to its last `}`: its braces balance and it holds

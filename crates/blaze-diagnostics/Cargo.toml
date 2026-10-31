@@ -20,8 +20,8 @@ annotate-snippets.workspace = true
 either.workspace = true
 hashbrown.workspace = true
 memchr.workspace = true
-ra-ap-rustc_lexer.workspace = true
-ra-ap-rustc_parse_format.workspace = true
+rustc_lexer.workspace = true
+rustc_parse_format.workspace = true
 rustc_apfloat.workspace = true
 rustc-hash.workspace = true
 serde = { workspace = true, features = ["derive"] }

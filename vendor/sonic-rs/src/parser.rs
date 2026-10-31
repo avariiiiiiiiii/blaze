@@ -1231,51 +1231,76 @@ where
         }
     }
 
-    #[inline(always)]
-    fn skip_object(&mut self) -> Result<()> {
-        match self.skip_space() {
-            Some(b'}') => return Ok(()),
-            Some(b'"') => {}
-            None => return perr!(self, EofWhileParsing),
-            Some(_) => return perr!(self, ExpectObjectKeyOrEnd),
-        }
-
+    // blaze: a checked skip of an object or array is a loop over the containers still open,
+    // held on the heap as serde_json's `ignore_value` holds them, not a call per level: upstream
+    // recursed through `skip_one` once per level with no limit, so a deep enough value in a
+    // field skipped overflowed the thread's stack and aborted the process. It takes and refuses
+    // what upstream's `skip_object`/`skip_array` did, with the same errors at the same places.
+    #[inline(never)]
+    fn skip_nested(&mut self, first: u8) -> Result<()> {
+        let mut open: Vec<u8> = Vec::new();
+        let mut entered = Some(first);
         loop {
-            self.skip_string()?;
-            self.parse_object_clo()?;
-            self.skip_one(true)?;
-
-            match self.skip_space() {
-                Some(b'}') => return Ok(()),
-                Some(b',') => match self.skip_space() {
-                    Some(b'"') => continue,
+            if let Some(container) = entered.take() {
+                let empty = match container {
+                    b'{' => match self.skip_space() {
+                        Some(b'}') => true,
+                        Some(b'"') => {
+                            self.skip_string()?;
+                            self.parse_object_clo()?;
+                            false
+                        }
+                        None => return perr!(self, EofWhileParsing),
+                        Some(_) => return perr!(self, ExpectObjectKeyOrEnd),
+                    },
+                    _ => match self.skip_space_peek() {
+                        Some(b']') => {
+                            self.read.eat(1);
+                            true
+                        }
+                        None => return perr!(self, EofWhileParsing),
+                        Some(_) => false,
+                    },
+                };
+                if !empty {
+                    open.push(container);
+                    entered = self.skip_scalar_or_open()?;
+                    continue;
+                }
+            }
+            // A value or a container ended: the enclosing container's comma or end.
+            let Some(&inner) = open.last() else { return Ok(()) };
+            match (inner, self.skip_space()) {
+                (b'{', Some(b'}')) | (b'[', Some(b']')) => _ = open.pop(),
+                (b'{', Some(b',')) => match self.skip_space() {
+                    Some(b'"') => {
+                        self.skip_string()?;
+                        self.parse_object_clo()?;
+                        entered = self.skip_scalar_or_open()?;
+                    }
                     _ => return perr!(self, ExpectObjectKeyOrEnd),
                 },
-                None => return perr!(self, EofWhileParsing),
-                Some(_) => return perr!(self, ExpectedObjectCommaOrEnd),
+                (_, Some(b',')) => entered = self.skip_scalar_or_open()?,
+                (_, None) => return perr!(self, EofWhileParsing),
+                (b'{', Some(_)) => return perr!(self, ExpectedObjectCommaOrEnd),
+                (_, Some(_)) => return perr!(self, ExpectedArrayCommaOrEnd),
             }
         }
     }
 
+    /// blaze: one value of a checked skip: a scalar skipped whole, or the `{` or `[` it opens,
+    /// eaten and returned for [`Self::skip_nested`] to go into.
     #[inline(always)]
-    fn skip_array(&mut self) -> Result<()> {
-        match self.skip_space_peek() {
-            Some(b']') => {
-                self.read.eat(1);
-                return Ok(());
-            }
-            None => return perr!(self, EofWhileParsing),
-            _ => {}
-        }
-
-        loop {
-            self.skip_one(true)?;
-            match self.skip_space() {
-                Some(b']') => return Ok(()),
-                Some(b',') => continue,
-                None => return perr!(self, EofWhileParsing),
-                _ => return perr!(self, ExpectedArrayCommaOrEnd),
-            }
+    fn skip_scalar_or_open(&mut self) -> Result<Option<u8>> {
+        match self.skip_space() {
+            Some(c @ (b'-' | b'0'..=b'9')) => self.skip_number(c).map(|_| None),
+            Some(b'"') => self.skip_string().map(|_| None),
+            Some(c @ (b'{' | b'[')) => Ok(Some(c)),
+            Some(b't') => self.parse_literal("rue").map(|()| None),
+            Some(b'f') => self.parse_literal("alse").map(|()| None),
+            Some(b'n') => self.parse_literal("ull").map(|()| None),
+            Some(_) => perr!(self, InvalidJsonValue),
+            None => perr!(self, EofWhileParsing),
         }
     }
 
@@ -1582,20 +1607,9 @@ where
                 };
                 Ok(())
             }
-            b'{' => {
-                if checked {
-                    self.skip_object()
-                } else {
-                    self.skip_container(b'{', b'}')
-                }
-            }
-            b'[' => {
-                if checked {
-                    self.skip_array()
-                } else {
-                    self.skip_container(b'[', b']')
-                }
-            }
+            c @ (b'{' | b'[') if checked => self.skip_nested(c),
+            b'{' => self.skip_container(b'{', b'}'),
+            b'[' => self.skip_container(b'[', b']'),
             b't' => self.parse_literal("rue"),
             b'f' => self.parse_literal("alse"),
             b'n' => self.parse_literal("ull"),

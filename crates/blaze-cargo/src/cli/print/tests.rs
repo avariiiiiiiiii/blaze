@@ -204,6 +204,7 @@ fn what_a_request_did_is_one_json_line_of_blazes() {
         served: Vec::new(),
         compiled: 1,
         critical_path_us: 1500,
+        steps_us: vec![(blaze_api::NodeKind::Link, 40)],
     };
     let json = Shown { format: Format::Json { short: false, ansi: false, render_diagnostics: false }, ..Shown::default() };
     let (out, err) = printed(json, &[Response::Work(worked.clone()), Response::Done { ok: true }], true);
@@ -211,12 +212,16 @@ fn what_a_request_did_is_one_json_line_of_blazes() {
         out,
         "{\"reason\": \"blaze-work\", \"reran\": 2, \"green\": 40, \"compiled\": 1, \"found\": 3, \"link\": \
          \"patched\", \"critical_path_us\": 1500, \"links\": [{\"path\": \"target/debug/foo\", \"how\": \
-         \"spliced\", \"why\": []}]}\n{\"reason\":\"build-finished\",\"success\":true}\n"
+         \"spliced\", \"why\": []}], \"steps_us\": {\"link\": 40}}\n{\"reason\":\"build-finished\",\"success\":true}\n"
     );
     assert!(err.starts_with("link: target/debug/foo (spliced)\n"), "{err}");
-    let (out, err) = printed(Shown::default(), &[Response::Work(worked), Response::Done { ok: true }], true);
+    let (out, err) = printed(Shown::default(), &[Response::Work(worked.clone()), Response::Done { ok: true }], true);
     assert_eq!(out, "", "under the human format the work line is not printed");
     assert!(err.starts_with("link: target/debug/foo (spliced)\n"), "but how it linked is: {err}");
+    assert!(!err.contains("timeline-us:"), "{err}");
+    let stats = Shown { stats: true, ..Shown::default() };
+    let (_, err) = printed(stats, &[Response::Work(worked), Response::Done { ok: true }], true);
+    assert!(err.starts_with("link: target/debug/foo (spliced)\ntimeline-us: link=40\n"), "{err}");
 }
 
 #[test]
@@ -239,6 +244,7 @@ fn each_dependency_crate_is_one_served_line_after_the_work() {
         ],
         compiled: 0,
         critical_path_us: 7,
+        steps_us: Vec::new(),
     };
     let json = Shown { format: Format::Json { short: false, ansi: false, render_diagnostics: false }, ..Shown::default() };
     let (out, _) = printed(json, &[Response::Work(worked.clone()), Response::Done { ok: true }], true);
@@ -246,7 +252,7 @@ fn each_dependency_crate_is_one_served_line_after_the_work() {
         out,
         concat!(
             "{\"reason\": \"blaze-work\", \"reran\": 1, \"green\": 0, \"compiled\": 0, \"found\": 0, \"link\": \
-             \"placed\", \"critical_path_us\": 7, \"links\": []}\n",
+             \"placed\", \"critical_path_us\": 7, \"links\": [], \"steps_us\": {}}\n",
             "{\"reason\": \"blaze-served\", \"package\": \"itoa\", \"outcome\": \"served\", \"bodies\": \"served\", \
              \"why\": null}\n",
             "{\"reason\": \"blaze-served\", \"package\": \"serde\", \"outcome\": \"checked\", \"bodies\": \"refused\", \

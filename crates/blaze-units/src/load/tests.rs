@@ -282,6 +282,29 @@ fn one_package_plans_its_library_and_binary_with_the_standard_library() {
     }
 }
 
+#[test]
+fn doc_checks_the_targets_cargo_doc_documents() {
+    let fixture = Fixture::new();
+    let files = [
+        ("ws/Cargo.toml", A),
+        ("ws/src/lib.rs", "pub fn f() {}\n"),
+        ("ws/src/main.rs", "fn main() {}\n"),
+        ("ws/src/bin/tool.rs", "fn main() {}\n"),
+        ("ws/examples/e.rs", "fn main() {}\n"),
+    ];
+    let doc = Ask { command: Command::Doc, args: &["--no-deps", "--open"], ..ask(&files) };
+    let units = ready(fixture.plan(fixture.open(&doc)));
+    // cargo's `filter_default_targets`: a binary named as its package's library is left out.
+    assert_eq!(roots_named(&units), ["a lib", "tool bin"]);
+    let roots = units.graph.roots.iter().map(|&at| &units.graph.units[at]);
+    assert!(roots.into_iter().all(|it| it.mode == Mode::Check), "every root is checked, none built");
+    assert_eq!(units.finished, "`dev` profile [unoptimized + debuginfo]");
+
+    let examples = Ask { command: Command::Doc, args: &["--examples"], ..ask(&files) };
+    let units = ready(fixture.plan(fixture.open(&examples)));
+    assert_eq!(roots_named(&units), ["e example"]);
+}
+
 // library/Cargo.toml's `[profile.*.package.panic_abort] rustflags = ["-Cpanic=abort"]` is
 // the profile's `panic` of `panic_abort`, not a flag blaze compiles by.
 #[test]

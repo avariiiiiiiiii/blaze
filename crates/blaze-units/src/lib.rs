@@ -44,7 +44,7 @@ use rustc_hash::FxHashMap;
 pub use read::Read;
 pub use schema::UnitGraph;
 
-/// What the user asked cargo to do (cargo's `UserIntent`, less `doc` and `doctest`).
+/// What the user asked cargo to do (cargo's `UserIntent`, less `doctest`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Intent {
     Build,
@@ -54,13 +54,17 @@ pub enum Intent {
     },
     Test,
     Bench,
+    /// `cargo doc`: the targets cargo documents, checked, for the front end the pages are
+    /// written from. With or without `--no-deps` every dependency is checked, as cargo checks
+    /// each for the metadata rustdoc reads.
+    Doc,
 }
 
 impl Intent {
     /// The profile the command builds with when `--release` and `--profile` say none.
     pub fn default_profile(self) -> &'static str {
         match self {
-            Intent::Build | Intent::Check { .. } => "dev",
+            Intent::Build | Intent::Check { .. } | Intent::Doc => "dev",
             Intent::Test => "test",
             Intent::Bench => "bench",
         }
@@ -165,7 +169,7 @@ impl Filter {
     pub fn need_dev_deps(&self, intent: Intent) -> bool {
         match intent {
             Intent::Test | Intent::Bench | Intent::Check { test: true } => true,
-            Intent::Build | Intent::Check { test: false } => match self {
+            Intent::Build | Intent::Check { test: false } | Intent::Doc => match self {
                 Filter::Default { .. } => false,
                 Filter::Only { examples, tests, benches, .. } => {
                     examples.is_specific() || tests.is_specific() || benches.is_specific()

@@ -1196,6 +1196,34 @@ fn a_parse_after_random_edits_is_the_whole_parse() {
 }
 
 #[test]
+fn an_edit_before_an_item_is_the_whole_parse() {
+    // Each edit's one changed range starts at the first item's start, so trivia before it
+    // (the file's) or a comment attached to it or not are in the item's new text.
+    let edits: &[(&str, &str)] = &[
+        // a reformat: blank lines before the item and its body indented again
+        (
+            "pub fn f(x: u32) -> u32 {\n    x + 1\n}\n",
+            "\n\npub fn f(x: u32) -> u32 {\n        x + 1\n}\n",
+        ),
+        ("fn f() {}\n", "// c\nfn f() {}\n"),
+        ("fn f() {}\n", "// c\n\nfn f() {}\n"),
+        ("/// a\nfn f() {}\n", "/// a\n\nfn f() {}\n"),
+        ("/// a\nfn f() {}\n", "/// ab\nfn f() {}\n"),
+    ];
+    for (i, &(before, after)) in edits.iter().enumerate() {
+        let mut db = Db::for_tests();
+        let file = FileId::from_raw(0);
+        put_root(&mut db, 0, &[(file, "/a/lib.rs", before)]);
+        let id = EditionedFileId::new(&db, file, Edition::Edition2021);
+        let _ = id.parse(&db);
+        db.set_file_text(file, after);
+        let parse = id.parse(&db);
+        assert_eq!(parse.root().text(), after, "edit {i}");
+        assert_whole(parse, db.file_text(file).text(&db), Edition::Edition2021, false);
+    }
+}
+
+#[test]
 fn a_reparse_is_made_from_the_last_text_that_was_parsed() {
     let mut db = Db::for_tests();
     let file = FileId::from_raw(0);

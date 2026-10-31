@@ -43,7 +43,7 @@ use crate::{
         syntax::Walk,
     },
     lower::{Found, Phase},
-    model::{self, Diag, MultiSpan, Sublevel},
+    model::{self, Breakage, Diag, MultiSpan, Sublevel},
 };
 
 /// The lint flags rustc is given.
@@ -110,9 +110,11 @@ impl Said<'_, '_, '_> {
     /// `diag` of `lint` at `spec` as rustc's `emit_lint_base` emits it: nothing when it is
     /// allowed or expected (the expectation fulfilled), or in another crate's macro and not of
     /// a lint given there; else at its level, with the future-incompatible warning and link
-    /// and the notes on where its level came from.
+    /// and the notes on where its level came from. A lint of the future-incompatibility
+    /// report (`report_in_deps`) allowed or expected is kept for the report alone, a warning.
     fn finish(&mut self, lcx: &LevelCx<'_, '_>, lint: &'static Lint, spec: Spec, mut diag: Diag) -> Option<Diag> {
-        if spec.level == Level::Allow {
+        let reported = lint.future_incompatible.is_some_and(|it| it.report_in_deps);
+        if spec.level == Level::Allow && !reported {
             return None;
         }
         if diag.span.primary.iter().any(attrs::external) {
@@ -125,12 +127,17 @@ impl Said<'_, '_, '_> {
         if let Some(expect) = spec.expect {
             self.fulfill(expect);
         }
-        if spec.level == Level::Expect {
+        if spec.level == Level::Expect && !reported {
             return None;
         }
         diag.level = match spec.level.is_error() {
             true => model::Level::Error,
             false => model::Level::Warning,
+        };
+        diag.breakage = match (reported, spec.level) {
+            (false, _) => Breakage::None,
+            (true, Level::Allow | Level::Expect) => Breakage::Unwritten,
+            (true, _) => Breakage::Written,
         };
         if let Some(future) = lint.future_incompatible {
             if future.explain_reason {

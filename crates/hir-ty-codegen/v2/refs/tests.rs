@@ -293,7 +293,7 @@ fn drops_list_their_glue() {
 }
 
 const DYN: &str = r#"
-//- minicore: sized, unsize, coerce_unsized, drop
+//- minicore: sized, unsize, coerce_unsized, dispatch_from_dyn, drop
 pub struct Held(pub u32);
 impl Drop for Held { fn drop(&mut self) {} }
 pub trait Sides { fn sides(&self) -> u32; }
@@ -320,7 +320,7 @@ fn a_dyn_coercion_lists_its_vtable() {
 }
 
 const DYN_FN: &str = r#"
-//- minicore: sized, unsize, coerce_unsized, fn, drop
+//- minicore: sized, unsize, coerce_unsized, dispatch_from_dyn, fn, drop
 pub struct Held(pub u32);
 impl Drop for Held { fn drop(&mut self) {} }
 pub fn call_dyn(f: &dyn Fn(u32) -> u32, x: u32) -> u32 { f(x) }
@@ -346,7 +346,7 @@ fn a_dyn_fn_call_lists_the_closure_vtable() {
 }
 
 const OVERFLOW: &str = r#"
-//- minicore: sized, index, panic_location
+//- minicore: sized, index, slice, panic_location
 #![feature(lang_items, rustc_attrs)]
 pub mod panicking {
     #[lang = "panic_bounds_check"]

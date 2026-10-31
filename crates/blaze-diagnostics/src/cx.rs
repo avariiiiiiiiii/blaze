@@ -60,13 +60,13 @@ impl<'a> Files<'a> {
     }
 
     /// The name rustc gives `path`: from `root` when it is below it, as cargo runs rustc there,
-    /// else the whole path, as `root` itself keeps it. A root of `""` or `/` keeps every path
-    /// whole: rustc prints a path as it was given.
+    /// else the whole path, as `root` itself keeps it. A root of `""` is none, and keeps every
+    /// path whole; under a root of `/` cargo gives rustc paths from `/`, without their `/`.
     pub fn relative<'p>(path: &'p str, root: &str) -> &'p str {
-        let root = root.trim_end_matches('/');
         if root.is_empty() {
             return path;
         }
+        let root = root.trim_end_matches('/');
         match path.strip_prefix(root).and_then(|rest| rest.strip_prefix('/')) {
             Some(rest) if !rest.is_empty() => rest,
             _ => path,
@@ -353,7 +353,8 @@ impl<'a, 'db> Cx<'a, 'db> {
                 Some(self.span(id.with_value(item_range_view(id.to_view(db).syntax()))))
             }
         };
-        Some(Expansion { call_site, kind, name, def_site })
+        let opaque = !matches!(loc.def.kind, MacroDefKind::Declarative(..) | MacroDefKind::ProcMacro(..));
+        Some(Expansion { call_site, kind, name, def_site, opaque })
     }
 
     /// What the macro call `call` is, its name (empty unless `named`) and the range its call

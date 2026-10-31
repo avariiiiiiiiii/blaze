@@ -1,7 +1,7 @@
 # cranelift-object
 
 - Upstream: https://github.com/bytecodealliance/wasmtime (`cranelift/object`), crates.io
-  `cranelift-object` 0.137.0 (sha256 78f98e6d6b502fa10bd1bb95776544033169d0c1860d6fe1ada03109ea500eb4), taken from the crate with the changes below.
+  `cranelift-object` 0.137.1 (sha256 c38304b64d440315410ae0229340dd2087bed7d7e8411a7bb72b4b6a2132db05; its `src/` is 0.137.0's byte for byte), taken from the crate with the changes below.
 - Licence: Apache-2.0 WITH LLVM-exception (LICENSE).
 - Left out: tests/ (and the dev-dependencies and `[[test]]` they need), Cargo.lock.
 

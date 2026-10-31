@@ -265,7 +265,7 @@ fn e0597_points_at_the_drop_and_the_later_use() {
 /// slice, a union, a `static mut`, closures by reference and by value, a returned
 /// `impl Trait`, moves out and reinitialization.
 const CLEAN: &str = r#"
-//- minicore: sized, copy, clone, fn
+//- minicore: sized, copy, clone, fn, index, slice
 struct Point { x: u32, y: u32 }
 struct Stack { items: [u32; 4], len: usize }
 enum Shape { Circle(Point), Square(u32), Empty }

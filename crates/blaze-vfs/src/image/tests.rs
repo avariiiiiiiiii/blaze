@@ -12,7 +12,7 @@ use blaze_core::{
 use blaze_ids::ContentId;
 use blaze_image::{Builder, Image, MIN_GROUP_SHIFT, SectionId};
 
-use super::{BLOBS_SCHEMA, ImageError, ImageMark, ImageUse, TREE_SCHEMA};
+use super::{BLOBS_SCHEMA, DISKS_SCHEMA, DisksUnused, ImageError, ImageMark, ImageUse, TREE_SCHEMA};
 use crate::{Change, Mode, Op, OpError, Vfs, journal::base_of, store::Source, tree::NodeId};
 
 fn file() -> FileName {
@@ -446,6 +446,22 @@ fn a_start_reads_the_journals_tail_and_no_file_until_one_is_read() {
     }
     let tree = image.section(SectionId::VFS_TREE, TREE_SCHEMA).unwrap();
     assert!((0..tree.groups).all(|group| image.is_checked(&tree, group)), "the tree, whole");
+}
+
+#[test]
+fn a_corrupt_disks_section_is_named_not_taken_for_another_schema() {
+    let (_, image, _, journal) = imaged();
+    let disks_at = {
+        let opened = Image::open(mapping(&image)).unwrap();
+        opened.section(SectionId::VFS_DISKS, DISKS_SCHEMA).unwrap().at
+    };
+    let mut corrupt = image.clone();
+    corrupt[disks_at as usize] ^= 1;
+    let (_, found) = Vfs::restore(file(), 0, &journal, Some(mapping(&corrupt)));
+    let ImageUse::Used { disks: Some(DisksUnused::Corrupt(why)), .. } = &found.image else {
+        panic!("a corrupt disks section, named: {found:?}");
+    };
+    assert_eq!(why.section, SectionId::VFS_DISKS);
 }
 
 #[test]

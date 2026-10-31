@@ -1,47 +1,31 @@
 //! Applies blaze's edits to a program while it runs.
 //!
-//! The daemon already answers an edit with a patch: the functions that differ from the
-//! executable of the last full link, linked against that executable's symbols. On disk it
-//! is spliced into the executable. A program that links this crate and calls
-//! [`Live::start`] gets each patch in memory as well: the daemon lays the patch out for a
-//! place the program set aside next to its own code, the program maps it there and writes
-//! a jump over the entry of each function it replaces. Whatever calls the old function, a
-//! call, a vtable or a function pointer handed to a library, arrives at the new one.
+//! A program blaze-link linked calls every function a patch can replace through a slot of a
+//! jump table, and [`Live::start`] readies it to take patches: blaze-link writes each patch's
+//! code and data where it placed them, and the program switches to it in one atomic store
+//! ([`slots`]). No thread is stopped and no code a thread can be in is written over.
 //!
-//! [`Live::poll`] applies what came in since it was last called. Call it where nothing of
-//! the program's is half done, such as between two frames: a function the calling thread is
+//! [`Live::poll`] takes what came in since it was last called. Call it where nothing of the
+//! program's is half done, such as between two frames: a function the calling thread is
 //! running when its patch lands finishes as it was, and the next call runs the new code.
-//! v1 writes its jumps over the entries of functions and its statics with every other
-//! thread of the program stopped, and none strictly inside the bytes it writes (`apply`); a
-//! thread it can't stop, or one that stays inside, makes it refuse the patch. The jump-table
-//! runtime in [`slots`] stops no thread: it never writes over code a thread can be in, and
-//! writes data with atomic stores.
 //!
-//! Unsafe code is only in the modules that reach the kernel and the image's memory (the
-//! platforms', `sample`, and `slots`' platform, image and execution-log modules), each
-//! allowing it with its reason; the rest denies it, and `apply`, which checks every field of a
-//! patch against the image before any of those writes, forbids it. There is no safe version
-//! of them to pay for: std maps no executable memory, stops no thread and gives no view of
-//! the image's words at the addresses the linker placed them. A message is read in place by safe code only
+//! Unsafe code is only in the modules that reach the kernel and the image's memory (`slots`'
+//! platform, image and execution-log modules, and Windows' socket for [`edit`]), each allowing
+//! it with its reason; the rest denies it. There is no safe version of them to pay for: std
+//! maps no executable memory and gives no view of the image's words at the addresses the
+//! linker placed them. A message is read in place by safe code only
 //! ([`patch::Message::view`]), and the jump table's own words are `std` atomics at the
 //! addresses the linker gave them.
 //!
-//! What a patch cannot do, it says, and the program has to be started again: an edit that
-//! changes a type the rest of the program can see writes the whole object again, and a
-//! patch is for one executable, named by its `LC_UUID` (its GNU build ID on Linux, the GUID
-//! of its PDB on Windows).
+//! What a patch cannot do, it says, and the program has to be started again
+//! ([`Outcome::Restart`]).
 //!
-//! The daemon also tiers the program up while it runs: when it asks, a thread of this crate
-//! samples where the program's threads are, and the daemon compiles the functions they are
-//! found in again with LLVM and sends them as patches like any other. [`tiers`] says what it
-//! did, for the program to show. `BLAZE_TIER=off` in the
-//! program's environment turns the sampling off.
-//!
-//! macOS on AArch64, and Linux and Windows on x86-64; elsewhere [`Live::start`] says so.
+//! Linux on x86-64 and AArch64, macOS on AArch64 and Windows on x86-64; elsewhere
+//! [`Live::start`] says so.
 
 #![deny(unsafe_code)]
 
-use std::{fmt, path::PathBuf, sync::OnceLock, time::Duration};
+use std::{path::PathBuf, sync::OnceLock};
 
 #[cfg(test)]
 #[global_allocator]
@@ -49,7 +33,7 @@ static ALLOC: blaze_alloc_count::Counting = blaze_alloc_count::Counting;
 
 /// The setting `BLAZE_<name>`.
 fn setting(name: &str) -> Option<std::ffi::OsString> {
-    // alloc: setup, read when the runtime starts and when a program asks for its tiers
+    // alloc: setup, read when the program asks where the daemon is
     std::env::var_os(format!("BLAZE_{name}"))
 }
 
@@ -57,172 +41,16 @@ pub mod format;
 pub mod patch;
 pub mod slots;
 
-#[cfg(any(
-    test,
-    feature = "fuzz",
-    all(target_os = "macos", target_arch = "aarch64"),
-    all(target_os = "linux", target_arch = "x86_64"),
-    all(windows, target_arch = "x86_64")
-))]
-#[cfg_attr(feature = "fuzz", allow(dead_code, reason = "a host with no v1 runtime uses only `fuzz_checks`"))]
-mod apply;
-
-/// v1's checks of a decoded patch's code, in the order each platform's `apply` makes them
-/// before it maps or writes anything (`in_image` of every write over the executable at
-/// `image`, the plan of those writes, the claim of its room in `process`, the pointers slid
-/// in what it maps): the first refusal, or where the patch ends with what each platform's
-/// check of its unwind tables says (the run Linux registers, the FDEs macOS does, the
-/// `RUNTIME_FUNCTION`s Windows does, in that order), each reading `frames` its own way. For
-/// the fuzz target `live_patch`; it maps and writes nothing of the process's.
-#[cfg(feature = "fuzz")]
-pub fn fuzz_checks(
-    code: &format::Code,
-    mut process: format::Process,
-    slide: u64,
-    image: std::ops::Range<u64>,
-    page: u64,
-) -> Result<(u64, [Result<(), String>; 3]), String> {
-    apply::in_image(&code.writes, slide, &image)?;
-    let mut plan = apply::Plan::default();
-    apply::Overwrites::default().plan(code, slide, &mut plan)?;
-    let end = apply::claim(&mut process, code, page)?;
-    let len = usize::try_from(end - code.base).map_err(|_| "a patch larger than memory")?;
-    // alloc: the fuzz target's copy of what a platform would map
-    let mut memory = vec![0; len];
-    memory[..code.text.len()].copy_from_slice(&code.text);
-    memory[code.text.len()..code.text.len() + code.data.len()].copy_from_slice(&code.data);
-    for &pointer in &code.pointers {
-        apply::slide_at(&mut memory, pointer, slide)?;
-    }
-    let patch = code.base.wrapping_add(slide).wrapping_sub(image.start);
-    let unwind = [
-        apply::frame_run(&code.text, code.frames).map(drop),
-        // alloc: the fuzz target's, the buffers `fdes` fills for macOS
-        apply::fdes(&code.text, code.frames, &mut Vec::new(), &mut Vec::new()),
-        apply::functions(&memory, code.frames, patch).map(drop),
-    ];
-    Ok((end, unwind))
-}
-
-#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
-mod linux;
-#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-mod macos;
-#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-mod sample;
 #[cfg(all(windows, target_arch = "x86_64"))]
-mod windows;
+mod socket;
 
-/// The directory [`Live::start`] takes edits through.
+pub use slots::{Live, Outcome, Unwatched};
+
+/// The directory [`Live::start`] takes patches through.
 static DIR: OnceLock<PathBuf> = OnceLock::new();
 
-/// What became of a patch.
-#[derive(Debug)]
-pub enum Outcome {
-    Applied {
-        sequence: u64,
-        /// How many functions now jump to new code.
-        functions: u64,
-        /// How many statics were given another value.
-        statics: u64,
-        /// How many places an earlier edit wrote were put back as they first were.
-        restored: u64,
-        /// How long writing it into the program took.
-        took: Duration,
-        /// How long it waited between arriving and [`Live::poll`] applying it.
-        waited: Duration,
-    },
-    /// The edit needs the program started again, for this reason.
-    Restart(String),
-    /// The patch could not be applied, for this reason; the program runs on as it was.
-    Declined(String),
-}
-
-impl fmt::Display for Outcome {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Outcome::Applied { sequence, functions, statics, restored, took, waited } => {
-                write!(f, "edit {sequence} applied: {functions} functions")?;
-                if *statics != 0 {
-                    write!(f, ", {statics} statics")?;
-                }
-                if *restored != 0 {
-                    write!(f, ", {restored} put back")?;
-                }
-                write!(f, " in {took:.1?} after waiting {waited:.1?}")
-            }
-            Outcome::Restart(why) => write!(f, "restart needed: {why}"),
-            Outcome::Declined(why) => write!(f, "edit not applied: {why}"),
-        }
-    }
-}
-
-/// A program that takes edits while it runs.
-pub struct Live {
-    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-    inner: macos::Live,
-    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
-    inner: linux::Live,
-    #[cfg(all(windows, target_arch = "x86_64"))]
-    inner: windows::Live,
-}
-
-impl Live {
-    /// Sets aside room for edits next to the program's code and starts watching for them.
-    pub fn start() -> Result<Live, String> {
-        #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-        return macos::Live::start().map(|inner| Live { inner });
-        #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
-        return linux::Live::start().map(|inner| Live { inner });
-        #[cfg(all(windows, target_arch = "x86_64"))]
-        return windows::Live::start().map(|inner| Live { inner });
-        #[cfg(not(any(
-            all(target_os = "macos", target_arch = "aarch64"),
-            all(target_os = "linux", target_arch = "x86_64"),
-            all(windows, target_arch = "x86_64")
-        )))]
-        // alloc: error path, once at start on a platform it doesn't run on
-        Err("live edits run on macOS AArch64, Linux x86-64 and Windows x86-64".to_owned())
-    }
-
-    /// Applies the newest patch that came in since the last call, if any.
-    pub fn poll(&mut self) -> Option<Outcome> {
-        #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-        return self.inner.poll();
-        #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
-        return self.inner.poll();
-        #[cfg(all(windows, target_arch = "x86_64"))]
-        return self.inner.poll();
-        #[cfg(not(any(
-            all(target_os = "macos", target_arch = "aarch64"),
-            all(target_os = "linux", target_arch = "x86_64"),
-            all(windows, target_arch = "x86_64")
-        )))]
-        None
-    }
-
-    /// Applies each patch as soon as it comes, on a thread of its own, instead of at
-    /// [`Live::poll`], and tells `told` what became of it. For a program whose functions
-    /// can change between any two calls; one of many functions that work together can be
-    /// in the middle of a frame when some of them do.
-    pub fn apply_as_they_come(self, told: impl FnMut(Outcome) + Send + 'static) {
-        #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-        self.inner.apply_as_they_come(told);
-        #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
-        self.inner.apply_as_they_come(told);
-        #[cfg(all(windows, target_arch = "x86_64"))]
-        self.inner.apply_as_they_come(told);
-        #[cfg(not(any(
-            all(target_os = "macos", target_arch = "aarch64"),
-            all(target_os = "linux", target_arch = "x86_64"),
-            all(windows, target_arch = "x86_64")
-        )))]
-        drop(told);
-    }
-}
-
-/// The counters that code the daemon compiled to count its branches adds to, which the
-/// sampler reports with the samples. That code finds them by calling this, by name.
+/// The counters that code the daemon compiled to count its branches adds to. That code finds
+/// them by calling this, by name (`hir_ty_codegen::tier::COUNTERS`).
 // SAFETY: the `blaze_live_` prefix is this crate's, so no other item of a program exports
 // `blaze_live_counters`; a second one would fail the link or bind the daemon's code to the
 // wrong counters.
@@ -232,9 +60,8 @@ pub extern "C" fn blaze_live_counters() -> *mut u64 {
     COUNTERS.as_ptr() as *mut u64
 }
 
-/// [`blaze_live_counters`]'s: an `AtomicU64` is a `u64` in memory, and the sampler loads each
-/// atomically. The daemon's code must add to them atomically too (relaxed is enough), or its
-/// adds race the sampler's loads.
+/// [`blaze_live_counters`]'s: an `AtomicU64` is a `u64` in memory. The daemon's code must add
+/// to them atomically (relaxed is enough).
 static COUNTERS: [std::sync::atomic::AtomicU64; format::COUNTERS] =
     [const { std::sync::atomic::AtomicU64::new(0) }; format::COUNTERS];
 
@@ -269,7 +96,7 @@ pub fn edit(path: &std::path::Path, text: &str) -> Result<String, String> {
     #[cfg(unix)]
     let stream = std::os::unix::net::UnixStream::connect(&socket);
     #[cfg(windows)]
-    let stream = windows::Socket::connect(&socket);
+    let stream = socket::Socket::connect(&socket);
     // alloc: error path
     let mut stream = stream.map_err(|it| format!("no daemon at {}: {it}", socket.display()))?;
     // alloc: error path

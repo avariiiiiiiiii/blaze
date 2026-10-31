@@ -13,7 +13,7 @@
 //! `compiler/rustc_target/src/asm/mod.rs` (`InlineAsmArch::from_arch`) (MIT or Apache-2.0).
 
 use hir::{InFile, MacroCallId};
-use ra_ap_rustc_parse_format as parse_format;
+use rustc_parse_format as parse_format;
 use syntax::{
     SyntaxKind, SyntaxNodePtr, T,
     view::{self as ast, AstNode as _, AstToken as _, HasLoopBody as _, IsString as _},

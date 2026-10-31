@@ -562,6 +562,9 @@ impl Session {
             Request::Pack { view, targets, program } => {
                 self.build(cx, req, &view, Work::Pack { targets, program })?
             }
+            Request::Doc { view, targets, no_deps, private } => {
+                self.build(cx, req, &view, Work::Doc { targets, no_deps, private })?
+            }
             Request::Reach { from, to, targets } => {
                 let from = resolve(cx.vfs, &from)?;
                 let to = resolve(cx.vfs, &to)?;
@@ -962,7 +965,8 @@ fn incremental(work: &Work) -> bool {
         | Work::Run { .. }
         | Work::CodegenInputs(_)
         | Work::Trace(_)
-        | Work::Pack { .. } => true,
+        | Work::Pack { .. }
+        | Work::Doc { .. } => true,
         Work::Reach { .. }
         | Work::Verify(_)
         | Work::Snapshot

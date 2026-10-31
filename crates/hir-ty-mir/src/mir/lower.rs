@@ -4701,24 +4701,46 @@ pub(crate) fn build_mir_body<'db>(db: &'db Db, owner: MirOwner<'db>) -> Result<'
     }
 }
 
-/// Refuses a body with a macro call that failed to expand, or whose expansion is not what
+/// Stops at a body with a macro call that failed to expand, or whose expansion is not what
 /// rustc parses it as: what stands in for the expansion is a guess, where rustc stops.
 fn check_expansions<'db>(db: &'db Db, owner: InferBodyId<'db>) -> Result<'db, ()> {
-    if let Some(message) = failed_expansion(db, owner) {
-        not_supported!("{message}");
+    match failed_expansion(db, owner) {
+        None => Ok(()),
+        // The expansion's error is reported at the call; rustc lowers the call to
+        // `ExprKind::Err`, which taints the body, and builds and checks nothing of it.
+        Some(UnexpandedCall::Failed) => Err(MirLowerError::HasErrors),
+        Some(UnexpandedCall::Misparsed(message)) => not_supported!("{message}"),
     }
-    Ok(())
 }
 
-/// What is wrong with the first macro call of the body, in the order lowering met them, that
-/// failed to expand or whose expansion is not what rustc parses it as. It reads the store's
-/// macro calls and their sites, not the source map, so lowering a body never builds its map.
+/// Whether a macro call of `owner`'s body failed to expand: its error is reported at the call
+/// and taints the body, as rustc's `ExprKind::Err` does, so no borrow check or build reads it.
+pub fn has_failed_expansion<'db>(db: &'db Db, owner: InferBodyId<'db>) -> bool {
+    matches!(failed_expansion(db, owner), Some(UnexpandedCall::Failed))
+}
+
+/// What keeps a body's macro calls from being lowered.
+#[derive(Debug, Clone, PartialEq, Eq, blaze_query::Value)]
+enum UnexpandedCall {
+    /// One failed to expand, an error at the call.
+    Failed,
+    /// The first whose expansion is not what rustc parses it as, and why.
+    Misparsed(String),
+}
+
+/// What keeps the body's macro calls from being lowered: one that failed to expand, else the
+/// first, in the order lowering met them, whose expansion is not what rustc parses it as. It
+/// reads the store's macro calls and their sites, not the source map, so lowering a body
+/// never builds its map.
 #[blaze_query::tracked(returns(ref))]
-fn failed_expansion<'db>(db: &'db Db, owner: InferBodyId<'db>) -> Option<String> {
+fn failed_expansion<'db>(db: &'db Db, owner: InferBodyId<'db>) -> Option<UnexpandedCall> {
     use syntax::view::AstNode;
     let calls = ExpressionStore::of(db, owner.expression_store_owner(db)).macro_calls();
     if calls.is_empty() {
         return None;
+    }
+    if calls.iter().any(|&call| call.parse_macro_expansion(db).err.is_some()) {
+        return Some(UnexpandedCall::Failed);
     }
     let site_of = |call: hir_expand::MacroCallId| {
         let site = call.loc(db).to_node_view(db);
@@ -4727,13 +4749,8 @@ fn failed_expansion<'db>(db: &'db Db, owner: InferBodyId<'db>) -> Option<String>
     // The call a macro file of the body is the expansion of, for one last in it.
     let enclosing =
         |file: hir_expand::MacroCallId| if calls.contains(&file) { site_of(file) } else { None };
-    calls.iter().find_map(|&call| {
+    let misparsed = calls.iter().find_map(|&call| {
         let expansion = call.parse_macro_expansion(db);
-        if let Some(error) = &expansion.err {
-            let message = error.render_to_string(db).message;
-            // alloc: the refusal's message, made only for a body that is refused
-            return Some(format!("macro call that failed to expand: {message}"));
-        }
         // A builtin's expansion is rust-analyzer's own stand-in (`builtin #asm (..)`), not
         // what rustc parses: the rule is of what a macro is written to expand to.
         let written = matches!(
@@ -4793,7 +4810,8 @@ fn failed_expansion<'db>(db: &'db Db, owner: InferBodyId<'db>) -> Option<String>
             "macro call in parentheses or brackets with no `;` after it, which rustc \
              parses as one expression, whose expansion is {what}"
         ))
-    })
+    });
+    misparsed.map(UnexpandedCall::Misparsed)
 }
 
 /// Whether rustc parses `call` as an expression (`parse_stmt_mac`): in statement position,

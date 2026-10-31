@@ -182,7 +182,7 @@ fn no() {}
             [
                 "EditionedFileId::parse_",
                 "file_item_tree_query",
-                "HirFileId::ast_id_map_",
+                "HirFileId::ast_id_map",
                 "real_span_map",
             ]
         "#]],
@@ -226,11 +226,11 @@ pub struct S {}
             [
                 "EditionedFileId::parse_",
                 "file_item_tree_query",
-                "HirFileId::ast_id_map_",
+                "HirFileId::ast_id_map",
                 "real_span_map",
-                "MacroCallId::macro_arg_",
-                "MacroCallId::parse_macro_expansion_",
-                "HirFileId::ast_id_map_",
+                "MacroCallId::macro_arg",
+                "MacroCallId::parse_macro_expansion",
+                "HirFileId::ast_id_map",
                 "file_item_tree_query",
             ]
         "#]],
@@ -265,13 +265,13 @@ fn f() { foo }
         expect![[r#"
             [
                 "EditionedFileId::parse_",
-                "HirFileId::ast_id_map_",
+                "HirFileId::ast_id_map",
                 "file_item_tree_query",
                 "real_span_map",
-                "MacroCallId::macro_arg_",
-                "MacroCallId::proc_macro_expansion_",
-                "MacroCallId::parse_macro_expansion_",
-                "HirFileId::ast_id_map_",
+                "MacroCallId::macro_arg",
+                "MacroCallId::proc_macro_expansion",
+                "MacroCallId::parse_macro_expansion",
+                "HirFileId::ast_id_map",
                 "file_item_tree_query",
             ]
         "#]],
@@ -365,11 +365,11 @@ pub struct S {}
             [
                 "EditionedFileId::parse_",
                 "file_item_tree_query",
-                "HirFileId::ast_id_map_",
+                "HirFileId::ast_id_map",
                 "real_span_map",
-                "MacroCallId::macro_arg_",
-                "AstId < ast :: Macro >::decl_macro_expander_",
-                "MacroCallId::macro_arg_",
+                "MacroCallId::macro_arg",
+                "AstId::decl_macro_expander",
+                "MacroCallId::macro_arg",
             ]
         "#]],
     );
@@ -469,11 +469,11 @@ m!(Z);
             [
                 "EditionedFileId::parse_",
                 "file_item_tree_query",
-                "HirFileId::ast_id_map_",
+                "HirFileId::ast_id_map",
                 "real_span_map",
-                "MacroCallId::macro_arg_",
-                "MacroCallId::macro_arg_",
-                "MacroCallId::macro_arg_",
+                "MacroCallId::macro_arg",
+                "MacroCallId::macro_arg",
+                "MacroCallId::macro_arg",
             ]
         "#]],
     );
@@ -525,7 +525,7 @@ pub type Ty = ();
             [
                 "EditionedFileId::parse_",
                 "file_item_tree_query",
-                "HirFileId::ast_id_map_",
+                "HirFileId::ast_id_map",
                 "real_span_map",
             ]
         "#]],
@@ -557,7 +557,7 @@ fn execute_assert_write(
 fn assert_events(events: &[String], required: &[(&str, usize)], expect: Expect) {
     for (event, count) in required {
         let n = events.iter().filter(|it| it.contains(event)).count();
-        assert_eq!(n, *count, "Expected {event} to be executed {count} times, but only got {n}");
+        assert_eq!(n, *count, "Expected {event} to be executed {count} times, but got {n}: {events:#?}");
     }
     expect.assert_debug_eq(&events);
 }

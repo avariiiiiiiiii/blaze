@@ -190,7 +190,7 @@ impl<'db> SourceAnalyzer<'db> {
 
     pub(crate) fn type_of_type_view(&self, db: &'db Db, ty: ast::Type<'_>) -> Option<Type<'db>> {
         let type_ref = self.type_id_view(ty)?;
-        let generic_def = self.resolver.generic_def()?;
+        let generic_def = self.generic_def(db)?;
         let store = self.store()?;
         let generics = OnceCell::new();
         let ty = blaze_mem::frame::task(blaze_mem::Tag::Infer, |frame| {

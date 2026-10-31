@@ -34,8 +34,8 @@ tracing.workspace = true
 blaze-manifest.workspace = true
 intern.workspace = true
 parser.workspace = true
-# The lexer rust-analyzer's parser uses, cooked into rustc's tokens by `parse::lexer`.
-ra-ap-rustc_lexer.workspace = true
+# The pinned nightly's lexer, cooked into rustc's tokens by `parse::lexer`.
+rustc_lexer.workspace = true
 syntax.workspace = true
 
 # `cargo fmt -q` sends rustfmt's standard output to /dev/null, as cargo-fmt does its child's.

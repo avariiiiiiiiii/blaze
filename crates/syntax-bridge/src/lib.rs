@@ -828,16 +828,68 @@ impl<'t> TokenConverter for StaticRawConverter<'t> {
     }
 }
 
-/// A token of a flat tree.
+/// The ends of the dot and of the last of the pieces a float the parser split as a field name
+/// (`x.0.1`, `x.0. await`) would be, for an `INT_NUMBER` at `int` and the tokens `next` gives
+/// after it: the `.` right after it and the `INT_NUMBER` right after that, if any.
+fn float_pieces(
+    int: TextRange,
+    mut next: impl Iterator<Item = (SyntaxKind, TextRange)>,
+) -> Option<[TextSize; 2]> {
+    let (_, dot) =
+        next.next().filter(|&(kind, range)| kind == T![.] && range.start() == int.end())?;
+    let end = match next.next() {
+        Some((INT_NUMBER, frac)) if frac.start() == dot.end() => frac.end(),
+        _ => dot.end(),
+    };
+    Some([dot.end(), end])
+}
+
+/// Whether a token of `kind` at `range`, after `prev`, may be a later piece of a float the
+/// parser split: a `.` or an `INT_NUMBER` right after a token of the other kind.
+fn may_continue_float(
+    kind: SyntaxKind,
+    range: TextRange,
+    prev: Option<(SyntaxKind, TextRange)>,
+) -> bool {
+    prev.is_some_and(|(prev, at)| {
+        at.end() == range.start()
+            && matches!((prev, kind), (INT_NUMBER, T![.]) | (T![.], INT_NUMBER))
+    })
+}
+
+/// The float literal starting at `int`, an `INT_NUMBER` that starts a token of the source's
+/// lexing, when the parser split it into the pieces ending at `ends` ([`float_pieces`]):
+/// `window` is the source from `int` to the char after the pieces, and the lexer's first token
+/// there is a float ending at a piece's end. rustc's tokens, which a macro sees, hold the float.
+/// A number lexes alike in every edition, and the lexer reads one char past its end at most.
+fn split_float(int: TextRange, ends: [TextSize; 2], window: &str) -> Option<TextRange> {
+    let lexed = parser::LexedStr::new(Edition::CURRENT, window);
+    if lexed.is_empty() || lexed.kind(0) != FLOAT_NUMBER {
+        return None;
+    }
+    let end = int.start() + TextSize::try_from(lexed.text_len(0)).ok()?;
+    ends.contains(&end).then(|| TextRange::new(int.start(), end))
+}
+
+/// The end of the text a window for [`split_float`] ending at `end` takes: `end` and the char
+/// after it.
+fn window_end(source: &str, end: TextSize) -> usize {
+    let end = usize::from(end);
+    end + source[end..].chars().next().map_or(0, char::len_utf8)
+}
+
+/// A token of a flat tree, with the source its range indexes.
 #[derive(Debug, Clone, Copy)]
 struct FlatTok<'t> {
     kind: SyntaxKind,
     range: TextRange,
     text: &'t str,
+    source: &'t str,
 }
 
 /// The tokens of a node of a flat tree in order, through the parts of the lazy nodes in it
 /// (parsing them) and the part of the node itself if it is lazy.
+#[derive(Clone)]
 struct FlatTokens<'t> {
     /// The trees being walked, the innermost last: each with its next element, the element its
     /// walk ends before, and where the next element starts.
@@ -885,7 +937,8 @@ impl<'t> Iterator for FlatTokens<'t> {
             if tree.is_token(at) {
                 let kind = SyntaxKind::from(tree.kind(at).0);
                 debug_assert_eq!(range, tree.range(at));
-                return Some(FlatTok { kind, range, text: &tree.text()[range] });
+                let source = tree.text();
+                return Some(FlatTok { kind, range, text: &source[range], source });
             }
             if tree.is_lazy(at) {
                 self.enter(tree, at);
@@ -898,6 +951,11 @@ impl<'t> Iterator for FlatTokens<'t> {
 struct FlatConverter<'t, SpanMap> {
     tokens: FlatTokens<'t>,
     current: Option<FlatTok<'t>>,
+    /// The float in the node that the parser split and `current` is the first piece of.
+    float: Option<TextRange>,
+    /// Whether `current` ends a token of the source's lexing.
+    ends_token: bool,
+    range: TextRange,
     punct_offset: Option<(FlatTok<'t>, TextSize)>,
     /// Used to make the emitted text ranges in the spans relative to the span anchor.
     map: SpanMap,
@@ -915,7 +973,53 @@ impl<'t, SpanMap> FlatConverter<'t, SpanMap> {
     ) -> Self {
         let mut tokens = FlatTokens::new(tree, at);
         let current = tokens.next();
-        FlatConverter { tokens, current, punct_offset: None, map, call_site, mode }
+        let range = tree.range(at);
+        let mut converter = FlatConverter {
+            tokens,
+            current,
+            float: None,
+            ends_token: false,
+            range,
+            punct_offset: None,
+            map,
+            call_site,
+            mode,
+        };
+        converter.settle(Some(range.start()));
+        converter
+    }
+
+    /// Reads `current` against the source's lexing, `boundary` being where the token before it
+    /// ended when that ended a token of the lexing: the walk has no gaps, so `current` starts
+    /// one exactly when it starts there.
+    fn settle(&mut self, boundary: Option<TextSize>) {
+        self.float = None;
+        self.ends_token = false;
+        let Some(token) = self.current else { return };
+        if boundary != Some(token.range.start()) {
+            return;
+        }
+        self.ends_token = true;
+        if token.kind != INT_NUMBER
+            || token.source.as_bytes().get(usize::from(token.range.end())) != Some(&b'.')
+        {
+            return;
+        }
+        let next = self.tokens.clone().map(|it| (it.kind, it.range));
+        let Some(ends) = float_pieces(token.range, next) else { return };
+        let window =
+            &token.source[usize::from(token.range.start())..window_end(token.source, ends[1])];
+        match split_float(token.range, ends, window) {
+            Some(float) if self.range.contains_range(float) => self.float = Some(float),
+            Some(_) => self.ends_token = false,
+            None => {}
+        }
+    }
+
+    /// The float `current` is the first piece of, as one token.
+    fn float_token(&self, token: FlatTok<'t>, float: TextRange) -> FlatTok<'t> {
+        let source = token.source;
+        FlatTok { kind: FLOAT_NUMBER, range: float, text: &source[float], source }
     }
 }
 
@@ -979,7 +1083,16 @@ where
         }
 
         let curr = self.current?;
+        if let Some(float) = self.float {
+            while self.current.is_some_and(|it| it.range.start() < float.end()) {
+                self.current = self.tokens.next();
+            }
+            self.settle(Some(float.end()));
+            self.punct_offset = None;
+            return Some((FlatToken::Ordinary(self.float_token(curr, float)), float));
+        }
         self.current = self.tokens.next();
+        self.settle(self.ends_token.then_some(curr.range.end()));
         let token = if curr.kind.is_punct() {
             self.punct_offset = Some((curr, 0.into()));
             let range = TextRange::at(curr.range.start(), TextSize::of('.'));
@@ -1000,6 +1113,9 @@ where
         }
 
         let curr = self.current?;
+        if let Some(float) = self.float {
+            return Some(FlatToken::Ordinary(self.float_token(curr, float)));
+        }
         let token = if curr.kind.is_punct() {
             FlatToken::Punct { token: curr, offset: 0_usize }
         } else {
@@ -1057,6 +1173,10 @@ impl blaze_mem::scratch::Shelved for PendingLeaves {
 
 struct ViewConverter<'t, SpanMap, OnEvent, A: Allocator + Clone> {
     current: Option<syntax::view::Token<'t>>,
+    /// The float in the node that the parser split and `current` is the first piece of.
+    float: Option<TextRange>,
+    /// Whether `current` ends a token of the source's lexing.
+    ends_token: bool,
     current_leaves: blaze_mem::scratch::Lent<PendingLeaves>,
     preorder: syntax::view::PreorderWithTokens<'t>,
     range: TextRange,
@@ -1087,6 +1207,8 @@ where
     ) -> Self {
         let mut converter = ViewConverter {
             current: None,
+            float: None,
+            ends_token: false,
             preorder: node.preorder_with_tokens(),
             range: node.text_range(),
             punct_offset: None,
@@ -1099,7 +1221,39 @@ where
             on_event,
         };
         converter.current = converter.next_token();
+        converter.settle(Some(converter.range.start()));
         converter
+    }
+
+    /// Reads `current` against the source's lexing, `boundary` being where the token before it
+    /// ended when that ended a token of the lexing. After a gap in the walk `current` starts a
+    /// token of the lexing unless it may be a later piece of a split float: a `.` or an
+    /// `INT_NUMBER` right after a token of the other kind.
+    fn settle(&mut self, boundary: Option<TextSize>) {
+        self.float = None;
+        self.ends_token = false;
+        let Some(token) = self.current else { return };
+        let range = token.text_range();
+        let prev = || token.prev_token().map(|it| (it.kind(), it.text_range()));
+        if boundary != Some(range.start()) && may_continue_float(token.kind(), range, prev()) {
+            return;
+        }
+        self.ends_token = true;
+        let source = token.flat().0.text();
+        if token.kind() != INT_NUMBER
+            || source.as_bytes().get(usize::from(range.end())) != Some(&b'.')
+        {
+            return;
+        }
+        let next = std::iter::successors(token.next_token(), |it| it.next_token())
+            .map(|it| (it.kind(), it.text_range()));
+        let Some(ends) = float_pieces(range, next) else { return };
+        let window = &source[usize::from(range.start())..window_end(source, ends[1])];
+        match split_float(range, ends, window) {
+            Some(float) if self.range.contains_range(float) => self.float = Some(float),
+            Some(_) => self.ends_token = false,
+            None => {}
+        }
     }
 
     fn next_token(&mut self) -> Option<syntax::view::Token<'t>> {
@@ -1139,6 +1293,7 @@ where
 enum ViewToken<'t> {
     Ordinary(syntax::view::Token<'t>),
     Punct { token: syntax::view::Token<'t>, offset: usize },
+    Float(&'t str),
     Leaf(tt::Leaf),
 }
 
@@ -1146,7 +1301,7 @@ impl<'t> ViewToken<'t> {
     fn token(&self) -> syntax::view::Token<'t> {
         match self {
             ViewToken::Ordinary(it) | ViewToken::Punct { token: it, offset: _ } => *it,
-            ViewToken::Leaf(_) => unreachable!(),
+            ViewToken::Float(_) | ViewToken::Leaf(_) => unreachable!(),
         }
     }
 }
@@ -1160,6 +1315,7 @@ impl<'t, SpanMap, OnEvent, A: Allocator + Clone> SrcToken<ViewConverter<'t, Span
             ViewToken::Punct { token, offset: i } => {
                 SyntaxKind::from_char(punct_char(token.text(), *i).unwrap()).unwrap()
             }
+            ViewToken::Float(_) => FLOAT_NUMBER,
             ViewToken::Leaf(_) => {
                 never!();
                 SyntaxKind::ERROR
@@ -1168,13 +1324,14 @@ impl<'t, SpanMap, OnEvent, A: Allocator + Clone> SrcToken<ViewConverter<'t, Span
     }
     fn to_char(&self, _ctx: &ViewConverter<'t, SpanMap, OnEvent, A>) -> Option<char> {
         match self {
-            ViewToken::Ordinary(_) | ViewToken::Leaf(_) => None,
+            ViewToken::Ordinary(_) | ViewToken::Float(_) | ViewToken::Leaf(_) => None,
             ViewToken::Punct { token, offset: i } => punct_char(token.text(), *i),
         }
     }
     fn to_text<'a>(&'a self, _ctx: &'a ViewConverter<'t, SpanMap, OnEvent, A>) -> &'a str {
         match self {
             ViewToken::Ordinary(token) | ViewToken::Punct { token, offset: _ } => token.text(),
+            ViewToken::Float(text) => text,
             ViewToken::Leaf(_) => {
                 never!();
                 ""
@@ -1183,7 +1340,7 @@ impl<'t, SpanMap, OnEvent, A: Allocator + Clone> SrcToken<ViewConverter<'t, Span
     }
     fn as_leaf(&self) -> Option<&tt::Leaf> {
         match self {
-            ViewToken::Ordinary(_) | ViewToken::Punct { .. } => None,
+            ViewToken::Ordinary(_) | ViewToken::Punct { .. } | ViewToken::Float(_) => None,
             ViewToken::Leaf(it) => Some(it),
         }
     }
@@ -1229,8 +1386,18 @@ where
             return None;
         }
 
-        self.current = self.next_token();
         let range = curr.text_range();
+        if let Some(float) = self.float {
+            self.current = self.next_token();
+            while self.current.is_some_and(|it| it.text_range().start() < float.end()) {
+                self.current = self.next_token();
+            }
+            self.settle(Some(float.end()));
+            self.punct_offset = None;
+            return Some((ViewToken::Float(&curr.flat().0.text()[float]), float));
+        }
+        self.current = self.next_token();
+        self.settle(self.ends_token.then_some(range.end()));
         let token = if curr.kind().is_punct() {
             self.punct_offset = Some((curr, 0.into()));
             let range = TextRange::at(range.start(), TextSize::of('.'));
@@ -1253,6 +1420,9 @@ where
         let curr = self.current?;
         if !self.range.contains_range(curr.text_range()) {
             return None;
+        }
+        if let Some(float) = self.float {
+            return Some(ViewToken::Float(&curr.flat().0.text()[float]));
         }
         Some(match curr.kind().is_punct() {
             true => ViewToken::Punct { token: curr, offset: 0 },

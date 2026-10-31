@@ -972,8 +972,10 @@ fn root_code(db: &Db, func: FunctionId, tier: bool) -> Result<Produced> {
     })
 }
 
-/// The crates of a program of `crates`: what they depend on, but not through a proc macro,
-/// which is a library of the compiler's.
+/// The crates of a program of `crates`: what they name
+/// ([`hir_def::nameres::named::named_dependencies`]), as rustc loads them, and what that names
+/// in turn, but not through a proc macro, which is a library of the compiler's. A dependency
+/// nothing names is not linked, nor its constructors, `#[used]` statics or allocator.
 fn linked_crates(
     db: &Db,
     crates: impl IntoIterator<Item = Crate>,
@@ -983,7 +985,7 @@ fn linked_crates(
     let mut stack: Vec<Crate> = crates.into_iter().collect();
     while let Some(krate) = stack.pop() {
         if linked.insert(krate) {
-            let deps = krate.data(db).dependencies.iter().map(|it| it.crate_id);
+            let deps = hir_def::nameres::named::named_dependencies(db, krate).iter().copied();
             stack.extend(deps.filter(|it| !it.data(db).target_kind.is_proc_macro()));
         }
     }

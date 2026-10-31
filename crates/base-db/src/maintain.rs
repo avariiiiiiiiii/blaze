@@ -113,8 +113,8 @@ pub(crate) struct Maintenance {
     maintained: Vec<Maintained>,
 }
 
-/// A pending [`Written`], owned. Its buffers are kept from one pass to the next.
-#[derive(Default)]
+/// A pending [`Written`], owned. Its buffers are kept from one pass to the next, and made with
+/// room for [`PENDING_ROOM`] of each, so the first writes of a new database grow none of them.
 struct Pending {
     set: Vec<FileId>,
     added: Vec<FileId>,
@@ -124,7 +124,37 @@ struct Pending {
     included: Vec<IncludedFile>,
 }
 
+/// What each of [`Pending`]'s lists has room for when the database is made: an edit's files.
+const PENDING_ROOM: usize = 64;
+
+impl Default for Pending {
+    fn default() -> Pending {
+        // alloc: once a database, as it is made.
+        Pending {
+            set: Vec::with_capacity(PENDING_ROOM),
+            added: Vec::with_capacity(PENDING_ROOM),
+            removed: Vec::with_capacity(PENDING_ROOM),
+            roots: Vec::with_capacity(PENDING_ROOM),
+            crates: false,
+            included: Vec::with_capacity(PENDING_ROOM),
+        }
+    }
+}
+
 impl Pending {
+    /// No lists and no room: what stands in for the pending writes while the maintainers read
+    /// them.
+    const fn empty() -> Pending {
+        Pending {
+            set: Vec::new(), // alloc: none, an empty list
+            added: Vec::new(), // alloc: see above
+            removed: Vec::new(), // alloc: see above
+            roots: Vec::new(), // alloc: see above
+            crates: false,
+            included: Vec::new(), // alloc: see above
+        }
+    }
+
     fn is_empty(&self) -> bool {
         self.written().is_empty()
     }
@@ -356,7 +386,7 @@ impl Db {
         }
         self.maintenance.pending.normalize();
         self.maintenance.passes = self.maintenance.passes.saturating_add(1);
-        let pending = std::mem::take(&mut self.maintenance.pending);
+        let pending = std::mem::replace(&mut self.maintenance.pending, Pending::empty());
         self.maintenance.maintaining = true;
         let ran = panic::catch_unwind(AssertUnwindSafe(|| {
             let written = pending.written();

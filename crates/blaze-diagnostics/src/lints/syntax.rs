@@ -823,7 +823,8 @@ extern "C" {
                     }
                 }
             }
-            assert!(owners >= 10, "{owners}");
+            // `f`'s body is no owner of its own: its inner attribute is `f`'s, as rustc reads it.
+            assert!(owners >= 9, "{owners}");
         });
         walked(&crate::lints::quiet_crate(3), |_, walk| {
             assert!(walk.trees.iter().all(|tree| tree.attrs.iter().all(|&it| !it)));

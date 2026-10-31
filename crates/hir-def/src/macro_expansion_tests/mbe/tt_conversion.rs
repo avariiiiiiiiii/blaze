@@ -42,7 +42,7 @@ macro_rules! m {
     }
 }
 fn f() {
-    m!()
+    m!();
 }
 "#,
         expect![[r#"
@@ -62,7 +62,7 @@ fn f() {
     let _ = 12E+99_f64;
     let _ = 45E+1234_f128;
     let _ = "rust1";
-    let _ = -92;
+    let _ = -92;;
 }
 "#]],
     );

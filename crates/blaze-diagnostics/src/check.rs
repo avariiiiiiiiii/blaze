@@ -25,7 +25,7 @@ use crate::{
     cx::{Cx, Files},
     emit, lints,
     lower::{self, Found, Phase},
-    model::Diag,
+    model::{Breakage, Diag},
 };
 
 /// What a crate is checked with: the flags of rustc's that change what it says.
@@ -37,6 +37,10 @@ pub struct Options {
     /// `-Z deduplicate-diagnostics=no`, as compiletest gives every UI test: a diagnostic
     /// identical to one written is written again, with a note that it is.
     pub keep_duplicates: bool,
+    /// The future-incompatibility report `--error-format=json` gives after the closing lines,
+    /// which compiletest writes into a UI test's stderr: a copy of each diagnostic of a lint
+    /// with `report_in_deps`, allowed ones too, as [`Breakage::Reported`].
+    pub future_breakage_report: bool,
 }
 
 /// What rustc says compiling `krate`: its diagnostics in the order it writes them, then its
@@ -146,11 +150,7 @@ fn finish(diags: Vec<Diag>, keep_duplicates: bool) -> Vec<Diag> {
     seen.reserve(diags.len());
     let mut written = Vec::with_capacity(diags.len());
     for mut diag in diags {
-        if diag.span.primary.iter().any(|it| it.expansion.is_some())
-            && !diag.children.iter().any(|it| it.message.contains("(in Nightly builds, run with -Z macro-backtrace for more info)"))
-        {
-            diag.originates_in();
-        }
+        note_origin(&mut diag);
         let already = !seen.insert(key(&diag));
         if already && !keep_duplicates {
             continue;
@@ -162,6 +162,15 @@ fn finish(diags: Vec<Diag>, keep_duplicates: bool) -> Vec<Diag> {
         written.push(diag);
     }
     written
+}
+
+/// The note of the macro `diag` came from, as rustc's emitter writes it, unless it has one.
+fn note_origin(diag: &mut Diag) {
+    if diag.span.primary.iter().any(|it| it.expansion.is_some())
+        && !diag.children.iter().any(|it| it.message.contains("(in Nightly builds, run with -Z macro-backtrace for more info)"))
+    {
+        diag.originates_in();
+    }
 }
 
 /// rustc's key for a diagnostic already emitted (`DiagCtxtInner::emitted_diagnostics`, a set of
@@ -193,11 +202,23 @@ impl Hasher for Blake3 {
     }
 }
 
-/// `diags` as rustc writes them, then its closing lines.
+/// `diags` as rustc writes them, then its closing lines, then the future-incompatibility
+/// report when `options` asks for it: rustc keeps each one for it as it is emitted, before it
+/// is deduplicated (`DiagCtxtInner::emit_diagnostic`).
 fn written(diags: Vec<Diag>, options: &Options) -> Vec<Diag> {
+    let report: Vec<Diag> = match options.future_breakage_report {
+        true => diags.iter().filter(|it| !it.breakage.is_none()).cloned().collect(), // clone: the report's copies
+        false => Vec::new(), // alloc: empty, allocates nothing
+    };
+    let diags = diags.into_iter().filter(|it| it.breakage != Breakage::Unwritten).collect();
     let mut written = finish(diags, options.keep_duplicates);
     let closing = emit::summary(written.iter());
     written.extend(closing);
+    for mut diag in report {
+        diag.breakage = Breakage::Reported;
+        note_origin(&mut diag);
+        written.push(diag);
+    }
     written
 }
 
@@ -297,5 +318,31 @@ mod tests {
         assert_eq!(diags[1].children.last().map(|it| it.message.as_str()), Some(DUPLICATE));
         let closing = emit::summary(diags.iter());
         assert_eq!(closing[0].message, "aborting due to 2 previous errors");
+    }
+
+    #[test]
+    fn the_future_breakage_report_follows_the_closing_lines_with_the_allowed_too() {
+        let mut denied = Diag::lint("conflicting_repr_hints", "conflicting representation hints", at(0));
+        denied.level = Level::Error;
+        denied.breakage = Breakage::Written;
+        let mut allowed = Diag::lint("semicolon_in_expressions_from_macros", "trailing semicolon", at(5));
+        allowed.breakage = Breakage::Unwritten;
+        let diags = vec![denied.clone(), allowed.clone()];
+
+        let options = Options { future_breakage_report: true, ..Options::default() };
+        let out = written(diags.clone(), &options);
+        let shown: Vec<(&str, Breakage)> = out.iter().map(|it| (it.message.as_str(), it.breakage)).collect();
+        assert_eq!(
+            shown,
+            [
+                ("conflicting representation hints", Breakage::Written),
+                ("aborting due to 1 previous error", Breakage::None),
+                ("conflicting representation hints", Breakage::Reported),
+                ("trailing semicolon", Breakage::Reported),
+            ]
+        );
+
+        let out = written(diags, &Options::default());
+        assert_eq!(out.len(), 2, "no report, and the allowed one not written: {out:?}");
     }
 }

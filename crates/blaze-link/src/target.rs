@@ -44,15 +44,17 @@
 #[cfg(test)]
 mod tests;
 
+use std::cell::RefCell;
 use std::fmt::Write as _;
 use std::io::Read as _;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::{Arc, Mutex, PoisonError};
 
 use blaze_codegen::settings::{Sanitize, Sanitizers};
 use blaze_codegen::{Arch, NativeLib, NativeLibKind};
 use blaze_ids::ContentId;
+use rustc_hash::{FxHashMap, FxHashSet};
 use smallvec::SmallVec;
 
 use crate::{Debug, Format, LinkError, Native, NativeKind, Output, OutputKind, Platform};
@@ -316,7 +318,8 @@ fn locate_with<A: Ask>(
     let runtimes = runtimes(target, output, sysroot)?;
     let found = cache.found(ask, target, Some(sysroot))?;
     let executable = matches!(output.kind, OutputKind::Executable { .. });
-    let mut line = Line { cache, output, search, found: &found, out: Vec::with_capacity(libs.len() + 8) };
+    let mut line =
+        Line { cache, output, search, found: &found, out: Vec::with_capacity(libs.len() + 8), listings: RefCell::default() };
     for name in target.start(executable) {
         line.object(name)?;
     }
@@ -1009,6 +1012,22 @@ struct Line<'a> {
     search: &'a [PathBuf],
     found: &'a Found,
     out: Vec<Located>,
+    /// Each search directory's entry names, read once per link ([`listing`]).
+    listings: RefCell<FxHashMap<PathBuf, Option<Listing>>>,
+}
+
+/// A directory's entry names, ASCII lowercased.
+type Listing = FxHashSet<Box<[u8]>>;
+
+/// The entry names of `dir`, ASCII lowercased; none when it or an entry can't be read, which
+/// leaves every name of it to a stat, as a directory that can be searched but not listed is.
+fn listing(dir: &Path) -> Option<Listing> {
+    let mut names = Listing::default();
+    for entry in std::fs::read_dir(dir).ok()? {
+        // alloc: once per entry of a search directory per link
+        names.insert(entry.ok()?.file_name().as_encoded_bytes().to_ascii_lowercase().into_boxed_slice());
+    }
+    Some(names)
 }
 
 impl Line<'_> {
@@ -1019,6 +1038,27 @@ impl Line<'_> {
             false => &self.found.dirs,
         };
         self.search.iter().chain(theirs).map(PathBuf::as_path)
+    }
+
+    /// Whether `dir` may have `file`: false only when no entry of `dir` is `file`'s first
+    /// component with ASCII case ignored, so a miss costs no syscall and a case-insensitive file
+    /// system still finds what a stat finds. A name the listing can't answer for (not ASCII, or
+    /// not starting with a plain name) is a maybe.
+    fn may_have(&self, dir: &Path, file: &str) -> bool {
+        let Some(Component::Normal(first)) = Path::new(file).components().next() else { return true };
+        if !file.is_ascii() {
+            return true;
+        }
+        let mut listings = self.listings.borrow_mut();
+        if !listings.contains_key(dir) {
+            // alloc: once per search directory per link
+            listings.insert(dir.to_path_buf(), listing(dir));
+        }
+        let Some(names) = &listings[dir] else { return true };
+        let mut key: SmallVec<[u8; 64]> = SmallVec::new();
+        // alloc: none for a name of up to 64 bytes
+        key.extend(first.as_encoded_bytes().iter().map(u8::to_ascii_lowercase));
+        names.contains(&key[..])
     }
 
     fn object(&mut self, name: &str) -> Result<(), LinkError> {
@@ -1041,6 +1081,9 @@ impl Line<'_> {
         let framework = matches!(kind, NativeLibKind::Framework);
         for dir in self.dirs(framework) {
             for (file, kind) in &files {
+                if !self.may_have(dir, file) {
+                    continue;
+                }
                 let path = dir.join(file);
                 if path.is_file() {
                     return Ok((path, *kind));
@@ -1135,6 +1178,9 @@ impl Line<'_> {
             };
         }
         for dir in self.dirs(false) {
+            if !self.may_have(dir, library) {
+                continue;
+            }
             let path = dir.join(library);
             if path.is_file() {
                 return Ok(path);

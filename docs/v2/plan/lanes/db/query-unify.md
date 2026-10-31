@@ -86,9 +86,10 @@ thread-local, no downcasters, no revision-keyed claim table.
 - A run that produces a value equal to the old one keeps the old stamp (backdating), so its
   readers verify without running. Equal means `==` while the old value is in memory, and equal
   64-bit hashes once it was evicted: an `lru` function's value is hashed (`V: Hash`, through
-  `blaze_ids`' stable hasher) when it is made, so an evicted value that comes back the same
-  keeps its stamp and **eviction never counts as a change** (the `INCREMENTAL.md` bug: every
-  macro of a file expanded again on each edit). A `no_eq` function's value is never compared,
+  `blaze_ids`' stable hasher) as it is evicted, the hash kept in its row, and a rerun of an
+  evicted row hashes its new value to compare. A value that stays in memory is never hashed.
+  So an evicted value that comes back the same keeps its stamp and **eviction never counts as
+  a change** (the `INCREMENTAL.md` bug: every macro of a file expanded again on each edit). A `no_eq` function's value is never compared,
   so it is never hashed either (no `V: Hash` with `lru`): every run of it, evicted or not, is a
   change (R19, qu-check8: hir-ty-codegen's `Option<Inlinable>`).
 - No backdating when the new run's durability is lower than the old one's, or for a value made

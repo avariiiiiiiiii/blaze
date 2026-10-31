@@ -16,6 +16,7 @@
 
 use std::{
     collections::HashMap,
+    ffi::OsString,
     path::{Path, PathBuf},
     sync::{Arc, Mutex},
 };
@@ -173,26 +174,17 @@ pub(super) fn check(asked: &Asked<'_>, shown: &str, source: &str, library: &Libr
     Ok(Checked { failed: diags.iter().any(Diag::is_error), stderr: written(&diags, asked, shown, source, library) })
 }
 
-/// BLAKE3 of the `library/std/build.rs` whose outputs [`std_script`] gives.
-pub(super) const STD_SCRIPT: &str = "3be73c2bf16ec86c52fb2d8973c92f1b0ef3c61f9412e8e647f7c71086f00871";
-
 /// What std's build script (`library/std/build.rs`) gives std, set on its crate: the probe's
 /// load runs no build script, and `restricted_std` decides whether a probe on a bare-metal
-/// target may name std. The rule is the script's, for the script whose BLAKE3 hash is
-/// [`STD_SCRIPT`]; any other script stops the check. It is read as for the library rustc ships,
-/// with none of the script's variables set (`RUSTC_STD_NETBSD10`, `WIND_RELEASE_ID`,
-/// `RUSTC_BOOTSTRAP_SYNTHETIC_TARGET`).
+/// target may name std. The output is the build's own ([`stdlib::scripts`], whose pin of the
+/// script stops the check when it differs), run with the target's cfg variables and none of the
+/// script's own (`RUSTC_STD_NETBSD10`, `WIND_RELEASE_ID`, `RUSTC_BOOTSTRAP_SYNTHETIC_TARGET`),
+/// as for the library rustc ships.
 fn std_script(lowered: &mut blaze_lower::Lowered, units: &Units, library: &Library) -> anyhow::Result<()> {
-    let path = library.dir.join("std/build.rs");
-    let script = std::fs::read(&path).with_context(|| format!("reading {}", path.display()))?;
-    let got = blaze_format::hex::encode(&blaze_ids::b3::hash(&script));
-    if got != STD_SCRIPT {
-        bail!(
-            "{} has BLAKE3 hash {got}, and blaze's rustc stand-in gives the outputs of the one with \
-             {STD_SCRIPT} (`std_script` in crates/blaze-engine/src/as_rustc/probe.rs)",
-            path.display()
-        );
-    }
+    let root = library.dir.join("std/build.rs");
+    let root = root.to_str().with_context(|| format!("{} is not UTF-8", root.display()))?;
+    let read = |path: &str| std::fs::read(path).map_err(|e| format!("reading {path}: {e}"));
+    let script = stdlib::scripts::identify("std", root, read).map_err(anyhow::Error::msg)?;
     let index = units
         .graph
         .units
@@ -203,33 +195,35 @@ fn std_script(lowered: &mut blaze_lower::Lowered, units: &Units, library: &Libra
     let mut cfg = krate.cfg_options(lowered.db()).clone();
     let mut env = krate.env(lowered.db()).clone();
     let value = |key: &str| cfg.get_cfg_values(key).next().map_or("", |it| it.as_str());
-    let arch = value("target_arch");
-    if std_restricted(arch, value("target_os"), value("target_vendor"), value("target_env")) {
-        cfg.insert_atom(Symbol::intern("restricted_std"));
+    let vars = [
+        ("CARGO_CFG_TARGET_ARCH", value("target_arch")),
+        ("CARGO_CFG_TARGET_ENV", value("target_env")),
+        ("CARGO_CFG_TARGET_OS", value("target_os")),
+        ("CARGO_CFG_TARGET_VENDOR", value("target_vendor")),
+    ]
+    .map(|(name, value)| (OsString::from(name), OsString::from(value)));
+    let dir = library.dir.join("std");
+    let printed = stdlib::scripts::printed(script, &vars, &dir).map_err(anyhow::Error::msg)?;
+    let printed = String::from_utf8(printed).context("std's build script printed other than UTF-8")?;
+    for line in printed.lines() {
+        let directive = line.strip_prefix("cargo::").or_else(|| line.strip_prefix("cargo:"));
+        let Some((key, value)) = directive.and_then(|it| it.split_once('=')) else {
+            bail!("std's build script printed `{line}`, which the rustc stand-in does not read");
+        };
+        match key {
+            "rerun-if-changed" | "rustc-check-cfg" => {}
+            "rustc-cfg" if !value.contains('=') => cfg.insert_atom(Symbol::intern(value)),
+            "rustc-env" => {
+                let (name, value) = value.split_once('=').with_context(|| format!("std's build script printed `{line}`"))?;
+                env.set(name, value);
+            }
+            _ => bail!("std's build script printed `{line}`, which the rustc stand-in does not read"),
+        }
     }
-    cfg.insert_atom(Symbol::intern("backtrace_in_libstd"));
-    env.set("STD_ENV_ARCH", arch);
     let db = lowered.served_db();
     krate.set_cfg_options(db, cfg);
     krate.set_env(db, env);
     Ok(())
-}
-
-/// Whether std's build script sets `restricted_std` for a target of these cfgs: on every target
-/// it does not list (bare metal, JSON targets, new ones), std is unstable to name.
-pub(super) fn std_restricted(arch: &str, os: &str, vendor: &str, env: &str) -> bool {
-    let listed = matches!(
-        os,
-        "linux" | "android" | "netbsd" | "dragonfly" | "openbsd" | "freebsd" | "solaris" | "illumos"
-            | "macos" | "ios" | "tvos" | "watchos" | "visionos" | "windows" | "fuchsia" | "motor"
-            | "hermit" | "trusty" | "l4re" | "redox" | "haiku" | "vxworks" | "espidf" | "vita"
-            | "aix" | "nto" | "qnx" | "xous" | "hurd" | "uefi" | "teeos" | "zkvm" | "rtems"
-            | "nuttx" | "cygwin" | "vexos"
-    ) || (vendor == "fortanix" && env == "sgx")
-        || matches!(arch, "wasm32" | "wasm64")
-        || os.starts_with("solid")
-        || (vendor == "nintendo" && env == "newlib");
-    !listed
 }
 
 /// `diags` as rustc writes them to standard error, the files they point into read: the probe's

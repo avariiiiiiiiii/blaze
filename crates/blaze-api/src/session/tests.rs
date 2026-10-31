@@ -655,6 +655,7 @@ fn worked() -> Response {
         link: crate::LinkKind::Placed,
         links: vec![crate::Linked { how: crate::LinkHow::First, path: "target/debug/app".to_owned() }],
         critical_path_us: 70,
+        steps_us: vec![(crate::NodeKind::Codegen, 70)],
     })
 }
 

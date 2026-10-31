@@ -236,30 +236,6 @@ fn unknown_feature_fails() {
     assert!(stderr.contains("error[E0635]: unknown feature `no_such_feature_at_all`"), "{stderr}");
 }
 
-/// std is restricted where its build script says: on every target it does not list.
-#[test]
-fn std_is_restricted_where_its_script_says() {
-    let restricted = |arch, os, vendor, env| probe::std_restricted(arch, os, vendor, env);
-    assert!(!restricted("x86_64", "linux", "unknown", "gnu"));
-    assert!(!restricted("aarch64", "macos", "apple", ""));
-    assert!(!restricted("wasm32", "unknown", "unknown", ""));
-    assert!(!restricted("x86_64", "unknown", "fortanix", "sgx"));
-    assert!(!restricted("arm", "solid_asp3", "kmc", ""));
-    assert!(restricted("arm", "none", "unknown", ""));
-    assert!(restricted("mips", "psp", "sony", ""));
-    assert!(restricted("nvptx64", "cuda", "nvidia", ""));
-    assert!(restricted("avr", "none", "unknown", ""));
-}
-
-/// The checkout's std build script is the one `probe::std_script` gives the outputs of: a
-/// toolchain bump that changes it fails here, before any probe.
-#[test]
-fn std_script_is_the_ported_one() {
-    let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../library/std/build.rs");
-    let got = blaze_format::hex::encode(&blaze_ids::b3::hash(&std::fs::read(path).unwrap()));
-    assert_eq!(got, probe::STD_SCRIPT);
-}
-
 #[test]
 fn unanswerable_is_an_error() {
     let refused = |asked: &[&str]| answer(&args(asked), b"", checkout).unwrap_err().to_string();

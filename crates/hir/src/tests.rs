@@ -892,20 +892,40 @@ const BATCHES: [&str; 4] =
 
 #[test]
 fn a_dependency_batch_is_what_the_per_item_lowering_gives() {
-    let db = signatures_db();
+    // Every write ends in the maintainers, and hir-ty's impls maintainer lowers each impl's
+    // self type and trait there, so the log starts at the write that fills both crates.
+    let fx = fixture::db("//- /dep.rs crate:dep library\n//- /main.rs crate:main\n");
+    let files = [fx.file_at("/dep.rs"), fx.file_at("/main.rs")].map(|it| it.file_id(fx.db()));
+    let mut db = fx.into_db();
+    let written = db.log_mut(|db| {
+        db.batch(|db| {
+            for file in files {
+                db.set_file_text(file, SIGNATURES);
+            }
+        })
+    });
+    let mut executed: Vec<String> = written
+        .into_iter()
+        .filter_map(|event| match event.kind {
+            blaze_query::db::EventKind::WillExecute { database_key } => Some(
+                blaze_query::db::Database::storage(&db)
+                    .ingredient_name(database_key.ingredient_index())
+                    .to_owned(),
+            ),
+            _ => None,
+        })
+        .collect();
     crate::attach_db(&db, || {
         let (dep, main) = dep_and_main(&db);
-        // The def map's impl tables lower each impl's self type and trait as it is built, so
-        // the log starts before the def maps are read.
         let (mut batched, mut per_item) = (Vec::new(), Vec::new());
         let (mut dep_variants, mut dep_impls) = (Vec::new(), Vec::new());
         let (mut main_variants, mut main_impls) = (Vec::new(), Vec::new());
-        let executed = db.log_executed(|| {
+        executed.extend(db.log_executed(|| {
             (dep_variants, dep_impls) = signatures(&db, dep);
             (main_variants, main_impls) = signatures(&db, main);
             batched = lowered(&db, &dep_variants, &dep_impls);
             per_item = lowered(&db, &main_variants, &main_impls);
-        });
+        }));
         let names = |variants: &[(String, VariantId)]| -> Vec<String> {
             variants.iter().map(|(name, _)| name.clone()).collect()
         };
@@ -1020,7 +1040,7 @@ fn constant(db: &TestDB, name: &str) -> ConstId {
 fn allocations_read_back_as_written() {
     let db = fixture::db(
         r#"
-//- minicore: sized, unsize, coerce_unsized
+//- minicore: sized, unsize, coerce_unsized, dispatch_from_dyn
 trait T { fn f(&self) -> u8; }
 impl T for u8 { fn f(&self) -> u8 { *self } }
 const S: &str = "text";

@@ -10,6 +10,7 @@
 //! - shift amounts are taken modulo the lane width; rotates likewise (`fshl`/`fshr`);
 //! - `fmin`/`fmax` are `llvm.minimum`/`llvm.maximum`: NaN in, NaN out, `-0 < +0`;
 //! - `nearest` is `llvm.roundeven` (half to even);
+//! - `fma` keeps its multiplicands in Cranelift's order, which decides the NaN of two;
 //! - `fcvt_to_*` trap on NaN (`Trap`, `bad_toint`) and out of range (`TrapOverflow`);
 //!   the `_sat` forms saturate, with NaN to 0 (`llvm.fpto*i.sat`);
 //! - atomics are sequentially consistent;
@@ -188,10 +189,7 @@ pub fn body(b: &mut B<'_>, shape: Shape, args: &[String]) -> Vec<String> {
         Op::Fcopysign => one(intrinsic2(b, "llvm.copysign", ty, x(), y())),
         Op::Fmin => one(intrinsic2(b, "llvm.minimum", ty, x(), y())),
         Op::Fmax => one(intrinsic2(b, "llvm.maximum", ty, x(), y())),
-        Op::Fma => {
-            let name = format!("llvm.fma.{}", mangle(ty));
-            one(b.call(t, &name, &[(t, x()), (t, y()), (t, z())]))
-        }
+        Op::Fma => one(fma(b, ty, &x(), &y(), &z())),
 
         Op::Bitcast => one(b.cast("bitcast", shape.arg(0), x(), ty)),
         Op::Ireduce => one(b.cast("trunc", shape.arg(0), x(), ty)),
@@ -692,6 +690,26 @@ fn confined(b: &mut B<'_>, shape: Shape, args: &[String]) -> Vec<String> {
         }
         other => unreachable!("{shape} fuses `{}`, which no confined op does", other.info().name),
     }
+}
+
+/// `x * y + z` fused, with `x` and `y` in the registers Cranelift's AArch64 lowering puts them
+/// in, by asm: `fmadd d, x, y, z` and `fmla z, x, y`. Which NaN a fused multiply-add returns
+/// when both multiplicands are NaN is the first's, and LLVM takes `llvm.fma`'s multiplicands
+/// as commutative, so the intrinsic may swap them.
+fn fma(b: &mut B<'_>, ty: Ty, x: &str, y: &str, z: &str) -> String {
+    let t = ir(ty);
+    let asm = match ty {
+        Ty::F32 => "fmadd ${0:s}, ${1:s}, ${2:s}, ${3:s}\", \"=w,w,w,w",
+        Ty::F64 => "fmadd ${0:d}, ${1:d}, ${2:d}, ${3:d}\", \"=w,w,w,w",
+        Ty::F32x4 => "fmla $0.4s, $2.4s, $3.4s\", \"=w,0,w,w",
+        Ty::F64x2 => "fmla $0.2d, $2.2d, $3.2d\", \"=w,0,w,w",
+        _ => {
+            let name = format!("llvm.fma.{}", mangle(ty));
+            return b.call(t, &name, &[(t, x), (t, y), (t, z)]);
+        }
+    };
+    let args = if ty.is_vector() { format!("{t} {z}, {t} {x}, {t} {y}") } else { format!("{t} {x}, {t} {y}, {t} {z}") };
+    b.val(&format!("call {t} asm \"{asm}\"({args})"))
 }
 
 /// The `i16` word `word` of `<16 x i8>` `v` (as an `i32`, zero-extended), by `pextrw` in

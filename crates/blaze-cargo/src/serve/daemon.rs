@@ -37,7 +37,7 @@ use blaze_format::SchemaHash;
 use blaze_ids::ContentId;
 use blaze_image::{Corrupt, Image, OpenError, Refused};
 use blaze_query::{Database, DbError};
-use blaze_vfs::{ImageUse, Outside, Ticket, Vfs};
+use blaze_vfs::{DisksUnused, ImageUse, Outside, Ticket, Vfs};
 use intern::RestoreError;
 
 use super::{
@@ -188,9 +188,9 @@ pub struct Started {
     /// The image's VFS tree is of another layout: the journal was loaded alone and every
     /// checkout is scanned.
     pub tree: Option<Refused>,
-    /// Why the watchers' metadata in the image was not used, so they scan their checkouts, in
-    /// blaze-vfs's words.
-    pub disks: Option<String>,
+    /// The image's watcher metadata (its disks section) is missing or of another schema: the
+    /// watchers scan their checkouts.
+    pub disks: Option<Refused>,
     /// A stop came between the image's rename and its journal's rewrite: the whole journal was
     /// loaded over the image.
     pub resumed: bool,
@@ -226,8 +226,8 @@ impl fmt::Display for Started {
             write!(f, "{sep}the VFS's tree was not used ({refused}): the journal was loaded alone")?;
             sep = "; ";
         }
-        if let Some(why) = &self.disks {
-            write!(f, "{sep}the checkouts are scanned ({why})")?;
+        if let Some(refused) = &self.disks {
+            write!(f, "{sep}the VFS's watcher metadata was not used ({refused}): the checkouts are scanned")?;
             sep = "; ";
         }
         if self.resumed {
@@ -342,6 +342,9 @@ pub enum VfsFault {
     Malformed(&'static str),
     /// The journal starts from another image (`journal`), or from none, than this one.
     Unnamed { image: ContentId, journal: Option<ContentId> },
+    /// Its disks section (the watchers' metadata) is corrupt, outside the file or not one
+    /// this blaze writes; never [`DisksUnused::Refused`], which is [`Started::disks`].
+    Disks(DisksUnused),
 }
 
 impl fmt::Display for VfsFault {
@@ -355,6 +358,7 @@ impl fmt::Display for VfsFault {
             VfsFault::Unnamed { image, journal: None } => {
                 write!(f, "the VFS's journal starts from no image, not this one ({image})")
             }
+            VfsFault::Disks(unused) => write!(f, "{unused}"),
         }
     }
 }
@@ -415,10 +419,10 @@ fn vfs_used(used: ImageUse, started: &mut Started) -> Result<(), VfsFault> {
     match used {
         // Unopened: the start opened the same bytes first, and stopped unless another blaze's.
         ImageUse::None | ImageUse::Unopened(_) => {}
-        ImageUse::Used { disks, .. } => started.disks = disks,
+        ImageUse::Used { disks, .. } => started.disks = disks_used(disks)?,
         ImageUse::Resumed { disks, .. } => {
+            started.disks = disks_used(disks)?;
             started.resumed = true;
-            started.disks = disks;
         }
         ImageUse::Refused(refused) => started.tree = Some(refused),
         ImageUse::Corrupt(corrupt) => return Err(VfsFault::Corrupt(corrupt)),
@@ -426,6 +430,17 @@ fn vfs_used(used: ImageUse, started: &mut Started) -> Result<(), VfsFault> {
         ImageUse::Unnamed { image, journal } => return Err(VfsFault::Unnamed { image, journal }),
     }
     Ok(())
+}
+
+/// Why the watchers' metadata was not used, when by a rule, or the fault.
+fn disks_used(unused: Option<DisksUnused>) -> Result<Option<Refused>, VfsFault> {
+    match unused {
+        None => Ok(None),
+        Some(DisksUnused::Refused(refused)) => Ok(Some(refused)),
+        Some(fault @ (DisksUnused::Corrupt(_) | DisksUnused::Outside | DisksUnused::Malformed(_))) => {
+            Err(VfsFault::Disks(fault))
+        }
+    }
 }
 
 /// The buffers the loop's calls borrow and give back, so a warm turn allocates none: a call
@@ -1027,8 +1042,21 @@ mod tests {
         vfs_used(ImageUse::Used { name, nodes: 10, disks: None }, &mut started).unwrap();
         assert!(started.whole(), "{started}");
 
-        vfs_used(ImageUse::Resumed { name, nodes: 10, disks: Some("another schema".to_owned()) }, &mut started).unwrap();
-        assert!(started.resumed && started.disks.is_some(), "{started:?}");
+        let refused = Refused::Missing { id: SectionId::VFS_DISKS };
+        let disks = Some(DisksUnused::Refused(refused.clone()));
+        vfs_used(ImageUse::Resumed { name, nodes: 10, disks }, &mut started).unwrap();
+        assert!(started.resumed && started.disks == Some(refused), "{started:?}");
+        assert!(started.to_string().contains("the checkouts are scanned"), "{started}");
+        for fault in [
+            DisksUnused::Corrupt(corrupt(SectionId::VFS_DISKS)),
+            DisksUnused::Outside,
+            DisksUnused::Malformed("a cursor past the end"),
+        ] {
+            let mut started = Started::default();
+            let used = ImageUse::Used { name, nodes: 10, disks: Some(fault.clone()) };
+            assert_eq!(vfs_used(used, &mut started), Err(VfsFault::Disks(fault)));
+            assert!(started.whole(), "a fault records no rule: {started}");
+        }
         let mut started = Started::default();
         let refused = Refused::Missing { id: SectionId::VFS_TREE };
         vfs_used(ImageUse::Refused(refused.clone()), &mut started).unwrap();

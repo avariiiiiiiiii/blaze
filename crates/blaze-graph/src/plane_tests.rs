@@ -312,8 +312,15 @@ fn a_key_the_database_has_runs_nothing() {
     assert_eq!(runs(&add(&mut plane, 4, vec![keyed(6, &[], 1, 7)])), [6]);
 }
 
-/// Each request counts what it ran, what the database settled and what it joined, and its
-/// longest chain of measured run times, a cached or joined node's own time being 0.
+/// `stats` with `ns` of run time summed under [`NodeKind::Codegen`], the kind of every node here.
+fn codegen(mut stats: RequestStats, ns: u64) -> RequestStats {
+    stats.steps_ns[NodeKind::Codegen as usize] = ns;
+    stats
+}
+
+/// Each request counts what it ran, what the database settled and what it joined, its
+/// longest chain of measured run times and its run time by kind, a cached or joined node's own
+/// time being 0.
 #[test]
 fn a_request_says_what_it_ran_and_its_measured_critical_path() {
     let (mut plane, db) = with_db(config(1, 2));
@@ -338,7 +345,7 @@ fn a_request_says_what_it_ran_and_its_measured_critical_path() {
     at(&mut plane, done_at(3, 12));
     assert_eq!(finished(&at(&mut plane, done_at(2, 15))), [(1, true)]);
     let stats = plane.stats(RequestId(1)).unwrap();
-    assert_eq!(stats, RequestStats { ran: 3, cached: 0, joined: 0, critical_path_ns: 15 });
+    assert_eq!(stats, codegen(RequestStats { ran: 3, cached: 0, joined: 0, critical_path_ns: 15, ..Default::default() }, 27));
 
     // Request 3's node of key 7 joins request 2's, which runs 20..30; each then runs one
     // more: request 2's 30..38, request 3's 30..33.
@@ -355,9 +362,9 @@ fn a_request_says_what_it_ran_and_its_measured_critical_path() {
     assert_eq!(finished(&at(&mut plane, done_at(7, 33))), [(3, true)]);
     assert_eq!(finished(&at(&mut plane, done_at(5, 38))), [(2, true)]);
     let two = plane.stats(RequestId(2)).unwrap();
-    assert_eq!(two, RequestStats { ran: 2, cached: 0, joined: 0, critical_path_ns: 18 });
+    assert_eq!(two, codegen(RequestStats { ran: 2, cached: 0, joined: 0, critical_path_ns: 18, ..Default::default() }, 18));
     let three = plane.stats(RequestId(3)).unwrap();
-    assert_eq!(three, RequestStats { ran: 1, cached: 0, joined: 1, critical_path_ns: 3 });
+    assert_eq!(three, codegen(RequestStats { ran: 1, cached: 0, joined: 1, critical_path_ns: 3, ..Default::default() }, 3));
 
     // Now the database has key 7: request 4's node of it is cached, and only 9 runs, 40..47.
     open(&mut plane, 4, 1, false);
@@ -365,7 +372,7 @@ fn a_request_says_what_it_ran_and_its_measured_critical_path() {
     close(&mut plane, 4);
     assert_eq!(finished(&at(&mut plane, done_at(9, 47))), [(4, true)]);
     let four = plane.stats(RequestId(4)).unwrap();
-    assert_eq!(four, RequestStats { ran: 1, cached: 1, joined: 0, critical_path_ns: 7 });
+    assert_eq!(four, codegen(RequestStats { ran: 1, cached: 1, joined: 0, critical_path_ns: 7, ..Default::default() }, 7));
 
     assert_eq!(plane.stats(RequestId(99)), None);
     plane.release(RequestId(4)).unwrap();
@@ -846,6 +853,34 @@ fn a_task_passed_over_starts_before_smaller_ones_behind_it() {
     assert_eq!(plane.granted(), 10);
     let out = built(&mut plane, 2);
     assert_eq!(runs(&out), [9, 5, 6, 7]);
+}
+
+/// A task predicted the whole budget (a program never measured) runs alone: it waits while any
+/// task granted memory runs, starts once none does though the process holds memory besides,
+/// and while it runs only tasks with no memory start.
+#[test]
+fn a_task_predicted_the_whole_budget_runs_alone() {
+    let mut plane =
+        Plane::new(PlaneConfig { io: 1, work: 4, budget: budget(10), starve_after: 100 }).unwrap();
+    open(&mut plane, 1, 1, true);
+    plane.step(PlaneInput::Held { at_ns: 0, bytes: 4 }).unwrap();
+    assert_eq!(runs(&add(&mut plane, 1, vec![node(1, &[], Pool::Work, 1000, None, 3)])), [1]);
+    let out = add(
+        &mut plane,
+        1,
+        vec![
+            node(2, &[], Pool::Work, 100, None, 10),
+            node(3, &[], Pool::Work, 10, None, 2),
+            node(4, &[], Pool::Work, 1, None, 0),
+        ],
+    );
+    assert_eq!(runs(&out), [3, 4], "the whole budget does not fit beside what runs");
+    assert_eq!(runs(&built(&mut plane, 1)), Vec::<u32>::new());
+    assert_eq!(runs(&built(&mut plane, 3)), [2], "nothing granted memory runs: it starts");
+    assert_eq!(plane.granted(), 10);
+    let out = add(&mut plane, 1, vec![node(5, &[], Pool::Work, 1, None, 1), node(6, &[], Pool::Work, 1, None, 0)]);
+    assert_eq!(runs(&out), [6], "beside it, only what holds no memory");
+    assert_eq!(runs(&built(&mut plane, 2)), [5]);
 }
 
 /// With one thread and every request ready, each request's starts keep to its weight.

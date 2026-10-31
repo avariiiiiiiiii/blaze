@@ -9,7 +9,7 @@
 use std::fmt;
 
 use blaze_api::{
-    Diagnostic, FetchVerb, How, Level, LinkHow, LinkKind, Linked, Ranked, Response, ServedCrate,
+    Diagnostic, FetchVerb, How, Level, LinkHow, LinkKind, Linked, NodeKind, Ranked, Response, ServedCrate,
     TestOutcome, TestResult, Traced, Verb, Worked,
 };
 use blaze_ids::ContentId;
@@ -136,6 +136,11 @@ pub fn lines_into(out: &mut String, response: &Response, color: bool) {
         }
         Response::Announced { root } => put!(out, "{} {root}\n", status("Announced")),
         Response::Packed { pack } => put!(out, "{} {} bytes\n", status("Packed"), pack.len()),
+        Response::DocPage { path, page } => put!(out, "{} {path}, {} bytes\n", status("Page"), page.len()),
+        Response::Documented(documented) => {
+            let (dir, crates) = (&documented.dir, documented.crates.len());
+            put!(out, "{} {crates} crates, {} pages in {dir}\n", status("Documented"), documented.pages);
+        }
         Response::TestResult(result) => test_lines(out, result, color),
         Response::Ran { code, stdout, stderr } => {
             bytes(out, stdout);
@@ -398,7 +403,11 @@ pub fn work_json(worked: &Worked) -> String {
         }
         out.push_str("]}");
     }
-    out.push_str("]}\n");
+    out.push_str("], \"steps_us\": {");
+    for (at, (kind, us)) in worked.steps_us.iter().enumerate() {
+        put!(&mut out, "{}\"{}\": {us}", if at == 0 { "" } else { ", " }, kind.name());
+    }
+    out.push_str("}}\n");
     out
 }
 
@@ -408,6 +417,19 @@ pub fn link_lines(out: &mut String, links: &[Linked]) {
     for it in links {
         put!(out, "link: {} ({})\n", it.path, it.how);
     }
+}
+
+/// `timeline-us: <kind>=<micros> ...`, the request's run time by kind ([`Worked::steps_us`]):
+/// what `harness/bench.py`'s `daemon_steps` reads. Nothing for a request that ran nothing.
+pub fn timeline_line(out: &mut String, steps: &[(NodeKind, u64)]) {
+    if steps.is_empty() {
+        return;
+    }
+    out.push_str("timeline-us:");
+    for (kind, us) in steps {
+        put!(out, " {}={us}", kind.name());
+    }
+    out.push('\n');
 }
 
 /// What became of each dependency crate's check ([`Worked::served`]), as the CLI prints it under
@@ -584,15 +606,23 @@ mod tests {
             link: LinkKind::Patched,
             links: Vec::new(),
             critical_path_us: 1500,
+            steps_us: vec![(NodeKind::Bodies, 900), (NodeKind::Codegen, 600)],
         };
         let line = work_json(&worked);
         assert_eq!(
             line,
             "{\"reason\": \"blaze-work\", \"reran\": 12, \"green\": 300, \"compiled\": 2, \
-             \"found\": 40, \"link\": \"patched\", \"critical_path_us\": 1500, \"links\": []}\n"
+             \"found\": 40, \"link\": \"patched\", \"critical_path_us\": 1500, \"links\": [], \
+             \"steps_us\": {\"bodies\": 900, \"codegen\": 600}}\n"
         );
         let value: serde_json::Value = serde_json::from_str(&line).unwrap();
         assert_eq!(value["link"], "patched");
+        let mut timeline = String::new();
+        timeline_line(&mut timeline, &worked.steps_us);
+        assert_eq!(timeline, "timeline-us: bodies=900 codegen=600\n");
+        timeline.clear();
+        timeline_line(&mut timeline, &[]);
+        assert_eq!(timeline, "");
     }
 
     /// Each link is a `link:` line in the form `harness/bench.py`'s `link_kind` reads, and an
@@ -624,6 +654,7 @@ mod tests {
             link: LinkKind::Placed,
             links,
             critical_path_us: 0,
+            steps_us: Vec::new(),
         };
         assert!(lines(&Response::Work(worked.clone()), false).ends_with(&text));
         let value: serde_json::Value = serde_json::from_str(&work_json(&worked)).unwrap();

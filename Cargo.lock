@@ -154,7 +154,6 @@ dependencies = [
 [[package]]
 name = "blake3-servil"
 version = "0.8.0+b3c5efc7c975d903762dea809066f7c0a0603861"
-source = "git+https://github.com/johnservil/BLAKE3?rev=c6bd679a0911cc233cb28297f2b25875381215a1#c6bd679a0911cc233cb28297f2b25875381215a1"
 dependencies = [
  "arrayvec",
  "cc",
@@ -232,6 +231,7 @@ dependencies = [
  "blaze-codegen",
  "blaze-core",
  "blaze-diagnostics",
+ "blaze-doc",
  "blaze-format",
  "blaze-global",
  "blaze-graph",
@@ -249,6 +249,7 @@ dependencies = [
  "blaze-macro-eval",
  "blaze-manifest",
  "blaze-mem",
+ "blaze-profile",
  "blaze-protocol",
  "blaze-query",
  "blaze-registry",
@@ -426,11 +427,11 @@ dependencies = [
  "hir-ty-borrowck",
  "intern",
  "memchr",
- "ra-ap-rustc_lexer",
- "ra-ap-rustc_parse_format",
  "rustc-hash",
  "rustc_abi",
  "rustc_apfloat",
+ "rustc_lexer",
+ "rustc_parse_format",
  "rustc_type_ir",
  "serde",
  "serde_json",
@@ -505,7 +506,7 @@ dependencies = [
  "itertools",
  "libc",
  "parser",
- "ra-ap-rustc_lexer",
+ "rustc_lexer",
  "semver",
  "serde",
  "serde_json",
@@ -894,8 +895,8 @@ dependencies = [
  "libc",
  "parser",
  "proc-macro-api",
- "ra-ap-rustc_lexer",
  "rustc-hash",
+ "rustc_lexer",
  "serde",
  "serde_json",
  "span",
@@ -1536,9 +1537,9 @@ dependencies = [
 
 [[package]]
 name = "cranelift-bforest"
-version = "0.137.0"
+version = "0.137.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "47784bc3c4b57c0182bb8ff04aae5d5f5fc6bae8ba26b1212c9a659b90dab84e"
+checksum = "81d47ec2358cdbace0520ac212c003656b529f0c60e43fbbe9a331632cd9e8fc"
 dependencies = [
  "cranelift-entity",
  "wasmtime-internal-core",
@@ -1546,9 +1547,9 @@ dependencies = [
 
 [[package]]
 name = "cranelift-bitset"
-version = "0.137.0"
+version = "0.137.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e13d120406f713dbce1940751e77bbb14daad1261379b7200c19285953e79a1d"
+checksum = "eebb94b54db96b26e387bc8c698823d83d9254d551a6ed846a60cebf62ed7135"
 dependencies = [
  "serde",
  "serde_derive",
@@ -1557,7 +1558,7 @@ dependencies = [
 
 [[package]]
 name = "cranelift-codegen"
-version = "0.137.0"
+version = "0.137.1"
 dependencies = [
  "bumpalo",
  "cranelift-assembler-x64",
@@ -1610,9 +1611,9 @@ dependencies = [
 
 [[package]]
 name = "cranelift-entity"
-version = "0.137.0"
+version = "0.137.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "903c6592c7d600c251d20929f143543b7303ac70b072ad3394d65b29caf56f69"
+checksum = "a1bffb83ac1d7052691d1710ca8eb334d4fcaad363e589f2b89d38d97bda5776"
 dependencies = [
  "cranelift-bitset",
  "serde",
@@ -1622,9 +1623,9 @@ dependencies = [
 
 [[package]]
 name = "cranelift-frontend"
-version = "0.137.0"
+version = "0.137.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b929f09b82a270e2aae062945cf86cd9db39c59ad9bead6986ea6b09fcf8a969"
+checksum = "1bc727c856bf57eae76c72ac4f9b1eaf49947a2b02f699798262fc8399557b7a"
 dependencies = [
  "cranelift-codegen",
  "hashbrown 0.17.1",
@@ -1635,9 +1636,9 @@ dependencies = [
 
 [[package]]
 name = "cranelift-interpreter"
-version = "0.137.0"
+version = "0.137.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "098f689c7be73cae6e1a9fa0b4e2f41de89f6c1a840a035fc01bd914b779855d"
+checksum = "536ee8658bbe247b2431a55d1a878d21f7a209ba938afca7f30a1adbf3361439"
 dependencies = [
  "cranelift-codegen",
  "cranelift-entity",
@@ -1649,15 +1650,15 @@ dependencies = [
 
 [[package]]
 name = "cranelift-isle"
-version = "0.137.0"
+version = "0.137.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b1c5809e8636a37e5a25ecc35242d33d6e7391c49b67488b83446e2898af2a2f"
+checksum = "a92e743f35915d55cd3d3178aab483661f78c2f9274aa704f29be69e3789c5bd"
 
 [[package]]
 name = "cranelift-module"
-version = "0.137.0"
+version = "0.137.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "bb4f4b6e71b257549ffa6f14ddc0c314f332f66c7531b3c9a645c290a9d1effa"
+checksum = "d1fc79497db837c8433435264d34eec0fd5e0db56dc41ffc1a3d096dad28e572"
 dependencies = [
  "anyhow",
  "cranelift-codegen",
@@ -1669,7 +1670,7 @@ dependencies = [
 
 [[package]]
 name = "cranelift-object"
-version = "0.137.0"
+version = "0.137.1"
 dependencies = [
  "anyhow",
  "cranelift-codegen",
@@ -1683,9 +1684,9 @@ dependencies = [
 
 [[package]]
 name = "cranelift-reader"
-version = "0.137.0"
+version = "0.137.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "89f6e80143235e2b8762c0346d792232acfb6a746667213e1ab33fff0537086b"
+checksum = "b8e29bdf107419ae7980792cad76ac5b45a3c7dd3b7b394dd7e301dcf841b647"
 dependencies = [
  "anyhow",
  "cranelift-codegen",
@@ -2231,10 +2232,10 @@ dependencies = [
  "inventory",
  "itertools",
  "la-arena",
- "ra-ap-rustc_parse_format",
  "rustc-hash",
  "rustc_abi",
  "rustc_apfloat",
+ "rustc_parse_format",
  "smallvec",
  "span",
  "stdx",
@@ -3096,8 +3097,8 @@ dependencies = [
  "expect-test",
  "intern",
  "parser",
- "ra-ap-rustc_lexer",
  "rustc-hash",
+ "rustc_lexer",
  "smallvec",
  "span",
  "stdx",
@@ -3299,8 +3300,8 @@ dependencies = [
  "edition",
  "expect-test",
  "hegeltest",
- "ra-ap-rustc_lexer",
  "rustc-literal-escaper",
+ "rustc_lexer",
  "smallvec",
  "stdx",
  "tracing",
@@ -3398,8 +3399,8 @@ dependencies = [
  "blaze-usercode",
  "hir-expand",
  "intern",
- "ra-ap-rustc_lexer",
  "rustc-hash",
+ "rustc_lexer",
  "span",
  "tt",
 ]
@@ -3515,27 +3516,6 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn 2.0.117",
-]
-
-[[package]]
-name = "ra-ap-rustc_lexer"
-version = "0.179.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e5f08deda6d8142c7faaa1ff6232fd6909a14f2479ac513378629ccf48b72d52"
-dependencies = [
- "memchr",
- "unicode-ident",
- "unicode-properties",
-]
-
-[[package]]
-name = "ra-ap-rustc_parse_format"
-version = "0.179.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "400e7718b983925132652d434d6dd42169b7f2baa17ae4367d8d4475670a9cf8"
-dependencies = [
- "ra-ap-rustc_lexer",
- "rustc-literal-escaper",
 ]
 
 [[package]]
@@ -3768,6 +3748,15 @@ dependencies = [
  "rustc_type_ir_macros",
  "thin-vec",
  "tracing",
+]
+
+[[package]]
+name = "rustc_parse_format"
+version = "0.0.0"
+dependencies = [
+ "ra-ap-rustc_index",
+ "rustc-literal-escaper",
+ "rustc_lexer",
 ]
 
 [[package]]
@@ -4237,11 +4226,11 @@ dependencies = [
  "expect-test",
  "itertools",
  "parser",
- "ra-ap-rustc_lexer",
  "rayon",
  "rustc-hash",
  "rustc-literal-escaper",
  "rustc_apfloat",
+ "rustc_lexer",
  "smallvec",
  "smol_str",
  "stdx",
@@ -4316,7 +4305,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "32497e9a4c7b38532efcdebeef879707aa9f794296a4f0244f6f69e9bc8574bd"
 dependencies = [
  "fastrand",
- "getrandom 0.3.4",
+ "getrandom 0.4.3",
  "once_cell",
  "rustix",
  "windows-sys 0.61.2",
@@ -4621,8 +4610,8 @@ dependencies = [
  "blaze-mem",
  "hegeltest",
  "intern",
- "ra-ap-rustc_lexer",
  "rustc-hash",
+ "rustc_lexer",
  "span",
  "stdx",
  "text-size",
@@ -4856,9 +4845,9 @@ dependencies = [
 
 [[package]]
 name = "wasmtime-internal-core"
-version = "50.0.0"
+version = "50.0.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "83d4ac46034b149aed44335595402503094a04e3b70d0cff8c169d83437318b8"
+checksum = "e765a08b721bf2b2e5cbd3e9365a71b497d57fc5e8b2cf73ddf12d85d502d7fa"
 dependencies = [
  "hashbrown 0.17.1",
  "libm",

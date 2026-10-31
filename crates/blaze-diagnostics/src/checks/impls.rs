@@ -25,7 +25,7 @@ use rustc_hash::FxHashMap;
 use syntax::view::{AstNode as _, HasName as _};
 
 use crate::{
-    cx::Cx,
+    cx::{Cx, item_range_view},
     lower::{Found, Phase, incoherent_impl::ImplAt, trait_impl_orphan},
     model::{Diag, Expansion, MacroKind, Span},
 };
@@ -47,13 +47,18 @@ impl<'db> Origin<'db> {
                 let name = source.value.name()?;
                 let mut span = cx.span(source.with_value(name.syntax().text_range()));
                 let loc = id.loc(cx.db);
+                let derive = loc.trait_.derive_macro(lang_items(cx.db, cx.krate.base()));
+                let def_site = derive
+                    .and_then(|it| cx.vsema.source(hir::Macro::from(it)))
+                    .map(|it| cx.span(it.map(|it| item_range_view(it.either(|it| it.syntax(), |it| it.syntax())))));
                 // alloc: the error's span; called only on an error path (`builtin`'s E0204, E0206, E0184)
                 span.expansion = Some(Box::new(Expansion {
                     call_site: cx.span(loc.source(cx.db)),
                     kind: MacroKind::Derive,
                     // alloc: as above
                     name: loc.trait_.name().as_str().to_owned(),
-                    def_site: None,
+                    def_site,
+                    opaque: true,
                 }));
                 Some(span)
             }

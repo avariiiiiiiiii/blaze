@@ -1042,30 +1042,27 @@ impl Iterator for SyntaxElementChildren {
     }
 }
 
+/// A walk of a node's subtree in preorder. Each step is taken when asked for, after a
+/// [`Preorder::skip_subtree`] of the one before: entering a lazy node never moves into it, so
+/// skipping it leaves its part unparsed.
 #[derive(Debug, Clone)]
 pub struct Preorder {
     start: SyntaxNode,
-    next: Option<WalkEvent<SyntaxNode>>,
+    /// The event returned last, `None` before the first and after the last.
+    last: Option<WalkEvent<SyntaxNode>>,
+    done: bool,
     skip_subtree: bool,
 }
 
 impl Preorder {
     fn new(start: SyntaxNode) -> Preorder {
-        // clone: the walk keeps its start to stop at and returns entering it, a count bump
-        let next = Some(WalkEvent::Enter(start.clone()));
-        Preorder { start, next, skip_subtree: false }
+        Preorder { start, last: None, done: false, skip_subtree: false }
     }
 
+    /// Leaves the node entered last without walking its subtree; after a leave, leaves the
+    /// parent without walking the siblings after.
     pub fn skip_subtree(&mut self) {
         self.skip_subtree = true;
-    }
-
-    #[cold]
-    fn do_skip(&mut self) {
-        self.next = self.next.take().map(|next| match next {
-            WalkEvent::Enter(first_child) => WalkEvent::Leave(first_child.parent().unwrap()),
-            WalkEvent::Leave(parent) => WalkEvent::Leave(parent),
-        })
     }
 }
 
@@ -1073,57 +1070,48 @@ impl Iterator for Preorder {
     type Item = WalkEvent<SyntaxNode>;
 
     fn next(&mut self) -> Option<WalkEvent<SyntaxNode>> {
-        if self.skip_subtree {
-            self.do_skip();
-            self.skip_subtree = false;
-        }
-        let next = self.next.take();
-        self.next = next.as_ref().and_then(|next| {
-            Some(match next {
-                WalkEvent::Enter(node) => match node.first_child() {
+        let skip = std::mem::take(&mut self.skip_subtree);
+        let event = match self.last.take() {
+            None if self.done => None,
+            // clone: the walk keeps its start to stop at and returns entering it, a count bump
+            None => Some(WalkEvent::Enter(self.start.clone())),
+            Some(WalkEvent::Enter(node)) => {
+                Some(match if skip { None } else { node.first_child() } {
                     Some(child) => WalkEvent::Enter(child),
-                    // clone: entering a childless node was returned, leaving it is a second cursor
-                    None => WalkEvent::Leave(node.clone()),
-                },
-                WalkEvent::Leave(node) => {
-                    if node == &self.start {
-                        return None;
-                    }
-                    match node.next_sibling() {
-                        Some(sibling) => WalkEvent::Enter(sibling),
-                        None => WalkEvent::Leave(node.parent()?),
-                    }
-                }
-            })
-        });
-        next
+                    None => WalkEvent::Leave(node),
+                })
+            }
+            Some(WalkEvent::Leave(node)) if node == self.start => None,
+            Some(WalkEvent::Leave(node)) => match if skip { None } else { node.next_sibling() } {
+                Some(sibling) => Some(WalkEvent::Enter(sibling)),
+                None => node.parent().map(WalkEvent::Leave),
+            },
+        };
+        self.done = event.is_none();
+        // clone: the next step is taken from the event returned, a count bump
+        self.last = event.clone();
+        event
     }
 }
 
+/// [`Preorder`] with tokens, each step taken when asked for as there.
 #[derive(Debug, Clone)]
 pub struct PreorderWithTokens {
     start: SyntaxElement,
-    next: Option<WalkEvent<SyntaxElement>>,
+    /// The event returned last, `None` before the first and after the last.
+    last: Option<WalkEvent<SyntaxElement>>,
+    done: bool,
     skip_subtree: bool,
 }
 
 impl PreorderWithTokens {
     fn new(start: SyntaxNode) -> PreorderWithTokens {
-        // clone: the walk keeps its start to stop at and returns entering it, a count bump
-        let next = Some(WalkEvent::Enter(start.clone().into()));
-        PreorderWithTokens { start: start.into(), next, skip_subtree: false }
+        PreorderWithTokens { start: start.into(), last: None, done: false, skip_subtree: false }
     }
 
+    /// As [`Preorder::skip_subtree`].
     pub fn skip_subtree(&mut self) {
         self.skip_subtree = true;
-    }
-
-    #[cold]
-    fn do_skip(&mut self) {
-        self.next = self.next.take().map(|next| match next {
-            WalkEvent::Enter(first_child) => WalkEvent::Leave(first_child.parent().unwrap().into()),
-            WalkEvent::Leave(parent) => WalkEvent::Leave(parent),
-        })
     }
 }
 
@@ -1131,30 +1119,30 @@ impl Iterator for PreorderWithTokens {
     type Item = WalkEvent<SyntaxElement>;
 
     fn next(&mut self) -> Option<WalkEvent<SyntaxElement>> {
-        if self.skip_subtree {
-            self.do_skip();
-            self.skip_subtree = false;
-        }
-        let next = self.next.take();
-        self.next = next.as_ref().and_then(|next| {
-            Some(match next {
-                WalkEvent::Enter(el) => match el {
-                    NodeOrToken::Node(node) => match node.first_child_or_token() {
-                        Some(child) => WalkEvent::Enter(child),
-                        // clone: entering a childless node was returned, leaving it is a second cursor
-                        None => WalkEvent::Leave(node.clone().into()),
-                    },
-                    // clone: entering a token was returned, leaving it is a second cursor
-                    NodeOrToken::Token(token) => WalkEvent::Leave(token.clone().into()),
-                },
-                WalkEvent::Leave(el) if el == &self.start => return None,
-                WalkEvent::Leave(el) => match el.next_sibling_or_token() {
-                    Some(sibling) => WalkEvent::Enter(sibling),
-                    None => WalkEvent::Leave(el.parent()?.into()),
-                },
-            })
-        });
-        next
+        let skip = std::mem::take(&mut self.skip_subtree);
+        let event = match self.last.take() {
+            None if self.done => None,
+            // clone: the walk keeps its start to stop at and returns entering it, a count bump
+            None => Some(WalkEvent::Enter(self.start.clone())),
+            Some(WalkEvent::Enter(NodeOrToken::Node(node))) => {
+                Some(match if skip { None } else { node.first_child_or_token() } {
+                    Some(child) => WalkEvent::Enter(child),
+                    None => WalkEvent::Leave(node.into()),
+                })
+            }
+            Some(WalkEvent::Enter(token)) => Some(WalkEvent::Leave(token)),
+            Some(WalkEvent::Leave(el)) if el == self.start => None,
+            Some(WalkEvent::Leave(el)) => {
+                match if skip { None } else { el.next_sibling_or_token() } {
+                    Some(sibling) => Some(WalkEvent::Enter(sibling)),
+                    None => el.parent().map(|it| WalkEvent::Leave(it.into())),
+                }
+            }
+        };
+        self.done = event.is_none();
+        // clone: the next step is taken from the event returned, a count bump
+        self.last = event.clone();
+        event
     }
 }
 // endregion

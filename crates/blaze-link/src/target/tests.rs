@@ -8,7 +8,7 @@ use object::write::Object as Builder;
 use object::{Architecture, BinaryFormat, Endianness, SectionKind};
 
 use super::{
-    Ask, Cache, Located, Target, caseless, fhs, loader, locate_with, output_with, parse_version, rpaths,
+    Ask, Cache, Located, Target, caseless, fhs, listing, loader, locate_with, output_with, parse_version, rpaths,
     top_level_string,
 };
 use crate::{Debug, Format, LinkError, NativeKind, Output, OutputKind, Platform};
@@ -367,6 +367,8 @@ fn a_library_is_the_first_file_the_kind_allows_in_the_first_directory_that_has_o
     touch(&b.join("z.o"), &elf(1));
     touch(&b.join("libw.so.1"), &elf(3));
     touch(&b.join("libv.a"), ARCHIVE);
+    std::fs::create_dir_all(a.join("libq.so")).unwrap();
+    touch(&b.join("libq.so"), &elf(3));
     let search = vec![a.clone(), b.clone()];
     let mine = |libs: &[NativeLib]| -> Vec<(PathBuf, NativeKind)> {
         let located = locate_plain(&cache, &glibc.answers, &output, libs, &search).unwrap();
@@ -378,6 +380,7 @@ fn a_library_is_the_first_file_the_kind_allows_in_the_first_directory_that_has_o
     assert_eq!(mine(&[static_lib("v", true)]), [(b.join("libv.a"), NativeKind::Archive { whole: true })]);
     assert_eq!(mine(&[verbatim("z.o")]), [(b.join("z.o"), NativeKind::Object)]);
     assert_eq!(mine(&[verbatim("libw.so.1")]), [(b.join("libw.so.1"), SHARED)]);
+    assert_eq!(mine(&[dylib("q")]), [(b.join("libq.so"), SHARED)], "a directory listed with the name is not a file");
     assert_eq!(mine(&[dylib("gcc")]), [(glibc.gcc.join("libgcc.a"), ARCHIVED)], "then the toolchain's directories");
 
     let error = locate_plain(&cache, &glibc.answers, &output, &[dylib("nope")], &search).unwrap_err();
@@ -390,6 +393,17 @@ fn a_library_is_the_first_file_the_kind_allows_in_the_first_directory_that_has_o
     let framework = NativeLib { name: "Cocoa".to_owned(), kind: NativeLibKind::Framework, verbatim: false };
     let error = locate_plain(&cache, &glibc.answers, &output, &[framework], &search).unwrap_err();
     assert!(error.what.contains("Cocoa") && error.what.contains("Apple"), "{}", error.what);
+}
+
+#[test]
+fn a_search_directory_is_listed_with_its_names_case_folded() {
+    let dir = temp("listing");
+    touch(&dir.join("LibFoo.A"), ARCHIVE);
+    std::fs::create_dir_all(dir.join("Sub.framework")).unwrap();
+    let names = listing(&dir).unwrap();
+    assert!(names.contains(&b"libfoo.a"[..]) && names.contains(&b"sub.framework"[..]), "{names:?}");
+    assert_eq!(names.len(), 2);
+    assert!(listing(&dir.join("missing")).is_none(), "a directory that can't be listed leaves its names to a stat");
 }
 
 #[test]

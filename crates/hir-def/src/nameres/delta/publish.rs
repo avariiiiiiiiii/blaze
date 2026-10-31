@@ -15,8 +15,8 @@ use crate::{
     ExternCrateId, FxIndexMap, MacroId, ModuleId, TraitId, UseId,
     item_scope::ItemScope,
     nameres::{
-        DefMap, DefMapCrateData, DiagnosticsByModule, LocalDefMap, ModulesMap, ModulesSlot,
-        OwnedRecords, RecordsSlot, uses::NameRecords,
+        DefMap, DefMapCrateData, DiagnosticsByModule, LocalDefMap, ModuleData, ModulesMap,
+        ModulesSlot, OwnedRecords, RecordsSlot, uses::NameRecords,
     },
     per_ns::PerNs,
 };
@@ -136,6 +136,24 @@ pub(in crate::nameres) fn input_children(db: &Db, id: blaze_query::db::Id) -> &F
 
 pub(in crate::nameres) fn published_modules(db: &Db, id: blaze_query::db::Id) -> &ModulesMap {
     resolution(id).modules(db)
+}
+
+pub(in crate::nameres) fn published_module(
+    db: &Db,
+    id: blaze_query::db::Id,
+    module: ModuleId,
+) -> Option<&ModuleData> {
+    resolution(id).module(db, module).as_ref()
+}
+
+#[blaze_query::tracked]
+impl CrateResolution {
+    /// One module of a published `DefMap`, as `Modules::module` is of a collected one:
+    /// depends on the modules there are, and is the same for as long as the module is.
+    #[blaze_query::tracked(returns(ref))]
+    fn module(self, db: &Db, module: ModuleId) -> Option<ModuleData> {
+        self.modules(db).get(&module).cloned()
+    }
 }
 
 pub(in crate::nameres) fn published_records(db: &Db, id: blaze_query::db::Id) -> &OwnedRecords {

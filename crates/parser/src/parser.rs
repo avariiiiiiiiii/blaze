@@ -359,10 +359,27 @@ impl<'t> Parser<'t> {
     }
 
     /// Create an error node and consume the next token.
+    /// A `{` some `}` closes is taken with everything up to that `}`, so the error never splits
+    /// a pair of braces between two nodes.
     pub(crate) fn err_and_bump(&mut self, message: &'static str) {
         let m = self.start();
         self.error(message);
-        self.bump_any();
+        if self.at(T!['{']) && self.curly_closes(self.pos) {
+            let mut depth = 0usize;
+            loop {
+                match self.current() {
+                    T!['{'] => depth += 1,
+                    T!['}'] => depth -= 1,
+                    _ => (),
+                }
+                self.bump_any();
+                if depth == 0 {
+                    break;
+                }
+            }
+        } else {
+            self.bump_any();
+        }
         m.complete(self, ERROR);
     }
 

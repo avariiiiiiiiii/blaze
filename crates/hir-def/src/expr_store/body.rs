@@ -2,9 +2,10 @@
 //! consts.
 use std::ops;
 
-use base_db::Db;
+use base_db::{Db, EditionedFileId};
 use hir_expand::{HirFileId, InFile, Lookup, span_map::SpanMap};
-use span::{AstIdMap, Edition, ROOT_ERASED_FILE_AST_ID, RealSpanMap};
+use rustc_hash::FxHashMap;
+use span::{AstIdMap, Edition, ErasedFileAstId, ROOT_ERASED_FILE_AST_ID, RealSpanMap};
 use syntax::{
     FlatTree, NodeOrToken, SyntaxKind, SyntaxNodePtr, TextRange, TextSize,
     view::{self, AstNode as _},
@@ -14,7 +15,8 @@ use triomphe::Arc;
 use crate::{
     DefWithBodyId, ExpressionStoreOwnerId, HasModule,
     expr_store::{
-        ExpressionStore, ExpressionStoreSourceMap, Move, MoveTo, SelfParamPtr,
+        ExpressionStore, ExpressionStoreDiagnostics, ExpressionStoreSourceMap, Move, MoveTo,
+        SelfParamPtr,
         lower::{BodyLowering, lower_body},
         pretty,
     },
@@ -170,6 +172,17 @@ impl Body {
             Some((body, _)) => body,
             None => lower_in_file(db, def, BodyLowering::Body).0,
         }
+    }
+
+    /// Whether lowering the body found an error: a diagnostic of its source map other than
+    /// [`ExpressionStoreDiagnostics::InactiveCode`]. What rustc keeps a body out of borrow
+    /// checking for, without the positions the map holds, so that a reader of it reads none.
+    #[blaze_query::tracked(returns(copy))]
+    pub fn has_lowering_errors(db: &Db, def: DefWithBodyId) -> bool {
+        Self::unmoved_source_map(db, def)
+            .diagnostics()
+            .iter()
+            .any(|it| !matches!(it, ExpressionStoreDiagnostics::InactiveCode { .. }))
     }
 }
 
@@ -576,13 +589,76 @@ mod trees {
 }
 
 /// The [`BodySyntax`] of a body written in a file, `None` for one a macro writes.
+///
+/// A body outside fn bodies reads only its own [`ItemBodySyntax`], which an edit of the file
+/// rewrites in place and leaves as it was when the edit left its anchor alone, so an edit of one
+/// body reaches no reader of another. A body in a fn body, or one a macro writes, has no ast id
+/// that holds without a walk of the bodies, and is placed by [`placed_body_syntax`].
+pub fn body_syntax(db: &Db, def: DefWithBodyId) -> &Option<BodySyntax> {
+    let InFile { file_id, value: ast_id } = def.erased_ast_id(db);
+    let Some(file) = file_id.file_id() else { return placed_body_syntax(db, def) };
+    if ast_id.in_body() {
+        return placed_body_syntax(db, def);
+    }
+    let Some(&id) = file_body_syntax(db, file).get(&ast_id) else {
+        panic!("{def:?}: {ast_id:?} is outside fn bodies but no item of {file:?} with a body has it")
+    };
+    <ItemBodySyntax<'_> as blaze_query::db::FromId>::from_id(id).syntax(db)
+}
+
+/// The [`BodySyntax`] of one item of a file with a body outside fn bodies, set by
+/// [`file_body_syntax`] at each edit of the file.
+#[blaze_query::tracked]
+struct ItemBodySyntax<'db> {
+    ast_id: ErasedFileAstId,
+    #[tracked]
+    #[returns(ref)]
+    syntax: Option<BodySyntax>,
+}
+
+/// The [`ItemBodySyntax`] of each fn, const, static and variant of `file` outside fn bodies, by
+/// its ast id: changed only when such an item comes or goes, not by where an item is.
 #[blaze_query::tracked(returns(ref))]
-pub fn body_syntax(db: &Db, def: DefWithBodyId) -> Option<BodySyntax> {
+fn file_body_syntax(db: &Db, file: EditionedFileId) -> FxHashMap<ErasedFileAstId, blaze_query::db::Id> {
+    let file_id = HirFileId::from(file);
+    let SpanMap::RealSpanMap(span_map) = file_id.span_map(db) else {
+        unreachable!("{file:?} is a real file")
+    };
+    let ast_id_map = file_id.ast_id_map(db);
+    let root = file_id.root(db);
+    let mut items = FxHashMap::default();
+    for &[start, end, kind, id] in ast_id_map.entries() {
+        let kind = SyntaxKind::from(kind as u16);
+        if !matches!(kind, SyntaxKind::FN | SyntaxKind::CONST | SyntaxKind::STATIC | SyntaxKind::VARIANT) {
+            continue;
+        }
+        let ast_id = ErasedFileAstId::from_raw(id);
+        let ptr = SyntaxNodePtr::from_parts(kind, TextRange::new(start.into(), end.into()));
+        let syntax = anchored_body_syntax(db, file_id, span_map, ast_id_map, view::to_node(ptr, root));
+        let item = ItemBodySyntax::new(db, ast_id, syntax);
+        items.insert(ast_id, blaze_query::db::AsId::as_id(&item));
+    }
+    items
+}
+
+/// The [`BodySyntax`] of `def` found by where it is in its file: what [`body_syntax`] reads for
+/// a body in a fn body or one a macro writes.
+#[blaze_query::tracked(returns(ref))]
+fn placed_body_syntax(db: &Db, def: DefWithBodyId) -> Option<BodySyntax> {
     let src = def_syntax(db, def);
     let SpanMap::RealSpanMap(span_map) = src.file_id.span_map(db) else { return None };
-    let item = src.value;
+    anchored_body_syntax(db, src.file_id, span_map, src.file_id.ast_id_map(db), src.value)
+}
+
+/// The [`BodySyntax`] of `item`, a node of the real file `file_id`.
+fn anchored_body_syntax(
+    db: &Db,
+    file_id: HirFileId,
+    span_map: &RealSpanMap,
+    ast_id_map: &AstIdMap,
+    item: view::Node<'_>,
+) -> Option<BodySyntax> {
     let (start, anchor) = span_map.anchor_at(item.text_range().start());
-    let ast_id_map = src.file_id.ast_id_map(db);
     let anchor = match anchor == ROOT_ERASED_FILE_AST_ID {
         true => item.ancestors().last()?,
         false => {
@@ -599,8 +675,8 @@ pub fn body_syntax(db: &Db, def: DefWithBodyId) -> Option<BodySyntax> {
     };
     let relative =
         relative.ancestors().find(|it| it.text_range() == range && it.kind() == item.kind())?;
-    let (file, edition) = src.file_id.file_id()?.unpack(db);
-    let AnchorMaps { ast_id_map, span_map, outline } = trees::maps(anchor, src.file_id, || {
+    let (file, edition) = file_id.file_id()?.unpack(db);
+    let AnchorMaps { ast_id_map, span_map, outline } = trees::maps(anchor, file_id, || {
         AnchorMaps {
             // alloc: one per anchor, shared by its bodies
             ast_id_map: Arc::new(ast_id_map.relative_to_view(anchor, root)),
@@ -610,7 +686,7 @@ pub fn body_syntax(db: &Db, def: DefWithBodyId) -> Option<BodySyntax> {
         }
     });
     Some(BodySyntax {
-        file_id: src.file_id,
+        file_id,
         tree,
         // clone: a count of the file's text
         text: db.file_text(file).text(db).clone(),

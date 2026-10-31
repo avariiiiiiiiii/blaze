@@ -117,6 +117,7 @@ fn diag_in(file: &str, out: &str) -> Diag {
         kind: MacroKind::Bang,
         name: "include_str".to_owned(),
         def_site: Some(span(file, 0, 1)),
+        opaque: false,
     }));
     let mut diag = Diag::error(Some("E0308"), "mismatched types", called);
     diag.span.labels.push((span(file, 4, 9), "expected `u32`".to_owned()));
@@ -164,6 +165,7 @@ fn an_outcome_naming_another_machine_path_is_refused() {
         kind: MacroKind::Bang,
         name: "panic".to_owned(),
         def_site: Some(span("/toolchain/lib/rustlib/src/rust/library/core/src/macros/mod.rs", 0, 1)),
+        opaque: false,
     }));
     assert!(matches!(refused(diag), Refused::MachinePath { .. }));
     // A sibling package whose directory starts with the crate's.

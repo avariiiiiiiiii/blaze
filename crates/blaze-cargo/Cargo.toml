@@ -32,6 +32,8 @@ hir-def.workspace = true
 hir-ty.workspace = true
 hir-ty-ub.workspace = true
 hir-ty-pure.workspace = true
+# `blaze doc`'s pages, made in the daemon from the front end (`serve::unit::doc`).
+blaze-doc.workspace = true
 # `blaze pack`'s pack, made in the daemon (`serve::unit::pack`). It names no code generator, so
 # blaze-wasm's `wasm` feature never reaches this build.
 blaze-wasm-pack.workspace = true
@@ -50,6 +52,8 @@ blaze-manifest.workspace = true
 blaze-global.workspace = true
 blaze-graph.workspace = true
 blaze-history.workspace = true
+# `BLAZE_PROFILE`: the client puts the profile together, the daemon writes its part of each build.
+blaze-profile.workspace = true
 blaze-inproc.workspace = true
 blaze-intent.workspace = true
 blaze-image.workspace = true

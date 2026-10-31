@@ -109,6 +109,8 @@ pub enum Value<S: Steps> {
     /// A unit's compile, and the images it relinked, given back to the loop.
     Compiled(usize, Result<Compiled, ApiError>, Vec<Image<S>>),
     Answer(Result<Response, ApiError>),
+    /// Answered with these, in order: a [`Work::Doc`]'s pages, warnings and documentation.
+    Answers(Result<Vec<Response>, ApiError>),
     /// `blaze test --ub`: the tests selected, and one's result.
     Selected(Result<Vec<String>, ApiError>),
     Evaluated(Result<TestResult, ApiError>),
@@ -207,6 +209,8 @@ pub(super) enum Does<S: Steps> {
     Ahead { front: Arc<S::Front>, filter: Vec<String> },
     /// Posted with the job's writer, once its check is built and nothing reads its front end.
     Pack { front: Arc<S::Front>, program: String },
+    /// As [`Does::Pack`] is: the documentation sets `cfg(doc)` on the crates it documents.
+    Doc { front: Arc<S::Front>, no_deps: bool, private: bool },
 }
 
 impl<S: Steps> Step<S> {
@@ -296,6 +300,10 @@ impl<S: Steps> plane::Work for Step<S> {
                 let writer = readers.writer.expect("the pack's task is posted with its job's writer");
                 self.settle(front.pack(writer, program), |it| Value::Answer(it.map(|pack| Response::Packed { pack })))
             }
+            Does::Doc { front, no_deps, private } => {
+                let writer = readers.writer.expect("the documentation's task is posted with its job's writer");
+                self.settle(front.doc(writer, *no_deps, *private), Value::Answers)
+            }
         }
     }
 }
@@ -349,6 +357,7 @@ fn command_of(work: &Work) -> Command {
         | Work::Snapshot
         | Work::Edit(_)
         | Work::Pack { .. } => Command::Check,
+        Work::Doc { .. } => Command::Doc,
     }
 }
 
@@ -365,7 +374,8 @@ fn goal_of(work: &Work) -> Goal {
         | Work::Tables
         | Work::Snapshot
         | Work::Edit(_)
-        | Work::Pack { .. } => Goal::Check,
+        | Work::Pack { .. }
+        | Work::Doc { .. } => Goal::Check,
     }
 }
 
@@ -380,9 +390,18 @@ fn targets_of(work: &Work) -> Option<&Targets> {
         | Work::Run { targets, .. }
         | Work::Reach { targets, .. }
         | Work::Ahead { targets, .. }
-        | Work::Pack { targets, .. } => Some(targets),
+        | Work::Pack { targets, .. }
+        | Work::Doc { targets, .. } => Some(targets),
         Work::Tables | Work::Snapshot | Work::Edit(_) => None,
     }
+}
+
+/// The directory `BLAZE_PROFILE` names in the environment of the cargo command line that asked
+/// for `work`, when it names one.
+fn profile_dir(work: &Work) -> Option<&str> {
+    let cargo = targets_of(work)?.cargo.as_ref()?;
+    let (_, dir) = cargo.env.iter().find(|(name, _)| name == blaze_profile::VAR)?;
+    Some(dir.as_str()).filter(|it| !it.is_empty())
 }
 
 /// One word of cargo's command line: made once per job, at the edge.
@@ -767,6 +786,9 @@ struct Job<S: Steps> {
     served: Vec<ServedCrate>,
     /// Each image its units linked and how ([`Compiled::links`]), taken by its `Work` report.
     links: Vec<(String, Linking)>,
+    /// Its command line's environment names a profile's directory ([`profile_dir`]): the
+    /// daemon's part of the build is written there as it finishes.
+    profiled: bool,
 }
 
 impl<S: Steps> Job<S> {
@@ -1002,6 +1024,14 @@ impl<S: Steps> Jobs<S> {
             .and_then(|it| it.cargo.as_ref())
             .is_some_and(|cargo| cargo.args.iter().any(|arg| arg == "--keep-going"));
         let snapshot = matches!(work, Work::Snapshot);
+        // A daemon already running starts recording at the first request that asks.
+        let profiled = match profile_dir(&work) {
+            Some(dir) => {
+                blaze_profile::start(std::path::Path::new(dir));
+                true
+            }
+            None => false,
+        };
         let job = Job {
             work,
             views,
@@ -1025,6 +1055,7 @@ impl<S: Steps> Jobs<S> {
             compiled: 0,
             served: Vec::new(), // alloc: none; a build fills it once
             links: Vec::new(),  // alloc: none until a unit links
+            profiled,
         };
         if self.jobs.put(key_of(id), job).is_err() {
             // alloc: an error the session's free list can't give
@@ -1174,14 +1205,14 @@ impl<S: Steps> Jobs<S> {
                     build.held.push((task, again));
                     return;
                 };
-                let images = match task.kind == kinds::COMPILE {
+                let images = match task.kind == kinds::COMPILE || task.kind == kinds::PROGRAM {
                     true => self.paths.take_images(build.outputs.of(task.arg as usize)),
                     false => Vec::new(), // alloc: none
                 };
                 Some(Readers { this: Some(this), images, ..Readers::default() })
             }
             Some(job) if matches!(job.stage, Stage::Answer(_) | Stage::Ahead(_)) => match job.work {
-                Work::Tables | Work::Pack { .. } => job.ready.last_mut().and_then(|it| it.writer.take()).map(|writer| Readers {
+                Work::Tables | Work::Pack { .. } | Work::Doc { .. } => job.ready.last_mut().and_then(|it| it.writer.take()).map(|writer| Readers {
                     writer: Some(writer),
                     ..Readers::default()
                 }),
@@ -1250,11 +1281,27 @@ impl<S: Steps> Jobs<S> {
                 Happened::Started { id } => self.started_unit(w, id),
                 Happened::Post { task, again } => self.post(w, task, again),
                 Happened::Run { id } => self.run_script(w, id),
+                Happened::Panicked { id, panic } => self.panicked(id, &panic),
                 Happened::Settled { id, ok, why } => self.settled(w, id, ok, why),
                 Happened::Finished { request, ok, stats } => self.plane_finished(w, request, ok, stats),
             }
         }
         self.wind_up(w);
+    }
+
+    /// A task of a build's units that panicked fails its job with the panic, naming the unit.
+    /// A task of any other stage fails its job as it settles, the panic its `why`.
+    fn panicked(&mut self, node: NodeId, panic: &plane::Panic) {
+        let Some(job) = self.batches.job_of(node).and_then(|id| self.jobs.get_mut(key_of(id))) else { return };
+        let Stage::Units(build) = &job.stage else { return };
+        let error = match build.unit(node).map(|at| &build.input.units.graph.units[at]) {
+            Some(unit) => ApiError::new(
+                format!("the daemon {panic}, building {} of {}", unit.target.name, unit.pkg_id), // alloc: an error, once
+                Some(unit.pkg_id.clone()), // clone: an error, once
+            ),
+            None => ApiError::new(format!("the daemon {panic}, building the units"), None), // alloc: an error, once
+        };
+        job.over.get_or_insert((false, Some(error)));
     }
 
     /// Keeps what a task's expansions put, from the store's one owner: a refused one fails the
@@ -1420,6 +1467,13 @@ impl<S: Steps> Jobs<S> {
                     self.end(w, id, true, None);
                 }
                 Some(Value::Answer(Err(error))) => self.end(w, id, false, Some(error)),
+                Some(Value::Answers(Ok(responses))) => {
+                    for response in responses {
+                        w.said.push(Said::Report(id, response));
+                    }
+                    self.end(w, id, true, None);
+                }
+                Some(Value::Answers(Err(error))) => self.end(w, id, false, Some(error)),
                 _ => self.end(w, id, false, Some(ApiError::new(why, None))),
             },
             Stage::Ahead(at) if at == node => match job.take_value(node) {
@@ -1601,7 +1655,10 @@ impl<S: Steps> Jobs<S> {
             self.prepare(w, id);
             return;
         }
-        if matches!(job.work, Work::Check(_) | Work::Build(_) | Work::Test { .. } | Work::Run { .. } | Work::Pack { .. }) {
+        if matches!(
+            job.work,
+            Work::Check(_) | Work::Build(_) | Work::Test { .. } | Work::Run { .. } | Work::Pack { .. } | Work::Doc { .. }
+        ) {
             self.build(w, id, None);
             return;
         }
@@ -1686,6 +1743,11 @@ impl<S: Steps> Jobs<S> {
             name.push_str(&unit.pkg_id);
             name.push(' ');
             name.push_str(&unit.target.name);
+            // A program's build is admitted by what that program held, one never measured alone.
+            if !check && let Some(program) = super::unit::program_key(unit) {
+                w.plane.push_program(&mut nodes, node(kind, &name, &deps, Pool::Work, None), at as u32, program);
+                continue;
+            }
             let (kind, task) = match unit.mode {
                 UnitMode::RunCustomBuild => (NodeKind::ScriptRun, Task::Loop { kind: loops::SCRIPT_RUN }),
                 _ => (kind, Task::Thread { kind: kinds::COMPILE, arg: at as u32 }),
@@ -2187,7 +2249,7 @@ impl<S: Steps> Jobs<S> {
         }
         let ok = ok && job.over.is_none();
         let runs = ok && matches!(job.work, Work::Test { ub: None, .. } | Work::Run { .. });
-        let pack = ok && matches!(job.work, Work::Pack { .. });
+        let pack = ok && matches!(job.work, Work::Pack { .. } | Work::Doc { .. });
         let Stage::Units(build) = std::mem::replace(&mut job.stage, Stage::Over) else { return };
         let Build { input, front, mut writer, artifacts, evaluation, root, .. } = *build;
         if let Err(error) = writer.finished() {
@@ -2206,7 +2268,8 @@ impl<S: Steps> Jobs<S> {
                 w.said.push(Said::Report(id, Response::Diagnostic(note)));
             }
         }
-        // A pack's front end is not kept: recording its expansions changes its proc macros.
+        // A pack's front end is not kept: recording its expansions changes its proc macros; nor
+        // is the documentation's, which sets `cfg(doc)`.
         let packing = match pack {
             true => Some(writer),
             false => {
@@ -2292,8 +2355,9 @@ impl<S: Steps> Jobs<S> {
         }
     }
 
-    /// [`Work::Pack`]'s check built: the pack made by one task of a plane request of its own,
-    /// posted with the front end's writer, as no task reads the front end any more.
+    /// [`Work::Pack`]'s or [`Work::Doc`]'s check built: the pack or the documentation made by
+    /// one task of a plane request of its own, posted with the front end's writer, as no task
+    /// reads the front end any more.
     fn pack(&mut self, w: &mut World<'_, S>, id: JobId, input: JobInput, front: Arc<S::Front>, writer: S::Writer) {
         let Some(job) = self.jobs.get_mut(key_of(id)) else { return };
         job.ready.push(Ready { input, root: None, front: Some(front), writer: Some(writer) });
@@ -2307,7 +2371,11 @@ impl<S: Steps> Jobs<S> {
         job.request = Some(w.plane.open(w.now, false, job.idle));
         job.finished = false;
         job.closed = false;
-        let fresh = lone(w.plane, NodeKind::Bodies, "the pack", Pool::Work, None, kinds::WALK);
+        let what = match job.work {
+            Work::Doc { .. } => "the documentation",
+            _ => "the pack",
+        };
+        let fresh = lone(w.plane, NodeKind::Bodies, what, Pool::Work, None, kinds::WALK);
         job.stage = Stage::Answer(fresh.first());
         self.add(w, id, fresh, Some(work), true);
         self.close(w, id);
@@ -2331,6 +2399,13 @@ impl<S: Steps> Jobs<S> {
             // alloc: one a link, at the request's end
             links: links.into_iter().map(|(path, how)| blaze_api::Linked { how: how.how(), path }).collect(),
             critical_path_us: stats.critical_path_ns / 1000,
+            steps_us: NodeKind::ALL
+                .into_iter()
+                .zip(stats.steps_ns)
+                .filter(|it| it.1 > 0)
+                .map(|(kind, ns)| (kind, ns / 1000))
+                // alloc: one a kind that ran, at the request's end
+                .collect(),
         };
         w.said.push(Said::Report(id, Response::Work(worked)));
     }
@@ -2445,6 +2520,13 @@ impl<S: Steps> Jobs<S> {
             self.batches.remove(id);
             self.order.retain(|it| *it != id);
             self.ended = true;
+            // Written before the answer, so the client that puts the profile together finds
+            // this part; a build no profile asked for is in none, unless one under way is.
+            if job.profiled {
+                blaze_profile::write_part();
+            } else if blaze_profile::on() && !self.jobs.values().any(|it| it.profiled) {
+                blaze_profile::discard();
+            }
             w.said.push(Said::Finish(id, ok, error, job.built));
         }
         self.over = over;
@@ -2486,8 +2568,8 @@ impl<S: Steps> Jobs<S> {
 }
 
 /// The task that answers a job's work on its ready views: a reach, the codegen inputs, the
-/// tables, a trace, a verify, an edit, the units a build ahead picks, or a checked pack's
-/// pack.
+/// tables, a trace, a verify, an edit, the units a build ahead picks, a checked pack's pack, or
+/// a checked documentation's pages.
 fn answer<S: Steps>(job: &Job<S>, paths: &Paths<S>, steps: &Arc<S>) -> Result<Step<S>, ApiError> {
     let Some(ready) = job.ready.last() else { return Err(ApiError::new("the job has no view", None)) };
     let not_lowered = || ApiError::new("the job's view is not lowered", None);
@@ -2521,6 +2603,7 @@ fn answer<S: Steps>(job: &Job<S>, paths: &Paths<S>, steps: &Arc<S>) -> Result<St
         Work::Ahead { filter, .. } => Does::Ahead { front: lowered()?, filter: filter.clone() },
         // clone: the task owns the program's name, once per job
         Work::Pack { program, .. } => Does::Pack { front: lowered()?, program: program.clone() },
+        Work::Doc { no_deps, private, .. } => Does::Doc { front: lowered()?, no_deps: *no_deps, private: *private },
         Work::Check(_) | Work::Build(_) | Work::Test { .. } | Work::Run { .. } | Work::Snapshot => {
             return Err(ApiError::new("the job's work builds its units, answering nothing on its own", None));
         }

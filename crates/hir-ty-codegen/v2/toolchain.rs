@@ -29,7 +29,7 @@ pub(crate) const NIGHTLY: &str = include_str!("../../../harness/toolchain").trim
 const PRODUCER: &str = "blaze v2 codegen 1";
 
 /// The version of Cranelift blaze is built with, as `Cargo.lock` has it (checked there).
-const CRANELIFT: &str = "0.137.0";
+const CRANELIFT: &str = "0.137.1";
 
 /// The LLVM blaze pins (`llvm.json`).
 const LLVM_PIN: &str = include_str!("../llvm.json");

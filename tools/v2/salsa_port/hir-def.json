@@ -1,6 +1,6 @@
 {
  "crate": "crates/hir-def",
- "base": "9023f3e6d7d8a2d1954423c4ccdd89b220701525",
+ "base": "adc8bbbf04a20c189070000982f22445be80764f",
  "files": [
   {
    "path": "crates/hir-def/src/attrs.rs",
@@ -815,27 +815,6 @@
    ]
   },
   {
-   "path": "crates/hir-def/src/nameres/facts/tests/differential.rs",
-   "edits": [
-    {
-     "old": "    \"../macro_expansion_tests/mod.rs\",\n    \"../macro_expansion_tests/builtin_derive_macro.rs\",\n",
-     "new": "    \"../macro_expansion_tests/mod.rs\",\n    \"../macro_expansion_tests/budgets.rs\",\n    \"../macro_expansion_tests/builtin_derive_macro.rs\",\n"
-    },
-    {
-     "old": "    \"../macro_expansion_tests/builtin_derive_macro.rs\",\n    \"../macro_expansion_tests/builtin_fn_macro.rs\",\n",
-     "new": "    \"../macro_expansion_tests/builtin_derive_macro.rs\",\n    \"../macro_expansion_tests/builtin_errors.rs\",\n    \"../macro_expansion_tests/builtin_fn_macro.rs\",\n"
-    },
-    {
-     "old": "    check_files(&MACRO_EXPANSION[..5]);\n",
-     "new": "    check_files(&MACRO_EXPANSION[..7]);\n"
-    },
-    {
-     "old": "    check_files(&MACRO_EXPANSION[5..]);\n",
-     "new": "    check_files(&MACRO_EXPANSION[7..]);\n"
-    }
-   ]
-  },
-  {
    "path": "crates/hir-def/src/nameres/facts/tests/impls.rs",
    "edits": [
     {
@@ -879,23 +858,19 @@
    "path": "crates/hir-def/src/nameres/tests/incremental.rs",
    "edits": [
     {
-     "old": "        \"#]],\n        expect![[r#\"\n            [\n                \"EditionedFileId::parse\",\n                \"HirFileId::ast_id_map\",\n                \"file_item_tree_query\",\n                \"real_span_map\",\n                \"EnumVariants::of\",\n",
-     "new": "        \"#]],\n        expect![[r#\"\n            [\n                \"EditionedFileId::parse_\",\n                \"file_item_tree_query\",\n                \"real_span_map\",\n                \"EnumVariants::of\",\n"
+     "old": "            ]\n        \"#]],\n        expect![[r#\"\n            [\n                \"EditionedFileId::parse\",\n                \"file_item_tree_query\",\n                \"HirFileId::ast_id_map\",\n                \"real_span_map\",\n            ]\n",
+     "new": "            ]\n        \"#]],\n        expect![[r#\"\n            [\n                \"EditionedFileId::parse_\",\n                \"file_item_tree_query\",\n                \"HirFileId::ast_id_map\",\n                \"real_span_map\",\n            ]\n"
     },
     {
-     "old": "                \"EditionedFileId::parse_\",\n                \"file_item_tree_query\",\n                \"real_span_map\",\n                \"EnumVariants::of\",\n",
-     "new": "                \"EditionedFileId::parse_\",\n                \"file_item_tree_query\",\n                \"HirFileId::ast_id_map_\",\n                \"real_span_map\",\n                \"EnumVariants::of\",\n"
+     "old": "                \"EditionedFileId::parse_\",\n                \"file_item_tree_query\",\n                \"HirFileId::ast_id_map\",\n                \"real_span_map\",\n            ]\n",
+     "new": "                \"EditionedFileId::parse_\",\n                \"file_item_tree_query\",\n                \"HirFileId::ast_id_map_\",\n                \"real_span_map\",\n            ]\n"
     },
     {
-     "old": "                \"EnumVariants::of\",\n",
-     "new": ""
+     "old": "                \"crate_local_def_map\",\n            ]\n        \"#]],\n        expect![[r#\"\n            [\n                \"EditionedFileId::parse\",\n                \"file_item_tree_query\",\n                \"HirFileId::ast_id_map\",\n                \"real_span_map\",\n                \"MacroCallId::macro_arg\",\n                \"MacroCallId::parse_macro_expansion\",\n",
+     "new": "                \"crate_local_def_map\",\n            ]\n        \"#]],\n        expect![[r#\"\n            [\n                \"EditionedFileId::parse_\",\n                \"file_item_tree_query\",\n                \"HirFileId::ast_id_map\",\n                \"real_span_map\",\n                \"MacroCallId::macro_arg\",\n                \"MacroCallId::parse_macro_expansion\",\n"
     },
     {
-     "old": "            ]\n        \"#]],\n        expect![[r#\"\n            [\n                \"EditionedFileId::parse\",\n                \"HirFileId::ast_id_map\",\n                \"file_item_tree_query\",\n                \"real_span_map\",\n                \"MacroCallId::macro_arg\",\n                \"MacroCallId::parse_macro_expansion\",\n",
-     "new": "            ]\n        \"#]],\n        expect![[r#\"\n            [\n                \"EditionedFileId::parse_\",\n                \"file_item_tree_query\",\n                \"real_span_map\",\n                \"MacroCallId::macro_arg\",\n                \"MacroCallId::parse_macro_expansion\",\n"
-    },
-    {
-     "old": "                \"EditionedFileId::parse_\",\n                \"file_item_tree_query\",\n                \"real_span_map\",\n                \"MacroCallId::macro_arg\",\n",
+     "old": "                \"EditionedFileId::parse_\",\n                \"file_item_tree_query\",\n                \"HirFileId::ast_id_map\",\n                \"real_span_map\",\n                \"MacroCallId::macro_arg\",\n",
      "new": "                \"EditionedFileId::parse_\",\n                \"file_item_tree_query\",\n                \"HirFileId::ast_id_map_\",\n                \"real_span_map\",\n                \"MacroCallId::macro_arg\",\n"
     },
     {
@@ -903,44 +878,40 @@
      "new": "                \"MacroCallId::macro_arg_\",\n                \"MacroCallId::parse_macro_expansion_\",\n                \"HirFileId::ast_id_map_\",\n"
     },
     {
-     "old": "            ]\n        \"#]],\n        expect![[r#\"\n            [\n                \"EditionedFileId::parse\",\n                \"HirFileId::ast_id_map\",\n                \"file_item_tree_query\",\n                \"real_span_map\",\n                \"MacroCallId::macro_arg\",\n                \"MacroCallId::proc_macro_expansion\",\n",
-     "new": "            ]\n        \"#]],\n        expect![[r#\"\n            [\n                \"EditionedFileId::parse_\",\n                \"HirFileId::ast_id_map_\",\n                \"file_item_tree_query\",\n                \"real_span_map\",\n                \"MacroCallId::macro_arg\",\n                \"MacroCallId::proc_macro_expansion\",\n"
+     "old": "        \"#]],\n        expect![[r#\"\n            [\n                \"EditionedFileId::parse\",\n                \"HirFileId::ast_id_map\",\n                \"file_item_tree_query\",\n                \"real_span_map\",\n                \"MacroCallId::macro_arg\",\n",
+     "new": "        \"#]],\n        expect![[r#\"\n            [\n                \"EditionedFileId::parse_\",\n                \"HirFileId::ast_id_map_\",\n                \"file_item_tree_query\",\n                \"real_span_map\",\n                \"MacroCallId::macro_arg\",\n"
     },
     {
      "old": "                \"MacroCallId::macro_arg\",\n                \"MacroCallId::proc_macro_expansion\",\n                \"MacroCallId::parse_macro_expansion\",\n                \"HirFileId::ast_id_map\",\n",
      "new": "                \"MacroCallId::macro_arg_\",\n                \"MacroCallId::proc_macro_expansion_\",\n                \"MacroCallId::parse_macro_expansion_\",\n                \"HirFileId::ast_id_map_\",\n"
     },
     {
-     "old": "        \"#]],\n        expect![[r#\"\n            [\n                \"EditionedFileId::parse\",\n                \"HirFileId::ast_id_map\",\n                \"file_item_tree_query\",\n                \"real_span_map\",\n                \"MacroCallId::macro_arg\",\n",
-     "new": "        \"#]],\n        expect![[r#\"\n            [\n                \"EditionedFileId::parse_\",\n                \"file_item_tree_query\",\n                \"real_span_map\",\n                \"MacroCallId::macro_arg\",\n"
+     "old": "        \"#]],\n        expect![[r#\"\n            [\n                \"EditionedFileId::parse\",\n                \"file_item_tree_query\",\n                \"HirFileId::ast_id_map\",\n                \"real_span_map\",\n",
+     "new": "        \"#]],\n        expect![[r#\"\n            [\n                \"EditionedFileId::parse_\",\n                \"file_item_tree_query\",\n                \"HirFileId::ast_id_map\",\n                \"real_span_map\",\n"
     },
     {
-     "old": "                \"EditionedFileId::parse_\",\n                \"file_item_tree_query\",\n                \"real_span_map\",\n                \"MacroCallId::macro_arg\",\n",
+     "old": "                \"EditionedFileId::parse_\",\n                \"file_item_tree_query\",\n                \"HirFileId::ast_id_map\",\n                \"real_span_map\",\n                \"MacroCallId::macro_arg\",\n",
      "new": "                \"EditionedFileId::parse_\",\n                \"file_item_tree_query\",\n                \"HirFileId::ast_id_map_\",\n                \"real_span_map\",\n                \"MacroCallId::macro_arg\",\n"
     },
     {
-     "old": "                \"MacroCallId::macro_arg\",\n                \"AstId::decl_macro_expander\",\n                \"MacroCallId::macro_arg\",\n                \"MacroCallId::macro_arg\",\n",
+     "old": "                \"MacroCallId::macro_arg\",\n                \"AstId::decl_macro_expander\",\n                \"MacroCallId::macro_arg\",\n",
      "new": "                \"MacroCallId::macro_arg_\",\n                \"AstId < ast :: Macro >::decl_macro_expander_\",\n                \"MacroCallId::macro_arg_\",\n"
     },
     {
-     "old": "                \"Modules::module\",\n",
-     "new": ""
-    },
-    {
-     "old": "        &[(\"file_item_tree_query\", 1), (\"parse_macro_expansion\", 0)],\n        expect![[r#\"\n            [\n                \"EditionedFileId::parse\",\n                \"HirFileId::ast_id_map\",\n                \"file_item_tree_query\",\n                \"real_span_map\",\n                \"MacroCallId::macro_arg\",\n",
-     "new": "        &[(\"file_item_tree_query\", 1), (\"parse_macro_expansion\", 0)],\n        expect![[r#\"\n            [\n                \"EditionedFileId::parse_\",\n                \"HirFileId::ast_id_map_\",\n                \"file_item_tree_query\",\n                \"real_span_map\",\n                \"MacroCallId::macro_arg\",\n"
+     "old": "                \"EditionedFileId::parse\",\n                \"HirFileId::ast_id_map\",\n",
+     "new": "                \"EditionedFileId::parse_\",\n                \"HirFileId::ast_id_map_\",\n"
     },
     {
      "old": "                \"MacroCallId::macro_arg\",\n                \"MacroCallId::macro_arg\",\n                \"MacroCallId::macro_arg\",\n",
      "new": "                \"MacroCallId::macro_arg_\",\n                \"MacroCallId::macro_arg_\",\n                \"MacroCallId::macro_arg_\",\n"
     },
     {
-     "old": "                \"EditionedFileId::parse\",\n                \"HirFileId::ast_id_map\",\n",
+     "old": "                \"EditionedFileId::parse\",\n",
      "new": "                \"EditionedFileId::parse_\",\n"
     },
     {
-     "old": "                \"EditionedFileId::parse_\",\n                \"file_item_tree_query\",\n                \"real_span_map\",\n            ]\n",
-     "new": "                \"EditionedFileId::parse_\",\n                \"file_item_tree_query\",\n                \"HirFileId::ast_id_map_\",\n                \"real_span_map\",\n            ]\n"
+     "old": "                \"HirFileId::ast_id_map\",\n",
+     "new": "                \"HirFileId::ast_id_map_\",\n"
     }
    ]
   },

@@ -1087,6 +1087,26 @@ fn a_key_is_kept_once_and_runs_again_by_its_bytes() {
     let longer = view(&db, &tree, &[("a", "abcd")]);
     assert_eq!(db.pin().get::<Double>(longer, &"a".to_owned()), Ok(8));
     assert_eq!(runs("len"), 2);
+
+    // Its bytes are read back once: the next view's run of len(a) takes the key decoded then.
+    let task = blaze_reclaim::enter();
+    let decoded: *const crate::AnyKey = &**db.keys.get(&task, &key::<Len>("a")).expect("decoded for its run");
+    drop(task);
+    let longest = view(&db, &tree, &[("a", "abcde")]);
+    assert_eq!(db.pin().get::<Double>(longest, &"a".to_owned()), Ok(10));
+    assert_eq!(runs("len"), 3);
+    let task = blaze_reclaim::enter();
+    let again: *const crate::AnyKey = &**db.keys.get(&task, &key::<Len>("a")).expect("still kept");
+    assert!(std::ptr::addr_eq(again, decoded), "not decoded again");
+    drop(task);
+
+    for open in [one, longer, longest] {
+        db.close(open);
+    }
+    collect_until_freed(&db);
+    let task = blaze_reclaim::enter();
+    assert!(matches!(db.slot(&task, &key::<Len>("a")), Ok(None)), "len(a)'s slot is collected");
+    assert!(db.keys.get(&task, &key::<Len>("a")).is_none(), "and its decoded key with it");
 }
 
 /// Its runs are tasks of `Tag::Parse`: it answers its frame's tag and [`Double`] of its key.
@@ -1187,7 +1207,8 @@ fn a_warm_collection_allocates_nothing() {
 }
 
 /// Once warm, a miss allocates no more than a segment the store opens for what it copies: the
-/// run's frame, its value buffer, its key bytes and its slot's list are all reused.
+/// run's frame, its value buffer, its key bytes, the key its dependency's run decoded from
+/// them and its slot's list are all reused.
 #[test]
 fn a_warm_miss_allocates_at_most_a_segment() {
     let (db, tree) = setup();

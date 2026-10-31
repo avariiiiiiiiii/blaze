@@ -1,16 +1,7 @@
 {
  "crate": "crates/proc-macro-api",
- "base": "9023f3e6d7d8a2d1954423c4ccdd89b220701525",
+ "base": "adc8bbbf04a20c189070000982f22445be80764f",
  "files": [
-  {
-   "path": "crates/proc-macro-api/src/bridge/lex.rs",
-   "edits": [
-    {
-     "old": "            TokenKind::UnknownPrefix => return Err(format!(\"Unknown prefix: `{text}`\")),\n            TokenKind::UnknownPrefixLifetime => {\n",
-     "new": "            TokenKind::UnknownPrefix => return Err(format!(\"Unknown prefix: `{text}`\")),\n            // alloc: the message of text refused.\n            TokenKind::ForcedKeywordIdent => return Err(format!(\"Forced keyword: `{text}`\")),\n            TokenKind::UnknownPrefixLifetime => {\n"
-    }
-   ]
-  },
   {
    "path": "crates/proc-macro-api/src/bridge/spans.rs",
    "edits": [

@@ -1,88 +1,13 @@
 {
  "crate": "crates/blaze-cargo",
- "base": "9023f3e6d7d8a2d1954423c4ccdd89b220701525",
+ "base": "adc8bbbf04a20c189070000982f22445be80764f",
  "files": [
-  {
-   "path": "crates/blaze-cargo/src/serve/unit.rs",
-   "edits": [
-    {
-     "old": "    /// constants; worked out once.\n    pub(crate) inert: Box<[OnceLock<Option<blaze_usercode::run::Value>>]>,\n",
-     "new": "    /// constants or is one of std's own (`script::ported`), or why std's can't be said; worked\n    /// out once.\n    pub(crate) inert: Box<[OnceLock<Result<Option<blaze_usercode::run::Value>, String>>]>,\n"
-    }
-   ]
-  },
   {
    "path": "crates/blaze-cargo/src/serve/unit/codegen.rs",
    "edits": [
     {
      "old": "/// thread of the build reads the one database of the task's reader by reference: salsa's reads\n/// take `&self`, so none waits on another and none is cloned.\n",
      "new": "/// thread of the build reads the one database of the task's reader by reference: the query\n/// engine's reads take `&self`, so none waits on another and none is cloned.\n"
-    }
-   ]
-  },
-  {
-   "path": "crates/blaze-cargo/src/serve/unit/compile.rs",
-   "edits": [
-    {
-     "old": "    let verified = u.target.is_custom_build() && script::verifies(job)? && script::inert(job, unit).is_some();\n",
-     "new": "    let verified = u.target.is_custom_build()\n        && !script::ported(job, unit)\n        && script::verifies(job)?\n        && script::inert(job, unit)?.is_some();\n"
-    },
-    {
-     "old": "/// Whether `unit` is a build script elision found inert, so neither built nor run: under\n/// `BLAZE_ELIDE=verify` it is built and run as well.\n",
-     "new": "/// Whether `unit` is a build script elision found inert, or one of std's own that blaze has a\n/// port of, so neither built nor run: under `BLAZE_ELIDE=verify` an inert one is built and run\n/// as well; std's never is ([`script::ported`]).\n"
-    },
-    {
-     "old": "    Ok(custom_build && !script::verifies(job)? && script::inert(job, unit).is_some())\n",
-     "new": "    let unverified = script::ported(job, unit) || !script::verifies(job)?;\n    Ok(custom_build && unverified && script::inert(job, unit)?.is_some())\n"
-    }
-   ]
-  },
-  {
-   "path": "crates/blaze-cargo/src/serve/unit/script.rs",
-   "edits": [
-    {
-     "old": "    schema::{DebugInfo, Mode, Unit},\n};\n",
-     "new": "    schema::{DebugInfo, Mode, Unit},\n    stdlib,\n};\n"
-    },
-    {
-     "old": "/// VFS: it is then neither compiled nor run. `unit` is the script's compile or its run. Worked\n/// out once per job and script: its compile and its run both ask.\npub(crate) fn inert(job: &Job, unit: usize) -> Option<&Value> {\n",
-     "new": "/// VFS, or what blaze's port of one of std's own scripts says it prints ([`std_printed`]): it\n/// is then neither compiled nor run. `unit` is the script's compile or its run. Worked out once\n/// per job and script: its compile and its run both ask.\npub(crate) fn inert(job: &Job, unit: usize) -> Result<Option<&Value>, ApiError> {\n"
-    },
-    {
-     "old": "    let u = units.graph.units.get(unit)?;\n",
-     "new": "    let Some(u) = units.graph.units.get(unit) else { return Ok(None) };\n"
-    },
-    {
-     "old": "        Mode::RunCustomBuild => compile_of(units, unit)?,\n",
-     "new": "        Mode::RunCustomBuild => match compile_of(units, unit) {\n            Some(it) => it,\n            None => return Ok(None),\n        },\n"
-    },
-    {
-     "old": "    job.inert.get(compile)?.get_or_init(|| work_out_inert(job, compile)).as_ref()\n",
-     "new": "    let Some(slot) = job.inert.get(compile) else { return Ok(None) };\n    match slot.get_or_init(|| work_out_inert(job, compile)) {\n        Ok(value) => Ok(value.as_ref()),\n        // clone: the error the build stops with, once per unit that asks\n        Err(what) => Err(ApiError::new(what.clone(), None)),\n    }\n"
-    },
-    {
-     "old": "fn work_out_inert(job: &Job, compile: usize) -> Option<Value> {\n",
-     "new": "/// Whether `unit` is the compile or the run of one of std's own build scripts: never compiled,\n/// so neither `BLAZE_ELIDE=verify` nor `BLAZE_PURE=verify` can run it to check its port.\npub(crate) fn ported(job: &Job, unit: usize) -> bool {\n    job.units().graph.units.get(unit).is_some_and(|it| it.is_std && it.target.is_custom_build())\n}\n\nfn work_out_inert(job: &Job, compile: usize) -> Result<Option<Value>, String> {\n    if ported(job, compile) {\n        return std_printed(job, compile).map(Some);\n    }\n"
-    },
-    {
-     "old": "    let root = units.graph.units.get(compile)?.target.src_path.to_string_lossy().into_owned();\n",
-     "new": "    let Some(u) = units.graph.units.get(compile) else { return Ok(None) };\n    let root = u.target.src_path.to_string_lossy().into_owned();\n"
-    },
-    {
-     "old": "    let (_, _, bytes) = job.mounted.read(&root).ok()??;\n",
-     "new": "    let Ok(Some((_, _, bytes))) = job.mounted.read(&root) else { return Ok(None) };\n    let Some(plan) = units.plans.get(compile) else { return Ok(None) };\n"
-    },
-    {
-     "old": "    script::inert(Path::new(&root), &files, &units.plans.get(compile)?.rustflags)\n",
-     "new": "    Ok(script::inert(Path::new(&root), &files, &plan.rustflags))\n}\n\n/// What std's own build script compiled by unit `compile` prints, from blaze's port of it\n/// ([`blaze_units::stdlib::scripts`]), checked to be the script the port is of. A std script\n/// can't be compiled (no host std is there to build it against before these scripts ran), so\n/// its run is this. None of them reads a `DEP_*` variable, so this is known before the runs\n/// it depends on end.\nfn std_printed(job: &Job, compile: usize) -> Result<Value, String> {\n    let units = job.units();\n    let u = units.graph.units.get(compile).ok_or_else(|| format!(\"the build has no unit {compile}\"))?;\n    let package = package_of(units, u).map_err(|it| it.what)?;\n    let failed = |what: String| format!(\"std's `{}` build script: {what}\", package.name);\n    let root = u.target.src_path.to_string_lossy();\n    let read = |path: &str| match job.mounted.read(path) {\n        Ok(Some((_, _, bytes))) => Ok(bytes),\n        Ok(None) => Err(format!(\"{path} is not among the build's files\")),\n        Err(error) => Err(format!(\"{path}: {error}\")),\n    };\n    let which = stdlib::scripts::identify(&package.name, &root, read).map_err(failed)?;\n    let mut runs = (0..units.graph.units.len())\n        .filter(|at| units.graph.units[*at].mode == Mode::RunCustomBuild && compile_of(units, *at) == Some(compile));\n    let (Some(run), None) = (runs.next(), runs.next()) else {\n        return Err(failed(format!(\"unit {compile} compiles it, and the build does not run it exactly once\")));\n    };\n    let (unit, vars) = script_env(job, run).map_err(failed)?;\n    let printed = stdlib::scripts::printed(which, &vars, &unit.package.manifest_dir).map_err(failed)?;\n    Ok(script::elided(printed))\n}\n\n/// Run unit `run` as `blaze_build_script` describes it, its program named and not built, and\n/// the whole environment it is started in, sorted by name.\nfn script_env(job: &Job, run: usize) -> Result<(bs::Unit, Vec<(OsString, OsString)>), String> {\n    let units = job.units();\n    let compile = compile_of(units, run).ok_or_else(|| format!(\"the run of unit {run} has no build script compiled\"))?;\n    let of = Of {\n        units,\n        host: &job.input.config.host,\n        tools: &job.shared.tools,\n        launcher: &job.shared.launcher,\n        program: named_program(units, compile).map_err(|it| it.what)?,\n        scripts: &job.scripts,\n    };\n    let unit = script_unit(&of, run)?;\n    let env = inherited(&job.input.config.invocation.env, job.plan(run).map_err(|it| it.what)?);\n    let vars = blaze_build_script::env(&unit, &env).map_err(|error| error.0)?.vars;\n    Ok((unit, vars))\n"
-    },
-    {
-     "old": "    let verify = verifies(job)? || pure::verifies(job)?;\n",
-     "new": "    let verify = !ported(job, run) && (verifies(job)? || pure::verifies(job)?);\n"
-    },
-    {
-     "old": "    let elided = inert(job, run).or_else(|| pure::hit(job, run)).cloned();\n",
-     "new": "    let elided = inert(job, run)?.or_else(|| pure::hit(job, run)).cloned();\n"
     }
    ]
   },

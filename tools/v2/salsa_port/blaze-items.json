@@ -1,6 +1,6 @@
 {
  "crate": "crates/blaze-items",
- "base": "9023f3e6d7d8a2d1954423c4ccdd89b220701525",
+ "base": "adc8bbbf04a20c189070000982f22445be80764f",
  "files": [
   {
    "path": "crates/blaze-items/src/form.rs",
@@ -67,10 +67,6 @@
     {
      "old": "// The unit makes the arguments something salsa interns: `Inner` is no salsa struct.\n",
      "new": "// The unit makes the arguments an interned key: `Inner` alone is no ID.\n"
-    },
-    {
-     "old": "            for expr in exprs.expr_roots() {\n",
-     "new": "            let mut roots = exprs.expr_roots();\n            // A body's last root is the body itself, keyed by its item, not an anonymous\n            // constant: its index moves with every edit inside the body.\n            if let ExpressionStoreOwnerId::Body(_) = store {\n                roots.next_back();\n            }\n            for expr in roots {\n"
     }
    ]
   },
@@ -93,24 +89,11 @@
    ]
   },
   {
-   "path": "crates/blaze-items/src/tests/hashes.rs",
-   "edits": [
-    {
-     "old": "            \"trait A {} trait B {} impl A for u8 {} impl B for u8 {} fn g() -> impl A { 1u8 }\",\n            \"trait A {} trait B {} impl A for u8 {} impl B for u8 {} fn g() -> impl B { 1u8 }\",\n",
-     "new": "            \"trait A {} trait B { fn b(&self) {} } impl A for u8 {} impl B for u8 {}\\n\\\n             fn g() -> impl A { 1u8 }\",\n            \"trait A {} trait B { fn b(&self) {} } impl A for u8 {} impl B for u8 {}\\n\\\n             fn g() -> impl B { 1u8 }\",\n"
-    }
-   ]
-  },
-  {
    "path": "crates/blaze-items/src/tests/narrow.rs",
    "edits": [
     {
      "old": "/// Whether `query` is among the salsa debug names in `executed`, which end in `_` for a\n/// method of a tracked impl (`TraitImpls < 'db >::for_crate_`).\n",
      "new": "/// Whether `query` is among the ingredient names in `executed`, which name a method of a\n/// tracked impl by its type and method (`TraitImpls::for_crate`).\n"
-    },
-    {
-     "old": "pub fn g<T: Copy>(_: T) {}\npub fn h<U: Clone>(_: U) {}\n",
-     "new": "pub trait A {}\npub trait B {}\npub fn g<T: A>(_: T) {}\npub fn h<U: B>(_: U) {}\n"
     }
    ]
   }

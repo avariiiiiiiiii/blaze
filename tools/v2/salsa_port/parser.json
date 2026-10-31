@@ -1,20 +1,7 @@
 {
  "crate": "crates/parser",
- "base": "9023f3e6d7d8a2d1954423c4ccdd89b220701525",
+ "base": "adc8bbbf04a20c189070000982f22445be80764f",
  "files": [
-  {
-   "path": "crates/parser/src/lexed_str.rs",
-   "edits": [
-    {
-     "old": "                #[cfg(feature = \"in-rust-tree\")]\n                rustc_lexer::TokenKind::ForcedKeywordIdent => ERROR,\n",
-     "new": "                // `k#ident` is the identifier `k` and then `#ident`, as before 2021; from 2021\n                // rustc lexes a forced keyword, gated by `forced_keywords`, which this tree has\n                // no token for.\n                rustc_lexer::TokenKind::ForcedKeywordIdent => {\n                    if self.edition.at_least_2021() {\n                        self.error(\"forced keywords are experimental\");\n                    }\n                    token_text = &token_text[..1];\n                    IDENT\n                }\n"
-    },
-    {
-     "old": "\n    /// Two lexings' input, one after the other, is the input of their texts lexed as one, split\n",
-     "new": "\n    /// `k#fn` is `k`, `#` and `fn` in every edition, and from 2021 the error of rustc's\n    /// `forced_keywords` gate on the `k`.\n    #[test]\n    fn forced_keywords_split_and_are_gated_from_2021() {\n        for edition in Edition::iter() {\n            let error = edition.at_least_2021().then(|| \"forced keywords are experimental\".to_owned());\n            assert_eq!(\n                tokens(edition, \"k#fn\"),\n                [(IDENT, \"k\", error), (POUND, \"#\", None), (FN_KW, \"fn\", None)],\n                \"{edition:?}\"\n            );\n            assert_eq!(LexedStr::single_token(edition, \"k#fn\"), None);\n        }\n    }\n\n    /// Two lexings' input, one after the other, is the input of their texts lexed as one, split\n"
-    }
-   ]
-  },
   {
    "path": "crates/parser/test_data/parser/ok/0045_block_attrs.rast",
    "edits": [

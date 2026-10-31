@@ -1,6 +1,6 @@
 {
  "crate": "crates/hir-ty-share",
- "base": "9023f3e6d7d8a2d1954423c4ccdd89b220701525",
+ "base": "adc8bbbf04a20c189070000982f22445be80764f",
  "files": [
   {
    "path": "crates/hir-ty-share/src/lib.rs",
@@ -12,23 +12,6 @@
     {
      "old": "    /// The instance is in a cycle of instances or types, which salsa gives this to all of.\n",
      "new": "    /// The instance is in a cycle of instances or types, which the query engine gives this to all of.\n"
-    }
-   ]
-  },
-  {
-   "path": "crates/hir-ty-share/src/tests/mod.rs",
-   "edits": [
-    {
-     "old": "                assert_eq!(printed(&db, body, a), printed(&db, body, b), \"`{body}` of `{a}` and `{b}`\");\n",
-     "new": "                let ((raw_a, named_a), (raw_b, named_b)) = (printed(&db, body, a), printed(&db, body, b));\n                // Renaming `u32` also renames a `u32` the body names itself (`counter`'s), so\n                // bodies that print the same as written are one body too.\n                if raw_a != raw_b {\n                    assert_eq!(named_a, named_b, \"`{body}` of `{a}` and `{b}`\");\n                }\n"
-    },
-    {
-     "old": "/// The monomorphized runtime body of `func` with the alias `arg`, printed, with the name of the\n/// type `arg` points to or is replaced by `_`.\nfn printed(db: &TestDB, func: &str, arg: &'static str) -> String {\n",
-     "new": "/// The monomorphized runtime body of `func` with the alias `arg`, printed as it is and with the\n/// name of the type `arg` points to or is replaced by `_`.\nfn printed(db: &TestDB, func: &str, arg: &'static str) -> (String, String) {\n"
-    },
-    {
-     "old": "        replace_word(&print_mir_body(db, &body, func), named, \"_\")\n",
-     "new": "        let raw = print_mir_body(db, &body, func);\n        let renamed = replace_word(&raw, named, \"_\");\n        (raw, renamed)\n"
     }
    ]
   }

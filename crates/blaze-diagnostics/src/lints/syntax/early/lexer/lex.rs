@@ -204,6 +204,14 @@ impl<'a> Lexer<'a, '_> {
                     self.unknown_prefix(start);
                     self.ident(start, false)
                 }
+                TokenKind::ForcedKeywordIdent if self.edition.at_least_2021() => self.ident(start + 2, false),
+                TokenKind::ForcedKeywordIdent => {
+                    // Split into the prefix `k`, an identifier, and `#` and the rest after it.
+                    self.pos = start + 1;
+                    self.cursor = Cursor::new(&str_before[1..], FrontmatterAllowed::No);
+                    self.unknown_prefix(start);
+                    self.ident(start, false)
+                }
                 TokenKind::UnknownPrefixLifetime => self.unknown_prefix(start),
                 TokenKind::Literal { kind: kind @ (LiteralKind::CStr { .. } | LiteralKind::RawCStr { .. }), .. }
                     if !self.edition.at_least_2021() =>

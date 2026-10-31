@@ -522,7 +522,7 @@ impl<'db> rustc_type_ir::TypeSuperVisitable<DbInterner<'db>> for Clauses<'db> {
         visitor: &mut V,
     ) -> V::Result {
         use rustc_ast_ir::visit::VisitorResult;
-        rustc_ast_ir::walk_visitable_list!(visitor, self.iter());
+        rustc_ast_ir::walk_visitable_list!(visitor, (*self).as_slice());
         V::Result::output()
     }
 }

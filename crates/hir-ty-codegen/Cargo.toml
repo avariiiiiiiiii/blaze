@@ -55,7 +55,7 @@ blaze-items.workspace = true
 blaze-mem.workspace = true
 blaze-stencil.workspace = true
 
-cranelift-codegen = { workspace = true, features = ["incremental-cache", "x86", "arm64"] }
+cranelift-codegen = { workspace = true, features = ["enable-serde", "x86", "arm64"] }
 cranelift-frontend.workspace = true
 cranelift-module = { workspace = true, features = ["enable-serde"] }
 cranelift-object.workspace = true

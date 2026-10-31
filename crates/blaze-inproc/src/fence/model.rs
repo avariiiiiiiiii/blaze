@@ -547,14 +547,34 @@ fn daemon_steps(state: &State, config: &Config, out: &mut Vec<State>) -> Result<
     Ok(())
 }
 
-/// The representative of `state` under renaming the threads, when every thread plays the same
-/// part (no spawn: thread `i` is ID `i + 1` throughout). A thread ID only meets another in
-/// equality tests and as a bit of a set, so renaming the records and every ID with them
-/// (the slots' IDs, the OS's list, the daemon's list) gives a state that steps the same way,
-/// freeing exposes a thread in one exactly when it does in the other, and the range is freed
-/// from one exactly when from the other: exploring one state per class checks both
-/// properties. Sorted by everything of a thread but its ID; ties only cost reduction.
-fn canonical(state: State, config: &Config) -> State {
+/// The representative of `state`, exploring one state per class checks both properties:
+/// - A dead thread's record is its ID alone: nothing steps it, a spawn reads only its ID, and
+///   it died from `Top`, where it neither holds the old word nor is in the range.
+/// - Renaming the threads, when every thread plays the same part (no spawn: thread `i` is ID
+///   `i + 1` throughout). A thread ID only meets another in equality tests and as a bit of a
+///   set, so renaming the records and every ID with them (the slots' IDs, the OS's list, the
+///   daemon's list) gives a state that steps the same way, freeing exposes a thread in one
+///   exactly when it does in the other, and the range is freed from one exactly when from the
+///   other. Sorted by everything of a thread but its ID; ties only cost reduction.
+fn canonical(mut state: State, config: &Config) -> State {
+    for thread in &mut state.threads {
+        if thread.pc == Pc::Dead {
+            debug_assert!(!thread.old && !thread.in_range, "a thread died in the range");
+            *thread = Thread {
+                pc: Pc::Dead,
+                tid: thread.tid,
+                inside: false,
+                old: false,
+                in_range: false,
+                epoch: 0,
+                seen: 0,
+                slot: NONE,
+                reported: 0,
+                calls: 0,
+                quiesces: 0,
+            };
+        }
+    }
     if config.spawn {
         return state;
     }

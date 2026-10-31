@@ -312,7 +312,6 @@ unicode-normalization = "=0.1.25"
 unicode-security = "=0.1.2"
 
 # Dependencies of one member, moved to the root (dedup, 2026-10-30).
-blaze-cache-macros = { version = "0.1.0", path = "crates/blaze-cache-macros" }
 blaze-cargo = { path = "crates/blaze-cargo" }
 blaze-registry = { path = "crates/blaze-registry" }
 cargo-platform = "0.3.3"

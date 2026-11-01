@@ -25,11 +25,11 @@
 
 use blaze_codegen::driver::Digests;
 use blaze_codegen::{CompiledFunction, Init, InstanceKey, Static, Target, Unwind};
+use blaze_graph::par;
 use blaze_ids::ContentId;
 use blaze_items::{CodeHash, ItemKey};
 use blaze_link::{Native, NativeKind};
 use blaze_mem::{Tag, frame, frame::Frame};
-use blaze_graph::par;
 
 use crate::PremapError;
 use crate::image::View;

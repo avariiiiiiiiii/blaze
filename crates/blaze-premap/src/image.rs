@@ -18,10 +18,10 @@
 use blaze_bytes::le::{u32 as u32_at, u64 as u64_at};
 use blaze_codegen::content::{arch_of, arch_tag};
 use blaze_codegen::{Arch, InstanceKey};
+use blaze_graph::par;
 use blaze_ids::ContentId;
 use blaze_items::ItemKey;
 use blaze_link::Format;
-use blaze_graph::par;
 
 use crate::PremapError;
 use crate::key::{ImageKey, format_tag};

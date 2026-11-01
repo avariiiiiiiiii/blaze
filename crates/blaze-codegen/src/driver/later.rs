@@ -25,10 +25,10 @@
 //! Folding (#1292) is a whole build's: a lazy function is compiled alone, as its own template.
 
 use blaze_cas::Kind;
+use blaze_graph::par;
 use blaze_ids::ContentId;
 use blaze_items::{CodeHash, ItemKey};
 use blaze_mem::{Tag, frame};
-use blaze_graph::par;
 use rustc_hash::{FxHashMap, FxHashSet};
 
 use super::{

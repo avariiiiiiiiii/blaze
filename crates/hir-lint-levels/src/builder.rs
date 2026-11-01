@@ -265,6 +265,8 @@ pub struct Levels<'db> {
     cmd_at: [LintSet; LEVELS],
     /// The set in force at each node seen, by one FxHash of the node: 28 bytes a node.
     at: HashTable<(InFile<SyntaxNodePtr>, SetId)>,
+    /// [`Levels::at`] as [`Levels::set_of_in_file`] has it, out to the root of each file.
+    in_file: HashTable<(InFile<SyntaxNodePtr>, SetId)>,
     /// The nodes between one asked of and the nearest seen, kept for its capacity.
     chain: Vec<(u64, InFile<SyntaxNodePtr>, InFile<ast::Node<'db>>)>,
     /// The `#[expect]`s the HIR's builder came to on the walk, in its order.
@@ -305,6 +307,7 @@ impl<'db> Levels<'db> {
             anywhere: LintSet::EMPTY,
             cmd_at: [LintSet::EMPTY; LEVELS],
             at: HashTable::new(),
+            in_file: HashTable::new(),
             // alloc: empty, allocates nothing
             chain: Vec::new(),
             // alloc: empty, allocates nothing
@@ -374,22 +377,45 @@ impl<'db> Levels<'db> {
     /// The set in force at `node`: of its attributes, else of the nearest node around it with
     /// any. Each node between it and the nearest one seen is hashed once.
     pub fn set_at(&mut self, cx: &mut LevelCx<'_, 'db>, sink: &mut impl Sink<'db>, node: InFile<ast::Node<'db>>) -> SetId {
+        self.walk_out(cx, sink, node, false)
+    }
+
+    /// The set in force at the node `at` points to as rustc's pre-expansion lint pass has it.
+    /// That pass runs on each file it loads with a builder of its own (`pre_expansion_lint`),
+    /// so the walk out from the node stops at the root of its file, inside the command line's
+    /// set: a module file has neither its `mod` item's levels nor the crate's
+    /// (rust-lang/rust#132218). A macro's expansion is walked out of to the file of its call.
+    pub fn set_of_in_file(&mut self, cx: &mut LevelCx<'_, 'db>, sink: &mut impl Sink<'db>, at: InFile<SyntaxNodePtr>) -> SetId {
+        let hash = FxBuildHasher.hash_one(at);
+        if let Some(&(_, set)) = self.in_file.find(hash, |(it, _)| *it == at) {
+            return set;
+        }
+        let node = cx.node(at);
+        self.walk_out(cx, sink, node, true)
+    }
+
+    /// [`Levels::set_at`], or [`Levels::set_of_in_file`] when `in_file`, each with its own
+    /// table of the nodes seen.
+    fn walk_out(&mut self, cx: &mut LevelCx<'_, 'db>, sink: &mut impl Sink<'db>, node: InFile<ast::Node<'db>>, in_file: bool) -> SetId {
         let mut chain = std::mem::take(&mut self.chain);
         let mut next = Some(node);
         let mut set = COMMAND_LINE;
         while let Some(node) = next {
             let key = attrs::key(node);
             let hash = FxBuildHasher.hash_one(key);
-            if let Some(&(_, known)) = self.at.find(hash, |(it, _)| *it == key) {
+            let seen = if in_file { &self.in_file } else { &self.at };
+            if let Some(&(_, known)) = seen.find(hash, |(it, _)| *it == key) {
                 set = known;
                 break;
             }
-            next = attrs::parent(cx.db, cx.krate, node);
+            let file_root = node.value.kind() == SyntaxKind::SOURCE_FILE && !node.file_id.is_macro();
+            next = if in_file && file_root { None } else { attrs::parent(cx.db, cx.krate, node) };
             chain.push((hash, key, node));
         }
         for (hash, key, node) in chain.drain(..).rev() {
             set = self.push_node(cx, sink, set, node);
-            self.at.insert_unique(hash, (key, set), |(it, _)| FxBuildHasher.hash_one(it));
+            let seen = if in_file { &mut self.in_file } else { &mut self.at };
+            seen.insert_unique(hash, (key, set), |(it, _)| FxBuildHasher.hash_one(it));
         }
         self.chain = chain;
         set

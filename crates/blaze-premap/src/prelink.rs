@@ -8,13 +8,13 @@
 //! and apart, every bind and init cell inside a writable segment) and encodes the image.
 
 use blaze_codegen::{Arch, InstanceKey};
+use blaze_graph::par;
 use blaze_ids::ContentId;
 use blaze_link::premap as link;
 pub use blaze_link::premap::{
     Bind, BindKind, InitEntry, Library, PlacedName, PlacedStatic, Prot, StaticAt, Tls, page,
 };
 use blaze_link::{Format, Output, OutputKind};
-use blaze_graph::par;
 
 use crate::PremapError;
 use crate::image::{self, Meta, Pieces};

@@ -490,6 +490,18 @@ struct Out<R>(*mut R);
 // SAFETY: each index is written once, by one thread, which `R: Send` allows.
 unsafe impl<R: Send> Sync for Out<R> {}
 
+impl<R> Out<R> {
+    /// A method, so that a closure captures the whole `Out` (which is `Sync`) and not its
+    /// pointer field (which is not).
+    ///
+    /// # Safety
+    /// `at` is within the buffer's capacity and no other call writes it.
+    unsafe fn write(&self, at: usize, value: R) {
+        // SAFETY: the caller's.
+        unsafe { self.0.add(at).write(value) }
+    }
+}
+
 /// `f` of each of `items`, in their order, appended to `out`, each thread's calls given the
 /// state its `init` made.
 pub fn extend_init<I, St, R>(
@@ -512,7 +524,7 @@ pub fn extend_init<I, St, R>(
             // SAFETY: `split` gives each index below `len` once.
             let made = f(state, unsafe { items.item(at) });
             // SAFETY: `base + at` is within the capacity reserved above, and written once.
-            unsafe { to.0.add(at).write(made) };
+            unsafe { to.write(at, made) };
         }
     });
     // SAFETY: every index was taken; nothing from `len` on was.

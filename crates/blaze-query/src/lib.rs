@@ -66,7 +66,7 @@ use std::{
 use blaze_core::{Completion, Done, Effect, FileName, Mapping, Tag};
 use blaze_format::{FormatError, Persist, SchemaHash, Writer};
 use blaze_graph::{
-    pump::{self, Flights},
+    pump::Flights,
     sched::fiber,
 };
 use blaze_ids::{
@@ -495,7 +495,7 @@ impl Kinds {
 
 /// This thread's runs: the keys they are running, outermost first, and the edges each
 /// running query has read so far, a query's above those of the query that asked it. Runs
-/// nest as calls do (a query asks another inline, a wait pumps a job above it), so each takes
+/// nest as calls do (a query asks another inline), so each takes
 /// the top of both stacks and gives it back when it returns; the buffers stay, so a run
 /// allocates nothing once they have grown.
 struct Stacks {
@@ -504,9 +504,9 @@ struct Stacks {
 }
 
 thread_local! {
-    /// The pump depth of the plane task that runs a query on this thread, if one does. A job
-    /// the thread pumps while that query waits is a task above it, free to ask the database.
-    static INSIDE: Cell<Option<usize>> = const { Cell::new(None) };
+    /// Whether this thread's task runs a query. Carried with a job on a fiber: another job
+    /// the thread runs while it waits is a task of its own, free to ask the database.
+    static INSIDE: Cell<bool> = const { Cell::new(false) };
     // alloc: empty until a run grows them, then reused by every run of the thread.
     static STACKS: RefCell<Stacks> = const { RefCell::new(Stacks { keys: Vec::new(), edges: Vec::new() }) };
     /// Value buffers a run writes into and gives back once the store copied its value, so a
@@ -545,19 +545,16 @@ fn take_unreadable_corrupt() -> Option<Corrupt> {
 
 #[inline(never)]
 fn inside_a_query() -> bool {
-    let inside = INSIDE.with(Cell::get);
-    // A job on a fiber carries its own `INSIDE` and waits without pumping, so the pump's depth
-    // means nothing there.
-    if fiber::current_job().is_some() { inside.is_some() } else { inside == Some(pump::depth()) }
+    INSIDE.with(Cell::get)
 }
 
 /// Marks this thread's task as running a query while it lives.
-struct Inside(Option<usize>);
+struct Inside(bool);
 
 impl Inside {
     #[inline(never)]
     fn enter() -> Inside {
-        Inside(INSIDE.with(|it| it.replace(Some(pump::depth()))))
+        Inside(INSIDE.with(|it| it.replace(true)))
     }
 }
 
@@ -583,6 +580,11 @@ fn try_with_stacks<R>(f: impl FnOnce(&RefCell<Stacks>) -> R) -> Option<R> {
 /// Empty stacks threads left when a job's were put on them, for the next job to switch out.
 // alloc: none: an empty `Vec` in a static; it grows to the most jobs switched out at once.
 static SPARE_STACKS: ShortLock<Vec<Box<Stacks>>> = ShortLock::new(Vec::new());
+
+/// Moves a thread-local of a crate above the engine with each job on a fiber across its waits,
+/// as [`carry_with_fiber_jobs`] does the engine's: one a job sets and reads again after a query
+/// call, which may resume it on another thread.
+pub use blaze_graph::sched::{Carried, carry};
 
 /// Carries this engine's per-run thread-locals with each job on a fiber across its waits
 /// ([`fiber::carry`]): the query stacks (`db`'s and [`STACKS`]), [`INSIDE`] and
@@ -628,15 +630,15 @@ fn put_stacks(taken: usize) {
     SPARE_STACKS.lock().push(left);
 }
 
-/// The switching job's [`INSIDE`]: 0 for none, else its depth plus one.
+/// The switching job's [`INSIDE`]: 1 when it runs a query.
 #[inline(never)]
 fn take_inside() -> usize {
-    INSIDE.with(Cell::take).map_or(0, |depth| depth + 1)
+    usize::from(INSIDE.with(Cell::take))
 }
 
 #[inline(never)]
 fn put_inside(taken: usize) {
-    INSIDE.with(|it| it.set(taken.checked_sub(1)));
+    INSIDE.with(|it| it.set(taken != 0));
 }
 
 /// The switching job's [`UNREADABLE`]: 0 for none, else a box of it.
@@ -658,7 +660,7 @@ fn put_unreadable(taken: usize) {
 }
 
 /// One request's root and everything it runs inline, on one task: the keys of this thread's
-/// stack from `base` on. A job pumped above a waiting query is a run of its own.
+/// stack from `base` on. A job the thread runs while a query's job waits carries its own.
 #[derive(Clone, Copy)]
 struct Run {
     base: usize,
@@ -796,7 +798,7 @@ impl<'db> Cx<'db> {
     /// the same order (so verification and [`Database::why`] see what a loop of `get` makes).
     /// The keys the view has not resolved run at once: from the first, each other is a job of
     /// the plane's pool that resolves it ahead, while this task asks them in order and waits
-    /// (pumping, a wait of the plane's) for one still running. A job ahead never waits: a key
+    /// (holding no thread, a wait of the plane's) for one still running. A job ahead never waits: a key
     /// that needs one another task runs is left for this task to ask. The first key that is
     /// [`Cancelled`] cancels the call; what the jobs resolved stays as memos.
     ///
@@ -2555,7 +2557,7 @@ impl Database {
         }
     }
 
-    /// Runs `work` as the one run of `key`, or waits (pumping) for the run under way and
+    /// Runs `work` as the one run of `key`, or waits (holding no thread) for the run under way and
     /// returns without running it, for the caller to look again. A wait that would close a
     /// cycle of tasks is [`Cancelled`]; a run ahead never waits, and a key another task runs
     /// is [`Cancelled`] to it at once.
@@ -2564,7 +2566,11 @@ impl Database {
         if run.ahead {
             return self.flights.run_if_idle(key.task_key(), work).unwrap_or(Err(Cancelled));
         }
-        self.flights.get_or_run(key.task_key(), work)
+        let awaited = |it: &mut String| {
+            use std::fmt::Write as _;
+            _ = write!(it, "{key:?}");
+        };
+        self.flights.get_or_run_named(key.task_key(), awaited, work)
     }
 
     /// Resolves `key` in the view as a job of [`Cx::get_all`]'s, in a task of its own, ahead of

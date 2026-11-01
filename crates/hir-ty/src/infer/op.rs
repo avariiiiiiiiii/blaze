@@ -293,6 +293,16 @@ impl<'db, 'f> InferenceContext<'db, 'f> {
                 method.sig.output()
             }
             Err(errors) => {
+                // Core implements the operator's trait for every builtin operation on scalars,
+                // and the caller types a builtin one as its operand.
+                let is_builtin = match op {
+                    UnaryOp::Neg => operand_ty.is_numeric(),
+                    UnaryOp::Not => operand_ty.is_integral() || operand_ty.is_bool(),
+                    UnaryOp::Deref => false,
+                };
+                if is_builtin {
+                    return self.types.types.error;
+                }
                 let unmet = self.unmet_goals(errors);
                 let at_error = self.ty_at_error(operand_ty);
                 self.push_diagnostic(InferenceDiagnostic::UnaryOperatorCannotBeApplied {

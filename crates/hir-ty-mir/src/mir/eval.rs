@@ -805,8 +805,12 @@ pub fn run_function<'db, M: Machine<'db>>(
             }
         };
     let called = Some((func, MirSpan::Unknown, body.owner));
+    let base = evaluator.stack.len();
     let result = evaluator
         .interpret_mir(body, iter::empty(), called)
+        // Miri pops `main`'s frame, freeing its locals (those without storage statements
+        // too), before the exit calls and the leak check.
+        .and_then(|_| evaluator.free_stack(base))
         .and_then(|_| evaluator.main_returned(body))
         .and_then(|_| evaluator.machine.finish());
     let output = MirOutput {

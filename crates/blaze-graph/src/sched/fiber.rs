@@ -29,7 +29,8 @@
 use std::{
     any::Any,
     cell::Cell,
-    fmt, io, mem,
+    fmt, io,
+    mem::{self, ManuallyDrop},
     ops::{Deref, DerefMut},
     panic::{self, AssertUnwindSafe},
     ptr,
@@ -46,7 +47,7 @@ use corosensei::{
     stack::{DefaultStack, Stack},
 };
 
-use super::{CoreId, CounterId, Cores, Cycle, JobId, Spawn, Stats, Suspend, Wait, World, Yielded};
+use super::{CoreId, CounterId, Cores, Cycle, JobId, OWN, Spawn, Stats, Suspend, Wait, World, Yielded};
 use crate::Key;
 
 /// What the driver runs: each job's payload, and how to run one.
@@ -109,7 +110,7 @@ impl fmt::Display for DriverError {
 impl std::error::Error for DriverError {}
 
 // dyn: a job's panic payload, carried to `Driver::join` and raised there; cold.
-type Panic = Box<dyn Any + Send>;
+pub(super) type Panic = Box<dyn Any + Send>;
 
 /// What a worker passes into a fiber.
 enum In<J> {
@@ -119,9 +120,12 @@ enum In<J> {
 }
 
 /// What a wait or move came to.
-enum Answer {
+pub(super) enum Answer {
     Ready,
     Cycle(Cycle),
+    /// A carried thread-local's take or put panicked as the job switched: the job unwinds
+    /// with that panic where it waited, its own failure.
+    Raise(Panic),
 }
 
 /// What a fiber passes back to its worker.
@@ -138,10 +142,40 @@ enum Want {
 
 /// A fiber: a coroutine that runs job after job, never ending until told to, and its number
 /// ([`Switch::fiber`]).
-struct Fiber<J>(Coroutine<In<J>, Out, (), DefaultStack>, u32);
+struct Fiber<J>(Stackful<In<J>, Out>, u32);
+
+/// A coroutine that is never dropped suspended mid-job: such a one is leaked, stack and all.
+/// Dropping it would force-unwind the job, whose own `catch_unwind` swallows corosensei's
+/// unwind and goes on into code that panics, and corosensei aborts the process on that panic.
+pub(super) struct Stackful<I, O>(ManuallyDrop<Coroutine<I, O, (), DefaultStack>>);
+
+impl<I, O> Stackful<I, O> {
+    pub(super) fn new(coroutine: Coroutine<I, O, (), DefaultStack>) -> Stackful<I, O> {
+        Stackful(ManuallyDrop::new(coroutine))
+    }
+
+    pub(super) fn resume(&mut self, input: I) -> CoroutineResult<O, ()> {
+        self.0.resume(input)
+    }
+}
+
+impl<I, O> Drop for Stackful<I, O> {
+    #[allow(unsafe_code)]
+    fn drop(&mut self) {
+        if !self.0.started() || self.0.done() {
+            // SAFETY: dropped once, here, and never used after.
+            unsafe { ManuallyDrop::drop(&mut self.0) };
+        }
+    }
+}
 
 /// Fibers made in the process: the next one's number.
 static FIBERS: AtomicU32 = AtomicU32::new(0);
+
+/// A new fiber's number ([`Switch::fiber`]).
+pub(super) fn next_fiber() -> u32 {
+    FIBERS.fetch_add(1, Ordering::Relaxed)
+}
 
 // SAFETY: a fiber is moved to another thread only while suspended (in the idle pool, or parked
 // in its job's slot), never while it runs. Its stack then holds the driver's frames (an
@@ -159,7 +193,7 @@ enum Slot<J> {
     /// Started; on a core now.
     Running,
     /// Started; suspended, or moved and not resumed yet, with the thread-locals it carries.
-    Parked(Fiber<J>, Box<Taken>),
+    Parked(Fiber<J>, Box<Taken>, Option<Panic>),
 }
 
 /// A driver's own: its jobs' slots, by local id, and its fibers.
@@ -201,11 +235,22 @@ impl CoreSlot {
 /// each driver's placement as a member) and each member's wakers. A job of one driver woken by
 /// another's is woken through them. The per-core change (docs/v2/plan/lanes/sched.md) takes
 /// spawns and ends off this lock.
-struct Global {
-    world: World,
+pub(super) struct Global {
+    pub(super) world: World,
     /// By member, as the world numbers them; `None` once the driver stopped.
     io: Vec<Option<Io>>,
+    /// By member of its own placement (from [`OWN`]), how its woken jobs are handed back.
+    pub(super) own: Vec<Option<OwnIo>>,
     dirty: Vec<u32>,
+    woken: Vec<usize>,
+}
+
+/// How a member of its own placement takes back a woken job: `wake(ctx, token)`, called under
+/// the scheduler's lock, so it must not call into the scheduler.
+#[derive(Clone, Copy)]
+pub(super) struct OwnIo {
+    pub(super) wake: fn(usize, usize),
+    pub(super) ctx: usize,
 }
 
 struct Io {
@@ -216,8 +261,65 @@ struct Io {
 
 static GLOBAL: LazyLock<Mutex<Global>> = LazyLock::new(|| {
     // alloc: the process's scheduler, once
-    Mutex::new(Global { world: World::new(1024), io: Vec::with_capacity(8), dirty: Vec::with_capacity(8) })
+    Mutex::new(Global {
+        world: World::new(1024),
+        io: Vec::with_capacity(8),
+        own: Vec::with_capacity(8),
+        dirty: Vec::with_capacity(8),
+        woken: Vec::with_capacity(64),
+    })
 });
+
+/// The process's scheduler, locked: always before a driver's own lock.
+#[cfg(test)]
+thread_local! {
+    /// How many times this thread took the scheduler's lock.
+    pub(crate) static GLOBAL_TAKEN: Cell<u64> = const { Cell::new(0) };
+}
+
+pub(super) fn global() -> MutexGuard<'static, Global> {
+    #[cfg(test)]
+    GLOBAL_TAKEN.with(|it| it.set(it.get() + 1));
+    GLOBAL.lock().expect("the scheduler's lock: a call into the scheduler panicked")
+}
+
+/// Does what the scheduler decided, for every member whose jobs it changed: a member of its
+/// own placement is handed its woken jobs, a driver its `Run`s, wakes and moves. The `Run` of
+/// `mine` (a driver's member and core), if any, is returned (a local job id).
+pub(super) fn dispatch_global(global: &mut Global, mine: Option<(u32, u32)>) -> Option<u32> {
+    let mut found = None;
+    let Global { world, io, own, dirty, woken } = global;
+    world.take_dirty(dirty);
+    for &member in dirty.iter() {
+        if member & OWN != 0 {
+            world.take_woken(member, woken);
+            if let Some(Some(hook)) = own.get((member & !OWN) as usize) {
+                for &token in woken.iter() {
+                    (hook.wake)(hook.ctx, token);
+                }
+            }
+            continue;
+        }
+        let Some(Some(io)) = io.get_mut(member as usize) else { continue };
+        for decision in world.take_decisions(member) {
+            match decision {
+                super::Decision::Run { core, job } => {
+                    if mine == Some((member, core.0)) {
+                        found = Some(job.0);
+                    } else {
+                        io.pending[core.0 as usize] = job.0;
+                        io.cores[core.0 as usize].wake();
+                    }
+                }
+                super::Decision::Wake { core, .. } => io.cores[core.0 as usize].wake(),
+                super::Decision::Yield { core, .. } => {
+                    io.cores[core.0 as usize].moving.store(true, Ordering::Relaxed);
+                }
+            }
+        }
+    }
+    found
+}
 
 /// The process's [`Global`] and a driver's [`State`], locked in that order, always, so no two
 /// locks are ever taken the other way round.
@@ -268,7 +370,7 @@ struct Shared<W: Work> {
 
 impl<W: Work> Shared<W> {
     fn lock(&self) -> Locked<'_, W> {
-        let global = GLOBAL.lock().expect("the scheduler's lock: a call into the scheduler panicked");
+        let global = global();
         let state = self.state.lock().expect("a driver's lock: a call into the scheduler panicked");
         Locked { global, state, member: self.member }
     }
@@ -280,32 +382,9 @@ impl<W: Work> Shared<W> {
     /// Does what the scheduler decided, for every driver whose placement it changed; the
     /// `Run` of this driver's core `me`, if any, is returned (a local job id).
     fn dispatch(&self, st: &mut Locked<'_, W>, me: Option<u32>) -> Option<u32> {
-        let mut mine = None;
-        let Global { world, io, dirty } = &mut *st.global;
-        world.take_dirty(dirty);
-        for &member in dirty.iter() {
-            let Some(Some(io)) = io.get_mut(member as usize) else { continue };
-            for decision in world.take_decisions(member) {
-                match decision {
-                    super::Decision::Run { core, job } => {
-                        if member == self.member && Some(core.0) == me {
-                            mine = Some(job.0);
-                        } else {
-                            io.pending[core.0 as usize] = job.0;
-                            io.cores[core.0 as usize].wake();
-                        }
-                    }
-                    super::Decision::Wake { core, .. } => io.cores[core.0 as usize].wake(),
-                    super::Decision::Yield { core, .. } => {
-                        io.cores[core.0 as usize].moving.store(true, Ordering::Relaxed);
-                    }
-                }
-            }
-        }
-        mine
+        dispatch_global(&mut st.global, me.map(|me| (self.member, me)))
     }
 
-    /// Stops every worker and the joiner: the driver cannot go on.
     fn fail(&self, st: &mut State<W>, error: DriverError) {
         st.failed.get_or_insert(error);
         self.stop.store(true, Ordering::Release);
@@ -343,7 +422,7 @@ fn new_fiber<W: Work>(shared: &Arc<Shared<W>>) -> Result<Fiber<W::Job>, DriverEr
     let limit = stack.base().get() - bytes;
     let shared = Arc::clone(shared); // clone: one per fiber made, held for its life
     let number = FIBERS.fetch_add(1, Ordering::Relaxed);
-    Ok(Fiber(Coroutine::with_stack(stack, move |yielder, first| body(&shared, limit, yielder, first)), number))
+    Ok(Fiber(Stackful::new(Coroutine::with_stack(stack, move |yielder, first| body(&shared, limit, yielder, first))), number))
 }
 
 /// A fiber's life: run each job it is started with, report its end, and wait for the next.
@@ -492,6 +571,7 @@ impl<W: Work> Cx<'_, W> {
         match back {
             In::Go(Answer::Ready) => Ok(()),
             In::Go(Answer::Cycle(cycle)) => Err(cycle),
+            In::Go(Answer::Raise(panic)) => panic::resume_unwind(panic),
             In::Start(..) | In::Exit => unreachable!("a suspended job is only resumed"),
         }
     }
@@ -507,17 +587,23 @@ unsafe impl<W: Work> Sync for Cx<'_, W> {}
 
 /// This thread's running job, as the code without a [`Cx`] reaches it.
 #[derive(Clone, Copy)]
-struct Here {
-    cx: *const (),
-    job: JobId,
-    wait: unsafe fn(*const (), Wait) -> Result<(), Cycle>,
-    relocate: unsafe fn(*const ()),
-    claim: unsafe fn(*const (), Key) -> bool,
-    key_done: unsafe fn(*const (), Key),
+pub(super) struct Here {
+    pub(super) cx: *const (),
+    /// [`UNREGISTERED`] for a job of a pool's until it first joins the wait graph.
+    pub(super) job: JobId,
+    pub(super) register: unsafe fn(*const ()) -> JobId,
+    pub(super) wait: unsafe fn(*const (), Wait) -> Result<(), Cycle>,
+    pub(super) relocate: unsafe fn(*const ()),
+    pub(super) claim: unsafe fn(*const (), Key) -> bool,
+    pub(super) key_done: unsafe fn(*const (), Key),
+    pub(super) count: unsafe fn(*const (), CounterId),
 }
 
+/// The job id of a [`Here`] whose job is in no graph yet.
+pub(super) const UNREGISTERED: JobId = JobId(u32::MAX);
+
 thread_local! {
-    static HERE: Cell<Option<Here>> = const { Cell::new(None) };
+    pub(super) static HERE: Cell<Option<Here>> = const { Cell::new(None) };
     /// This worker's core's move flag; null off a worker.
     static FLAG: Cell<*const AtomicBool> = const { Cell::new(ptr::null()) };
     /// Open [`NoWait`] guards on this thread.
@@ -531,6 +617,19 @@ unsafe fn wait_thunk<W: Work>(cx: *const (), on: Wait) -> Result<(), Cycle> {
     // the fiber switches out).
     let cx = unsafe { &*cx.cast::<Cx<'_, W>>() };
     cx.wait(on)
+}
+
+#[allow(unsafe_code)]
+unsafe fn register_thunk<W: Work>(cx: *const ()) -> JobId {
+    // SAFETY: as in `wait_thunk`.
+    unsafe { &*cx.cast::<Cx<'_, W>>() }.job
+}
+
+#[allow(unsafe_code)]
+unsafe fn count_thunk<W: Work>(cx: *const (), counter: CounterId) {
+    // SAFETY: as in `wait_thunk`.
+    let cx = unsafe { &*cx.cast::<Cx<'_, W>>() };
+    cx.shared.lock().world().count_towards(cx.job, counter);
 }
 
 #[allow(unsafe_code)]
@@ -560,65 +659,45 @@ fn enter<W: Work>(cx: &Cx<'_, W>) {
     let here = Here {
         cx: ptr::from_ref(cx).cast(),
         job: cx.job,
+        register: register_thunk::<W>,
         wait: wait_thunk::<W>,
         relocate: relocate_thunk::<W>,
         claim: claim_thunk::<W>,
         key_done: key_done_thunk::<W>,
+        count: count_thunk::<W>,
     };
     HERE.set(Some(here));
 }
 
 /// No fiber is on this thread now.
 #[inline(never)]
-fn clear() {
+pub(super) fn clear() {
     HERE.set(None);
 }
 
 #[inline(never)]
-fn check_no_wait(job: JobId) {
+pub(super) fn check_no_wait(job: JobId) {
     let held = HELD.get();
     assert!(held == 0, "job {} waited inside {held} `NoWait` region(s): a lock or thread-local borrow would cross threads", job.0);
 }
 
-/// The job running on this thread's fiber; `None` off a fiber.
+/// The job running on this thread's fiber, put in the wait graph if it is not yet (a pool's
+/// job joins it at its first claim or wait); `None` off a fiber.
 #[inline(never)]
+#[allow(unsafe_code)]
 pub fn current_job() -> Option<JobId> {
-    HERE.get().map(|here| here.job)
+    let here = HERE.get()?;
+    if here.job != UNREGISTERED {
+        return Some(here.job);
+    }
+    // SAFETY: `here` was stored by the fiber running this code, on this thread.
+    Some(unsafe { (here.register)(here.cx) })
 }
 
-/// Waits for `on` on this thread's fiber, holding no thread. `None` off a fiber: the caller
-/// waits its own way.
-///
-/// # Errors
-///
-/// Inside the `Some`: the cycle the wait would close.
+/// Whether this thread runs a job on a fiber now.
 #[inline(never)]
-#[allow(unsafe_code)]
-pub fn wait(on: Wait) -> Option<Result<(), Cycle>> {
-    let here = HERE.get()?;
-    // SAFETY: `here` was stored by `enter` for the fiber running this code, on this thread.
-    Some(unsafe { (here.wait)(here.cx, on) })
-}
-
-/// The job on this thread's fiber makes `key` ([`Cx::claim`]): `false` when the key has a
-/// flight already. `None` off a fiber.
-#[inline(never)]
-#[allow(unsafe_code)]
-pub fn claim(key: Key) -> Option<bool> {
-    let here = HERE.get()?;
-    // SAFETY: as in `wait`.
-    Some(unsafe { (here.claim)(here.cx, key) })
-}
-
-/// The job on this thread's fiber ended its flight of `key` ([`Cx::key_done`]). `None` off a
-/// fiber.
-#[inline(never)]
-#[allow(unsafe_code)]
-pub fn key_done(key: Key) -> Option<()> {
-    let here = HERE.get()?;
-    // SAFETY: as in `wait`.
-    unsafe { (here.key_done)(here.cx, key) };
-    Some(())
+pub fn on_fiber() -> bool {
+    HERE.get().is_some()
 }
 
 /// A query miss on this thread's fiber: when the scheduler asked its core to give up the job,
@@ -654,16 +733,26 @@ pub struct Carried {
 }
 
 /// The most thread-locals carried with a job.
-pub const MAX_CARRIED: usize = 16;
+pub const MAX_CARRIED: usize = 32;
 
 static CARRIED: [OnceLock<Carried>; MAX_CARRIED] = [const { OnceLock::new() }; MAX_CARRIED];
 static CARRIED_LEN: AtomicUsize = AtomicUsize::new(0);
 
 /// The fiber stack limit `stdx::ensure_sufficient_stack` checks against, carried with the job
-/// (each job's limit is set at its start, in `body`).
-fn carry_stack_limit() {
+/// (each job's limit is set at its start, in `body`), and the job's reclamation task
+/// (`blaze_reclaim`: a pool's job is one), which keeps what the job read valid while it waits,
+/// its task frame (`blaze_mem::frame`, which allocates into the job's own frame wherever it
+/// resumes), its innermost open scope ([`super::innermost_scope`]) and its give-ways
+/// (`crate::pump::gave_way`), which a loop compares across an item that may resume elsewhere.
+pub(super) fn carry_stack_limit() {
     static ONCE: Once = Once::new();
     ONCE.call_once(|| {
+        carry(Carried { take: blaze_reclaim::park, put: blaze_reclaim::unpark });
+        carry(Carried { take: super::host::take_scope, put: super::host::put_scope });
+        carry(Carried { take: blaze_mem::frame::take_current, put: blaze_mem::frame::put_current });
+        carry(Carried { take: blaze_mem::frame::take_below, put: blaze_mem::frame::put_below });
+        carry(Carried { take: blaze_mem::frame::take_cancelling, put: blaze_mem::frame::put_cancelling });
+        carry(Carried { take: crate::pump::take_gave_ways, put: crate::pump::put_gave_ways });
         carry(Carried {
             take: || {
                 let limit = stdx::fiber_stack_limit();
@@ -688,25 +777,91 @@ pub fn carry(carried: Carried) {
 
 /// What a switching job takes off its thread: each carried thread-local's value, `None` for
 /// one not registered yet when it switched out (so it is not put back either).
-type Taken = [Option<usize>; MAX_CARRIED];
+pub(super) type Taken = [Option<usize>; MAX_CARRIED];
 
+/// Takes each carried thread-local off this thread into `taken`, leaving each at its default:
+/// every one, even past one whose take panics, so none is left behind; the first panic.
 #[inline(never)]
-fn take_carried() -> Taken {
-    let mut taken = [None; MAX_CARRIED];
+fn take_carried(taken: &mut Taken) -> Option<Panic> {
+    *taken = [None; MAX_CARRIED];
     let len = CARRIED_LEN.load(Ordering::Acquire).min(MAX_CARRIED);
+    let mut failed = None;
     for (slot, carried) in taken.iter_mut().zip(&CARRIED[..len]) {
-        *slot = carried.get().map(|it| (it.take)());
-    }
-    taken
-}
-
-#[inline(never)]
-fn put_carried(taken: &Taken) {
-    for (value, carried) in taken.iter().zip(&CARRIED) {
-        if let (Some(value), Some(carried)) = (value, carried.get()) {
-            (carried.put)(*value);
+        if let Some(carried) = carried.get() {
+            match panic::catch_unwind(carried.take) {
+                Ok(value) => *slot = Some(value),
+                Err(panic) => _ = failed.get_or_insert(panic),
+            }
         }
     }
+    failed
+}
+
+/// Puts what [`take_carried`] took onto this thread, whose carried thread-locals are each at
+/// their default: every one, even past one whose put panics; the first panic.
+#[inline(never)]
+fn put_carried(taken: &Taken) -> Option<Panic> {
+    let mut failed = None;
+    for (value, carried) in taken.iter().zip(&CARRIED) {
+        if let (Some(value), Some(carried)) = (value, carried.get()) {
+            let value = *value;
+            if let Err(panic) = panic::catch_unwind(move || (carried.put)(value)) {
+                failed.get_or_insert(panic);
+            }
+        }
+    }
+    failed
+}
+
+// A job's carried thread-locals are swapped with its worker's, never put over them: as a job
+// comes on a thread (starts or resumes) what the thread holds is set aside in `worker`, and as
+// it goes off (parks or ends) the thread gets that back. So each job runs with its own values
+// only, whatever another job or the worker itself left on the thread.
+
+/// A job comes on this thread: what it holds is taken into `worker`, and the job's (`job`, of
+/// a job that resumes; none for one that starts) put in its place. What the job is resumed
+/// with: the first panic of the swap or `failed` (of its take as it parked), for it to raise.
+#[inline(never)]
+pub(super) fn come_on(worker: &mut Taken, job: Option<&Taken>, failed: Option<Panic>) -> Answer {
+    let mut failed = failed;
+    if let Some(panic) = take_carried(worker) {
+        failed.get_or_insert(panic);
+    }
+    if let Some(panic) = job.and_then(put_carried) {
+        failed.get_or_insert(panic);
+    }
+    failed.map_or(Answer::Ready, Answer::Raise)
+}
+
+/// A job parks: its values are taken into `job`, and the thread gets `worker` back. The first
+/// panic, for the job to raise when it resumes.
+#[inline(never)]
+pub(super) fn go_off(job: &mut Taken, worker: &Taken) -> Option<Panic> {
+    let mut failed = take_carried(job);
+    if let Some(panic) = put_carried(worker) {
+        failed.get_or_insert(panic);
+    }
+    failed
+}
+
+/// A job ended: the thread gets `worker` back. A value the job left set stays on the thread
+/// where the worker held none, as the worker's own, which no job sees (each comes on with the
+/// worker's set aside); where the worker held one too, the job's is leaked. The first panic.
+#[inline(never)]
+pub(super) fn go_off_ended(worker: &Taken) -> Option<Panic> {
+    let mut left = [None; MAX_CARRIED];
+    let mut failed = take_carried(&mut left);
+    for (left, worker) in left.iter_mut().zip(worker) {
+        if let Some(held) = *worker
+            && held != 0
+        {
+            *left = Some(held);
+        }
+    }
+    if let Some(panic) = put_carried(&left) {
+        failed.get_or_insert(panic);
+    }
+    failed
 }
 
 /// A job's switch on its fiber, as the observer ([`observe`]) is told it: on the thread it
@@ -742,8 +897,13 @@ pub fn observe(observer: fn(Switch)) -> Result<(), fn(Switch)> {
     OBSERVER.set(observer)
 }
 
+/// Whether an observer is told of switches: only then is a switch worth the lock.
+pub(super) fn observing() -> bool {
+    OBSERVER.get().is_some()
+}
+
 #[inline]
-fn switched(world: &World, event: SwitchEvent, job: JobId, fiber: u32, me: u32) {
+pub(super) fn switched(world: &World, event: SwitchEvent, job: JobId, fiber: u32, me: u32) {
     if let Some(observer) = OBSERVER.get() {
         let generation = world.generation(job);
         observer(Switch { event, job, generation, fiber, core: CoreId(me) });
@@ -804,7 +964,7 @@ impl<W: Work> Driver<W> {
         pending.resize(n, NONE);
         let jobs = config.fibers.max(64);
         let member = {
-            let mut global = GLOBAL.lock().expect("the scheduler's lock: a call into the scheduler panicked");
+            let mut global = global();
             let member = global.world.join(cores, jobs);
             assert_eq!(member as usize, global.io.len(), "the world's members and their wakers");
             global.io.push(Some(Io { cores: Arc::clone(&slots), pending }));
@@ -983,11 +1143,10 @@ impl<W: Work> Driver<W> {
             }
         }
         // Fibers of jobs that never ended (the driver failed): their stacks hold frames that
-        // may hold locks, so they are not unwound; they stay mapped until the process ends.
+        // may hold locks, so they are not unwound; dropped, they stay mapped until the process
+        // ends (`Stackful`).
         for slot in &mut st.slots {
-            if let Slot::Parked(fiber, _) = mem::replace(slot, Slot::Free) {
-                mem::forget(fiber);
-            }
+            *slot = Slot::Free;
         }
         let member = self.shared.member;
         let stats = st.world().leave(member).map(|place| place.stats()).unwrap_or_default();
@@ -1064,13 +1223,14 @@ fn idle<W: Work>(shared: &Shared<W>, slot: &CoreSlot, deadline: Option<u64>) {
 }
 
 /// Takes the carried thread-locals of the job that just switched out on this thread, as it
-/// parks: before it is visible as parked, so no core resumes it first. Only a job that really
-/// waits or moves pays for it; a wait that comes back at once leaves them where they are.
-fn park_carried<W: Work>(st: &mut State<W>) -> Box<Taken> {
+/// parks, and gives the thread `worker`'s back ([`go_off`]): before the job is visible as
+/// parked, so no core resumes it first. Only a job that really waits or moves pays for it; a
+/// wait that comes back at once leaves them where they are.
+fn park_carried<W: Work, J>(st: &mut State<W>, fiber: Fiber<J>, worker: &Taken) -> Slot<J> {
     // alloc: a box once per job parked at once, then kept in `spare_taken`.
     let mut taken = st.spare_taken.pop().unwrap_or_else(|| Box::new([None; MAX_CARRIED]));
-    *taken = take_carried();
-    taken
+    let failed = go_off(&mut taken, worker);
+    Slot::Parked(fiber, taken, failed)
 }
 
 /// Runs (or resumes) the job of local id `local` on core `me` until it waits, moves or ends;
@@ -1084,6 +1244,7 @@ fn run<'a, W: Work>(
     let member = shared.member;
     let j = local as usize;
     let job = st.world().place(member).global(local);
+    let mut worker = [None; MAX_CARRIED];
     let (mut fiber, mut input) = match mem::replace(&mut st.slots[j], Slot::Running) {
         Slot::Fresh(payload) => {
             let fiber = match st.idle.pop() {
@@ -1097,14 +1258,17 @@ fn run<'a, W: Work>(
                     }
                 },
             };
+            if let Answer::Raise(panic) = come_on(&mut worker, None, None) {
+                st.panic.get_or_insert(panic);
+            }
             switched(&st.global.world, SwitchEvent::Started, job, fiber.1, me);
             (fiber, In::Start(job, payload))
         }
-        Slot::Parked(fiber, taken) => {
-            put_carried(&taken);
+        Slot::Parked(fiber, taken, failed) => {
+            let answer = come_on(&mut worker, Some(&taken), failed);
             st.spare_taken.push(taken);
             switched(&st.global.world, SwitchEvent::Resumed, job, fiber.1, me);
-            (fiber, In::Go(Answer::Ready))
+            (fiber, In::Go(answer))
         }
         Slot::Running => panic!("job {} run on core {me} while it runs", job.0),
         Slot::Free => panic!("job {} run on core {me}, never spawned", job.0),
@@ -1134,8 +1298,7 @@ fn run<'a, W: Work>(
                     Some(Err(cycle)) => In::Go(Answer::Cycle(cycle)),
                     Some(Ok(Suspend::Waiting)) => {
                         switched(&st.global.world, SwitchEvent::Parked(on), job, fiber.1, me);
-                        let taken = park_carried(&mut st);
-                        st.slots[j] = Slot::Parked(fiber, taken);
+                        st.slots[j] = park_carried(&mut st, fiber, &worker);
                         let next = shared.dispatch(&mut st, Some(me));
                         return (st, next);
                     }
@@ -1145,20 +1308,20 @@ fn run<'a, W: Work>(
                 Yielded::Stay => In::Go(Answer::Ready),
                 Yielded::Moved => {
                     switched(&st.global.world, SwitchEvent::Parked(None), job, fiber.1, me);
-                    let taken = park_carried(&mut st);
-                    st.slots[j] = Slot::Parked(fiber, taken);
+                    st.slots[j] = park_carried(&mut st, fiber, &worker);
                     let next = shared.dispatch(&mut st, Some(me));
                     return (st, next);
                 }
             },
             Out::Done(panicked) => {
+                let left = go_off_ended(&worker);
                 switched(&st.global.world, SwitchEvent::Ended, job, fiber.1, me);
                 st.world().done(member, job);
                 st.slots[j] = Slot::Free;
                 st.free.push(local);
                 st.live -= 1;
                 st.idle.push(fiber);
-                if let Some(panicked) = panicked {
+                if let Some(panicked) = panicked.or(left) {
                     st.panic.get_or_insert(panicked);
                 }
                 if st.live == 0

@@ -20,7 +20,7 @@
 use std::{cell::Cell, marker::PhantomData, ptr};
 
 use crate::sync::{
-    atomic::{AtomicBool, AtomicPtr, AtomicU64, Ordering, fence},
+    atomic::{AtomicBool, AtomicPtr, AtomicU64, AtomicUsize, Ordering, fence},
     thread_local,
 };
 
@@ -44,11 +44,13 @@ struct Slot {
     /// [`OUT`], or the epoch its thread saw when its task began.
     since: AtomicU64,
     taken: AtomicBool,
+    /// The depth of the task parked with this slot ([`park`]); 0 otherwise.
+    parked: AtomicUsize,
 }
 
 impl Slot {
     const fn new() -> Slot {
-        Slot { since: AtomicU64::new(OUT), taken: AtomicBool::new(false) }
+        Slot { since: AtomicU64::new(OUT), taken: AtomicBool::new(false), parked: AtomicUsize::new(0) }
     }
 }
 
@@ -169,6 +171,45 @@ pub fn enter() -> Guard {
         local.depth.set(depth + 1);
     });
     Guard { _thread: PhantomData }
+}
+
+/// Moves the task this thread is in off it, for a job that parks on a fiber and resumes on
+/// another thread: its slot goes with it, still pinning the epoch the task began at, so what
+/// the job read before it parked stays valid until it ends; the thread takes a fresh slot at
+/// its next task. A word for [`unpark`]; 0 when the thread is in no task.
+pub fn park() -> usize {
+    LOCAL.with(|local| {
+        let depth = local.depth.replace(0);
+        if depth == 0 {
+            return 0;
+        }
+        let slot = local.slot.take().expect("a thread in a task has a slot");
+        slot.parked.store(depth, Ordering::Relaxed);
+        ptr::from_ref(slot).expose_provenance()
+    })
+}
+
+/// Puts a task [`park`] moved off a thread onto this one, which is in no task.
+///
+/// # Panics
+///
+/// Where this thread is in a task.
+pub fn unpark(parked: usize) {
+    if parked == 0 {
+        return;
+    }
+    LOCAL.with(|local| {
+        assert_eq!(local.depth.get(), 0, "a parked task put on a thread in a task");
+        if let Some(spare) = local.slot.get() {
+            spare.since.store(OUT, Ordering::Release);
+            spare.taken.store(false, Ordering::Release);
+        }
+        // SAFETY: `parked` is the address of a slot `park` gave, and slots are never freed
+        // (their blocks are leaked); it was taken off its thread, so it is this task's alone.
+        let slot: &'static Slot = unsafe { &*ptr::with_exposed_provenance::<Slot>(parked) };
+        local.slot.set(Some(slot));
+        local.depth.set(slot.parked.swap(0, Ordering::Relaxed));
+    });
 }
 
 /// Whether this thread is in a task.

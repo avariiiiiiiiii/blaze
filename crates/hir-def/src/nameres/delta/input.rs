@@ -86,6 +86,9 @@ fn incremental(
         checked.push(state.root);
     }
     for file in written.set {
+        if let Some(groups) = state.other_files.get(file) {
+            checked.extend_from_slice(groups);
+        }
         let Some(groups) = state.files.get(file) else { continue };
         for &group in groups {
             delta.touched.push(group);
@@ -94,18 +97,21 @@ fn incremental(
                 checked.push(state.group_of.get(&parent).copied().unwrap_or(parent));
             }
         }
-        if let Some(groups) = state.configured_out.get(file) {
-            checked.extend_from_slice(groups);
-        }
     }
     checked.sort_by_key(|it| state.groups.get_index_of(it));
     checked.dedup();
+    // Every log is checked before any is compared: `compare` keeps the new log, so one kept
+    // before a walk would hide its change from the walk.
+    for group in &checked {
+        let g = &state.groups[group];
+        let decls = queries::module_decls(db, g.key);
+        if decls.children != g.children || decls.other_files != g.other_files {
+            return false;
+        }
+    }
     for group in checked {
         let g = &mut state.groups[&group];
         let decls = queries::module_decls(db, g.key);
-        if decls.children != g.children || decls.configured_out != g.configured_out {
-            return false;
-        }
         compare(state.root, group, g, &decls.ops.ops, delta);
     }
     true
@@ -118,7 +124,7 @@ fn walk(db: &Db, state: &mut CrateState, root_key: DeclKey, written: &Written<'_
     let mut groups = FxIndexMap::default();
     groups.reserve(old.len());
     state.files.clear();
-    state.configured_out.clear();
+    state.other_files.clear();
     let mut stack = vec![root_key]; // alloc: the walk's stack, once per walk
     while let Some(key) = stack.pop() {
         let decl = key.decl(db);
@@ -136,7 +142,7 @@ fn walk(db: &Db, state: &mut CrateState, root_key: DeclKey, written: &Written<'_
                 // clone: the keys of the round-0 children, once per walk
                 group.children = decls.children.clone();
                 // clone: as above, empty for most modules
-                group.configured_out = decls.configured_out.clone();
+                group.other_files = decls.other_files.clone();
                 compare(state.root, module, &mut group, &decls.ops.ops, delta);
                 if file.is_some_and(|it| written.set.contains(&it)) {
                     delta.touched.push(module);
@@ -156,7 +162,7 @@ fn walk(db: &Db, state: &mut CrateState, root_key: DeclKey, written: &Written<'_
                     // clone: as above
                     children: decls.children.clone(),
                     // clone: as above
-                    configured_out: decls.configured_out.clone(),
+                    other_files: decls.other_files.clone(),
                     modules: Vec::new(), // alloc: empty, the group's run fills it
                     out: GroupOut::default(),
                     records: RecordShare::default(),
@@ -166,8 +172,8 @@ fn walk(db: &Db, state: &mut CrateState, root_key: DeclKey, written: &Written<'_
         if let Some(file) = file {
             state.files.entry(file).or_default().push(module);
         }
-        for &file in &decls.configured_out {
-            state.configured_out.entry(file).or_default().push(module);
+        for &file in &decls.other_files {
+            state.other_files.entry(file).or_default().push(module);
         }
         groups.insert(module, group);
         stack.extend(decls.children.iter().rev().copied());

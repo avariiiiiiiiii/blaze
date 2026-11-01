@@ -814,11 +814,11 @@ impl Query for AsksHold {
     }
 }
 
-/// A query waiting on a worker pumps the pool: a job pumped above it may ask the database (it is
-/// a task of its own, not the query), and one that asks the key the query below it holds is
-/// cancelled at once rather than waiting for a run that can't go on until it returns.
+/// A query waiting on the one worker of a pool frees it: another job runs there meanwhile and may
+/// ask the database (it is a task of its own, not the query), and one that asks the waiting
+/// query's key waits for it like any other task, and gets its value once the query has it.
 #[test]
-fn a_job_pumped_under_a_waiting_query_asks_as_a_task_of_its_own() {
+fn a_query_waiting_on_the_one_worker_frees_it_for_other_jobs() {
     use blaze_graph::{pool::Pool, topology::Topology};
     use std::{sync::mpsc, time::Duration};
 
@@ -854,30 +854,28 @@ fn a_job_pumped_under_a_waiting_query_asks_as_a_task_of_its_own() {
             let (db, asked) = (db.clone(), asked.clone());
             pool.submit(
                 None,
-                move || {
-                    let depth = blaze_graph::pump::depth() as u64;
-                    db.pin().get::<Len>(one, &"a".to_owned()).map(|len| len * 100 + depth)
-                },
+                move || db.pin().get::<Len>(one, &"a".to_owned()),
                 move |it| _ = asked.send(("len", it)),
             );
         }
-        let (name, len) = heard.recv_timeout(Duration::from_secs(60)).expect("the pumped job ran");
-        assert_eq!(name, "len", "the one worker is the waiting query's: only a pump runs this");
-        assert_eq!(len.expect("no panic"), Ok(301), "len 3, asked from pump depth 1");
+        let (name, len) = heard.recv_timeout(Duration::from_secs(60)).expect("the worker ran another job");
+        assert_eq!(name, "len", "the waiting query holds no worker");
+        assert_eq!(len.expect("no panic"), Ok(3));
 
         {
             let (db, asked) = (db.clone(), asked.clone());
             pool.submit(None, move || db.pin().get::<AsksHold>(one, &()), move |it| _ = asked.send(("again", it)));
         }
-        let (name, again) = heard.recv_timeout(Duration::from_secs(60)).expect("not a deadlock");
-        assert_eq!(name, "again");
-        assert_eq!(again.expect("no panic"), Err(DbError::Cancelled));
+        std::thread::sleep(Duration::from_millis(50));
 
         RELEASED.store(1, Ordering::SeqCst);
         assert_eq!(holder.join().expect("the holder"), Ok(5));
-        let (name, asks) = heard.recv_timeout(Duration::from_secs(60)).expect("the waiting query ended");
-        assert_eq!(name, "asks");
-        assert_eq!(asks.expect("no panic"), Ok(6));
+        let mut ended: Vec<_> = (0..2)
+            .map(|_| heard.recv_timeout(Duration::from_secs(60)).expect("the waiting queries ended"))
+            .map(|(name, it)| (name, it.expect("no panic")))
+            .collect();
+        ended.sort_by_key(|it| it.0);
+        assert_eq!(ended, [("again", Ok(6)), ("asks", Ok(6))]);
     });
 }
 

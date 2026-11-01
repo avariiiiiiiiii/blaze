@@ -42,6 +42,7 @@ pub mod fiber;
 #[cfg(all(test, not(blaze_check)))]
 mod fiber_tests;
 mod graph;
+mod host;
 #[cfg(test)]
 mod tests;
 
@@ -50,7 +51,11 @@ use std::{collections::VecDeque, fmt};
 use blaze_core::wheel::Wheel;
 
 pub use cores::{CoreInfo, Cores, Distances, LEVELS, Level, MAX_CORES, ShapeError};
-pub use fiber::{Carried, NoWait, Switch, SwitchEvent, carry, claim, current_job, key_done, miss, observe, wait};
+pub use fiber::{Carried, NoWait, Switch, SwitchEvent, carry, current_job, miss, observe, on_fiber};
+pub(crate) use host::{Host, join_pool, leave_pool};
+pub use host::{
+    claim, claim_for, close_scope, count_towards, innermost_scope, job_here, key_done, open_scope, release, wait,
+};
 
 use crate::Key;
 use cores::{any_in, first_from, get, set};
@@ -64,6 +69,25 @@ pub const LIFO_RUNS: u8 = 3;
 pub const MAX_JOBS: u32 = 1 << 30;
 
 const NONE: u32 = u32::MAX;
+
+/// The bit of a member number that says it has its own placement ([`World::join_own`]).
+const OWN: u32 = 1 << 31;
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum OwnState {
+    Free,
+    Running,
+    Waiting,
+}
+
+/// A member of its own placement: its jobs in the graph, by local id.
+struct Own {
+    state: Vec<OwnState>,
+    token: Vec<usize>,
+    free: Vec<u32>,
+    /// The tokens of jobs woken since its member last took them.
+    woken: Vec<usize>,
+}
 
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug, PartialOrd, Ord)]
 pub struct JobId(pub u32);
@@ -923,14 +947,24 @@ impl Place {
 /// jobs of every driver, and a local id, its index in its member; a wait, a claim and a cycle
 /// name world ids, and a member's decisions name local ones. A job woken by a job of another
 /// member goes to the core it last ran on, as a wake from a timer does. Sans-IO, as [`Sched`].
+///
+/// A member of its own placement ([`World::join_own`]: a pool that keeps its own queues, or
+/// the process's client threads) has no [`Place`]: its jobs join the graph only when they first
+/// claim or wait ([`World::add_own`]), and a woken one is handed back as the token its member
+/// gave it ([`World::take_woken`]), for the member to run again where it likes.
 pub(crate) struct World {
     graph: Graph,
     /// By member; a driver that stopped leaves `None`, never reused, so a stale home names
     /// no other driver's job.
     members: Vec<Option<Place>>,
+    /// By member of its own placement, numbered from [`OWN`].
+    own: Vec<Option<Own>>,
     /// By world id: bumped at each end, so a [`fiber::Handle`] tells an old job from a new one.
     generation: Vec<u32>,
     free: Vec<u32>,
+    /// Whether job ids come from [`World::alloc`], and go back to `free` as they end: a
+    /// [`Sched`] names its own.
+    recycles: bool,
     /// Members whose placement made decisions since the last [`World::take_dirty`].
     dirty: Vec<u32>,
     woken: Vec<u32>,
@@ -942,8 +976,10 @@ impl World {
         World {
             graph: Graph::new(jobs),
             members: Vec::with_capacity(4),
+            own: Vec::with_capacity(4),
             generation: Vec::with_capacity(jobs),
             free: Vec::with_capacity(jobs),
+            recycles: true,
             dirty: Vec::with_capacity(4),
             woken: Vec::with_capacity(64),
             here: Vec::with_capacity(64),
@@ -1045,12 +1081,132 @@ impl World {
 
     fn assert_running(&self, job: JobId, what: &str) -> (u32, u32) {
         let (member, local) = self.home(job);
-        let running = member != NONE
-            && self.members.get(member as usize).is_some_and(|place| {
-                place.as_ref().is_some_and(|place| place.job_state(local) == JobState::Running)
-            });
+        let running = member != NONE && self.is_running(member, local);
         assert!(running, "job {} {what} while not running", job.0);
         (member, local)
+    }
+
+    fn is_running(&self, member: u32, local: u32) -> bool {
+        if member & OWN != 0 {
+            return self.own.get((member & !OWN) as usize).is_some_and(|own| {
+                own.as_ref().is_some_and(|own| own.state.get(local as usize) == Some(&OwnState::Running))
+            });
+        }
+        self.members.get(member as usize).is_some_and(|place| {
+            place.as_ref().is_some_and(|place| place.job_state(local) == JobState::Running)
+        })
+    }
+
+    fn own_mut(&mut self, member: u32) -> &mut Own {
+        assert!(member & OWN != 0, "member {member} has a placement");
+        self.own[(member & !OWN) as usize].as_mut().expect("a member of the world that left")
+    }
+
+    /// A new member of its own placement ([`World`]), from [`OWN`].
+    pub(crate) fn join_own(&mut self) -> u32 {
+        self.own.push(Some(Own {
+            state: Vec::with_capacity(64),
+            token: Vec::with_capacity(64),
+            free: Vec::with_capacity(64),
+            woken: Vec::with_capacity(64),
+        }));
+        (self.own.len() - 1) as u32 | OWN
+    }
+
+    /// The member of its own placement stopped.
+    ///
+    /// # Panics
+    ///
+    /// Where one of its jobs is still in the graph.
+    pub(crate) fn leave_own(&mut self, member: u32) {
+        let own = self.own[(member & !OWN) as usize].take().expect("a member that left");
+        let live = own.state.iter().filter(|&&it| it != OwnState::Free).count();
+        assert_eq!(live, 0, "member {member} left with {live} jobs in the wait graph");
+    }
+
+    /// A running job of `member` (of its own placement) joins the graph, counted towards
+    /// `counter` if given: its world id. `token` is what [`World::take_woken`] hands back when
+    /// it wakes.
+    pub(crate) fn add_own(&mut self, member: u32, token: usize, counter: Option<CounterId>) -> JobId {
+        let own = self.own_mut(member);
+        let local = match own.free.pop() {
+            Some(local) => local,
+            None => {
+                own.state.push(OwnState::Free);
+                own.token.push(0);
+                (own.state.len() - 1) as u32
+            }
+        };
+        own.state[local as usize] = OwnState::Running;
+        own.token[local as usize] = token;
+        let job = self.alloc();
+        if self.generation.len() <= job.0 as usize {
+            self.generation.resize(job.0 as usize + 1, 0);
+        }
+        self.graph.add(job, Home { member, local }, counter);
+        job
+    }
+
+    /// What [`World::take_woken`] hands back for `job` (of a member of its own placement) from
+    /// now on.
+    pub(crate) fn set_token(&mut self, job: JobId, token: usize) {
+        let (member, local) = self.home(job);
+        self.own_mut(member).token[local as usize] = token;
+    }
+
+    /// `job` (running, not counted yet) counts towards `counter`.
+    pub(crate) fn count_towards(&mut self, job: JobId, counter: CounterId) {
+        self.assert_running(job, "counted");
+        self.graph.count_towards(job, counter);
+    }
+
+    /// `job` (running) opens a scope that counts its jobs itself: a counter held until
+    /// [`World::release`], which the job waits on before it ends ([`graph::Graph::open_scope`]).
+    pub(crate) fn open_scope(&mut self, job: JobId) -> CounterId {
+        self.assert_running(job, "opened a scope");
+        let counter = self.graph.counter();
+        self.graph.hold(counter);
+        self.graph.open_scope(job, counter);
+        counter
+    }
+
+    /// `job`'s innermost scope, of `counter`, is over, nothing waiting on it: the scope around
+    /// it, if any.
+    pub(crate) fn close_scope(&mut self, job: JobId, counter: CounterId) -> Option<CounterId> {
+        self.assert_running(job, "closed a scope");
+        let outer = self.graph.close_scope(job, counter);
+        self.graph.drop_counter(counter);
+        outer
+    }
+
+    /// Closes every scope `job` still has open, innermost first: it panicked out of them, and
+    /// no wait of it is on their counters any more.
+    pub(crate) fn close_scopes(&mut self, job: JobId) {
+        while let Some(counter) = self.graph.innermost_scope(job) {
+            self.close_scope(job, counter);
+        }
+    }
+
+    /// A count of `counter` no job holds: see [`World::release`].
+    pub(crate) fn hold(&mut self, counter: CounterId) {
+        self.graph.hold(counter);
+    }
+
+    /// Lets go of a [`World::hold`]; the counter's waiters wake if it was the last count.
+    pub(crate) fn release(&mut self, counter: CounterId) {
+        let mut woken = std::mem::take(&mut self.woken);
+        woken.clear();
+        self.graph.release(counter, &mut woken);
+        self.woken = woken;
+        self.split(None);
+    }
+
+    /// The tokens of `member`'s woken jobs (of its own placement), taken into `into`.
+    pub(crate) fn take_woken(&mut self, member: u32, into: &mut Vec<usize>) {
+        into.clear();
+        if let Some(Some(own)) = self.own.get_mut((member & !OWN) as usize) {
+            into.append(&mut own.woken);
+        }
     }
 
     /// `by` (running, or a driver for `None`: IO, a child process) makes `key`'s value.
@@ -1062,10 +1218,32 @@ impl World {
         self.graph.claim(key, by)
     }
 
+    /// `key` is made by `job`, which is live but need not be running: a waiter claims a run's
+    /// flight for its runner when it first waits for it. `false` when the key has a flight.
+    pub(crate) fn claim_for(&mut self, key: Key, job: JobId, scope: Option<CounterId>) -> bool {
+        assert!(self.graph.life(job) == Life::Live, "key {key:?} claimed for job {}, not live", job.0);
+        self.graph.claim_in(key, job, scope)
+    }
+
     /// `job`, running on `member`, waits for `on`; its core runs something else.
     pub(crate) fn suspended(&mut self, member: u32, job: JobId, on: Wait) -> Result<Suspend, Cycle> {
         let (home, local) = self.assert_running(job, "suspended");
         assert_eq!(home, member, "job {} suspended on a member not its own", job.0);
+        if member & OWN != 0 {
+            let on = match on {
+                Wait::Until(_) => panic!("job {} of a member of its own placement waits for a time", job.0),
+                Wait::Job(other) => On::Job(other),
+                Wait::Key(key) => On::Key(key),
+                Wait::Counter(counter) => On::Counter(counter),
+            };
+            return match self.graph.wait(job, on)? {
+                Waited::Ready => Ok(Suspend::Ready),
+                Waited::Waiting => {
+                    self.own_mut(member).state[local as usize] = OwnState::Waiting;
+                    Ok(Suspend::Waiting)
+                }
+            };
+        }
         let on = match on {
             Wait::Until(at) => {
                 let waited = self.place_mut(member).wait_until(local, at);
@@ -1098,7 +1276,13 @@ impl World {
         here.clear();
         for &job in &woken {
             let home = self.graph.home(JobId(job));
-            if Some(home.member) == member {
+            if home.member & OWN != 0 {
+                if let Some(Some(own)) = self.own.get_mut((home.member & !OWN) as usize) {
+                    own.state[home.local as usize] = OwnState::Running;
+                    own.woken.push(own.token[home.local as usize]);
+                    self.touch(home.member);
+                }
+            } else if Some(home.member) == member {
                 here.push(home.local);
             } else if let Some(Some(place)) = self.members.get_mut(home.member as usize) {
                 place.ready_remote(home.local);
@@ -1120,6 +1304,18 @@ impl World {
         woken.clear();
         self.graph.end(job, &mut woken);
         self.woken = woken;
+        if member & OWN != 0 {
+            self.split(None);
+            let own = self.own_mut(member);
+            own.state[local as usize] = OwnState::Free;
+            own.free.push(local);
+            let generation = &mut self.generation[job.0 as usize];
+            *generation = generation.wrapping_add(1);
+            if self.recycles {
+                self.free.push(job.0);
+            }
+            return;
+        }
         self.split(Some(member));
         let here = std::mem::take(&mut self.here);
         self.place_mut(member).done(local, &here);
@@ -1127,7 +1323,9 @@ impl World {
         self.touch(member);
         let generation = &mut self.generation[job.0 as usize];
         *generation = generation.wrapping_add(1);
-        self.free.push(job.0);
+        if self.recycles {
+            self.free.push(job.0);
+        }
     }
 
     /// `key`'s flight ended. Its waiters of its claimer's member wake on the claimer's core,
@@ -1139,6 +1337,7 @@ impl World {
         let claimer = self.graph.key_done(key, &mut woken);
         self.woken = woken;
         match claimer {
+            Some(claimer) if self.home(claimer).0 & OWN != 0 => self.split(None),
             Some(claimer) => {
                 let (member, local) = self.home(claimer);
                 assert!(
@@ -1216,6 +1415,7 @@ impl Sched {
     /// Every core parked, room for `jobs` job ids before a column grows.
     pub fn new(cores: Cores, jobs: usize) -> Sched {
         let mut world = World::new(jobs);
+        world.recycles = false;
         world.join(cores, jobs);
         Sched { world }
     }

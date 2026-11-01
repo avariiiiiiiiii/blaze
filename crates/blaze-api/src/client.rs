@@ -8,7 +8,7 @@ use std::{
     fmt,
     io::{self, Read},
     net::{SocketAddr, TcpStream},
-    path::Path,
+    path::{Path, PathBuf},
 };
 
 use blaze_protocol::cbor;
@@ -21,6 +21,39 @@ use crate::{
 
 /// The most bytes one read takes.
 const RECEIVE: usize = 64 << 10;
+
+/// Where this user's daemon listens: `<home>/v2.sock` ([`home`]).
+pub fn socket() -> Result<PathBuf, String> {
+    Ok(home()?.join("v2.sock"))
+}
+
+/// Where the daemon's socket lives: `BLAZE_HOME`, else `blaze` in `XDG_RUNTIME_DIR`, else
+/// `~/.cache/blaze`.
+pub fn home() -> Result<PathBuf, String> {
+    let set = |name| std::env::var_os(name).filter(|it| !it.is_empty());
+    if let Some(home) = set("BLAZE_HOME") {
+        return Ok(PathBuf::from(home));
+    }
+    if let Some(runtime) = set("XDG_RUNTIME_DIR") {
+        return Ok(PathBuf::from(runtime).join("blaze"));
+    }
+    let home = std::env::var_os("HOME").or_else(|| std::env::var_os("USERPROFILE"));
+    // alloc: error path
+    let home = home.ok_or("no BLAZE_HOME, XDG_RUNTIME_DIR or HOME says where the daemon's socket is")?;
+    Ok(PathBuf::from(home).join(".cache/blaze"))
+}
+
+/// The checkout a manifest in `dir` is part of, whose absolute path names its head
+/// ([`crate::ViewRef::Head`]): the root of the git repository it is in (a workspace's root and
+/// its members are in the same one), else the highest directory from `dir` up with a
+/// `Cargo.toml`, which the workspace's root manifest is in whichever of them it is.
+pub fn checkout(dir: &Path) -> PathBuf {
+    if let Some(repository) = dir.ancestors().find(|it| std::fs::metadata(it.join(".git")).is_ok()) {
+        return repository.to_owned();
+    }
+    let highest = dir.ancestors().filter(|it| std::fs::metadata(it.join("Cargo.toml")).is_ok()).last();
+    highest.unwrap_or(dir).to_owned()
+}
 
 #[derive(Debug)]
 pub enum ClientError {

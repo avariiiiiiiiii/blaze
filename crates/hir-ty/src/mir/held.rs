@@ -295,7 +295,8 @@ impl MirBody<'_> {
         let count = self.locals.len();
         let reached = reachable(frame, self);
         let always_live = self.always_storage_live(frame);
-        let forward = self.forward(frame, reached);
+        // A coroutine's first parameter is its receiver, the future itself: none of its locals.
+        let forward = self.forward(frame, reached, self.param_locals.get(1..).unwrap_or(&[]));
         let live_out = self.liveness(frame, reached);
         let receiver = self.param_locals.first().copied().map(local_index);
 
@@ -373,7 +374,7 @@ impl MirBody<'_> {
     ) -> &'f [&'f [LocalId]] {
         let count = self.locals.len();
         let reached = reachable(frame, self);
-        let forward = self.forward(frame, reached);
+        let forward = self.forward(frame, reached, &self.param_locals);
         let live_out = self.liveness(frame, reached);
         let mut borrowed = empty_in(frame, count);
         let mut requires = empty_in(frame, count);
@@ -481,7 +482,9 @@ impl MirBody<'_> {
         borrow_terminator(terminator, borrowed);
     }
 
-    fn forward<'f>(&self, frame: &'f Frame, reached: &[bool]) -> Forward<'f> {
+    /// `params`: the parameters whose storage the start block requires, the ones the body
+    /// reads its arguments from.
+    fn forward<'f>(&self, frame: &'f Frame, reached: &[bool], params: &[LocalId]) -> Forward<'f> {
         let count = self.locals.len();
         let blocks = self.basic_blocks.len();
         let mut forward = Forward {
@@ -489,7 +492,7 @@ impl MirBody<'_> {
             requires: frame.alloc_slice_fill_with(blocks, |_| None),
         };
         let mut start_requires = empty_in(frame, count);
-        for &param in self.param_locals.iter().skip(1) {
+        for &param in params {
             start_requires.insert(local_index(param));
         }
         let start = block_index(self.start_block);

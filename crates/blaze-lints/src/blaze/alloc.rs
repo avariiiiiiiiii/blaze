@@ -11,6 +11,10 @@
 //! resolves to no body (a trait's required method, through a type parameter the hot function
 //! itself has, or through `dyn`) does not count. Cycles start as not reaching and are iterated to
 //! their fixpoint.
+//!
+//! The walk goes into a function of a workspace member only for `hot_alloc_call`, the
+//! item-level contract that nothing a hot function calls allocates; for `hot_alloc` such a
+//! function's allocations are found in its own body, and a call of it is none.
 
 use base_db::Db;
 use hir_def::{
@@ -39,13 +43,14 @@ use rustc_type_ir::inherent::IntoKind as _;
 const LONGEST: usize = 256;
 
 /// Whether the instance `f` with `args`, in the environment `env`, reaches the global
-/// allocator.
-#[blaze_query::tracked(returns(copy), cycle_initial = |_, _, _, _, _| false)]
+/// allocator: through functions of workspace members too when `through_workspace`.
+#[blaze_query::tracked(returns(copy), cycle_initial = |_, _, _, _, _, _| false)]
 pub(crate) fn reaches_alloc(
     db: &Db,
     env: StoredParamEnvAndCrate,
     f: FunctionId,
     args: StoredGenericArgs,
+    through_workspace: bool,
 ) -> bool {
     if is_root(db, f) {
         return true;
@@ -66,7 +71,7 @@ pub(crate) fn reaches_alloc(
         let Some((callee, callee_args)) = written_callee(infer, body, id) else { continue };
         let callee_args =
             EarlyBinder::bind(interner, callee_args).instantiate(interner, args).skip_norm_wip();
-        if instance_reaches(db, env, resolve(db, env, callee, callee_args)) {
+        if instance_reaches(db, env, resolve(db, env, callee, callee_args), through_workspace) {
             return true;
         }
     }
@@ -129,18 +134,23 @@ pub(super) fn resolve<'db>(
     }
 }
 
-/// Whether what `resolved` runs reaches the allocator.
+/// Whether what `resolved` runs reaches the allocator: through functions of workspace members
+/// too when `through_workspace`.
 pub(super) fn instance_reaches<'db>(
     db: &'db Db,
     env: ParamEnvAndCrate<'db>,
     resolved: Resolved<'db>,
+    through_workspace: bool,
 ) -> bool {
     match resolved {
         Resolved::Function(f, args) => {
-            fits(args.types().map(|it| it.walk()), LONGEST)
-                && reaches_alloc(db, env.store(), f, args.store())
+            (through_workspace || !f.krate(db).data(db).origin.is_local())
+                && fits(args.types().map(|it| it.walk()), LONGEST)
+                && reaches_alloc(db, env.store(), f, args.store(), through_workspace)
         }
-        Resolved::Derived(impl_, method, args) => derived_reaches(db, env, impl_, method, args),
+        Resolved::Derived(impl_, method, args) => {
+            derived_reaches(db, env, impl_, method, args, through_workspace)
+        }
     }
 }
 
@@ -166,6 +176,7 @@ fn derived_reaches<'db>(
     impl_: BuiltinDeriveImplId,
     method: BuiltinDeriveImplMethod,
     args: GenericArgs<'db>,
+    through_workspace: bool,
 ) -> bool {
     if !matches!(method, BuiltinDeriveImplMethod::clone | BuiltinDeriveImplMethod::default) {
         return false;
@@ -177,7 +188,7 @@ fn derived_reaches<'db>(
         db.field_types(variant).iter().any(|(_, field)| {
             let ty = field.ty().instantiate(interner, args).skip_norm_wip();
             let field_args = GenericArgs::new_from_slice(&[GenericArg::from(ty)]);
-            instance_reaches(db, env, resolve(db, env, trait_method, field_args))
+            instance_reaches(db, env, resolve(db, env, trait_method, field_args), through_workspace)
         })
     })
 }

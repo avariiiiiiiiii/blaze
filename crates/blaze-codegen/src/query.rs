@@ -7,7 +7,7 @@
 //! |---|---|---|
 //! | a dev template | [`keys::template`] | the instance key: code hash, type-argument facts, settings (the policy among them) |
 //! | a release template | [`keys::release`] | [`crate::summary::Imports::blob_key`]: the instance key and everything imported and assumed |
-//! | a summary | [`keys::summary`] | the instance key |
+//! | a summary | [`keys::summary`] | the instance key, what it builds in and its callees' keys, which the instance key takes by their interface (`driver::summarized`) |
 //! | a masked shape | [`keys::masked`] | the instance key |
 //! | a folded body | [`keys::folded`] | the group's key: masked shape, settings, which constants vary |
 //! | a thunk | [`keys::thunk`] | the group's key and the member's instance key, which holds its constants |

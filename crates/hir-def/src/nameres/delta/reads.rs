@@ -58,7 +58,30 @@ impl Drop for Reading {
 /// Reads from now until the guard drops are `module`'s.
 #[inline]
 pub(crate) fn reading(module: ModuleId) -> Reading {
+    carry_capture();
     Reading { before: READER.replace(Some(module)) }
+}
+
+/// Carries [`ON`], [`READER`] and [`READS`] with each job on a fiber across its waits
+/// ([`blaze_query::carry`]): a run capturing its reads that waits on a query goes on capturing
+/// into its own list, wherever it resumes, and another job on the thread meanwhile captures
+/// nothing.
+fn carry_capture() {
+    static CARRIED: std::sync::Once = std::sync::Once::new();
+    CARRIED.call_once(|| {
+        blaze_query::carry(blaze_query::Carried {
+            take: || stdx::lend::take_carried_cell(&ON, |on| !on),
+            put: |it| stdx::lend::put_carried_cell(&ON, |on| !on, it),
+        });
+        blaze_query::carry(blaze_query::Carried {
+            take: || stdx::lend::take_carried_cell(&READER, Option::is_none),
+            put: |it| stdx::lend::put_carried_cell(&READER, Option::is_none, it),
+        });
+        blaze_query::carry(blaze_query::Carried {
+            take: || stdx::lend::take_carried(&READS, Vec::is_empty),
+            put: |it| stdx::lend::put_carried(&READS, Vec::is_empty, it),
+        });
+    });
 }
 
 /// Runs `f`, then moves what it read to the end of `into` (with repeats; the caller sorts).
@@ -72,6 +95,7 @@ pub(super) fn capture<R>(into: &mut Vec<Read>, f: impl FnOnce() -> R) -> R {
             READS.with_borrow_mut(|it| it.clear());
         }
     }
+    carry_capture();
     assert!(!ON.get(), "nameres delta: a maintainer run inside another");
     READS.with_borrow_mut(|it| it.clear());
     READER.set(None);

@@ -105,7 +105,20 @@ thread_local! {
 /// What the expansion running on this thread read: called by an expander before `expand`
 /// returns. An expander that does not call it has reads [`ExpansionReads::Unknown`].
 pub fn report_reads(reads: ExpansionReads) {
+    carry_reads();
     READS.set(Some(reads));
+}
+
+/// Carries [`READS`] with each job on a fiber across its waits ([`blaze_query::carry`]): an
+/// expansion that reported its reads and then waits on a query finds them, wherever it resumes.
+fn carry_reads() {
+    static CARRIED: std::sync::Once = std::sync::Once::new();
+    CARRIED.call_once(|| {
+        blaze_query::carry(blaze_query::Carried {
+            take: || stdx::lend::take_carried_cell(&READS, Option::is_none),
+            put: |it| stdx::lend::put_carried_cell(&READS, Option::is_none, it),
+        });
+    });
 }
 
 /// What the expander reported since the last call, cleared.

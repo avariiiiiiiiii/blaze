@@ -144,7 +144,7 @@ const SOLVER_DOMAIN: &str = "blaze v2 goal 1 solver";
 /// nightly, the vendored solver's patch series (each crate's series file and every patch), and
 /// the front end's code ([`install`]'s `build`). A patch added to a series is added here too;
 /// `the_solver_version_covers_every_patch` checks it.
-const SOLVER_FILES: [(&str, &[u8]); 17] = [
+const SOLVER_FILES: [(&str, &[u8]); 21] = [
     ("harness/toolchain", include_bytes!("../../../../harness/toolchain")),
     (
         "vendor/rustc_next_trait_solver/PATCHES.md",
@@ -180,6 +180,18 @@ const SOLVER_FILES: [(&str, &[u8]); 17] = [
         "vendor/rustc_next_trait_solver/patches/0006-def-id-is-local.patch",
         include_bytes!("../../../../vendor/rustc_next_trait_solver/patches/0006-def-id-is-local.patch"),
     ),
+    (
+        "vendor/rustc_next_trait_solver/patches/0007-solver-temporaries-kept.patch",
+        include_bytes!(
+            "../../../../vendor/rustc_next_trait_solver/patches/0007-solver-temporaries-kept.patch"
+        ),
+    ),
+    (
+        "vendor/rustc_next_trait_solver/patches/0008-scratch-buffers-raised.patch",
+        include_bytes!(
+            "../../../../vendor/rustc_next_trait_solver/patches/0008-scratch-buffers-raised.patch"
+        ),
+    ),
     ("vendor/rustc_type_ir/PATCHES.md", include_bytes!("../../../../vendor/rustc_type_ir/PATCHES.md")),
     (
         "vendor/rustc_type_ir/patches/0001-from-checked-parts.patch",
@@ -212,6 +224,16 @@ const SOLVER_FILES: [(&str, &[u8]); 17] = [
     (
         "vendor/rustc_type_ir/patches/0008-def-id-is-local.patch",
         include_bytes!("../../../../vendor/rustc_type_ir/patches/0008-def-id-is-local.patch"),
+    ),
+    (
+        "vendor/rustc_type_ir/patches/0009-small-sets-and-stalled-lists-inline.patch",
+        include_bytes!(
+            "../../../../vendor/rustc_type_ir/patches/0009-small-sets-and-stalled-lists-inline.patch"
+        ),
+    ),
+    (
+        "vendor/rustc_type_ir/patches/0010-solver-cache-in-blocks.patch",
+        include_bytes!("../../../../vendor/rustc_type_ir/patches/0010-solver-cache-in-blocks.patch"),
     ),
 ];
 

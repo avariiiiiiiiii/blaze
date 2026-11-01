@@ -1,58 +1,6 @@
-//! What the daemon and a running program say to each other outside a patch: where the daemon
-//! of this user is ([`root`]), an edit's text on one line ([`escape`]), and `tiers`, which the
-//! daemon writes in the directory the program takes patches through: which functions are hot
-//! and at which level, and what it did of late ([`Tiers`]), for the program to show.
-
-use std::path::{Path, PathBuf};
-
-/// The daemon's directory of running programs: in the daemon's home, which is in
-/// `USERPROFILE` on Windows when nothing says `HOME`.
-pub fn root() -> Option<PathBuf> {
-    let set = |name| std::env::var_os(name).filter(|it| !it.is_empty());
-    let home = set("HOME").or_else(|| set("USERPROFILE"));
-    let blaze_home = crate::setting("HOME").filter(|it| !it.is_empty());
-    let home = match (blaze_home, set("XDG_RUNTIME_DIR"), home) {
-        (Some(home), _, _) => PathBuf::from(home),
-        (None, Some(runtime), _) => Path::new(&runtime).join("blaze"),
-        (None, None, Some(home)) => Path::new(&home).join(".cache/blaze"),
-        (None, None, None) => return None,
-    };
-    Some(home.join("live"))
-}
-
-/// Text on one line, as an edit goes to the daemon: a backslash, a newline, a tab and a
-/// carriage return are written as `\\`, `\n`, `\t` and `\r`.
-pub fn escape(text: &str, line: &mut String) {
-    for c in text.chars() {
-        match c {
-            '\\' => line.push_str("\\\\"),
-            '\n' => line.push_str("\\n"),
-            '\t' => line.push_str("\\t"),
-            '\r' => line.push_str("\\r"),
-            c => line.push(c),
-        }
-    }
-}
-
-/// What [`escape`] wrote.
-pub fn unescape(line: &str) -> String {
-    let mut text = String::with_capacity(line.len());
-    let mut chars = line.chars();
-    while let Some(c) = chars.next() {
-        if c != '\\' {
-            text.push(c);
-            continue;
-        }
-        match chars.next() {
-            Some('n') => text.push('\n'),
-            Some('t') => text.push('\t'),
-            Some('r') => text.push('\r'),
-            Some(other) => text.push(other),
-            None => text.push('\\'),
-        }
-    }
-    text
-}
+//! What the daemon and a running program say to each other outside a patch: the tiers, which
+//! the program asks the daemon for ([`crate::tiers`]): which functions are hot and at which
+//! level, and what it did of late ([`Tiers`]), for the program to show.
 
 /// How many counters [`counters`](crate::blaze_live_counters) has room for.
 pub const COUNTERS: usize = 1 << 16;

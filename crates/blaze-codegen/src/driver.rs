@@ -366,6 +366,28 @@ impl<B: Prepare> Job<'_, B> {
     fn stored(&self) -> InstanceKey {
         stored(self.unit.instance.key(), &self.node.built_in)
     }
+
+    /// What its summary is kept and flown under: [`Self::stored`] and its callees.
+    fn summarized(&self) -> InstanceKey {
+        summarized(self.stored(), &self.node.refs)
+    }
+}
+
+pub const SUMMARIZED_DOMAIN: &str = "blaze v2 summarized 1";
+
+/// What a summary of `stored` with `refs` is kept under. A summary names callees by key, and a
+/// unit's own key takes them by their interface: one body with other callees is another
+/// summary. Each reference counts by position, a callee by its key.
+fn summarized(stored: InstanceKey, refs: &[Target]) -> InstanceKey {
+    let mut hasher = Hasher::new(SUMMARIZED_DOMAIN);
+    hasher.id(&stored.0).update(&(refs.len() as u64).to_le_bytes());
+    for target in refs {
+        match callee(target) {
+            Some(key) => hasher.update(&[1]).id(&key.0),
+            None => hasher.update(&[0]),
+        };
+    }
+    InstanceKey(hasher.finish())
 }
 
 fn error(unit: InstanceKey, item: ItemKey, what: impl Into<String>) -> CodegenError {
@@ -1628,7 +1650,7 @@ impl<'a, B: Prepare> Build<'a, B> {
         // alloc: per build, sized by its units
         let mut unsummarized = Vec::new();
         for job in jobs {
-            let read = out.read(store, &keys::summary(&job.stored()), &job.unit, |it| {
+            let read = out.read(store, &keys::summary(&job.summarized()), &job.unit, |it| {
                 // alloc: an error
                 serde_json::from_slice::<Summary>(it).map_err(|e| e.to_string())
             });
@@ -1651,7 +1673,7 @@ impl<'a, B: Prepare> Build<'a, B> {
                 (name, summarized)
             })
         };
-        let summary_flight = |name: &InstanceKey| InstanceKey(keys::summary(&by_name[name].stored()).0);
+        let summary_flight = |name: &InstanceKey| InstanceKey(keys::summary(&by_name[name].summarized()).0);
         let flights = self.memo.flights();
         let mut claims = flights.claims();
         while !unsummarized.is_empty() {
@@ -1676,7 +1698,7 @@ impl<'a, B: Prepare> Build<'a, B> {
                 match summarized {
                     Ok((summary, export, made)) => {
                         let bytes = serde_json::to_vec(&summary).expect("a summary is plain data");
-                        out.put(keys::summary(&job.stored()), Kind::Query, bytes);
+                        out.put(keys::summary(&job.summarized()), Kind::Query, bytes);
                         let flight = summary_flight(&name);
                         out.used(flight.0);
                         // clone: per summary made, the one the memo's other builds take
@@ -1928,7 +1950,7 @@ impl<'a, B: Prepare> Build<'a, B> {
             match summary {
                 Some(summary) => {
                     let bytes = serde_json::to_vec(&summary).expect("a summary is plain data");
-                    out.put(keys::summary(&by_name[&name].stored()), Kind::Query, bytes);
+                    out.put(keys::summary(&by_name[&name].summarized()), Kind::Query, bytes);
                     out.used(flight.0);
                     summaries.insert(name, summary);
                 }

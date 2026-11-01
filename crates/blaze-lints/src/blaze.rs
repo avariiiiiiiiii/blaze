@@ -51,11 +51,13 @@ pub enum Lint {
     Parallelizable,
     SerialDependence,
     FiberBoundary,
+    HotAllocCall,
 }
 
 /// The group `blaze::hot`: every lint of hot code, SipHash maps included as `hot_lint.py`
 /// checks them.
-pub(crate) const HOT: &[Lint] = &[Lint::HotClone, Lint::HotAlloc, Lint::HotDyn, Lint::StdHashmap];
+pub(crate) const HOT: &[Lint] =
+    &[Lint::HotClone, Lint::HotAlloc, Lint::HotAllocCall, Lint::HotDyn, Lint::StdHashmap];
 
 impl Lint {
     /// In discriminant order.
@@ -67,6 +69,7 @@ impl Lint {
         Lint::Parallelizable,
         Lint::SerialDependence,
         Lint::FiberBoundary,
+        Lint::HotAllocCall,
     ];
 
     /// The name after `blaze::`.
@@ -79,6 +82,7 @@ impl Lint {
             Lint::Parallelizable => "parallelizable",
             Lint::SerialDependence => "serial_dependence",
             Lint::FiberBoundary => "fiber_boundary",
+            Lint::HotAllocCall => "hot_alloc_call",
         }
     }
 
@@ -92,6 +96,7 @@ impl Lint {
         match self {
             Lint::HotClone => concat!(docs!(), "#hot_clone"),
             Lint::HotAlloc => concat!(docs!(), "#hot_alloc"),
+            Lint::HotAllocCall => concat!(docs!(), "#hot_alloc_call"),
             Lint::HotDyn => concat!(docs!(), "#hot_dyn"),
             Lint::StdHashmap => concat!(docs!(), "#std_hashmap"),
             Lint::Parallelizable => concat!(parallel_docs!(), "#parallelizable"),
@@ -108,6 +113,9 @@ impl Lint {
             Lint::HotClone => "borrow it, copy an ID, or make the type not `Clone`",
             Lint::HotAlloc => {
                 "write into a buffer the caller keeps, an arena, or intern it; format only at the edge"
+            }
+            Lint::HotAllocCall => {
+                "keep the allocation out of what the hot path calls, or say why it is needed there with `// alloc: <why>`"
             }
             Lint::HotDyn => "use a concrete type, a generic, or a `match` on a tag",
             Lint::StdHashmap => "use `rustc_hash::FxHashMap` (or `FxHashSet`), or index by content hash",
@@ -148,9 +156,13 @@ pub(crate) fn check_node<'t>(cx: &mut Cx<'_, 't>, node: ast::Node<'t>) {
             .help(Lint::StdHashmap.help())
             .help(format!("for further information visit {}", Lint::StdHashmap.docs_url()));
     }
+    // An `extern crate` is placed at the name it writes: the item's own range starts at the
+    // comments the parser attaches to it.
     if cx.on_blaze(Lint::FiberBoundary)
         && let Some(message) = fiber::check(cx, node)
-        && let Some(range) = cx.range(node)
+        && let Some(range) = cx.range(
+            ast::ExternCrate::cast(node).and_then(|it| it.name_ref()).map_or(node, |it| it.syntax()),
+        )
     {
         let span = cx.span(range);
         cx.blaze(Lint::FiberBoundary, node, span, message)
@@ -211,7 +223,8 @@ fn check_body(cx: &mut Cx<'_, '_>) {
     let on = |lint| cx.on_blaze(lint);
     let (on_clone, on_alloc, on_dyn, on_map) =
         (on(Lint::HotClone), on(Lint::HotAlloc), on(Lint::HotDyn), on(Lint::StdHashmap));
-    if !(on_clone || on_alloc || on_dyn || on_map) {
+    let on_alloc_call = on(Lint::HotAllocCall);
+    if !(on_clone || on_alloc || on_alloc_call || on_dyn || on_map) {
         return;
     }
     let mut found: Vec<Finding> = Vec::new();
@@ -257,32 +270,33 @@ fn check_body(cx: &mut Cx<'_, '_>) {
             if on_dyn && let Some(message) = dispatch::finding(&k, callee, args) {
                 push(Lint::HotDyn, range, message, None);
             }
-            if on_alloc
-                && !is_clone
-                && alloc::instance_reaches(db, k.env, alloc::resolve(db, k.env, callee, args))
-                && !alloc::grows_kept_buffer(db, body, id, callee)
-            {
-                let message = match macro_name(cx.snippet(range)) {
-                    Some(called) => format!("this `{called}!` reaches the global allocator"),
-                    None => format!(
-                        "this call to `{}` reaches the global allocator",
-                        hir::Function::from(callee).name(db).as_str()
-                    ),
-                };
-                push(Lint::HotAlloc, range, message, None);
+            let reaches = |through_workspace| {
+                !is_clone
+                    && alloc::instance_reaches(
+                        db,
+                        k.env,
+                        alloc::resolve(db, k.env, callee, args),
+                        through_workspace,
+                    )
+                    && !alloc::grows_kept_buffer(db, body, id, callee)
+            };
+            let call = || match macro_name(cx.snippet(range)) {
+                Some(called) => format!("this `{called}!`"),
+                None => format!("this call to `{}`", hir::Function::from(callee).name(db).as_str()),
+            };
+            if on_alloc && reaches(false) {
+                push(Lint::HotAlloc, range, format!("{} reaches the global allocator", call()), None);
+            } else if on_alloc_call && reaches(true) && !reaches(false) {
+                let message = format!("{} reaches the global allocator through the workspace's own code", call());
+                let note = "`hot_alloc` finds the allocation in the function of the workspace that \
+                            makes it; a hot function promises that nothing it calls allocates";
+                push(Lint::HotAllocCall, range, message, Some(note.to_owned()));
             } else if on_alloc
                 && !is_clone
                 && let Some(made) = alloc::makes_global(&k, callee, infer.expr_ty(id))
             {
                 let made = hir::Adt::from(made).name(db);
-                let made = made.as_str();
-                let message = match macro_name(cx.snippet(range)) {
-                    Some(called) => format!("this `{called}!` makes a `{made}` of the global allocator"),
-                    None => format!(
-                        "this call to `{}` makes a `{made}` of the global allocator",
-                        hir::Function::from(callee).name(db).as_str()
-                    ),
-                };
+                let message = format!("{} makes a `{}` of the global allocator", call(), made.as_str());
                 let note = "it allocates from the global heap once it grows: name its allocator \
                             (`Vec::new_in(alloc)`), grow a buffer the caller keeps, or say why it \
                             needs the global heap with `// alloc: <why>`";

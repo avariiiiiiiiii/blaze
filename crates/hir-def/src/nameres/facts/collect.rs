@@ -440,8 +440,8 @@ struct DeclSink<'a, 'db, 'f> {
     log: FrameVec<'f, DeclOp>,
     children: FrameVec<'f, DeclKey>,
     child_keys: FrameVec<'f, (ModuleId, DeclKey)>,
-    /// [`ModuleDecls::configured_out`].
-    configured_out: FrameVec<'f, span::FileId>,
+    /// [`ModuleDecls::other_files`].
+    other_files: FrameVec<'f, span::FileId>,
     from_glob_import: PerNsGlobImports<&'f Frame>,
     /// The module's plain imports by the name each binds: indices into `log`, in order.
     named: FrameMap<'f, Name, FrameVec<'f, u32>>,
@@ -480,7 +480,7 @@ impl<'a, 'db, 'f> DeclSink<'a, 'db, 'f> {
             log: Vec::new_in(cx.frame),
             children: Vec::new_in(cx.frame),
             child_keys: Vec::new_in(cx.frame),
-            configured_out: Vec::new_in(cx.frame),
+            other_files: Vec::new_in(cx.frame),
             from_glob_import: PerNsGlobImports::new_in(cx.frame),
             named: map_in(cx.frame),
         }
@@ -694,10 +694,10 @@ impl<'a, 'db, 'f> DeclSink<'a, 'db, 'f> {
             // clone: test capture of the held scope
             HELD.with(|it| it.borrow_mut().insert(self.key, (**held).clone()));
         }
-        // alloc: the files of its configured-out `mod`s, at exact size; empty for most modules
-        let configured_out = Box::from(&self.configured_out[..]);
+        // alloc: the other files it read, at exact size; empty for most modules
+        let other_files = Box::from(&self.other_files[..]);
         // alloc: one per module, the tables its first macro step starts from
-        ModuleDecls { ops, children, legacy, side: Arc::new(side), configured_out }
+        ModuleDecls { ops, children, legacy, side: Arc::new(side), other_files }
     }
 }
 
@@ -744,7 +744,23 @@ impl<'a, 'db, 'f> Sink<'db> for DeclSink<'a, 'db, 'f> {
     }
 
     fn configured_out_file(&mut self, file: EditionedFileId) {
-        self.configured_out.push(file.file_id(self.cx.db));
+        let file = file.file_id(self.cx.db);
+        if !self.other_files.contains(&file) {
+            self.other_files.push(file);
+        }
+    }
+
+    fn collecting_expansion(&mut self, call: MacroCallId) {
+        let db = self.cx.db;
+        // A declarative macro's body is an input of the expansion, and its file may be
+        // another crate's, whose edit changes no binding when the macro keeps its id.
+        if let MacroDefKind::Declarative(ast, _) = call.loc(db).def.kind {
+            let file = ast.file_id.original_file(db).file_id(db);
+            let own = HirFileId::from(call).original_file(db).file_id(db);
+            if file != own && !self.other_files.contains(&file) {
+                self.other_files.push(file);
+            }
+        }
     }
 
     fn child(&mut self, request: ChildRequest<'_>) -> ChildMode {

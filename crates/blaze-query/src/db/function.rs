@@ -321,7 +321,11 @@ fn depend_on(local: &mut local::Local, head: u32) {
 /// Runs `run` holding the flight of row `id` of `index`, or waits for whoever holds it.
 fn in_flight(storage: &Storage, index: u32, id: Id, run: impl FnOnce()) {
     let barrier = local::barrier();
-    let got = storage.flights.get_or_run(Storage::flight(index, id), || {
+    let awaited = |it: &mut String| {
+        use std::fmt::Write as _;
+        _ = write!(it, "{:?}", DatabaseKeyIndex::new(index, id));
+    };
+    let got = storage.flights.get_or_run_named(Storage::flight(index, id), awaited, || {
         let _lifted = barrier.lift();
         run();
         Ok(())

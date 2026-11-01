@@ -52,6 +52,9 @@ class Symptom:
     # `error`: a regex its first `error:` line matches; for the others, extra text that must be
     # in the output (empty: none).
     text: str = ""
+    # A regex the whole output must also match (empty: none), for an error whose first line
+    # many failures share and whose cause is on a line after it.
+    detail: str = ""
 
 
 @dataclass(frozen=True)
@@ -118,6 +121,8 @@ def matches(got: Symptom, want: Symptom, text: str) -> bool:
     if got.kind != want.kind:
         return False
     if want.kind == "panic" and want.at and got.at != want.at:
+        return False
+    if want.detail and re.search(want.detail, text, re.M) is None:
         return False
     if want.kind == "error":
         return re.search(want.text, got.text) is not None

@@ -62,13 +62,7 @@ pub(super) fn run<A: Glue>(
             if plan.dead[inst.as_u32() as usize] {
                 continue;
             }
-            let mut sel = one::<A>(plan, func, target, library, inst)?;
-            if sel.kind == Kind::Stencil {
-                fuse(plan, func, library, inst, &mut sel);
-                confine(plan, func, library, inst, &mut sel);
-                negate(plan, func, library, inst, &mut sel)?;
-            }
-            plan.sels[inst.as_u32() as usize] = sel;
+            plan.sels[inst.as_u32() as usize] = selected::<A>(plan, func, target, library, inst)?;
         }
     }
 
@@ -106,6 +100,51 @@ pub(super) fn run<A: Glue>(
         }
     }
     Ok(())
+}
+
+/// Every instruction of `func` that selection refuses, each with its [`crate::Gap`], where
+/// [`run`] stops at the first: the coverage survey's view of one function.
+pub(super) fn survey<A: Glue>(
+    plan: &mut Plan<'_>,
+    func: &ir::Function,
+    target: &Target,
+    library: &Reader<'_>,
+    out: &mut Vec<Error>,
+) {
+    reset(&mut plan.sels, func.dfg.num_insts(), Sel::default());
+    for block in func.layout.blocks() {
+        for inst in func.layout.block_insts(block) {
+            if plan.dead[inst.as_u32() as usize] {
+                continue;
+            }
+            match selected::<A>(plan, func, target, library, inst) {
+                Ok(sel) => plan.sels[inst.as_u32() as usize] = sel,
+                Err(error) => out.push(error),
+            }
+        }
+    }
+}
+
+/// What writes `inst` with its fusions taken; a refusal carries the instruction's gap.
+fn selected<A: Glue>(
+    plan: &mut Plan<'_>,
+    func: &ir::Function,
+    target: &Target,
+    library: &Reader<'_>,
+    inst: ir::Inst,
+) -> Result<Sel, Error> {
+    let chosen = one::<A>(plan, func, target, library, inst).and_then(|mut sel| {
+        if sel.kind == Kind::Stencil {
+            fuse(plan, func, library, inst, &mut sel);
+            confine(plan, func, library, inst, &mut sel);
+            negate(plan, func, library, inst, &mut sel)?;
+        }
+        Ok(sel)
+    });
+    chosen.map_err(|mut error| {
+        error.gap.get_or_insert(crate::Gap { opcode: func.dfg.insts[inst].opcode(), ty: inst_type(func, inst) });
+        error
+    })
 }
 
 /// What writes `inst`, and its base shape if a stencil does.
@@ -525,12 +564,19 @@ fn no_type(inst: ir::Inst, opcode: Opcode, ty: ir::Type) -> Error {
     Error::at(inst, format!("`{opcode}` of {ty}: no stencil is of that type"))
 }
 
-fn type_name(func: &ir::Function, inst: ir::Inst) -> String {
+/// `inst`'s controlling type: its first result's, else its first operand's, else
+/// `types::INVALID`.
+fn inst_type(func: &ir::Function, inst: ir::Inst) -> ir::Type {
     match func.dfg.inst_results(inst).first().or(func.dfg.inst_args(inst).first()) {
-        // alloc: part of an error's message, once per failed compile.
-        Some(value) => func.dfg.value_type(*value).to_string(),
-        // alloc: as above.
-        None => "no type".to_owned(),
+        Some(value) => func.dfg.value_type(*value),
+        None => types::INVALID,
+    }
+}
+
+fn type_name(func: &ir::Function, inst: ir::Inst) -> String {
+    match inst_type(func, inst) {
+        types::INVALID => "no type".to_owned(), // alloc: part of an error's message, once per failed compile.
+        ty => ty.to_string(), // alloc: as above.
     }
 }
 

@@ -114,13 +114,13 @@ impl Drop for Plain {
 }
 "#;
 
-/// What the check finds in crate `x` of the engine with `x` appended.
+/// `test` of what the check finds in crate `x` of the engine with `x` appended, with the
+/// database attached: a failed assertion prints interned types, which read it.
 #[track_caller]
-fn check(x: &str) -> (Db, Found) {
+fn check(x: &str, test: impl FnOnce(&Db, &Found)) {
     // alloc: a test's fixture text
     let db = fixture::db(&format!("{ENGINE}{x}")).into_db();
-    let found = hir_ty::attach_db(&db, || suspend_check(&db, crate_named(&db, "x")).clone());
-    (db, found)
+    hir_ty::attach_db(db, || test(db, suspend_check(db, crate_named(db, "x"))));
 }
 
 #[track_caller]
@@ -165,7 +165,7 @@ fn fn_named(db: &Db, func: FunctionId) -> String {
 
 #[test]
 fn a_guard_held_across_a_query_call_is_rejected_naming_the_path() {
-    let (db, found) = check(
+    check(
         r#"
 //- /x.rs crate:x deps:engine
 use engine::Db;
@@ -177,17 +177,19 @@ pub fn query(db: &Db) -> u32 {
     v
 }
 "#,
+        |db, found| {
+            let held = one_held(found);
+            assert_eq!(binding_name(db, held), "guard");
+            assert_eq!(owner_name(db, held), "query");
+            assert!(matches!(held.why, Why::MustNotSuspend(AdtId::StructId(_))), "{:?}", held.why);
+            assert_eq!(held.path_said(), "`variance` → `fetch` → `get_or_run` → `suspend`");
+        },
     );
-    let held = one_held(&found);
-    assert_eq!(binding_name(&db, held), "guard");
-    assert_eq!(owner_name(&db, held), "query");
-    assert!(matches!(held.why, Why::MustNotSuspend(AdtId::StructId(_))), "{:?}", held.why);
-    assert_eq!(held.path_said(), "`variance` → `fetch` → `get_or_run` → `suspend`");
 }
 
 #[test]
 fn the_same_guard_dropped_before_the_call_is_accepted() {
-    let (_, found) = check(
+    check(
         r#"
 //- /x.rs crate:x deps:engine
 use engine::Db;
@@ -207,13 +209,15 @@ pub fn scoped(db: &Db) -> u32 {
     db.variance(1)
 }
 "#,
+        |_, found| {
+            nothing(found);
+        },
     );
-    nothing(&found);
 }
 
 #[test]
 fn a_dyn_method_without_the_marker_whose_impl_suspends_is_rejected() {
-    let (db, found) = check(
+    check(
         r#"
 //- /x.rs crate:x deps:engine
 use engine::Db;
@@ -234,19 +238,21 @@ pub fn work(query: &Query) -> &dyn Work {
     query
 }
 "#,
+        |db, found| {
+            assert!(found.held.is_empty(), "{:?}", found.held);
+            let [broken] = &*found.broken else { panic!("one broken promise, not {:?}", found.broken) };
+            match broken.promise {
+                Promise::Dyn { method: Some(method), .. } => assert_eq!(fn_named(db, method), "run"),
+                ref promise => panic!("the promise of `Work::run`, not {promise:?}"),
+            }
+            assert_eq!(broken.path_said(), "`run` → `variance` → `fetch` → `get_or_run` → `suspend`");
+        },
     );
-    assert!(found.held.is_empty(), "{:?}", found.held);
-    let [broken] = &*found.broken else { panic!("one broken promise, not {:?}", found.broken) };
-    match broken.promise {
-        Promise::Dyn { method: Some(method), .. } => assert_eq!(fn_named(&db, method), "run"),
-        ref promise => panic!("the promise of `Work::run`, not {promise:?}"),
-    }
-    assert_eq!(broken.path_said(), "`run` → `variance` → `fetch` → `get_or_run` → `suspend`");
 }
 
 #[test]
 fn a_marked_dyn_method_suspends_its_callers() {
-    let (db, found) = check(
+    check(
         r#"
 //- /x.rs crate:x deps:engine
 #![feature(register_tool)]
@@ -273,15 +279,17 @@ pub fn calm(job: &dyn Job) -> u32 {
     v
 }
 "#,
+        |db, found| {
+            let held = one_held(found);
+            assert_eq!(owner_name(db, held), "call");
+            assert_eq!(held.path_said(), "`run` (`#[blaze::may_suspend]`, through `dyn`)");
+        },
     );
-    let held = one_held(&found);
-    assert_eq!(owner_name(&db, held), "call");
-    assert_eq!(held.path_said(), "`run` (`#[blaze::may_suspend]`, through `dyn`)");
 }
 
 #[test]
 fn an_rc_or_a_thread_local_borrow_across_a_suspend_is_rejected() {
-    let (db, found) = check(
+    check(
         r#"
 //- /x.rs crate:x deps:engine
 use engine::{Db, Local, Plain};
@@ -301,20 +309,22 @@ pub fn plain(db: &Db, plain: Plain) -> u32 {
     plain.n
 }
 "#,
-    );
-    assert!(found.broken.is_empty(), "{:?}", found.broken);
-    let mut held: Vec<(String, String, Why)> =
-        found.held.iter().map(|it| (owner_name(&db, it), binding_name(&db, it), it.why)).collect();
-    held.sort_by(|a, b| a.0.cmp(&b.0));
-    assert_eq!(
-        held,
-        [("borrowed".to_owned(), "local".to_owned(), Why::NotSend), ("counted".to_owned(), "count".to_owned(), Why::NotSend)],
+        |db, found| {
+            assert!(found.broken.is_empty(), "{:?}", found.broken);
+            let mut held: Vec<(String, String, Why)> =
+                found.held.iter().map(|it| (owner_name(db, it), binding_name(db, it), it.why)).collect();
+            held.sort_by(|a, b| a.0.cmp(&b.0));
+            assert_eq!(
+                held,
+                [("borrowed".to_owned(), "local".to_owned(), Why::NotSend), ("counted".to_owned(), "count".to_owned(), Why::NotSend)],
+            );
+        },
     );
 }
 
 #[test]
 fn a_generic_caller_suspends_through_its_closure() {
-    let (db, found) = check(
+    check(
         r#"
 //- /x.rs crate:x deps:engine
 use engine::Db;
@@ -334,11 +344,13 @@ pub fn quiet() -> u32 {
     run(|| 4)
 }
 "#,
+        |db, found| {
+            let held = one_held(found);
+            assert_eq!(owner_name(db, held), "run");
+            assert_eq!(binding_name(db, held), "guard");
+            assert_eq!(held.path_said(), "a closure in `queries` → `variance` → `fetch` → `get_or_run` → `suspend`");
+        },
     );
-    let held = one_held(&found);
-    assert_eq!(owner_name(&db, held), "run");
-    assert_eq!(binding_name(&db, held), "guard");
-    assert_eq!(held.path_said(), "a closure in `queries` → `variance` → `fetch` → `get_or_run` → `suspend`");
 }
 
 #[test]
@@ -362,9 +374,9 @@ pub fn here() -> Here {
     Here { wait }
 }
 "#;
-    nothing(&check(into_marked).1);
+    check(into_marked, |_, found| nothing(found));
 
-    let (_, found) = check(
+    check(
         r#"
 //- /x.rs crate:x deps:engine
 use engine::Db;
@@ -378,16 +390,18 @@ pub fn loose(db: &Db) -> u32 {
     pointer(db)
 }
 "#,
+        |_, found| {
+            assert!(found.held.is_empty(), "{:?}", found.held);
+            let [broken] = &*found.broken else { panic!("one broken promise, not {:?}", found.broken) };
+            assert_eq!(broken.promise, Promise::Pointer);
+            assert_eq!(broken.path_said(), "`wait` → `variance` → `fetch` → `get_or_run` → `suspend`");
+        },
     );
-    assert!(found.held.is_empty(), "{:?}", found.held);
-    let [broken] = &*found.broken else { panic!("one broken promise, not {:?}", found.broken) };
-    assert_eq!(broken.promise, Promise::Pointer);
-    assert_eq!(broken.path_said(), "`wait` → `variance` → `fetch` → `get_or_run` → `suspend`");
 }
 
 #[test]
 fn a_call_through_a_marked_field_suspends_its_caller() {
-    let (db, found) = check(
+    check(
         r#"
 //- /x.rs crate:x deps:engine
 #![feature(register_tool)]
@@ -406,15 +420,17 @@ pub fn waits(here: &Here, db: &Db) -> u32 {
     v
 }
 "#,
+        |db, found| {
+            let held = one_held(found);
+            assert_eq!(owner_name(db, held), "waits");
+            assert_eq!(held.path_said(), "a function pointer from a `#[blaze::may_suspend]` field");
+        },
     );
-    let held = one_held(&found);
-    assert_eq!(owner_name(&db, held), "waits");
-    assert_eq!(held.path_said(), "a function pointer from a `#[blaze::may_suspend]` field");
 }
 
 #[test]
 fn recursion_reaches_its_fixpoint() {
-    let (db, found) = check(
+    check(
         r#"
 //- /x.rs crate:x deps:engine
 use engine::Db;
@@ -434,10 +450,12 @@ pub fn held(db: &Db) -> u32 {
     v
 }
 "#,
+        |db, found| {
+            let held = one_held(found);
+            assert_eq!(owner_name(db, held), "held");
+            assert_eq!(held.path_said(), "`odd` → `even` → `variance` → `fetch` → `get_or_run` → `suspend`");
+        },
     );
-    let held = one_held(&found);
-    assert_eq!(owner_name(&db, held), "held");
-    assert_eq!(held.path_said(), "`odd` → `even` → `variance` → `fetch` → `get_or_run` → `suspend`");
 }
 
 #[test]
@@ -462,9 +480,9 @@ pub fn f() -> u32 {
 "#,
     )
     .into_db();
-    hir_ty::attach_db(&db, || {
-        let krate = crate_named(&db, "x");
-        assert!(roots(&db, krate).is_empty(), "no root without `corosensei`");
-        nothing(suspend_check(&db, krate));
+    hir_ty::attach_db(db, || {
+        let krate = crate_named(db, "x");
+        assert!(roots(db, krate).is_empty(), "no root without `corosensei`");
+        nothing(suspend_check(db, krate));
     });
 }

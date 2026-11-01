@@ -50,11 +50,12 @@ pub use borrowed::{
 };
 pub use blaze_protocol::events::NodeKind;
 pub use intent::{Edit, Edited, EditedItem, How, Target};
+pub use blaze_vfs::{Mode, Op};
 
 use blaze_core::Conn;
 use blaze_ids::{ContentId, Fingerprint};
 use blaze_query::{QueryKey, Why};
-use blaze_vfs::{Change, Op, View};
+use blaze_vfs::{Change, View};
 use serde::{Deserialize, Serialize};
 
 /// The version of every body's schema. A change to any type here is a new number. 11: every

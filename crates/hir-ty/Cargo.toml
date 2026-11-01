@@ -67,6 +67,7 @@ blaze-check.workspace = true
 
 [dev-dependencies]
 blaze-alloc-count.workspace = true
+blaze-graph.workspace = true
 expect-test.workspace = true
 hir-expand = { workspace = true, features = ["fixture"] }
 

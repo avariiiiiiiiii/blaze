@@ -692,7 +692,10 @@ mod tests {
         assert_eq!(on, clippy_where(|it| it.group.in_all()));
         assert_eq!(on & Implemented::DbgMacro.bit(), 0, "a restriction lint is not in `all`");
         let (on, _) = named_in("#[expect(blaze::hot)] #[warn(blaze::std_hashmap)]");
-        assert_eq!(named(on), ["blaze::hot_alloc", "blaze::hot_clone", "blaze::hot_dyn", "blaze::std_hashmap"]);
+        assert_eq!(
+            named(on),
+            ["blaze::hot_alloc", "blaze::hot_alloc_call", "blaze::hot_clone", "blaze::hot_dyn", "blaze::std_hashmap"]
+        );
         for text in ["notclippy::needless_bool", "clippy::not_a_lint", "clippy needless_bool", "blaze::"] {
             assert_eq!(named_in(text).0, 0, "{text:?}");
         }

@@ -209,25 +209,39 @@
             --prefix LD_LIBRARY_PATH : ${libPath}
         '';
 
-        # The demo's own source and the crates it links (blaze-live and the run side of
-        # blaze-inproc it asks the daemon through), with the root manifest their `workspace = true`
-        # fields come from, copied to a writable directory at run time; its crates.io dependencies
-        # are vendored from Cargo.lock so that needs no network.
+        # The demo's own source and the crates it links (blaze-live, the run side of blaze-inproc
+        # it takes patches through, and blaze-api, which its editor sends edits to the daemon
+        # with), with the root manifest their `workspace = true` fields come from, copied to a
+        # writable directory at run time; its crates.io dependencies are vendored from Cargo.lock
+        # so that needs no network.
         lifeSource = pkgs.lib.fileset.toSource {
           root = ./.;
           fileset = pkgs.lib.fileset.unions [
             ./Cargo.toml
             ./demo/life
-            ./crates/blaze-live
-            ./crates/blaze-inproc
+            ./crates/blaze-api
             ./crates/blaze-bytes
             ./crates/blaze-check
             ./crates/blaze-core
+            ./crates/blaze-format
+            ./crates/blaze-graph
+            ./crates/blaze-ids
+            ./crates/blaze-image
+            ./crates/blaze-inproc
+            ./crates/blaze-live
             ./crates/blaze-mem
+            ./crates/blaze-phf
+            ./crates/blaze-protocol
+            ./crates/blaze-query
+            ./crates/blaze-query-macros
             ./crates/blaze-radix
             ./crates/blaze-reclaim
             ./crates/blaze-rng
             ./crates/blaze-sha256
+            ./crates/blaze-vfs
+            ./crates/intern
+            ./crates/stdx
+            ./vendor/blake3-servil
           ];
         };
         lifeVendor = pkgs.rustPlatform.importCargoLock { lockFile = ./demo/life/Cargo.lock; };

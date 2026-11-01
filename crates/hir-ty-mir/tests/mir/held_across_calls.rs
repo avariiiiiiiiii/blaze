@@ -12,7 +12,7 @@ use rustc_type_ir::inherent::IntoKind;
 use crate::function;
 
 const WORK: &str = r#"
-//- minicore: sized
+//- minicore: sized, copy
 pub fn park() {}
 pub fn work(a: u8) -> (u8, u16) {
     let kept: u16 = 1;
@@ -52,6 +52,6 @@ fn a_call_holds_what_is_used_after_it_or_borrowed_before_it() {
                 })
                 .collect()
         });
-        assert_eq!(held, ["U8", "U16", "U64"]);
+        assert_eq!(held, ["u8", "u16", "u64"]);
     });
 }

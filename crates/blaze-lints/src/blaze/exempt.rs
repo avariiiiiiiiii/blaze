@@ -11,7 +11,7 @@ use super::Lint;
 const fn tag(lint: Lint) -> Option<&'static str> {
     match lint {
         Lint::HotClone => Some("clone"),
-        Lint::HotAlloc | Lint::StdHashmap => Some("alloc"),
+        Lint::HotAlloc | Lint::HotAllocCall | Lint::StdHashmap => Some("alloc"),
         Lint::HotDyn => Some("dyn"),
         Lint::Parallelizable | Lint::SerialDependence | Lint::FiberBoundary => None,
     }

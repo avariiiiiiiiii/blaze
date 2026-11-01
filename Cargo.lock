@@ -1361,20 +1361,30 @@ dependencies = [
 name = "blaze-stencil"
 version = "0.0.0"
 dependencies = [
+ "base-db",
  "blaze-alloc-count",
  "blaze-bytes",
  "blaze-codegen",
+ "blaze-format",
  "blaze-ids",
  "blaze-inproc",
+ "blaze-lower",
+ "blaze-macro-eval",
  "blaze-mem",
+ "blaze-query",
+ "blaze-units",
+ "blaze-vfs",
  "cranelift-codegen",
  "cranelift-frontend",
  "cranelift-interpreter",
  "cranelift-reader",
  "gimli",
+ "hir-ty-codegen",
  "libc",
  "llvm-sys",
  "object 0.40.0",
+ "serde",
+ "serde_json",
  "smallvec",
 ]
 
@@ -2641,6 +2651,7 @@ dependencies = [
  "blaze-check",
  "blaze-dbsp",
  "blaze-format",
+ "blaze-graph",
  "blaze-hashcons",
  "blaze-ids",
  "blaze-mem",

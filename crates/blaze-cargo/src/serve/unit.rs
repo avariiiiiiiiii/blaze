@@ -42,6 +42,7 @@ mod reach;
 mod run;
 mod say;
 mod script;
+pub(crate) use script::compile_of;
 mod test;
 
 #[cfg(test)]

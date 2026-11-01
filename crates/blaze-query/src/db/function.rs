@@ -328,7 +328,7 @@ fn in_flight(storage: &Storage, index: u32, id: Id, run: impl FnOnce()) {
     });
     drop(barrier);
     if got.is_err() {
-        Cancelled::WouldWaitOnItself.throw();
+        Cancelled::WouldWaitOnItself { asked: Some(DatabaseKeyIndex::new(index, id)) }.throw();
     }
 }
 

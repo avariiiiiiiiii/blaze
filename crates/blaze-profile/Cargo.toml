@@ -17,6 +17,7 @@ doctest = false
 arrow-array.workspace = true
 arrow-ipc.workspace = true
 arrow-schema.workspace = true
+blaze-graph.workspace = true
 object.workspace = true
 parquet.workspace = true
 rustc-demangle.workspace = true

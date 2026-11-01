@@ -102,7 +102,7 @@ impl Body {
         db: &Db,
         def: DefWithBodyId,
     ) -> (Arc<Body>, BodySourceMap) {
-        let _p = tracing::info_span!("body_with_source_map_query").entered();
+        let _p = crate::body_span!(db, def, "body_with_source_map_query").entered();
         let Some((body, source_map)) = Self::relative(db, def) else {
             let of = Self::of(db, def);
             let (body, source_map) = lower_in_file(db, def, of.lowering_with_source_map());
@@ -151,7 +151,7 @@ impl Body {
         db: &Db,
         def: DefWithBodyId,
     ) -> Option<(Arc<Body>, BodySourceMap)> {
-        let _p = tracing::info_span!("body_relative_query").entered();
+        let _p = crate::body_span!(db, def, "body_relative_query").entered();
         body_syntax(db, def).as_ref()?;
         let of = Self::of(db, def);
         let (body, source_map) = lower_relative(db, def, of.lowering_with_source_map())?;
@@ -167,7 +167,7 @@ impl Body {
     /// The body is the memo's own value, lent by reference: no `Arc` and no count to write.
     #[blaze_query::tracked(returns(ref))]
     pub fn of(db: &Db, def: DefWithBodyId) -> Body {
-        let _p = tracing::info_span!("body_query").entered();
+        let _p = crate::body_span!(db, def, "body_query").entered();
         match lower_relative(db, def, BodyLowering::Body) {
             Some((body, _)) => body,
             None => lower_in_file(db, def, BodyLowering::Body).0,

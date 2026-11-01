@@ -277,18 +277,18 @@ pub(crate) fn current() -> u64 {
 
 thread_local! {
     static SEQ: Cell<u64> = const { Cell::new(0) };
-    static GAVE_WAY: Cell<u64> = const { Cell::new(0) };
+    static GAVE_WAYS: Cell<u64> = const { Cell::new(0) };
 }
 
 /// How many waits on this thread have given way ([`Cancelled`] for a cycle): a loop tells an
 /// item that unwound because it gave way, which it may run again where the cycle is its own,
 /// from one that failed.
 pub(crate) fn gave_way() -> u64 {
-    GAVE_WAY.with(Cell::get)
+    GAVE_WAYS.with(Cell::get)
 }
 
 fn give_way() -> Cancelled {
-    GAVE_WAY.with(|it| it.set(it.get() + 1));
+    GAVE_WAYS.with(|it| it.set(it.get() + 1));
     Cancelled
 }
 

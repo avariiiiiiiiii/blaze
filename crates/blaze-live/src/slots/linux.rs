@@ -534,13 +534,15 @@ mod tests {
 
     #[test]
     fn a_window_is_aligned_and_within_its_mapping_and_the_room_left() {
-        let mapping = 0x30_0000 - 0x3000..0x50_0000 + 0x1000;
+        const W: u64 = WINDOW;
+        let mapping = 2 * W - 0x3000..4 * W + 0x1000;
         let all = 0..u64::MAX;
-        assert_eq!(window(0x30_0010, &mapping, all.clone()), 0x30_0000..0x40_0000);
-        assert_eq!(window(0x2f_f000, &mapping, all.clone()), mapping.start..0x30_0000);
-        assert_eq!(window(0x50_0800, &mapping, all), 0x50_0000..mapping.end);
-        assert_eq!(window(0x38_0000, &mapping, 0x34_0000..0x3c_0000), 0x34_0000..0x3c_0000);
-        for at in [mapping.start, 0x30_0000, 0x3f_ffff, 0x4a_b123, mapping.end - 1] {
+        assert_eq!(window(2 * W + 0x10, &mapping, all.clone()), 2 * W..3 * W);
+        assert_eq!(window(2 * W - 0x1000, &mapping, all.clone()), mapping.start..2 * W);
+        assert_eq!(window(4 * W + 0x800, &mapping, all), 4 * W..mapping.end);
+        let free = 2 * W + 0x4_0000..3 * W - 0x4_0000;
+        assert_eq!(window(2 * W + W / 2, &mapping, free.clone()), free);
+        for at in [mapping.start, 2 * W, 3 * W - 1, 3 * W + 0xa_b123, mapping.end - 1] {
             let found = window(at, &mapping, 0..u64::MAX);
             assert!(found.contains(&at), "{at:#x} in {found:x?}");
             assert!(found.start >= mapping.start && found.end <= mapping.end);

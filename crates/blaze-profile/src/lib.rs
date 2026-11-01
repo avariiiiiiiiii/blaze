@@ -512,7 +512,9 @@ impl tracing::Subscriber for Recorder {
         tracing::span::Id::from_u64(id.into_u64())
     }
 
-    fn record(&self, _: &tracing::span::Id, _: &tracing::span::Record<'_>) {}
+    fn record(&self, id: &tracing::span::Id, values: &tracing::span::Record<'_>) {
+        flight::recorded(id.into_u64(), values);
+    }
 
     fn record_follows_from(&self, _: &tracing::span::Id, _: &tracing::span::Id) {}
 

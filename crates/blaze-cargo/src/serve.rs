@@ -120,6 +120,13 @@ pub fn build_id(exe: &Path) -> anyhow::Result<blaze_ids::ContentId> {
     Ok(hasher.finish())
 }
 
+/// The daemon of `state` as a writer of a shared store: one per `BLAZE_HOME`, as one daemon
+/// at a time has a state directory.
+fn writer_of(state: &Path) -> anyhow::Result<blaze_ids::ContentId> {
+    let text = state.to_str().with_context(|| format!("{} is not UTF-8", state.display()))?;
+    Ok(blaze_ids::Hasher::new("blaze v2 shared store writer 1").part(text.as_bytes()).finish())
+}
+
 /// An absolute path as the driver names it: the driver's root is `/`.
 pub fn file_name(path: &Path) -> anyhow::Result<FileName> {
     let text = path.to_str().with_context(|| format!("{} is not UTF-8", path.display()))?;
@@ -237,8 +244,13 @@ fn serve(args: impl IntoIterator<Item = OsString>) -> anyhow::Result<()> {
     // Read once: the explorer and live SQL run this DuckDB; set wrong, the daemon does not start.
     let duckdb = observe::duckdb(std::env::var_os(observe::DUCKDB)).map_err(|why| anyhow::anyhow!(why))?;
     let (profiling, keeper) = observe::keep_history(&paths.state, duckdb).map_err(|why| anyhow::anyhow!(why))?;
+    let build = build_id(&paths.launcher)?;
+    let std = machine()?.join("std").join(format!("{build:x}"));
+    std::fs::create_dir_all(&std).with_context(|| format!("making the standard library's shared directory {}", std.display()))?;
     let options = Options {
         state: file_name(&paths.state)?,
+        std: file_name(&std)?,
+        writer: writer_of(&paths.state)?,
         socket: file_name(&paths.socket)?,
         http: args.http.zip(token),
         budget: Some(blaze_graph::arena::machine_budget(1 << 30).context("the memory the daemon's tasks may hold")?),

@@ -20,7 +20,7 @@ use hir_def::{
     item_tree::FieldsShape,
     lang_item::LangItems,
     resolver::{HasResolver, ResolveValueResult, Resolver, ValueNs},
-    signatures::{ConstSignature, EnumSignature, FunctionSignature, StaticSignature},
+    signatures::{EnumSignature, FunctionSignature},
 };
 use hir_expand::name::Name;
 use itertools::{Either, EitherOrBoth, Itertools};
@@ -5277,35 +5277,18 @@ pub(crate) fn compute_mir_body<'db>(
     db: &'db Db,
     def: InferBodyId<'db>,
 ) -> Result<'db, MirBody<'db>> {
-    let span = tracing::info_span!("mir_body_query", detail = tracing::field::Empty);
-    if !span.is_disabled() {
-        /// `it` as the text of the span's detail.
-        fn shown(it: impl std::fmt::Display) -> String {
-            // alloc: only while a subscriber records this span
-            it.to_string()
-        }
-        let edition = def.krate(db).data(db).edition;
-        let detail = match def {
-            InferBodyId::DefWithBodyId(DefWithBodyId::FunctionId(it)) => {
-                shown(FunctionSignature::of(db, it).name.display(db, edition))
-            }
-            InferBodyId::DefWithBodyId(DefWithBodyId::StaticId(it)) => {
-                shown(StaticSignature::of(db, it).name.display(db, edition))
-            }
-            InferBodyId::DefWithBodyId(DefWithBodyId::ConstId(it)) => {
-                match &ConstSignature::of(db, it).name {
-                    Some(name) => shown(name.display(db, edition)),
-                    None => shown(Name::missing().display(db, edition)),
-                }
-            }
-            InferBodyId::DefWithBodyId(DefWithBodyId::VariantId(it)) => {
-                let loc = it.lookup(db);
-                shown(loc.name.display(db, edition))
-            }
-            InferBodyId::AnonConstId(_) => shown("{const}"),
-        };
-        span.record("detail", tracing::field::debug(&detail));
-    }
+    let span = match def {
+        InferBodyId::DefWithBodyId(it) => hir_def::body_span!(db, it, "mir_body_query"),
+        InferBodyId::AnonConstId(it) => hir_def::span_names::of_anon_const(
+            db,
+            it.loc(db).owner,
+            tracing::info_span!(
+                "mir_body_query",
+                krate = tracing::field::Empty,
+                function = tracing::field::Empty
+            ),
+        ),
+    };
     let _p = span.entered();
     lower_body(db, def)
 }

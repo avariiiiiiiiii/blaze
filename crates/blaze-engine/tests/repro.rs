@@ -3,7 +3,10 @@
 //! broke. A test copies its crate out of the tree, runs this package's `blaze` on it with a
 //! `BLAZE_HOME` of its own, and checks what makes the build right: it succeeds and the program
 //! prints what the program says it prints.
-#![cfg(unix)]
+//!
+//! Every case builds std, which is compiled at opt-level 3, so only a blaze with LLVM can build
+//! one: without `--features llvm` this target is empty, and a run must pass the feature.
+#![cfg(all(unix, feature = "llvm"))]
 
 use std::{
     fs,

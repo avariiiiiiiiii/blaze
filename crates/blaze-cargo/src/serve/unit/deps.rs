@@ -560,7 +560,7 @@ impl ImageStore for Images {
 fn on_pool(count: usize, task: &(dyn Fn(usize) + Sync)) {
     let task = |at: usize| blaze_mem::frame::task(blaze_mem::Tag::Query, |_| task(at));
     let again = blaze_graph::par::for_each_giving_way(count, task, |panic| {
-        matches!(panic.downcast_ref::<blaze_query::db::Cancelled>(), Some(blaze_query::db::Cancelled::WouldWaitOnItself))
+        matches!(panic.downcast_ref::<blaze_query::db::Cancelled>(), Some(blaze_query::db::Cancelled::WouldWaitOnItself { .. }))
     });
     for at in again {
         task(at);

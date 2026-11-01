@@ -758,3 +758,25 @@ fn a_test_binarys_context_holds_the_native_inputs_it_linked() {
     assert_eq!(with, compile::with_natives(context, &[libz(2)]));
     assert_ne!(with, compile::with_natives(context, &[libz(3)]), "an edit of the library");
 }
+
+/// A std unit's record key reads its dependencies by what they are: in another workspace's
+/// graph, where every unit sits at another index, the key is the same, and std is built once.
+#[test]
+fn a_units_key_is_the_same_wherever_the_graph_puts_its_dependencies() {
+    let core = unit("core", target("core", "lib", "/rustc/0/library/core/src/lib.rs"), Mode::Build, &[]);
+    let mut alloc = unit("alloc", target("alloc", "lib", "/rustc/0/library/alloc/src/lib.rs"), Mode::Build, &[0]);
+    alloc.is_std = true;
+    let app = unit("app", target("app", "bin", "/w/src/main.rs"), Mode::Build, &[]);
+    let first = [core.clone(), alloc.clone()];
+    let mut moved = alloc.clone();
+    moved.dependencies[0].index = 2;
+    let second = [app, alloc, core];
+    let bytes = |graph: &[Unit], u: &Unit| {
+        let keyed = compile::KeyedUnit::among(u, |at| Ok(&graph[at])).unwrap();
+        blaze_protocol::cbor::to_vec(&keyed).unwrap()
+    };
+    assert_eq!(bytes(&first, &first[1]), bytes(&second, &moved));
+    let mut other = moved.clone();
+    other.dependencies[0].index = 0;
+    assert_ne!(bytes(&first, &first[1]), bytes(&second, &other), "a dependency on another unit is another key");
+}

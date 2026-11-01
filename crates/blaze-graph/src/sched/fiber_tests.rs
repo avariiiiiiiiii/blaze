@@ -71,6 +71,147 @@ fn a_waiting_job_holds_no_thread() {
     assert_eq!(work.ended.load(Ordering::Relaxed), 1001, "every job of the chain ended");
 }
 
+/// More jobs than workers, each waiting for the next one spawned, the last only once every
+/// other waits: they end only if a waiting job frees its worker for the next.
+struct Line {
+    handles: Vec<OnceLock<Handle>>,
+    waiting: AtomicU32,
+    ended: AtomicU32,
+}
+
+impl Work for &'static Line {
+    type Job = usize;
+
+    fn run(&self, cx: &Cx<'_, Self>, at: usize) {
+        let last = self.handles.len() - 1;
+        if at == last {
+            while self.waiting.load(Ordering::Acquire) < last as u32 {
+                cx.wait(Wait::Until(cx.now() + 100_000)).expect("a timed wait closes no cycle");
+            }
+        } else {
+            let next = loop {
+                if let Some(next) = self.handles[at + 1].get() {
+                    break *next;
+                }
+                cx.wait(Wait::Until(cx.now() + 100_000)).expect("a timed wait closes no cycle");
+            };
+            self.waiting.fetch_add(1, Ordering::AcqRel);
+            cx.wait_job(next).expect("a line of waits is no cycle");
+        }
+        self.ended.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+#[test]
+fn a_waiting_job_frees_its_worker() {
+    const JOBS: usize = 48;
+    let work: &'static Line = Box::leak(Box::new(Line {
+        handles: (0..JOBS).map(|_| OnceLock::new()).collect(),
+        waiting: AtomicU32::new(0),
+        ended: AtomicU32::new(0),
+    }));
+    let driver = start(Cores::flat(2).unwrap(), work);
+    for at in 0..JOBS {
+        let handle = driver.spawn(at, Spawn::root());
+        work.handles[at].set(handle).unwrap();
+    }
+    driver.join().unwrap();
+    assert_eq!(work.ended.load(Ordering::Relaxed), JOBS as u32, "every job of the line ended");
+}
+
+/// Two drivers, one job each: one claims a key, the other waits on it. The wait suspends on
+/// the other driver's flight (one wait graph for both) and resumes at its end.
+struct Across {
+    claimed: AtomicBool,
+    asked: AtomicBool,
+    ended: AtomicBool,
+    resumed_after_end: AtomicBool,
+}
+
+impl Work for &'static Across {
+    type Job = bool;
+
+    fn run(&self, cx: &Cx<'_, Self>, owner: bool) {
+        let key = key(77);
+        if owner {
+            assert!(cx.claim(key), "the key is new");
+            self.claimed.store(true, Ordering::Release);
+            while !self.asked.load(Ordering::Acquire) {
+                cx.wait(Wait::Until(cx.now() + 100_000)).expect("a timed wait closes no cycle");
+            }
+            cx.wait(Wait::Until(cx.now() + 2_000_000)).expect("a timed wait closes no cycle");
+            self.ended.store(true, Ordering::Release);
+            cx.key_done(key);
+        } else {
+            while !self.claimed.load(Ordering::Acquire) {
+                cx.wait(Wait::Until(cx.now() + 100_000)).expect("a timed wait closes no cycle");
+            }
+            self.asked.store(true, Ordering::Release);
+            cx.wait(Wait::Key(key)).expect("a wait on another driver's flight is no cycle");
+            self.resumed_after_end.store(self.ended.load(Ordering::Acquire), Ordering::Relaxed);
+        }
+    }
+}
+
+#[test]
+fn a_job_waits_on_a_flight_of_another_drivers_job() {
+    let work: &'static Across = Box::leak(Box::new(Across {
+        claimed: AtomicBool::new(false),
+        asked: AtomicBool::new(false),
+        ended: AtomicBool::new(false),
+        resumed_after_end: AtomicBool::new(false),
+    }));
+    let owner = start(Cores::flat(1).unwrap(), work);
+    let asker = start(Cores::flat(1).unwrap(), work);
+    owner.spawn(true, Spawn::root());
+    asker.spawn(false, Spawn::root());
+    asker.join().unwrap();
+    owner.join().unwrap();
+    assert!(work.resumed_after_end.load(Ordering::Relaxed), "the wait came back before the flight ended");
+}
+
+/// Two drivers, one job each, each claiming a key and then waiting on the other's: the wait
+/// that closes the cycle is refused, naming both jobs, though they run on different drivers;
+/// the refused job ends its flight and the other goes on.
+struct CrossedDrivers {
+    claimed: AtomicU32,
+    refused: Mutex<Vec<Cycle>>,
+}
+
+impl Work for &'static CrossedDrivers {
+    type Job = u32;
+
+    fn run(&self, cx: &Cx<'_, Self>, mine: u32) {
+        assert!(cx.claim(key(100 + mine)), "the key is new");
+        self.claimed.fetch_add(1, Ordering::AcqRel);
+        while self.claimed.load(Ordering::Acquire) < 2 {
+            cx.wait(Wait::Until(cx.now() + 100_000)).expect("a timed wait closes no cycle");
+        }
+        if let Err(cycle) = cx.wait(Wait::Key(key(100 + (1 - mine)))) {
+            self.refused.lock().unwrap().push(cycle);
+        }
+        cx.key_done(key(100 + mine));
+    }
+}
+
+#[test]
+fn a_cycle_of_waits_through_two_drivers_is_refused_once() {
+    let work: &'static CrossedDrivers = Box::leak(Box::new(CrossedDrivers { claimed: AtomicU32::new(0), refused: Mutex::new(Vec::new()) }));
+    let first = start(Cores::flat(1).unwrap(), work);
+    let second = start(Cores::flat(1).unwrap(), work);
+    let a = first.spawn(0, Spawn::root());
+    let b = second.spawn(1, Spawn::root());
+    first.join().unwrap();
+    second.join().unwrap();
+    let refused = work.refused.lock().unwrap();
+    assert_eq!(refused.len(), 1, "exactly one wait gives way: {refused:?}");
+    let mut jobs = refused[0].jobs.clone();
+    jobs.sort_unstable();
+    let mut both = vec![a.job, b.job];
+    both.sort_unstable();
+    assert_eq!(jobs, both, "the cycle names the job of each driver");
+}
+
 /// Jobs whose waits form a DAG, some doing a parallel map whose items wait for other jobs.
 struct Graph {
     deps: Vec<Vec<u32>>,

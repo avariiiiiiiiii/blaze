@@ -121,7 +121,10 @@ pub enum Cancelled {
     PendingWrite,
     /// Waiting for a key another task runs would have closed a cycle of tasks: this one gives
     /// way, and meets the cycle on its own stack when it runs again.
-    WouldWaitOnItself,
+    WouldWaitOnItself {
+        /// The key whose wait was refused; `None` only from a test that gives way by hand.
+        asked: Option<DatabaseKeyIndex>,
+    },
     /// A host rethrew a job's panic.
     PropagatedPanic,
 }
@@ -142,11 +145,14 @@ impl Cancelled {
 
 impl fmt::Display for Cancelled {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(match self {
-            Cancelled::PendingWrite => "pending write",
-            Cancelled::WouldWaitOnItself => "would wait on itself",
-            Cancelled::PropagatedPanic => "propagated panic",
-        })
+        match self {
+            Cancelled::PendingWrite => f.write_str("pending write"),
+            Cancelled::WouldWaitOnItself { asked: Some(asked) } => {
+                write!(f, "would wait on itself, asking for {asked:?}")
+            }
+            Cancelled::WouldWaitOnItself { asked: None } => f.write_str("would wait on itself"),
+            Cancelled::PropagatedPanic => f.write_str("propagated panic"),
+        }
     }
 }
 
@@ -226,7 +232,7 @@ pub fn pump_barrier<R>(f: impl FnOnce() -> R) -> R {
 pub fn par_for_each(count: usize, task: impl Fn(usize) + Sync) {
     let again = pump_barrier(|| {
         blaze_graph::par::for_each_giving_way(count, &task, |panic| {
-            matches!(panic.downcast_ref::<Cancelled>(), Some(Cancelled::WouldWaitOnItself))
+            matches!(panic.downcast_ref::<Cancelled>(), Some(Cancelled::WouldWaitOnItself { .. }))
         })
     });
     for at in again {
@@ -236,8 +242,8 @@ pub fn par_for_each(count: usize, task: impl Fn(usize) + Sync) {
 
 /// `f(at)` for each `at` in `0..count`, in order, run as [`par_for_each`] runs its tasks.
 pub fn par_map<R: Send>(count: usize, f: impl Fn(usize) -> R + Sync) -> Vec<R> {
-    // alloc: the results, once per loop
     let made: Vec<std::sync::Mutex<Option<R>>> =
+        // alloc: a slot per result, once per loop
         (0..count).map(|_| std::sync::Mutex::new(None)).collect();
     par_for_each(count, |at| {
         let it = f(at);
@@ -249,6 +255,7 @@ pub fn par_map<R: Send>(count: usize, f: impl Fn(usize) -> R + Sync) -> Vec<R> {
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .expect("every task ran")
         })
+        // alloc: the results, once per loop
         .collect()
 }
 

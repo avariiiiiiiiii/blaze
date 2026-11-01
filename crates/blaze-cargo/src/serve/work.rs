@@ -123,6 +123,10 @@ pub struct JobInput {
     /// The store, read by tasks with no lock (a read is valid while its
     /// [`blaze_cas::enter`] guard is held); written only by the loop.
     pub store: blaze_cas::Reader,
+    /// The standard library's store, shared by this build's daemons, read as `store` is: a
+    /// std unit's record is found there when `store` has none, as of the look the job's build
+    /// waited for.
+    pub std: blaze_cas::Reader,
     pub color: bool,
     /// Diagnostics are rendered a line each: cargo's `--message-format=short` or
     /// `json-diagnostic-short`.
@@ -194,6 +198,9 @@ pub struct Compiled {
     /// cargo's.
     pub ok: bool,
     pub puts: Vec<Put>,
+    /// What the loop puts into the standard library's shared store ([`JobInput::std`]): a std
+    /// unit's record and every output it names, once made here; nothing for any other unit.
+    pub share: Vec<Put>,
     /// Placed by the loop once `puts` are in the store.
     pub outputs: Vec<Output>,
     /// cargo's `compiler-artifact` of the unit, reported in `Built` once its outputs are

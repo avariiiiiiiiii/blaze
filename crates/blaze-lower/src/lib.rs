@@ -40,7 +40,7 @@ mod tests;
 use std::{cell::Cell, collections::HashMap, fmt};
 
 use base_db::{
-    AbsPathBuf, ContentId, Crate, CrateWorkspaceData, Env, FileId, FileSet, LibraryRoots,
+    AbsPathBuf, ConstEvalBudget, ContentId, Crate, CrateWorkspaceData, Env, FileId, FileSet, LibraryRoots,
     LocalRoots, SourceRoot, SourceRootId, VfsPath, ViewChange, ViewFile, ViewRoot,
 };
 use blaze_ids::{Hasher, radix};
@@ -362,7 +362,8 @@ pub fn lower_into<T: blaze_query::Tree>(db: Db, lower: Lower<'_, T>) -> Result<L
 
     let workspace_root = crates::root(units, &tree)?;
     let toolchain = crates::toolchain()?;
-    let mut workspaces: HashMap<&str, Arc<CrateWorkspaceData>> = HashMap::new();
+    // By triple and whether the crates are the standard library's.
+    let mut workspaces: HashMap<(&str, bool), Arc<CrateWorkspaceData>> = HashMap::new();
     let mut lowerings: Vec<Lowering> = Vec::with_capacity(unit_count);
     for (index, unit) in units.graph.units.iter().enumerate() {
         let plan = &units.plans[index];
@@ -404,11 +405,14 @@ pub fn lower_into<T: blaze_query::Tree>(db: Db, lower: Lower<'_, T>) -> Result<L
         let what = &whats[index];
         let package = package_of(unit)?;
         let triple = unit.platform.as_deref().unwrap_or(&config.host);
-        let workspace = match workspaces.get(triple) {
+        let workspace = match workspaces.get(&(triple, unit.is_std)) {
             Some(it) => it.clone(),
             None => {
-                let made = crates::workspace_data(triple, &toolchain, workspace_root.const_eval)?;
-                workspaces.insert(triple, made.clone());
+                // The workspace's `const-eval` budget is for its own crates: the standard
+                // library's are evaluated under blaze's, the same in every workspace.
+                let const_eval = if unit.is_std { ConstEvalBudget::default() } else { workspace_root.const_eval };
+                let made = crates::workspace_data(triple, &toolchain, const_eval)?;
+                workspaces.insert((triple, unit.is_std), made.clone());
                 made
             }
         };

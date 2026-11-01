@@ -15,10 +15,11 @@
 //!   database and the plane's history each open their sections of it.
 //! - A stop writes the image, waits for it to be mapped, then stops listening and hangs up.
 //! - The explorer, the live feed and live SQL are answered by the loop itself ([`Observe`]);
-//!   each build that ends goes to the profile history's thread. A build whose tasks stop
-//!   moving for [`Watchdog::BOUND`] fails with the stall, whose trace is written to the
-//!   state's `stalls/`, and the daemon stops: its workers may be deadlocked and cannot be got
-//!   back.
+//!   each build that ends goes to the profile history's thread. A build whose tasks run while
+//!   no span closes for [`Watchdog::BOUND`], no query completes for [`Watchdog::QUERY_BOUND`],
+//!   or no unit's step ends for [`Watchdog::STEP_BOUND`] fails with the stall, whose trace is
+//!   written to the state's `stalls/`, and the daemon stops: its workers may be deadlocked or
+//!   going around without end, and cannot be got back.
 
 #![forbid(unsafe_code)]
 
@@ -34,7 +35,7 @@ use blaze_api::{
     server::{Config as ServerConfig, Http, Server, Unix},
     session::{self, Session},
 };
-use blaze_profile::{Plot, Watchdog};
+use blaze_profile::{Plot, Watchdog, watchdog::still};
 use blaze_cas::Store;
 use blaze_core::{Address, Completion, Done, Driver, Effect, FileName, Mapping, Tag};
 use blaze_graph::{Budget, PlaneConfig, arena};
@@ -284,7 +285,11 @@ pub struct Daemon<D: Driver, S: Steps> {
     /// Its state directory, in whose `stalls/` a stall's trace is written.
     state: FileName,
     observe: Observe,
+    /// The stall watchdogs ([`Daemon::watch`]): of spans closed, of queries completed, of
+    /// unit's steps ended.
     watchdog: Watchdog,
+    query_watch: Watchdog,
+    step_watch: Watchdog,
     /// Since when nothing could move a build ([`Daemon::still`]), on the driver's clock.
     still_since: Option<u64>,
     /// The effects in flight that end on their own, by tag ([`ends_alone`]): what can still
@@ -795,6 +800,8 @@ impl<D: Driver, S: Steps> Daemon<D, S> {
             state,
             observe,
             watchdog: Watchdog::new(Watchdog::BOUND),
+            query_watch: Watchdog::new(Watchdog::QUERY_BOUND),
+            step_watch: Watchdog::new(Watchdog::STEP_BOUND),
             still_since: None,
             ending: rustc_hash::FxHashMap::default(),
             settled: 0,
@@ -981,19 +988,28 @@ impl<D: Driver, S: Steps> Daemon<D, S> {
         }
     }
 
-    /// The stall watchdog's turn: once the plane's tasks run and nothing has moved for its
-    /// bound, every job with a plane request under way fails with the stall, its trace is
-    /// written to the state directory, and the daemon stops.
+    /// The stall watchdogs' turn: once the plane's tasks run and what one counts has not moved
+    /// for its bound (spans closed, queries completed, unit's steps ended), every job with a
+    /// plane request under way fails with the stall, its trace is written to the state
+    /// directory, and the daemon stops.
     fn watch(&mut self) {
         self.still();
         if self.failed.is_some() {
             return;
         }
         let running = self.plane.running();
-        let progress = blaze_profile::flight::progress() + self.settled;
+        let busy = running > 0;
         let now = ns(self.driver.now());
-        let Some(quiet) = self.watchdog.tick(now, progress, running > 0) else { return };
-        let stall = blaze_profile::watchdog::stall(quiet, running);
+        let spans = blaze_profile::flight::progress() + self.settled;
+        let queries = blaze_query::db::completed() + self.settled;
+        let found = [
+            (self.watchdog.tick(now, spans, busy), still::SPANS),
+            (self.query_watch.tick(now, queries, busy), still::QUERIES),
+            (self.step_watch.tick(now, self.settled, busy), still::STEPS),
+        ];
+        let found = found.into_iter().find_map(|(quiet, what)| Some((quiet?, what)));
+        let Some((quiet, what)) = found else { return };
+        let stall = blaze_profile::watchdog::stall(quiet, running, what);
         let said = stall.to_string();
         tracing::error!("{said}");
         let file = under(&self.state, &format!("stalls/{now}.json"));

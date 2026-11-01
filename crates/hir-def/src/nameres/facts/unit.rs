@@ -1221,14 +1221,20 @@ impl<'db, 'f, A: Allocator + Clone> Unit<'db, 'f, A> {
         vis: Visibility,
         def_import_type: Option<ImportOrExternCrate>,
     ) -> bool {
+        let glob = matches!(def_import_type, Some(ImportOrExternCrate::Glob(_)));
+        let (db, def_map) = (self.db, &self.def_map);
+        let narrowed = |it: Visibility| {
+            let it = it.min(db, vis, def_map).unwrap_or(vis);
+            if glob { it.root_as_pub_crate(db, def_map) } else { it }
+        };
         if let Some(def) = defs.types.as_mut() {
-            def.vis = def.vis.min(self.db, vis, &self.def_map).unwrap_or(vis);
+            def.vis = narrowed(def.vis);
         }
         if let Some(def) = defs.values.as_mut() {
-            def.vis = def.vis.min(self.db, vis, &self.def_map).unwrap_or(vis);
+            def.vis = narrowed(def.vis);
         }
         if let Some(def) = defs.macros.as_mut() {
-            def.vis = def.vis.min(self.db, vis, &self.def_map).unwrap_or(vis);
+            def.vis = narrowed(def.vis);
         }
         // Whatever the scope does with them: an import that read the slot is retried, and
         // finds the same answer if nothing it reads changed.

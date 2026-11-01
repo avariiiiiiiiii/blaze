@@ -75,6 +75,38 @@ fn main() {}
 }
 
 #[test]
+fn a_signatures_parts_its_cfgs_remove_are_not_resolved() {
+    // Our own: object 0.39's read/any.rs, a path crate whose variants name modules only its
+    // off features declare. Only the field `cfg(not(..))` keeps is resolved.
+    let fixture = r#"//- minicore: sized
+//- /lib.rs crate:other:kinds edition:2024
+#[cfg(feature = "big")]
+pub mod big {
+    pub struct Big;
+}
+pub enum Kind {
+    Small(u8),
+    #[cfg(feature = "big")]
+    Big(big::Big),
+    #[cfg_attr(all(), cfg(feature = "big"))]
+    Wrapped { it: big::Big },
+}
+pub struct S {
+    pub small: u8,
+    #[cfg(feature = "big")]
+    pub big: big::Big,
+    #[cfg(not(feature = "big"))]
+    pub kept: kept::Kept,
+}
+pub fn f<#[cfg(feature = "big")] T: big::Tr>(#[cfg(feature = "big")] _: big::Big) {}
+"#;
+    let messages = checked(fixture).messages();
+    let unresolved: Vec<&String> = messages.iter().filter(|it| it.starts_with("E0433")).collect();
+    assert_eq!(unresolved.len(), 1, "only `kept`, which no cfg removes, is unresolved: {messages:?}");
+    assert!(unresolved[0].contains("`kept`"), "{messages:?}");
+}
+
+#[test]
 fn an_impl_of_a_struct_is_not_a_trait() {
     // tests/ui/error-codes/E0404.rs
     let source = "struct Foo;\nstruct Bar;\n\nimpl Foo for Bar {} //~ ERROR E0404\n\nfn main() {}\n\nfn baz<T: Foo>(_: T) {} //~ ERROR E0404\n";

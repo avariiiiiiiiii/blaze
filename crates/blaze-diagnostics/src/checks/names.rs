@@ -106,12 +106,18 @@ fn assoc_syntax<'db>(cx: &Cx<'_, 'db>, assoc: hir::AssocItem) -> Option<InFile<a
 }
 
 /// Each path of a type or trait and each lifetime of the signature, the items, bodies,
-/// attributes and constants inside it left out.
+/// attributes and constants inside it left out, and every part its `cfg`s remove (a variant,
+/// a field, a parameter, a generic parameter), as rustc resolves only what configuration
+/// keeps.
 fn walk<'db>(cx: &Cx<'_, 'db>, signature: &Signature<'db>, found: &mut Vec<Found>) {
     let mut walk = signature.node.value.preorder();
     walk.next();
     while let Some(event) = walk.next() {
         let WalkEvent::Enter(node) = event else { continue };
+        if !cx.cfg_enabled(node) {
+            walk.skip_subtree();
+            continue;
+        }
         match node.kind() {
             SyntaxKind::PATH_TYPE => {
                 let ty = ast::PathType::cast(node).expect("a PATH_TYPE node is a path type");

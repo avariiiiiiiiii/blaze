@@ -1,0 +1,23 @@
+{
+  "id": "01477",
+  "from_lane": "repro",
+  "owner": "codegen",
+  "paths": [
+    "crates/blaze-codegen/src/driver/owners.rs"
+  ],
+  "what": "libmimalloc-sys and blake3 build scripts (self-build 00:17) refused at blaze-codegen driver/owners.rs:146: hashbrown RawTable<(cc::CompilerFlag, bool)>::reserve_rehash closure (of build-time cc) goes in the dependency image and refers to <*mut u8>::cast::<(cc::CompilerFlag, bool)>, classed as the workspace one. Reduced: a build script calling cc 1.4.3 Build::is_flag_supported. Test: blaze-engine tests/repro.rs a_build_script_asking_cc_whether_a_flag_is_supported_builds (also needs 01358 for split_ascii_whitespace; the refusal is listed alongside).",
+  "state": "open",
+  "created": "2026-11-01T07:56:51Z",
+  "updated": "2026-11-01T07:56:51Z",
+  "taken_by": null,
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-11-01T07:56:51Z",
+      "by": "repro",
+      "action": "add",
+      "note": ""
+    }
+  ]
+}

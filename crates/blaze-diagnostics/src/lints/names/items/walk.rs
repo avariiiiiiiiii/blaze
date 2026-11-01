@@ -12,7 +12,6 @@ use std::{ops::ControlFlow, rc::Rc};
 
 use blaze_ids::radix;
 use blaze_mem::Frame;
-use cfg::CfgExpr;
 use hir::{HirFileId, InFile, view::ModuleSourceView};
 use rustc_hash::FxHashMap;
 use smallvec::SmallVec;
@@ -194,7 +193,7 @@ impl<'db> Walk<'_, '_, 'db> {
 
     /// Visits `item`, written in `container`, and what is in it.
     fn item(&mut self, item: InFile<ast::Item<'db>>, container: Container<'db>, module: hir::Module, in_body: Option<usize>) {
-        if !enabled(self.cx, item.value) {
+        if !self.cx.cfg_enabled(item.value.syntax()) {
             return;
         }
         if let ast::Item::MacroCall(call) = item.value {
@@ -259,13 +258,10 @@ impl<'db> Walk<'_, '_, 'db> {
     /// `direct` when it is one of the items of an impl, a trait or an `extern` block `owner`
     /// is, else of `owner`'s body.
     fn node(&mut self, file: HirFileId, node: ast::Node<'db>, owner: usize, direct: Option<Container<'db>>, module: hir::Module) {
-        let kind = node.kind();
-        if ast::AnyHasAttrs::can_cast(kind)
-            && let Some(it) = ast::AnyHasAttrs::cast(node)
-            && !enabled(self.cx, it)
-        {
+        if !self.cx.cfg_enabled(node) {
             return;
         }
+        let kind = node.kind();
         if is_item(node) {
             let item = ast::Item::cast(node).expect("an item");
             match direct {
@@ -313,28 +309,6 @@ fn is_item(node: ast::Node<'_>) -> bool {
         ),
         _ => ast::Item::can_cast(node.kind()),
     }
-}
-
-/// Whether the `cfg`s of `owner` keep it, its `cfg_attr`s expanded.
-pub(super) fn enabled<'t>(cx: &Cx<'_, '_>, owner: impl HasAttrs<'t>) -> bool {
-    if owner.attrs().next().is_none() {
-        return true;
-    }
-    let cfg = cx.krate.cfg(cx.db);
-    let off = hir_expand::attrs::expand_cfg_attr_view(
-        owner.attrs(),
-        || cfg,
-        |meta, _| {
-            if let ast::Meta::CfgMeta(meta) = meta
-                && let Some(predicate) = meta.cfg_predicate()
-                && cfg.check(&CfgExpr::parse_from_view(predicate)) == Some(false)
-            {
-                return ControlFlow::Break(());
-            }
-            ControlFlow::Continue(())
-        },
-    );
-    off.is_none()
 }
 
 /// Whether `f` accepts any attribute named `name` on `owner`, its `cfg_attr`s expanded,

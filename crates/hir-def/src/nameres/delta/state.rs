@@ -15,7 +15,7 @@ use triomphe::Arc;
 
 use super::publish::{CrateResolution, ScopeInput};
 use crate::{
-    AstId, BuiltinDeriveImplId, FxIndexMap, ImplId, ModuleId, UseId,
+    AstId, BuiltinDeriveImplId, EnumId, FxIndexMap, ImplId, ModuleId, UseId,
     nameres::{
         DefMapCrateData, ModulesMap,
         diagnostics::DefDiagnostic,
@@ -89,6 +89,10 @@ pub(super) struct CrateState {
     /// The crate attributes `data` was made from (`queries::crate_data`): an edit of the root's
     /// `#![feature]` or `#![no_std]` changes them, and no group's ops.
     pub(super) data_of: Option<Arc<DefMapCrateData>>,
+    /// A fingerprint of each globbed enum's variants (names, ids and shapes) as its glob
+    /// readers last woke on: a write touching the enum wakes them only when it differs. An enum
+    /// with no reader has none, and the first touch after a reader comes wakes it.
+    pub(super) variants_seen: FxHashMap<EnumId, u64>,
 }
 
 impl CrateState {
@@ -121,6 +125,7 @@ impl CrateState {
             impl_pos: FxHashMap::default(),
             derive_pos: FxHashMap::default(),
             group_pos: FxHashMap::default(),
+            variants_seen: FxHashMap::default(),
             data: None,
             data_of: None,
         }

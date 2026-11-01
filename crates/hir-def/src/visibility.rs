@@ -276,6 +276,18 @@ impl Visibility {
         }
     }
 
+    /// `self`, a restriction to the crate root spelled `pub(crate)`: the same visibility, which
+    /// a glob passes on in one spelling whichever of a private root import and a `pub(crate)`
+    /// item reached it first.
+    pub(crate) fn root_as_pub_crate(self, db: &Db, def_map: &DefMap) -> Visibility {
+        match self {
+            Visibility::Module(module, _) if module == def_map.crate_root(db) => {
+                Visibility::PubCrate(def_map.krate())
+            }
+            other => other,
+        }
+    }
+
     /// Returns the least permissive visibility of `self` and `other`.
     ///
     /// If there is no subset relation between `self` and `other`, returns `None` (i.e. they're only

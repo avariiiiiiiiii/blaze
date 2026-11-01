@@ -10,6 +10,37 @@ use crate::{
     tests::{Mode, checked_with, compiletest, normalized, ui},
 };
 
+#[test]
+fn a_lifetime_a_macro_emits_among_an_impls_items_is_the_impls() {
+    // Our own: serde's `forward_to_deserialize_any!` in an `impl<'de> Deserializer<'de>`
+    // (blaze-protocol's cbor/de.rs, sonic-rs), through a second macro as serde's is. The same
+    // methods emitted outside any impl have no `'de`.
+    let fixture = r#"//- minicore: sized
+//- /main.rs crate:other:main edition:2021
+pub trait Visitor<'de> {}
+pub trait Deserializer<'de> {
+    fn deserialize_bool<V: Visitor<'de>>(self, visitor: V);
+}
+macro_rules! method {
+    ($name:ident) => {
+        fn $name<V: Visitor<'de>>(self, visitor: V) {}
+    };
+}
+macro_rules! forward {
+    ($($name:ident)*) => { $(method! { $name })* };
+}
+struct D;
+impl<'de> Deserializer<'de> for D {
+    forward! { deserialize_bool }
+}
+forward! { outside }
+fn main() {}
+"#;
+    let messages = crate::tests::checked(fixture).messages();
+    let undeclared: Vec<&String> = messages.iter().filter(|it| it.starts_with("E0261")).collect();
+    assert_eq!(undeclared.len(), 1, "only `outside`'s `'de` is undeclared: {messages:?}");
+}
+
 /// [`ui`] of a file with minicore's items for `flags` (`crates/test-utils/src/minicore.rs`), as
 /// compiletest runs a test of `mode`.
 fn ui_core(mode: Mode, name: &str, flags: &str, source: &str) -> String {

@@ -385,6 +385,28 @@ fn the_fixture_scripts_that_once_failed_keep_the_maps_equal() {
         fixture_named("../macro_expansion_tests/builtin_derive_macro.rs::coerce_pointee_errors#0"),
         &[(TextEdit::Rename { at: 1932032, to: 0 }, TextEdit::Remove { at: 0 })],
     );
+    // 2026-11-01: removing `#![feature(import_trait_associated_functions)]` changed no round-0
+    // log, and the maintained map kept the glob of a trait's items without its error.
+    fixture_script(
+        fixture_named("tests/trait_imports.rs::glob_of_a_trait_with_the_feature#0"),
+        &[TextEdit::Remove { at: 0 }],
+        false,
+    );
+    // 2026-11-01: removing `fn f();` from a trait the same module globs touched the root and ran
+    // nothing: its own read of the trait's items was not kept, so the maintained map kept `f`.
+    fixture_script(
+        fixture_named("tests/trait_imports.rs::glob_of_a_trait_with_the_feature#0"),
+        &[TextEdit::Remove { at: 256 }],
+        false,
+    );
+    fixture_batches(
+        fixture_named("tests/trait_imports.rs::glob_of_a_trait_without_the_feature#0"),
+        &[(TextEdit::Remove { at: 0 }, TextEdit::Remove { at: 0 })],
+    );
+    // 2026-11-01: `reexport_2::Placeholder` reached by `use reexport_1::*` and `pub use
+    // reexport_1::*`: the fresh map credited the `pub use`, the maintained one the `use`, both
+    // `pub`.
+    fixture_script(fixture_named("tests/globs.rs::regression_18580#0"), &[TextEdit::Remove { at: 1024 }], false);
     // 2026-11-01: removing `#![crate_type="proc-macro"]` left the maintained root censored, its
     // `S` and fn `pub(crate)`.
     fixture_batches(
@@ -685,6 +707,9 @@ const PINNED_GENERATED: &[(u64, bool, &[ModelEdit])] = &[
     // 2026-11-01: removing a `macro_rules!` panicked in `incremental`, which read the log of a
     // group whose key still inherited it ("Can't find ast id MacroRules").
     (0, false, &[ModelEdit::RemoveItem { module: 0, at: 0 }]),
+    // 2026-11-01: one item through two globs, `pub(crate)` and private in the root (the same
+    // visibility): the fresh map kept `pub(crate)`, the maintained one the private spelling.
+    (0x4082715, false, &[ModelEdit::AddItem { module: 0, at: 1, seed: 181 }]),
 ];
 
 #[test]

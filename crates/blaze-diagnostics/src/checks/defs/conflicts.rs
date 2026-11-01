@@ -13,11 +13,10 @@
 //! `find_span_of_binding_until_next_binding`, `extend_span_to_previous_binding`) and
 //! `diagnostics/mod.rs` (`NameDefinedMultipleTime`) (MIT or Apache-2.0).
 
-use std::{hash::BuildHasher as _, ops::ControlFlow};
+use std::hash::BuildHasher as _;
 
 use blaze_ids::radix;
 use blaze_items::ItemId;
-use cfg::CfgExpr;
 use either::Either;
 use hashbrown::HashTable;
 use hir::{InFile, PathResolution};
@@ -506,7 +505,7 @@ fn enum_scope(cx: &Cx<'_, '_>, scope: &mut Scope, module: hir::Module, enum_: hi
     let Some(source) = cx.vsema.source(enum_) else { return };
     let Some(list) = source.value.variant_list() else { return };
     let item = Some(ItemId::Adt(hir::Adt::from(enum_).into()));
-    for variant in list.variants().filter(|&it| enabled(cx, it)) {
+    for variant in list.variants().filter(|&it| cx.cfg_enabled(it.syntax())) {
         let Some(name) = variant.name() else { continue };
         let name = scope.intern(name.text());
         let node = variant.syntax();
@@ -722,28 +721,6 @@ fn import_bindings<'db>(cx: &Cx<'_, 'db>, scope: &mut Scope, uses: &mut UseTrees
         }
     }
     prefixes.clear();
-}
-
-/// Whether the `cfg`s of `owner` keep it, its `cfg_attr`s expanded.
-fn enabled<'t, N: HasAttrs<'t>>(cx: &Cx<'_, '_>, owner: N) -> bool {
-    if owner.attrs().next().is_none() {
-        return true;
-    }
-    let cfg = cx.krate.cfg(cx.db);
-    let off = hir_expand::attrs::expand_cfg_attr_view(
-        owner.attrs(),
-        || cfg,
-        |meta, _| {
-            if let ast::Meta::CfgMeta(meta) = meta
-                && let Some(predicate) = meta.cfg_predicate()
-                && cfg.check(&CfgExpr::parse_from_view(predicate)) == Some(false)
-            {
-                return ControlFlow::Break(());
-            }
-            ControlFlow::Continue(())
-        },
-    );
-    off.is_none()
 }
 
 #[cfg(test)]

@@ -19,9 +19,10 @@
 //!   lowest it depends on, so nested cycles merge into the outermost head, which iterates.
 
 use std::{
+    cell::Cell,
     marker::PhantomData,
     ptr::NonNull,
-    sync::atomic::{AtomicUsize, Ordering},
+    sync::atomic::{AtomicU64, AtomicUsize, Ordering},
 };
 
 use blaze_mem::Tag;
@@ -293,7 +294,8 @@ fn refresh<F: Function>(
         let db_ptr = std::ptr::from_ref(db).cast::<()>();
         let mut assumed = None;
         in_flight(storage, index, id, || {
-            assumed = claimed::<F>(db_ptr, storage, index, row, key, value)
+            assumed = claimed::<F>(db_ptr, storage, index, row, key, value);
+            complete_one();
         });
         if let Some(head) = assumed {
             local::with(|local| depend_on(local, head));
@@ -316,6 +318,38 @@ fn depend_on(local: &mut local::Local, head: u32) {
     if let Some(frame) = local.frames.last_mut().filter(|it| it.kind == FrameKind::Verify) {
         frame.head = frame.head.min(head);
     }
+}
+
+/// A count of [`completed`]'s, alone on its cache line.
+#[repr(align(128))]
+struct Slot(AtomicU64);
+
+const SLOTS: usize = 64;
+
+/// [`completed`]'s counts, a slot per thread (threads past [`SLOTS`] share), so no two workers
+/// write one cache line on each query.
+static COMPLETED: [Slot; SLOTS] = [const { Slot(AtomicU64::new(0)) }; SLOTS];
+static NEXT_SLOT: AtomicUsize = AtomicUsize::new(0);
+
+std::thread_local! {
+    static SLOT: Cell<usize> = const { Cell::new(usize::MAX) };
+}
+
+fn complete_one() {
+    let at = SLOT.with(|slot| {
+        if slot.get() == usize::MAX {
+            slot.set(NEXT_SLOT.fetch_add(1, Ordering::Relaxed) % SLOTS);
+        }
+        slot.get()
+    });
+    COMPLETED[at].0.fetch_add(1, Ordering::Relaxed);
+}
+
+/// The queries this process's databases brought up to date under their flight (each run or
+/// verified there), on every thread: it grows while query work moves, so the daemon's
+/// watchdog fails a build where tasks run and it stays still.
+pub fn completed() -> u64 {
+    COMPLETED.iter().map(|it| it.0.load(Ordering::Relaxed)).sum()
 }
 
 /// Runs `run` holding the flight of row `id` of `index`, or waits for whoever holds it.

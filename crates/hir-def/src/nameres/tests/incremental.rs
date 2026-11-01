@@ -195,12 +195,16 @@ fn no() {}
                 "resolution_of",
             ]
         "#]],
+        // `use E::*` binds `E`'s variants, which no round-0 log holds: the maintainer reads
+        // them again (`variants_syntax`) to see whether the glob must run again.
         expect![[r#"
             [
                 "EditionedFileId::parse_",
                 "file_item_tree_query",
                 "HirFileId::ast_id_map",
                 "real_span_map",
+                "file_outline",
+                "variants_syntax",
             ]
         "#]],
     );

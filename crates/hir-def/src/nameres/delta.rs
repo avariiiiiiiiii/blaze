@@ -197,24 +197,30 @@ fn maintain_crate(
     let mut delta = input::read(db, krate, &mut cs, written, cold, deps_changed);
     work.ops += delta.ops;
     // The root of a crate exporting procedural macros is published censored, and its state row
-    // keeps the scope before the censor: a run makes both. A crate that starts or stops exporting
-    // them (`#![crate_type]`) has its root censored or no longer, which only a run publishes.
-    let proc_macro = queries::crate_data(db, krate).proc_macro;
-    let flipped = cs.data_of.as_ref().is_some_and(|it| it.proc_macro != proc_macro);
-    if let Some(at) = delta.direct.iter().position(|(it, _)| *it == cs.root)
-        && (proc_macro || flipped)
+    // keeps the scope before the censor: a run makes both.
+    let data = queries::crate_data(db, krate);
+    if data.proc_macro
+        && let Some(at) = delta.direct.iter().position(|(it, _)| *it == cs.root)
     {
         let (group, _) = delta.direct.swap_remove(at);
         delta.seeds.push(group);
-    } else if flipped && !delta.seeds.contains(&cs.root) {
-        delta.seeds.push(cs.root);
+    }
+    // A crate attribute reaches any module's run, with no round-0 log changed: `#![feature]`
+    // (trait item imports), `#![register_tool]`, `#![recursion_limit]`, and `#![crate_type]`
+    // the root's censor. A write that changes one runs every group again.
+    if cs.data_of.as_ref().is_some_and(|it| it != data) {
+        delta.direct.clear();
+        let seeded: FxHashSet<ModuleId> = delta.seeds.iter().copied().collect(); // alloc: once per write that changes a crate attribute
+        delta.seeds.extend(cs.groups.keys().filter(|it| !seeded.contains(*it)));
+        delta.removing.clear();
+        delta.removing.extend(cs.groups.keys());
     }
     let moved = match delta.tree {
         true => diff::update_positions(&mut cs),
         false => Vec::new(), // alloc: empty, allocates nothing
     };
     let mut wakes = dependency_wakes(db, &cs, earlier, modules_changed);
-    wakes.extend(enum_glob_wakes(db, &cs, &delta, earlier));
+    wakes.extend(enum_glob_wakes(db, &mut cs, &delta, earlier));
     let mut region = initial_region(&cs, &mut state.scratch, &delta, wakes, cold);
     if region.is_empty() && !delta.deleted.is_empty() {
         // The rows and inputs of a group gone go with a run, which reports their keys.
@@ -279,17 +285,30 @@ fn dependency_wakes(
 /// The groups that glob-imported an enum the write may have changed: one declared by a group
 /// of this crate it read again, or one an earlier crate's write touched. A variant is no
 /// binding of the enum's module, so nothing else wakes them; the glob is noted reading
-/// [`reads::enum_glob`] there, which no glob of the module reads. The same for the imports of a
-/// trait's items ([`reads::trait_import`]).
-fn enum_glob_wakes(db: &Db, cs: &CrateState, delta: &Delta, earlier: &[CrateDelta]) -> Vec<ModuleId> {
+/// [`reads::enum_glob`] there, which no glob of the module reads. An enum's readers wake only
+/// when its variants differ from those they last woke on ([`CrateState::variants_seen`]), so
+/// a body edit beside a globbed enum reruns no group. The same for the imports of a trait's
+/// items ([`reads::trait_import`]), which wake on every touch: the trait's items are listed
+/// through its crate's def map, which a crate being maintained has not got.
+fn enum_glob_wakes(db: &Db, cs: &mut CrateState, delta: &Delta, earlier: &[CrateDelta]) -> Vec<ModuleId> {
     let mut out = Vec::new(); // alloc: the groups woken, once per write that touches an enum
     let key = reads::enum_glob();
+    let (index, seen) = (&cs.reads, &mut cs.variants_seen);
     let mut wake = |def: ModuleDefId| match def {
         ModuleDefId::AdtId(crate::AdtId::EnumId(it)) => {
-            out.extend(cs.reads.readers((crate::Lookup::lookup(&it, db).container, Some(key))));
+            let read = (crate::Lookup::lookup(&it, db).container, Some(key));
+            if index.readers(read).next().is_none() {
+                // A reader that comes later reads the variants then; the next touch wakes it.
+                seen.remove(&it);
+                return;
+            }
+            let print = variants_print(db, it);
+            if seen.insert(it, print) != Some(print) {
+                out.extend(index.readers(read));
+            }
         }
         ModuleDefId::TraitId(it) => {
-            out.extend(cs.reads.readers((crate::Lookup::lookup(&it, db).container, Some(reads::trait_import()))));
+            out.extend(index.readers((crate::Lookup::lookup(&it, db).container, Some(reads::trait_import()))));
         }
         _ => {}
     };
@@ -309,6 +328,16 @@ fn enum_glob_wakes(db: &Db, cs: &CrateState, delta: &Delta, earlier: &[CrateDelt
         }
     }
     out
+}
+
+/// What a glob of `it` binds: each variant's name, id and shape, in order.
+fn variants_print(db: &Db, it: crate::EnumId) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = rustc_hash::FxHasher::default();
+    for (name, &(variant, shape)) in &it.enum_variants(db).variants {
+        (name, variant, shape).hash(&mut hasher);
+    }
+    hasher.finish()
 }
 
 /// The groups the write runs first: every one when cold; else the changed and new ones, and
@@ -590,17 +619,23 @@ fn publish_crate(
         }
 
         // Who read what, the region's reads replacing its old ones. A group's reads of its own
-        // modules are not kept: it runs whenever they change.
+        // modules are not kept: it runs whenever they change. An enum's variants and a trait's
+        // items are in no round-0 log, so an edit of them only touches the group, and its own
+        // globs of them are kept for `enum_glob_wakes`.
         for &group in &ran {
             cs.reads.forget(group);
             cs.module_readers.forget(group);
         }
+        let (enum_glob, trait_import) = (reads::enum_glob(), reads::trait_import());
         for &(reader, (module, name)) in &run.reads {
             let owner = cs.group_of.get(&module).copied();
+            let item_read = name.as_ref().is_some_and(|it| *it == enum_glob || *it == trait_import);
             let mut note = |group: ModuleId| {
                 if owner != Some(group) {
                     cs.reads.add((module, name), group);
                     cs.module_readers.add(module, group);
+                } else if item_read {
+                    cs.reads.add((module, name), group);
                 }
             };
             match reader.and_then(|it| cs.group_of.get(&it).copied()) {

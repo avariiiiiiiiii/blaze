@@ -338,18 +338,28 @@ misses that tick. Its cursor keeps its place, and rows written over meanwhile sh
 
 ## The stall watchdog
 
-The daemon counts progress: spans closed, query runs and tasks ended. When tasks are running
-and none of these has moved for the bound (60 s), it:
+While tasks are running, the daemon keeps three counts of progress, each with its own bound:
+
+| count | still for | the error says |
+| --- | --- | --- |
+| spans closed and tasks ended | 60 s | `no span closed and no task ended` |
+| queries completed (run or verified) and tasks ended | 120 s | `no query completed and no task ended` |
+| units' steps ended | 300 s | `no unit's step ended` |
+
+When one stays still for its bound, the daemon:
 
 1. writes `state/stalls/<time>.json`: the flight recorder's last two minutes and the CPU
    samples as a Chrome trace (ui.perfetto.dev opens it);
-2. fails each running request with the error `blaze stalled: no span closed and no task ended
-   for N s while M tasks ran`, followed by each thread inside spans, outermost span first, and
-   how long it has been in each;
-3. stops the daemon, whose threads may be deadlocked; the next request starts a new one.
+2. fails each running request with the error `blaze stalled: <what> for N s while M tasks
+   ran`, followed by each thread inside spans, outermost span first, and how long it has been
+   in each;
+3. stops the daemon, whose threads may be deadlocked or going around without end; the next
+   request starts a new one.
 
-A deadlock (jobs that all wait on each other, as in blaze-pool's hang at 0% CPU) becomes this
-error within the bound instead of a request that never ends.
+A deadlock (jobs that all wait on each other, as in blaze-pool's hang at 0% CPU) becomes the
+first error within its bound instead of a request that never ends. Work that keeps closing
+spans but never completes a query (a livelock) becomes the second. Queries that keep
+completing while no unit's step ends for five minutes becomes the third.
 
 ## `BLAZE_PROFILE` and `BLAZE_STATS`
 

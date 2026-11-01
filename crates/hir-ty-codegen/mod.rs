@@ -1818,53 +1818,6 @@ pub(crate) fn unexpanded_derive(
     })
 }
 
-/// The method of the impl a call of `func` with `args` runs, or `func` itself where its impl
-/// is chosen later or is the compiler's ([`NoImplMethod::is_expected`]). Any other reason no
-/// impl's method is found stops the call ([`no_impl_method`]).
-///
-/// [`NoImplMethod::is_expected`]: hir_ty::method_resolution::NoImplMethod::is_expected
-pub(crate) fn impl_method<'db>(
-    db: &'db Db,
-    env: ParamEnvAndCrate<'db>,
-    func: FunctionId,
-    args: GenericArgs<'db>,
-) -> std::result::Result<(ImplMethod, GenericArgs<'db>), String> {
-    match db.lookup_impl_method_or_why(env, func, args) {
-        Ok(found) => Ok(found),
-        Err(why) if why.is_expected() => Ok((either::Either::Left(func), args)),
-        Err(why) => Err(no_impl_method(db, func, args, why)),
-    }
-}
-
-/// What [`impl_method`] finds: a function, or the method of an impl a builtin derive makes.
-pub(crate) type ImplMethod = either::Either<
-    FunctionId,
-    (hir_def::BuiltinDeriveImplId, hir_def::builtin_derive::BuiltinDeriveImplMethod),
->;
-
-/// `trait P method m for <args>: why`, of a call of the trait method `func` with `args` that
-/// no impl's method was found for.
-pub(crate) fn no_impl_method(
-    db: &Db,
-    func: FunctionId,
-    args: GenericArgs<'_>,
-    why: hir_ty::method_resolution::NoImplMethod,
-) -> String {
-    let method = FunctionSignature::of(db, func).name.as_str();
-    let trait_ = match func.lookup(db).container {
-        ItemContainerId::TraitId(it) => Some(hir_def::signatures::TraitSignature::of(db, it)),
-        _ => None,
-    };
-    let (why, args) = (why.describe(), args.as_slice());
-    // A type's `Debug` reads its interned parts from the attached database.
-    hir_ty::attach_db(db, || match trait_ {
-        // alloc: the error's message
-        Some(trait_) => format!("trait {} method {method} for {args:?}: {why}", trait_.name.as_str()),
-        // alloc: the error's message
-        None => format!("method {method} for {args:?}: {why}"),
-    })
-}
-
 /// Whether `name` is of core's `check_language_ub` or `check_library_ub`, each
 /// `ub_checks() && ..` and the rest true at run time.
 fn is_ub_check(name: &intern::Symbol) -> bool {
@@ -7170,8 +7123,7 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
         if is_dyn_method(self.interner, self.env.param_env, func, generic_args).is_some() {
             return self.reified(fn_ty, false);
         }
-        let (callee, callee_args) =
-            impl_method(db, self.env, func, generic_args).map_err(CodegenError::Refused)?;
+        let (callee, callee_args) = db.lookup_impl_method(self.env, func, generic_args);
         let callee = match callee {
             either::Either::Left(callee) => callee,
             either::Either::Right(derived) => {
@@ -8481,7 +8433,7 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
         // The innermost reference to the callee and the address it is stored at.
         let mut by_ref = None;
         while let TyKind::Ref(_, inner, mutability) = ty.kind() {
-            if self.implements_fn_itself(method, ty, tuple_ty).map_err(CodegenError::Refused)? {
+            if self.implements_fn_itself(method, ty, tuple_ty) {
                 break;
             }
             by_ref = Some((addr, ty, mutability));
@@ -8642,26 +8594,21 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
     }
 
     /// Whether the reference type `ty` has an `Fn` impl written for it, as opposed to the ones
-    /// every reference to a callable has, which call what it points to. A call no impl's
-    /// method is found for, other than as [`impl_method`] expects, is an error.
-    fn implements_fn_itself(
-        &self,
-        method: FunctionId,
-        ty: Ty<'db>,
-        tuple_ty: Ty<'db>,
-    ) -> std::result::Result<bool, String> {
+    /// every reference to a callable has, which call what it points to.
+    fn implements_fn_itself(&self, method: FunctionId, ty: Ty<'db>, tuple_ty: Ty<'db>) -> bool {
         let db = self.cg.db;
         let args = GenericArgs::new_from_slice(&[ty.into(), tuple_ty.into()]);
-        let (either::Either::Left(callee), _) = impl_method(db, self.env, method, args)? else {
-            return Ok(false);
+        let (either::Either::Left(callee), _) = db.lookup_impl_method(self.env, method, args)
+        else {
+            return false;
         };
         let ItemContainerId::ImplId(impl_) = callee.lookup(db).container else {
-            return Ok(false);
+            return false;
         };
-        Ok(match db.impl_self_ty(impl_).skip_binder().kind() {
+        match db.impl_self_ty(impl_).skip_binder().kind() {
             TyKind::Ref(_, pointee, _) => !matches!(pointee.kind(), TyKind::Param(_)),
             _ => false,
-        })
+        }
     }
 
     /// Calls trait method `func` on the trait object behind the fat pointer at `receiver`.
@@ -8971,8 +8918,7 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
             let Some(callee_args) = self.vtable_method_args(func, trait_ref) else {
                 unsupported!("generic `Fn`-trait method in a vtable");
             };
-            let (callee, callee_args) =
-                impl_method(db, self.env, func, callee_args).map_err(CodegenError::Refused)?;
+            let (callee, callee_args) = db.lookup_impl_method(self.env, func, callee_args);
             let either::Either::Left(callee) = callee else {
                 unsupported!("builtin `Fn`-trait method in the vtable of {self_ty:?}");
             };
@@ -8994,8 +8940,7 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
         let Some(args) = self.vtable_method_args(func, trait_ref) else {
             unsupported!("generic method in a vtable");
         };
-        let (callee, callee_args) =
-            impl_method(db, self.env, func, args).map_err(CodegenError::Refused)?;
+        let (callee, callee_args) = db.lookup_impl_method(self.env, func, args);
         let callee = match callee {
             either::Either::Left(callee) => callee,
             either::Either::Right(derived) => {
@@ -9170,8 +9115,7 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
                         unsupported!("shim for an intrinsic");
                     }
                     let db = self.cg.db;
-                    let (callee, _) =
-                        impl_method(db, self.env, func, generic_args).map_err(CodegenError::Refused)?;
+                    let (callee, _) = db.lookup_impl_method(self.env, func, generic_args);
                     if let either::Either::Left(callee) = callee
                         && track_caller(db, callee)
                     {
@@ -9635,8 +9579,7 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
             let dyn_ty = generic_args.type_at(0);
             return self.call_virtual(func, dyn_ty, receiver, receiver_ty, rest, dst, dst_ty);
         }
-        let (callee, callee_args) =
-            impl_method(db, self.env, func, generic_args).map_err(CodegenError::Refused)?;
+        let (callee, callee_args) = db.lookup_impl_method(self.env, func, generic_args);
         let callee = match callee {
             either::Either::Left(callee) => callee,
             either::Either::Right(derived) => {

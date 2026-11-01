@@ -294,7 +294,7 @@ impl SignatureSyntax {
             }),
         }
         let base = anchor_range.start();
-        let tree = copy_without(anchor, &elided);
+        let tree = copy_without(anchor, &elided, None);
         let (placeholder, removed, spans_end) = match (own, elided.first()) {
             (true, Some(node)) => {
                 let range = node.text_range();
@@ -414,15 +414,27 @@ fn bodies_under<'t>(node: ast::Node<'t>, mut body: impl FnMut(ast::Node<'t>)) {
 /// A copy of `node`'s subtree with `elided` (under it, in order) each left as an empty node of
 /// its kind, shared: the file's own tree when `node` is its root and nothing is left out, as
 /// `clone_subtree` shared it.
-fn copy_without(node: ast::Node<'_>, elided: &[ast::Node<'_>]) -> std::sync::Arc<FlatTree> {
+fn copy_without(
+    node: ast::Node<'_>,
+    elided: &[ast::Node<'_>],
+    placeholder: Option<SyntaxKind>,
+) -> std::sync::Arc<FlatTree> {
     if elided.is_empty() && node.parent().is_none() && node.text_range().start() == TextSize::new(0)
     {
         // clone: an `Arc` count of the file's tree, which a copy would equal
         return std::sync::Arc::clone(node.shared_file());
     }
     // alloc: the copy, the memo's tree
-    std::sync::Arc::new(node.subtree_without(elided))
+    std::sync::Arc::new(match placeholder {
+        Some(kind) => node.subtree_without_as(elided, kind),
+        None => node.subtree_without(elided),
+    })
 }
+
+/// The kind of every empty node a [`FileOutline`] has in place of a body: one kind, so that an
+/// edit turning a body into an expression of another kind leaves the outline the same. A fn's
+/// body is one already, and a const's or static's body may be one.
+const CUT: SyntaxKind = SyntaxKind::BLOCK_EXPR;
 
 /// A file's tree with the body of every fn, const and static that is its own span anchor left
 /// out, each an empty node of its kind, and that tree's ast id and span maps: what every
@@ -497,7 +509,7 @@ pub fn file_outline(db: &Db, file_id: EditionedFileId) -> FileOutline {
                 bodies.push(body);
             }
         });
-        let outline = copy_without(root, &bodies);
+        let outline = copy_without(root, &bodies, Some(CUT));
         let ptrs = frame.alloc_slice_from_iter(bodies.iter().map(|&it| ast::ptr(it)));
         let ranges = frame.alloc_slice_from_iter(ptrs.iter().map(SyntaxNodePtr::text_range));
         let mut cut = TextSize::new(0);
@@ -506,7 +518,7 @@ pub fn file_outline(db: &Db, file_id: EditionedFileId) -> FileOutline {
             .map(|ptr| {
                 let at = ptr.text_range().start() - cut;
                 cut += ptr.text_range().len();
-                SyntaxNodePtr::from_parts(ptr.kind(), TextRange::empty(at))
+                SyntaxNodePtr::from_parts(CUT, TextRange::empty(at))
             })
             // alloc: the memo's cuts, exact: a slice's length
             .collect();

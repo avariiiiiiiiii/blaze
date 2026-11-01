@@ -108,7 +108,7 @@ pub fn location_caller(db: &Db, location: hir_def::StructId) -> Option<FunctionI
     ));
     let impls = crate::method_resolution::InherentImpls::in_crate_for_self_ty(
         db,
-        location.krate(db),
+        hir_def::HasModule::krate(&location, db),
         self_ty,
     );
     impls.iter().find_map(|imp| {

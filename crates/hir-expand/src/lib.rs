@@ -85,9 +85,9 @@ pub use mbe::{
 pub use syntax_bridge::parse_to_token_tree_static_span;
 pub use tt;
 
-/// What [`MacroCallId::macro_arg`] keeps: the argument's tree, how to undo its fixups, and the
-/// call's span.
-type MacroArgResult = (tt::TopSubtree, SyntaxFixupUndoInfo, Span);
+/// What [`MacroCallId::macro_arg`] keeps: the argument's tree, how to undo its fixups, the
+/// call's span, and why the call is not expanded when it is not (its tree is then empty).
+type MacroArgResult = (tt::TopSubtree, SyntaxFixupUndoInfo, Span, Option<ExpandError>);
 
 /// A macro call's argument as [`MacroCallId::macro_arg_considering_derives`] reads it: from the
 /// memo of `macro_arg`, or for an eager call from its interned location.

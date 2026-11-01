@@ -454,7 +454,7 @@ fn an_elided_body_of_another_kind_leaves_the_copy_with_one_placeholder_the_same(
     const LITERAL: SyntaxKind = SyntaxKind(20);
     const BINARY: SyntaxKind = SyntaxKind(21);
     const PLACEHOLDER: SyntaxKind = SyntaxKind(22);
-    fn item(body: SyntaxKind, words: &[&str]) -> FlatTree {
+    fn item(body: SyntaxKind, words: &[&str]) -> Arc<FlatTree> {
         let mut builder = FlatTreeBuilder::new();
         builder.start_node(ROOT);
         builder.start_node(GROUP);
@@ -471,12 +471,12 @@ fn an_elided_body_of_another_kind_leaves_the_copy_with_one_placeholder_the_same(
         builder.token(CLOSE, ";");
         builder.finish_node();
         builder.finish_node();
-        builder.finish()
+        Arc::new(builder.finish())
     }
-    let copies = |tree: &FlatTree| {
+    let copies = |tree: &Arc<FlatTree>| {
         let group = View::root(tree).first_child().expect("the item");
         let body = group.children().next().expect("the body");
-        (group.subtree_without_as(&[body], PLACEHOLDER), group.subtree_without(&[body]))
+        (Arc::new(group.subtree_without_as(&[body], PLACEHOLDER)), Arc::new(group.subtree_without(&[body])))
     };
     let (literal, binary) = (item(LITERAL, &["2"]), item(BINARY, &["2", "*", "2"]));
     let ((literal_as, literal_own), (binary_as, binary_own)) = (copies(&literal), copies(&binary));

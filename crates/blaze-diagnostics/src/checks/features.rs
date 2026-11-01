@@ -221,16 +221,63 @@ fn nightly_build(bootstrap: Option<&str>, krate: Option<&str>) -> bool {
 const INCOMPATIBLE_FEATURES: &[(&str, &str)] =
     &[("ref_pat_eat_one_layer_2024", "ref_pat_eat_one_layer_2024_structural")];
 
-/// rustc's `DEPENDENT_FEATURES`: each feature and those it needs enabled with it.
-const DEPENDENT_FEATURES: &[(&str, &[&str])] = &[
-    ("generic_const_args", &["min_generic_const_args"]),
-    ("macroless_generic_const_args", &["min_generic_const_args"]),
-    ("unsized_const_params", &["adt_const_params"]),
+/// rustc's `DependentFeature`: what a feature needs enabled with it.
+enum Dependent {
+    And(&'static [Dependent]),
+    Or(&'static [Dependent]),
+    Leaf(&'static str),
+}
+
+impl Dependent {
+    fn enabled(&self, features: &Features) -> bool {
+        match self {
+            Dependent::And(children) => children.iter().all(|it| it.enabled(features)),
+            Dependent::Or(children) => children.iter().any(|it| it.enabled(features)),
+            Dependent::Leaf(name) => features.enabled(name),
+        }
+    }
+
+    /// rustc's `format` in `check_dependent_features`: of an `And`, the children not enabled,
+    /// of an `Or`, every child.
+    fn missing(&self, features: &Features, out: &mut String) {
+        let (children, sep) = match self {
+            Dependent::And(children) => (*children, " and "),
+            Dependent::Or(children) => (*children, " or "),
+            Dependent::Leaf(name) => {
+                out.push('`');
+                out.push_str(name);
+                out.push('`');
+                return;
+            }
+        };
+        let and = matches!(self, Dependent::And(_));
+        let mut first = true;
+        for child in children.iter().filter(|it| !(and && it.enabled(features))) {
+            if !first {
+                out.push_str(sep);
+            }
+            first = false;
+            child.missing(features, out);
+        }
+    }
+}
+
+/// rustc's `DEPENDENT_FEATURES`: each feature and what it needs enabled with it.
+const DEPENDENT_FEATURES: &[(&str, Dependent)] = &[
+    (
+        "function_arg_const_generics",
+        Dependent::Or(&[Dependent::Leaf("gca_min_const_items"), Dependent::Leaf("gca_adts")]),
+    ),
+    ("gca_adts", Dependent::Or(&[Dependent::Leaf("min_adt_const_params"), Dependent::Leaf("adt_const_params")])),
+    ("gca_const_items", Dependent::Leaf("gca_min_const_items")),
+    ("gca_macroless_args", Dependent::Leaf("gca_min_const_items")),
+    ("gca_macroless_items", Dependent::Leaf("gca_min_const_items")),
+    ("unsized_const_params", Dependent::Leaf("adt_const_params")),
 ];
 
 /// The checks `check_crate` makes of the features themselves before its gates:
 /// `maybe_stage_features` (E0554), `check_incompatible_features`, `check_dependent_features`,
-/// `check_new_solver_banned_features`, `check_features_requiring_new_solver`.
+/// `warn_next_solver_and_gce`, `check_features_requiring_new_solver`.
 pub(crate) fn staged(cx: &Cx<'_, '_>, owners: &[Owner<'_>], features: &Features, flags: &Flags) -> Vec<Found> {
     // alloc: empty, allocates only when a feature is in error
     let mut diags = Vec::new();
@@ -251,16 +298,15 @@ pub(crate) fn staged(cx: &Cx<'_, '_>, owners: &[Owner<'_>], features: &Features,
             diags.push(diag);
         }
     }
-    for (parent, children) in DEPENDENT_FEATURES {
-        if !features.enabled(parent) || children.iter().all(|it| features.enabled(it)) {
+    for (parent, needs) in DEPENDENT_FEATURES {
+        if !features.enabled(parent) || needs.enabled(features) {
             continue;
         }
         let Some(at) = features.in_stable_order().find(|it| it.name == *parent) else { continue };
-        let missing: Vec<String> =
-            // alloc: the error's message
-            children.iter().filter(|it| !features.enabled(it)).map(|it| format!("`{it}`")).collect();
         // alloc: the error's message
-        let message = format!("`{parent}` requires {} to be enabled", missing.join(", "));
+        let mut message = format!("`{parent}` requires ");
+        needs.missing(features, &mut message);
+        message.push_str(" to be enabled");
         let mut diag = Diag::error(None, message, cx.span(at.at));
         diag.help("enable all of these features");
         diags.push(diag);
@@ -268,15 +314,19 @@ pub(crate) fn staged(cx: &Cx<'_, '_>, owners: &[Owner<'_>], features: &Features,
     if flags.next_solver_globally
         && let Some(gce) = features.lang.iter().find(|it| it.name == "generic_const_exprs")
     {
-        let message = "`-Znext-solver=globally` and `generic_const_exprs` are incompatible, using them at the same time is not allowed";
-        let mut diag = Diag::error(None, message, cx.span(gce.at));
-        diag.help("remove one of these features");
+        let message = "`feature(generic_const_exprs)` is not supported with the next-generation trait solver";
+        let mut diag = Diag::new(Level::Warning, None, message);
+        diag.span = cx.span(gce.at).into();
+        diag.note("`-Znext-solver=globally` is currently enabled by default for testing");
+        diag.note("reverted the setting to `-Znext-solver=coherence` for this crate");
+        diag.note("the currently stable trait solver will be used for this crate");
+        diag.note("see issues #160895 <https://github.com/rust-lang/rust/issues/160895> for more information");
         diags.push(diag);
     }
     if !flags.next_solver_globally
-        && let Some(gca) = features.lang.iter().find(|it| it.name == "generic_const_args")
+        && let Some(gca) = features.lang.iter().find(|it| it.name == "gca_const_items")
     {
-        let message = "`generic_const_args` requires -Znext-solver=globally to be enabled";
+        let message = "`gca_const_items` requires -Znext-solver=globally to be enabled";
         let mut diag = Diag::error(None, message, cx.span(gca.at));
         diag.help("enable all of these features");
         diags.push(diag);
@@ -459,5 +509,21 @@ mod tests {
         assert!(nightly_build(Some("a,b"), Some("b")));
         assert!(nightly_build(Some("x"), Some("a")));
         assert!(!nightly_build(Some("-1"), None));
+    }
+
+    #[test]
+    fn a_dependent_feature_names_every_choice_of_an_or_and_what_an_and_misses() {
+        let mut features = Features::default();
+        features.names.insert("b".to_owned());
+        let missing = |needs: &Dependent| {
+            let mut out = String::new();
+            needs.missing(&features, &mut out);
+            (needs.enabled(&features), out)
+        };
+        let or = Dependent::Or(&[Dependent::Leaf("a"), Dependent::Leaf("c")]);
+        assert_eq!(missing(&or), (false, "`a` or `c`".to_owned()));
+        let and = Dependent::And(&[Dependent::Leaf("a"), Dependent::Leaf("b"), Dependent::Leaf("c")]);
+        assert_eq!(missing(&and), (false, "`a` and `c`".to_owned()));
+        assert!(Dependent::Or(&[Dependent::Leaf("a"), Dependent::Leaf("b")]).enabled(&features));
     }
 }

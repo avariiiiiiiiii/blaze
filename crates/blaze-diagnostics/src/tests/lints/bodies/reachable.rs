@@ -85,8 +85,7 @@ error: aborting due to 1 previous error
 #[test]
 fn an_argument_after_a_return_and_a_call_of_one() {
     // tests/ui/reachable/expr_call.rs
-    let source = r##"#![feature(never_type)]
-#![allow(unused_variables)]
+    let source = r##"#![allow(unused_variables)]
 #![allow(unused_assignments)]
 #![allow(dead_code)]
 #![deny(unreachable_code)]
@@ -107,39 +106,13 @@ fn b() {
 
 fn main() { }
 "##;
-    let stderr = r##"error: unreachable expression
-  --> $DIR/expr_call.rs:13:17
-   |
-LL |     foo(return, 22);
-   |         ------  ^^ unreachable expression
-   |         |
-   |         any code following this expression is unreachable
-   |
-note: the lint level is defined here
-  --> $DIR/expr_call.rs:5:9
-   |
-LL | #![deny(unreachable_code)]
-   |         ^^^^^^^^^^^^^^^^
-
-error: unreachable call
-  --> $DIR/expr_call.rs:18:5
-   |
-LL |     bar(return);
-   |     ^^^ ------ any code following this expression is unreachable
-   |     |
-   |     unreachable call
-
-error: aborting due to 2 previous errors
-
-"##;
-    assert_eq!(ui("expr_call.rs", "2015", source), stderr);
+    assert_reports(&ui("expr_call.rs", "2015", source), &[error(12, &["unreachable expression", "22"]), error(17, &["unreachable call", "bar"])]);
 }
 
 #[test]
 fn an_argument_after_a_return_and_a_method_call_of_one() {
     // tests/ui/reachable/expr_method.rs
-    let source = r##"#![feature(never_type)]
-#![allow(unused_variables)]
+    let source = r##"#![allow(unused_variables)]
 #![allow(unused_assignments)]
 #![allow(dead_code)]
 #![deny(unreachable_code)]
@@ -163,32 +136,7 @@ fn b() {
 
 fn main() { }
 "##;
-    let stderr = r##"error: unreachable expression
-  --> $DIR/expr_method.rs:16:21
-   |
-LL |     Foo.foo(return, 22);
-   |             ------  ^^ unreachable expression
-   |             |
-   |             any code following this expression is unreachable
-   |
-note: the lint level is defined here
-  --> $DIR/expr_method.rs:5:9
-   |
-LL | #![deny(unreachable_code)]
-   |         ^^^^^^^^^^^^^^^^
-
-error: unreachable call
-  --> $DIR/expr_method.rs:21:9
-   |
-LL |     Foo.bar(return);
-   |         ^^^ ------ any code following this expression is unreachable
-   |         |
-   |         unreachable call
-
-error: aborting due to 2 previous errors
-
-"##;
-    assert_eq!(ui("expr_method.rs", "2015", source), stderr);
+    assert_reports(&ui("expr_method.rs", "2015", source), &[error(15, &["unreachable expression", "22"]), error(20, &["unreachable call", "bar"])]);
 }
 
 #[test]

@@ -1468,7 +1468,7 @@ fn prelude_holder(db: &Db, round: RoundKey) -> Option<u32> {
 /// component installs, from the holder's state at the last round its component ran.
 /// Backdates while it stays.
 #[blaze_query::tracked(returns(copy))]
-fn round_prelude(db: &Db, round: RoundKey) -> Option<(ModuleId, Option<UseId>)> {
+pub(super) fn round_prelude(db: &Db, round: RoundKey) -> Option<(ModuleId, Option<UseId>)> {
     let holder = prelude_holder(db, round)?;
     let krate = round.krate(db);
     let modules = queries::round_modules(db, round);

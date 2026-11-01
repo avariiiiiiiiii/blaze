@@ -220,6 +220,9 @@ pub fn covered_queries() -> &'static [(&'static str, Key)] {
         // 3.3 and 3.4: whether each macro call expanded as rustc parses it is of the calls,
         // which the entries hash; a body refused for one builds no MIR to store.
         ("failed_expansion", OwnBody),
+        // 3.3 and 3.4: which literals `line!()` made is of the HIR and of the macro call each
+        // came from, which the entries hash with its macro.
+        ("line_literals", OwnBody),
         // 3.1: the crate's lang items by key and signature, and by key in the goal store's
         // crate key.
         ("lang_items", OwnCrate),

@@ -1,7 +1,8 @@
 //! The dense engine's tests, on hand-written ingredients (the macros are another crate's): hits
 //! and edges, backdating, durability and summaries, every cycle form, inputs, interning,
-//! tracked structs, captured reads, LRU, cancellation, allocation budgets, and a property over
-//! random query graphs checked against a from-scratch evaluation.
+//! tracked structs, captured reads, LRU, cancellation, allocation budgets, provenance, and
+//! properties over random query graphs: checked against a from-scratch evaluation, and every
+//! rerun's cause chain ending at the edit.
 
 use std::{
     collections::HashMap,
@@ -17,8 +18,8 @@ use std::{
 use hegel::{TestCase, generators as gs};
 
 use super::{
-    AsId, Cancelled, Cycle, Database, DatabaseKeyIndex, Durability, Event, FromIdIn, Hook, Id,
-    ReadKind, Reads, Setter, Storage, attach, capture_reads,
+    AsId, Cancelled, Cause, Cycle, Database, DatabaseKeyIndex, Durability, Event, FromIdIn, Hook,
+    Id, Outcome, Provenance, ReadKind, Reads, Setter, Storage, attach, capture_reads,
     input::field_node,
     owner_is,
     plumbing::{
@@ -985,6 +986,72 @@ query!(
 );
 query!(TensReader, u64, |db, key| get::<Tens>(db, key) + 1);
 
+query!(Quad, u64, |db, key| get::<Double>(db, key) * 2);
+
+fn table(db: &TestDb) -> Vec<Provenance> {
+    let mut out = Vec::new();
+    db.storage().provenance(&mut out);
+    out
+}
+
+fn key_of<F: Function<Db = TestDb, Key = Cell>>(cell: Cell) -> DatabaseKeyIndex {
+    DatabaseKeyIndex::new(F::ingredient().index(), cell.0)
+}
+
+/// What `F` of `cell` did in the view `table` is of, and why it ran.
+fn did<F: Function<Db = TestDb, Key = Cell>>(
+    table: &[Provenance],
+    cell: Cell,
+) -> Option<(Outcome, Option<Cause>)> {
+    let key = key_of::<F>(cell);
+    table.iter().find(|it| it.key == key).map(|it| (it.outcome, it.cause))
+}
+
+#[test]
+fn a_view_tells_what_each_memo_did_and_why_it_ran() {
+    let mut db = TestDb::new();
+    let cell = Cell::new(&db, 1, 5);
+    let ask = |db: &TestDb| {
+        get::<Quad>(db, cell);
+        get::<Label>(db, cell);
+        get::<ReadB>(db, cell);
+        get::<Untracked>(db, cell);
+    };
+    ask(&db);
+    let first = table(&db);
+    assert_eq!(first.len(), 6, "Quad, Double, Label, Parity, ReadB, Untracked");
+    assert!(first.iter().all(|it| (it.outcome, it.cause) == (Outcome::Reran, Some(Cause::New))));
+    ask(&db);
+    assert_eq!(table(&db), first, "a hit records nothing");
+
+    cell.set_a(&mut db, 3);
+    ask(&db);
+    let after = table(&db);
+    let a = field_node::<Cells>(db.storage(), cell.0, 0);
+    let double = after.iter().find(|it| it.key == key_of::<Double>(cell)).expect("Double").node;
+    let changed = |node| Some(Cause::Changed(node));
+    assert_eq!(did::<Double>(&after, cell), Some((Outcome::Reran, changed(a))));
+    assert_eq!(did::<Quad>(&after, cell), Some((Outcome::Reran, changed(double))));
+    assert_eq!(did::<Parity>(&after, cell), Some((Outcome::ReranSameOutput, changed(a))));
+    assert_eq!(did::<Label>(&after, cell), Some((Outcome::Verified, None)), "cut off at Parity");
+    assert_eq!(did::<ReadB>(&after, cell), Some((Outcome::Verified, None)));
+    assert_eq!(
+        did::<Untracked>(&after, cell),
+        Some((Outcome::ReranSameOutput, Some(Cause::Untracked)))
+    );
+    let read = db.storage().node_read(a);
+    assert_eq!((read.key.key_index(), read.kind), (cell.0, ReadKind::InputField(0)));
+    assert_eq!(db.storage().node_read(double).key, key_of::<Double>(cell));
+
+    assert_eq!(*get::<TensReader>(&db, cell), 1);
+    assert_eq!(evict_values::<Tens>(&mut db), 1);
+    assert_eq!(*get::<Tens>(&db, cell), 0);
+    assert_eq!(
+        did::<Tens>(&table(&db), cell),
+        Some((Outcome::ReranSameOutput, Some(Cause::Evicted)))
+    );
+}
+
 #[test]
 fn an_evicted_value_recomputed_equal_does_not_rerun_its_readers() {
     let mut db = TestDb::new();
@@ -1163,6 +1230,19 @@ fn views_renumber_at_the_limit_and_every_answer_holds() {
         assert_eq!(*get::<Label>(&db, cell), (a % 2) * 10 + 1, "round {round}");
         assert_eq!(*get::<ReadB>(&db, cell), 7, "round {round}");
         assert_eq!(*get::<Double>(&db, still), 42, "round {round}");
+        let view = table(&db);
+        let ran_before = did::<ReadB>(&view, cell);
+        assert_eq!(ran_before, Some((Outcome::Verified, None)), "round {round}: an old run");
+        if round % 3 == 0 {
+            let parity = view.iter().find(|it| it.key == key_of::<Parity>(cell)).expect("Parity");
+            let field = field_node::<Cells>(db.storage(), cell.0, 0);
+            assert_eq!(parity.cause, Some(Cause::Changed(field)), "round {round}");
+            assert_eq!(
+                did::<Label>(&view, cell),
+                Some((Outcome::Reran, Some(Cause::Changed(parity.node)))),
+                "round {round}"
+            );
+        }
     }
     assert!(db.storage().view_bits() < start, "renumbered past the limit");
     assert!(db.storage().view() > before, "the view hosts see is never reused");
@@ -1443,8 +1523,9 @@ fn evaluate(graph: &[GNode], inputs: &[u64]) -> Vec<u64> {
     values
 }
 
-#[hegel::test]
-fn random_graphs_agree_with_a_run_from_scratch(tc: TestCase) {
+/// A random acyclic graph: how many inputs it reads, and its nodes, each reading inputs and
+/// nodes before it.
+fn random_graph(tc: &TestCase) -> (usize, Vec<GNode>) {
     let inputs: usize = tc.draw(gs::integers::<usize>().min_value(1).max_value(6));
     let queries: usize = tc.draw(gs::integers::<usize>().min_value(1).max_value(12));
     let mut graph = Vec::with_capacity(queries);
@@ -1462,6 +1543,13 @@ fn random_graphs_agree_with_a_run_from_scratch(tc: TestCase) {
             .collect();
         graph.push(GNode { op, deps });
     }
+    (inputs, graph)
+}
+
+#[hegel::test]
+fn random_graphs_agree_with_a_run_from_scratch(tc: TestCase) {
+    let (inputs, graph) = random_graph(&tc);
+    let queries = graph.len();
     let mut values: Vec<u64> = (0..inputs).map(|i| i as u64).collect();
     let mut db = TestDb::made(None, graph);
     let cells: Vec<Cell> = values.iter().map(|&value| Cell::new(&db, value, 0)).collect();
@@ -1490,4 +1578,58 @@ fn random_graphs_agree_with_a_run_from_scratch(tc: TestCase) {
         *seen.entry((query, key, view)).or_insert(0) += 1;
     }
     assert!(seen.values().all(|&count| count == 1), "a query ran twice in one view");
+}
+
+/// After one input is edited and every node is asked for again, every memo that ran did so
+/// because of a changed read, and following each cause (a memo that changed in this view, by
+/// its own cause) reaches the edited field.
+#[hegel::test]
+fn after_editing_one_input_every_rerun_memos_cause_chain_leads_back_to_it(tc: TestCase) {
+    let (inputs, graph) = random_graph(&tc);
+    let queries = graph.len();
+    let mut values: Vec<u64> = (0..inputs).map(|i| i as u64).collect();
+    let mut db = TestDb::made(None, graph);
+    let cells: Vec<Cell> = values.iter().map(|&value| Cell::new(&db, value, 0)).collect();
+    db.cells.lock().unwrap().extend(cells.iter().map(|it| it.0));
+    let ask = |db: &TestDb| {
+        for at in 0..queries {
+            fetch::<Graph>(db, node(db, at));
+        }
+    };
+    ask(&db);
+    let first = table(&db);
+    assert_eq!(first.len(), queries);
+    assert!(first.iter().all(|it| (it.outcome, it.cause) == (Outcome::Reran, Some(Cause::New))));
+    let writes: usize = tc.draw(gs::integers::<usize>().min_value(1).max_value(8));
+    for step in 0..writes {
+        let input: usize = tc.draw(gs::integers::<usize>().max_value(inputs - 1));
+        values[input] += 1 + tc.draw(gs::integers::<u64>().max_value(3));
+        cells[input].set_a(&mut db, values[input]);
+        ask(&db);
+        let edited = field_node::<Cells>(db.storage(), cells[input].0, 0);
+        let view = table(&db);
+        assert_eq!(view.len(), queries, "every node asked for is in the table at step {step}");
+        let by_node: HashMap<u32, &Provenance> = view.iter().map(|it| (it.node, it)).collect();
+        for entry in &view {
+            let mut cause = entry.cause;
+            while let Some(why) = cause {
+                let Cause::Changed(at) = why else {
+                    panic!("step {step}: {entry:?}'s chain reaches a run for {why:?}, not the edit")
+                };
+                if at == edited {
+                    break;
+                }
+                let Some(dep) = by_node.get(&at) else {
+                    panic!(
+                        "step {step}: {entry:?}'s chain reaches {:?}, neither the edited field \
+                         nor a memo of this view",
+                        db.storage().node_read(at)
+                    )
+                };
+                assert_eq!(dep.outcome, Outcome::Reran, "step {step}: a cause changed");
+                cause = dep.cause;
+                assert!(cause.is_some(), "step {step}: {dep:?} reran without a cause");
+            }
+        }
+    }
 }

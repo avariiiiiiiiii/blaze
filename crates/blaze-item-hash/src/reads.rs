@@ -248,6 +248,7 @@ pub(crate) const RULES: &[(&str, &str, Rule)] = &[
     ("in_crate_trait_value_items", "hir-ty/src/method_resolution.rs", Rule::DepCrate(Args::Name)),
     ("infer_body_query", "hir-ty/src/infer.rs", Rule::OwnStep(Step::Infer)),
     ("lang_items", "hir-def/src/lang_item.rs", Rule::OwnCrate(Else::CrateRoot)),
+    ("line_literals", "hir-ty-mir/src/mir/location.rs", Rule::OwnBody),
     ("loaded_crates", "hir-ty/src/method_resolution.rs", Rule::OwnCrate(Else::CrateRoot)),
     ("macros_writing_impls", "hir-ty/src/method_resolution.rs", Rule::WholeCrate),
     ("match_check", "hir-ty-matchck/src/lib.rs", Rule::OwnMatchCheck),

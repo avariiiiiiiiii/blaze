@@ -19,6 +19,7 @@ use super::{
     dense::{Dense, Heap},
     id::{Id, MAX_PAGES, PAGE_BITS, PAGE_LEN},
     ingredient::{self, Ingredient, MAX_INGREDIENTS},
+    provenance::{Cause, restamp_run},
     row::{Owners, Pages, VALUE, VIEW_MASK, span},
 };
 
@@ -156,6 +157,8 @@ pub struct Storage {
     pub(crate) colors: Dense<AtomicU64>,
     pub(crate) summaries: Dense<[AtomicU64; 2]>,
     pub(crate) keys: Dense<AtomicU64>,
+    /// Each memo's last run: its view and [`Cause`], written by the run's flight holder.
+    pub(crate) runs: Dense<AtomicU64>,
     next_node: AtomicU32,
     edges: Dense<AtomicU32>,
     edges_top: AtomicU64,
@@ -209,6 +212,7 @@ impl Storage {
             colors: Dense::growing(NODES, Tag::Query),
             summaries: Dense::growing(NODES, Tag::Query),
             keys: Dense::growing(NODES, Tag::Query),
+            runs: Dense::growing(NODES, Tag::Query),
             next_node: AtomicU32::new(1),
             edges: Dense::growing(EDGES, Tag::Query),
             edges_top: AtomicU64::new(0),
@@ -373,12 +377,12 @@ impl Storage {
     }
 
     /// Renumbers the views at the limit, under `&mut` (no reader, no running row): every view
-    /// stamp in use (the view, `last_changed`, each node's color, each row's verified view and
-    /// `changed`) becomes its rank among them, so every order between two stamps is kept, and
-    /// the view is the largest. The written-field history becomes all ones: a row verified
-    /// before it walks once (a [`super::Reads`] of an old view is never read again: its view
-    /// is past every new one until the next renumbering). `O(stamps log stamps)`, once per
-    /// 2^28 writes.
+    /// stamp in use (the view, `last_changed`, each node's color and last run, each row's
+    /// verified view and `changed`) becomes its rank among them, so every order between two
+    /// stamps is kept, and the view is the largest. The written-field history becomes all
+    /// ones: a row verified before it walks once (a [`super::Reads`] of an old view is never
+    /// read again: its view is past every new one until the next renumbering).
+    /// `O(stamps log stamps)`, once per 2^28 writes.
     #[cold]
     fn renumber(&mut self) {
         // alloc: once per 2^28 views, a stamp per row and node
@@ -405,6 +409,8 @@ impl Storage {
             let (verified, changed) = ((painted >> 32) as u32, painted as u32);
             let verified = if verified < FIELD { restamp.apply(verified) } else { verified };
             self.repaint(node, color(verified, restamp.apply(changed)));
+            let ran = self.runs.get(node as usize);
+            ran.store(restamp_run(ran.load(Ordering::Relaxed), restamp), Ordering::Relaxed);
         }
         for index in self.live() {
             if let Some(rows) = ingredient::vtable(index).and_then(|it| it.restamp) {
@@ -502,6 +508,7 @@ impl Storage {
         self.colors.ensure(end);
         self.summaries.ensure(end);
         self.keys.ensure(end);
+        self.runs.ensure(end);
         first
     }
 
@@ -534,6 +541,13 @@ impl Storage {
 
     pub(crate) fn set_key(&self, node: u32, key: u64) {
         self.keys.get(node as usize).store(key, Ordering::Relaxed);
+    }
+
+    /// Records that memo `node` runs in this view because of `cause`: its flight holder's one
+    /// store before the run, read back by [`Storage::provenance`].
+    #[inline]
+    pub(crate) fn record_run(&self, node: u32, cause: Cause) {
+        self.runs.get(node as usize).store(cause.word(self.view), Ordering::Relaxed);
     }
 
     /// Copies `edges` into the edge array: a span for a row or a capture.

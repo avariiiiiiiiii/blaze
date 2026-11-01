@@ -127,8 +127,9 @@ pub fn decide(
     let attrs = graph.attrs();
     let constants = graph.constants();
     // alloc: one exact-size column per build
-    let decided: Vec<Imports> = par::map(0..graph.len(), |node| {
-        SCRATCH.with_borrow_mut(|scratch| graph.imports(node, limits, &attrs, &constants, scratch))
+    let decided: Vec<Imports> = par::map(0..graph.len() as usize, |node| {
+        // `node < graph.len()`, a `u32`.
+        SCRATCH.with_borrow_mut(|scratch| graph.imports(node as u32, limits, &attrs, &constants, scratch))
     });
     // alloc: the build's answer, once per build
     Ok(graph.keys.iter().copied().zip(decided).collect())

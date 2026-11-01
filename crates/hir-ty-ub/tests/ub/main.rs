@@ -300,19 +300,26 @@ fn main() {
     );
 }
 
-// invalid_bool_field.rs: the path to a field inside an enum variant.
+// invalid_bool_field.rs: the path to a field inside an enum variant. The enum is `repr(u8)`, a
+// tag of its own: an `Option` of a `bool` takes the `bool` as its niche, where a 3 is a bad tag.
 #[test]
-fn validity_invalid_bool_in_option() {
+fn validity_invalid_bool_in_a_variant() {
     ub(
         program!(
-            "transmute, option",
+            "transmute",
             r#"
+#[repr(u8)]
+enum E {
+    A(u8, bool),
+    B,
+}
+
 fn main() {
-    let _b: Option<(u8, bool)> = unsafe { core::mem::transmute::<[u8; 3], Option<(u8, bool)>>([1, 0, 3]) };
+    let _e: E = unsafe { core::mem::transmute::<[u8; 3], E>([0, 1, 3]) };
 }
 "#
         ),
-        "encountered 0x03, but expected a boolean",
+        "at .<enum-variant(A)>.1, encountered 0x03, but expected a boolean",
     );
 }
 
@@ -402,7 +409,7 @@ fn main() {
 }
 "#
         ),
-        "encountered a value of zero-variant enum `Void`",
+        "encountered a value of zero-variant enum `ra_test_fixture::Void`",
     );
 }
 

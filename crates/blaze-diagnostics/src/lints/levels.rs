@@ -282,7 +282,11 @@ pub(crate) fn decide(cx: &Cx<'_, '_>, cmd: &CommandLine, found: Vec<Found>, abor
             true => &mut early,
             false => &mut late,
         };
-        let set = levels.set_of(&mut lcx, &mut said, at);
+        let set = match it.pre_expansion {
+            // `early`'s walk has said what the attributes on the way out from `at` say
+            true => levels.set_of_in_file(&mut lcx, &mut (), at),
+            false => levels.set_of(&mut lcx, &mut said, at),
+        };
         let spec = levels.spec(&lcx, lint, set);
         out.extend(said.finish(&lcx, lint, spec, it.diag));
     }

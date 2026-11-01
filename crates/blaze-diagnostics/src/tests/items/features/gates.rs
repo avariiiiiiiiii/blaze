@@ -168,8 +168,8 @@ For more information about this error, try `rustc --explain E0658`.
 }
 
 #[test]
-fn associated_const_equality_names_min_generic_const_args() {
-    // tests/ui/feature-gates/feature-gate-associated_const_equality.rs: a gate after `gate_all!`: `associated_const_equality`
+fn associated_const_equality_names_gca_min_const_items() {
+    // tests/ui/feature-gates/feature-gate-associated_const_equality.rs: a gate after `gate_all!`: `associated_const_equality`, part of `gca_min_const_items`
     let source = r#"pub trait TraitWAssocConst {
   const A: usize;
 }
@@ -186,21 +186,10 @@ fn main() {
   foo::<Demo>();
 }
 "#;
-    let stderr = r#"error[E0658]: associated const equality is incomplete
-  --> $DIR/feature-gate-associated_const_equality.rs:10:28
-   |
-LL | fn foo<A: TraitWAssocConst<A=32>>() {}
-   |                            ^^^^
-   |
-   = note: see issue #132980 <https://github.com/rust-lang/rust/issues/132980> for more information
-   = help: add `#![feature(min_generic_const_args)]` to the crate attributes to enable
-   = note: this compiler was built on YYYY-MM-DD; consider upgrading it if it is out of date
-
-error: aborting due to 1 previous error
-
-For more information about this error, try `rustc --explain E0658`.
-"#;
-    assert_eq!(ui("feature-gate-associated_const_equality.rs", "2015", source), stderr);
+    assert_reports(
+        &ui("feature-gate-associated_const_equality.rs", "2015", source),
+        &[error(10, &["E0658", "associated const equality is incomplete", "`#![feature(gca_min_const_items)]`"])],
+    );
 }
 
 #[test]
@@ -441,54 +430,25 @@ warning: 1 warning emitted
 }
 
 #[test]
-fn cfg_d_out_box_patterns_warn() {
-    // tests/ui/feature-gates/soft-feature-gate-box_patterns.rs: a soft gate: `box_patterns`, the field shorthand gated at `box`
-    let source = r#"// For historical reasons, box patterns don't have an erroring pre-expansion feature gate.
-// We're now at least issuing a warning for those that only exist before macro expansion.
-// FIXME(#154045): Turn this pre-expansion warning into an error and remove the post-expansion gate.
-//                 As part of this, move these test cases into `feature-gate-box_patterns.rs`.
-//@ check-pass
+fn a_box_pattern_is_removed_syntax() {
+    // tests/ui/parser/removed-syntax/removed-syntax-box-patterns.rs: `box_patterns` is removed, and the parser errors at each `box` of a pattern, a field shorthand's too
+    let source = r#"fn main() {
+    let box x = Box::new('c'); //~ ERROR `box` patterns have been removed
+    let _: char = x;
 
-fn main() {
-    #[cfg(false)]
-    let box x;
-    //~^ WARN box pattern syntax is experimental
-    //~| WARN unstable syntax can change at any point in the future
+    struct Packet { x: Box<i32> }
 
-    #[cfg(false)]
-    let Packet { box x };
-    //~^ WARN box pattern syntax is experimental
-    //~| WARN unstable syntax can change at any point in the future
+    let Packet { box x } = Packet { x: Box::new(0) }; //~ ERROR `box` patterns have been removed
+    let _: i32 = x;
+
+    let Packet { box ref mut x }; //~ ERROR `box` patterns have been removed
 }
 "#;
-    let stderr = r#"warning: box pattern syntax is experimental
-  --> $DIR/soft-feature-gate-box_patterns.rs:9:9
-   |
-LL |     let box x;
-   |         ^^^^^
-   |
-   = note: see issue #29641 <https://github.com/rust-lang/rust/issues/29641> for more information
-   = help: add `#![feature(box_patterns)]` to the crate attributes to enable
-   = note: this compiler was built on YYYY-MM-DD; consider upgrading it if it is out of date
-   = warning: unstable syntax can change at any point in the future, causing a hard error!
-   = note: for more information, see issue #154045 <https://github.com/rust-lang/rust/issues/154045>
-
-warning: box pattern syntax is experimental
-  --> $DIR/soft-feature-gate-box_patterns.rs:14:18
-   |
-LL |     let Packet { box x };
-   |                  ^^^
-   |
-   = note: see issue #29641 <https://github.com/rust-lang/rust/issues/29641> for more information
-   = help: add `#![feature(box_patterns)]` to the crate attributes to enable
-   = note: this compiler was built on YYYY-MM-DD; consider upgrading it if it is out of date
-   = warning: unstable syntax can change at any point in the future, causing a hard error!
-   = note: for more information, see issue #154045 <https://github.com/rust-lang/rust/issues/154045>
-
-warning: 2 warnings emitted
-
-"#;
-    assert_eq!(ui("soft-feature-gate-box_patterns.rs", "2015", source), stderr);
+    let removed = ["`box` patterns have been removed (feature `box_patterns`)", "deref!("];
+    assert_reports(
+        &ui_core("removed-syntax-box-patterns.rs", "2015", "sized", source),
+        &[error(2, &removed), error(7, &removed), error(10, &removed)],
+    );
 }
 
 #[test]

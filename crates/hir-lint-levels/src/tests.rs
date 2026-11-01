@@ -8,7 +8,7 @@ use hir_def::{
 use syntax::view::{self as ast, AstNode as _, HasName as _};
 use hir_expand::fixture;
 
-use crate::{LevelError, crate_lint_level, lint_level, lint_level_at, query::owner_node};
+use crate::{LevelCx, LevelError, Levels, attrs, crate_lint_level, lint_level, lint_level_at, query::owner_node};
 
 const LINT: LintId = LintId::LONG_RUNNING_CONST_EVAL;
 
@@ -229,4 +229,44 @@ fn main() {}
             Err(_) => assert_eq!(lint_level_at(&db, owner, Some(expr), LINT), Err(LevelError::NoSyntax { owner, expr })),
         }
     }
+}
+
+/// rustc's pre-expansion lint pass gives a module file the command line's levels and its own
+/// attributes', not the crate root's nor its `mod` item's (rust-lang/rust#132218); the HIR's
+/// walk goes through the `mod` item to the crate.
+#[test]
+fn a_module_file_before_expansion_has_the_command_lines_levels_and_its_own() {
+    let (db, krate) = db_of(
+        r#"
+//- /main.rs crate:main edition:2015
+#![deny(keyword_idents)]
+#[warn(keyword_idents_2018)]
+mod m;
+fn root() {}
+//- /m.rs
+fn plain() {}
+#[forbid(keyword_idents_2018)]
+fn own() {}
+"#,
+    );
+    let lint = LintId::named("keyword_idents_2018").lint();
+    let opts = LintOptions::default();
+    let mut cx = LevelCx::new(&db, krate, &opts);
+    let mut levels = Levels::new(&mut cx, &mut (), true, false);
+    let at = |name: &str| match item(&db, krate, name) {
+        ModuleDefId::FunctionId(id) => attrs::key(owner_node(&db, ExpressionStoreOwnerId::Body(id.into()))),
+        other => panic!("`{name}` is {other:?}"),
+    };
+    let mut level = |name: &str, in_file: bool| {
+        let set = match in_file {
+            true => levels.set_of_in_file(&mut cx, &mut (), at(name)),
+            false => levels.set_of(&mut cx, &mut (), at(name)),
+        };
+        levels.spec(&cx, lint, set).level
+    };
+    assert_eq!(level("plain", false), Level::Warn);
+    assert_eq!(level("plain", true), Level::Allow);
+    assert_eq!(level("own", true), Level::Forbid);
+    assert_eq!(level("root", true), Level::Deny);
+    assert_eq!(level("plain", false), Level::Warn, "the HIR's table is its own");
 }

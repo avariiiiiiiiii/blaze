@@ -54,12 +54,15 @@ pub(crate) fn expand_rules(
     if let Some((match_, rule, idx)) = match_ {
         let ExpandResult { value, err: transcribe_err } =
             transcriber::transcribe(&rule.rhs, &match_.bindings, marker, call_site);
-        // The account of a failure is the expander's, made apart from the match it compares.
-        let match_err = match_.err.map(|err| {
-            blaze_mem::frame::task(blaze_mem::Tag::Expand, |frame| {
+        // The account of a failure is the expander's, made apart from the match it compares;
+        // a fragment that failed inside is reported where its parse failed, as there.
+        let in_fragment = match_.err_in_fragment;
+        let match_err = match_.err.map(|err| match in_fragment {
+            true => err,
+            false => blaze_mem::frame::task(blaze_mem::Tag::Expand, |frame| {
                 super::matcher::match_failure(db, frame, rules, input, call_style)
             })
-            .unwrap_or(err)
+            .unwrap_or(err),
         });
         ExpandResult { value: (value, idx.try_into().ok()), err: match_err.or(transcribe_err) }
     } else {

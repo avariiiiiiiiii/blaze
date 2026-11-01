@@ -2,8 +2,9 @@
 //! removed what it removes, in the order rustc's walk comes to them: `#[doc(..)]`'s unstable
 //! flavours, negative and `default` impls, auto traits, trait aliases, `macro`, `impl Trait` in
 //! type aliases and associated types, `type const`, LLVM intrinsics, extern types, pattern
-//! types (`!` is stable since 1.100.0), binders with more than lifetimes, `try` blocks, `f16` and `f128` literals, `X..` in
-//! slice patterns, `box` patterns, associated type defaults and `default` associated items.
+//! types (`!` is stable since 1.100.0), binders with more than lifetimes, `try` blocks, `f16`
+//! and `f128` literals, `X..` in slice patterns, associated type defaults and `default`
+//! associated items.
 //!
 //! Follows rustc's `compiler/rustc_ast_passes/src/feature_gate.rs` (`PostExpansionVisitor`,
 //! `check_impl_trait`, `check_late_bound_lifetime_defs`), `compiler/rustc_ast_passes/src/
@@ -119,9 +120,6 @@ impl Visitor<'_, '_, '_, '_> {
                         self.gate(file, node, "half_open_range_patterns_in_slices", pat.text_range(), explain, None);
                     }
                 }
-            }
-            SyntaxKind::BOX_PAT => {
-                self.gate(file, node, "box_patterns", node.text_range(), "box pattern syntax is experimental", None);
             }
             _ => {}
         }

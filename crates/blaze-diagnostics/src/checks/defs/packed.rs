@@ -6,9 +6,10 @@
 //! Apache-2.0).
 
 use blaze_items::{Fact, ItemId};
+use hir_def::attrs::AttrFlags;
 use syntax::{
     NodeOrToken, SyntaxKind,
-    view::{self as ast, AstNode as _, HasAttrs as _},
+    view::{self as ast, AstNode as _, AstToken as _, HasAttrs as _},
 };
 
 use crate::{
@@ -18,12 +19,13 @@ use crate::{
 };
 
 pub(super) fn check(cx: &Cx<'_, '_>, adt: hir::Adt) -> Vec<Found> {
-    let (repr, node) = match adt {
-        hir::Adt::Struct(it) => (it.repr(cx.db), cx.vsema.source(it).map(|it| it.map(|it| it.syntax()))),
-        hir::Adt::Union(it) => (it.repr(cx.db), cx.vsema.source(it).map(|it| it.map(|it| it.syntax()))),
+    let node = match adt {
+        hir::Adt::Struct(it) => cx.vsema.source(it).map(|it| it.map(|it| it.syntax())),
+        hir::Adt::Union(it) => cx.vsema.source(it).map(|it| it.map(|it| it.syntax())),
         // alloc: empty, allocates nothing
         hir::Adt::Enum(_) => return Vec::new(),
     };
+    let repr = AttrFlags::repr(cx.db, hir_def::AdtId::from(adt));
     // alloc: empty, allocates nothing
     let (Some(repr), Some(node)) = (repr, node) else { return Vec::new() };
     // alloc: empty, allocates nothing

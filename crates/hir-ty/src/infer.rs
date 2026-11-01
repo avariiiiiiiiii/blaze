@@ -2768,7 +2768,9 @@ impl<'db, 'f> InferenceContext<'db, 'f> {
             .collect();
 
         let (diagnostics, resolver_has_errors) = resolver.resolve_diagnostics();
-        *has_errors |= resolver_has_errors;
+        // rustc taints the typeck results on any error typeck emits, and the checks after it
+        // (match checking, the `unused_mut` lint) skip a tainted body.
+        *has_errors |= resolver_has_errors || diagnostics.iter().any(InferenceDiagnostic::taints_body);
 
         // A `Vec`'s drain is `TrustedLen`: each `Box` is made once at its length, none when empty.
         result.freeze(

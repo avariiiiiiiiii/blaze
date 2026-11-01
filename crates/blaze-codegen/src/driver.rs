@@ -18,13 +18,16 @@
 use std::{
     collections::{HashMap, HashSet},
     hash::Hash,
-    sync::Arc,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
 };
 
 use blaze_cas::{Key, Kind};
+use blaze_graph::par::{self, IntoSource};
 use blaze_ids::{ContentId, Hasher};
 use blaze_items::{CodeHash, ItemKey};
-use blaze_graph::par::{self, IntoSource, Source};
 use blaze_mem::{Tag, frame};
 use rustc_hash::{FxHashMap, FxHashSet};
 
@@ -825,11 +828,16 @@ impl<'a, B: Prepare> Build<'a, B> {
         I: IntoSource,
         R: Send,
     {
-        let items = items.into_source();
-        let len = items.len();
+        let skipped = AtomicBool::new(false);
         // alloc: per build, sized by its units
-        let done: Vec<R> = par::filter_map(items, |it| (!self.frontend.stopped()).then(|| work(it)));
-        if done.len() < len {
+        let done: Vec<R> = par::filter_map(items, |it| {
+            if self.frontend.stopped() {
+                skipped.store(true, Ordering::Relaxed);
+                return None;
+            }
+            Some(work(it))
+        });
+        if skipped.into_inner() {
             errors.push(stopped());
         }
         done

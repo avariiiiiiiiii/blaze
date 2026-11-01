@@ -31,6 +31,7 @@ use super::{
     id::PAGE_LEN,
     ingredient::{self, Ingredient, Kind, Vtable},
     local::{self, Frame, Kind as FrameKind, Member, NONE, Pending},
+    provenance::Cause,
     row::{
         self, CYCLE, DURABILITY, HASHED, HEAD, Header, PROVISIONAL, Pages, RUNNING, Row, STALE,
         UNTRACKED, VALUE, VIEW_MASK, row_at, span,
@@ -363,11 +364,20 @@ fn claimed<F: Function>(
     let id = key.as_id();
     let node = node_of(storage, index, id, header);
     if current {
+        storage.record_run(node, Cause::Evicted);
         run::<F>(db, storage, index, row, key, None, true);
         return None;
     }
     let verifiable = word & VIEW_MASK != 0 && word & PROVISIONAL == 0 && meta & UNTRACKED == 0;
     if !verifiable {
+        let cause = if word & VIEW_MASK == 0 {
+            Cause::New
+        } else if word & PROVISIONAL != 0 {
+            Cause::Cycle
+        } else {
+            Cause::Untracked
+        };
+        storage.record_run(node, cause);
         run::<F>(db, storage, index, row, key, None, false);
         return None;
     }
@@ -375,6 +385,7 @@ fn claimed<F: Function>(
         || storage.inputs_unchanged(node, word & VIEW_MASK)
     {
         if mark(storage, header, word, node, index, id) && value && word & VALUE == 0 {
+            storage.record_run(node, Cause::Evicted);
             run::<F>(db, storage, index, row, key, None, true);
         }
         return None;
@@ -382,14 +393,14 @@ fn claimed<F: Function>(
     let at =
         local::with(|local| local.push(Frame::new(storage, FrameKind::Verify, node, index, id)));
     let mut guard = Running { storage, header, word, at, index, id, armed: true };
-    let unchanged = verify_claimed(db, storage, header, node, word & VIEW_MASK);
+    let changed = verify_claimed(db, storage, header, node, word & VIEW_MASK);
     let (reentered, head) = local::with(|local| {
         let frame = &local.frames[at as usize];
         (frame.reentered, frame.head)
     });
     guard.armed = false;
     drop(guard);
-    if unchanged && !reentered {
+    if changed.is_none() && !reentered {
         if head < at {
             debug_assert!(!value, "a fetch's verify never depends on one below it");
             local::with(|local| {
@@ -412,10 +423,12 @@ fn claimed<F: Function>(
         });
         mark_pending(storage, from);
         if mark(storage, header, word, node, index, id) && value && word & VALUE == 0 {
+            storage.record_run(node, Cause::Evicted);
             run::<F>(db, storage, index, row, key, None, true);
         }
         return None;
     }
+    storage.record_run(node, changed.map_or(Cause::Cycle, Cause::Changed));
     local::with(|local| local.verify_to_run(at));
     run::<F>(db, storage, index, row, key, Some(at), false);
     None
@@ -478,15 +491,15 @@ pub(crate) fn mark(
 }
 
 /// Checks a row's edges in read order holding its flight, bringing each dependency up to this
-/// view (running it if it changed): `true` when none changed since `verified`, and then the
-/// row's summary has its dependencies' current ones.
+/// view (running it if it changed): the node of the first that changed since `verified`, or
+/// `None` when none did, and then the row's summary has its dependencies' current ones.
 fn verify_claimed(
     db: *const (),
     storage: &Storage,
     header: &Header,
     row_node: u32,
     verified: u32,
-) -> bool {
+) -> Option<u32> {
     let edges = header.edges.load(Ordering::Acquire);
     let (start, len) = (span::start(edges), span::len(edges));
     let mut summary = [0; 2];
@@ -498,12 +511,12 @@ fn verify_claimed(
         if painted < FIELD && painted != view {
             let (index, id, _) = key_parts(storage.key_of(node));
             let Some(verify) = ingredient::vtable(index).and_then(|it| it.verify) else {
-                return false;
+                return Some(node);
             };
             // SAFETY: `db` is this storage's database as every function of it names it
             // (`Storage::check_db`), and `id` is a key of ingredient `index` (its node's key).
             match unsafe { verify(db, storage, id) } {
-                Verified::Changed => return false,
+                Verified::Changed => return Some(node),
                 Verified::Assumed => {
                     summary = or(summary, storage.summary_of(node));
                     continue;
@@ -512,16 +525,16 @@ fn verify_claimed(
             }
             seen = storage.color_of(node);
             if (seen >> 32) as u32 != view {
-                return false;
+                return Some(node);
             }
         }
         if seen as u32 > verified {
-            return false;
+            return Some(node);
         }
         summary = or(summary, storage.summary_of(node));
     }
     storage.grow_summary(row_node, summary);
-    true
+    None
 }
 
 /// [`Vtable::verify`] of `F`: brings row `id` up to this view for a reader's edge.

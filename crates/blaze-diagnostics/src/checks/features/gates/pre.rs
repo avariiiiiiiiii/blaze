@@ -51,7 +51,6 @@ pub(super) enum Pre {
     MgcaTypeConstSyntax,
     YieldExpr,
     AutoTraits,
-    BoxPatterns,
     DeclMacro,
     NegativeImpls,
     Specialization,
@@ -283,16 +282,6 @@ fn gates_of(node: ast::Node<'_>, push: &mut impl FnMut(Pre, TextRange, TextSize)
                 push(Pre::MoreQualifiedPaths, path, path.end());
             }
         }
-        SyntaxKind::BOX_PAT => {
-            let shorthand = node.parent().is_some_and(|it| {
-                it.kind() == SyntaxKind::RECORD_PAT_FIELD && child(it, SyntaxKind::NAME_REF).is_none()
-            });
-            match token(node, T![box]) {
-                // `Foo { box x }`: the parser gates the `box` it eats before the binding.
-                Some(it) if shorthand => push(Pre::BoxPatterns, it.text_range(), it.text_range().start()),
-                _ => push(Pre::BoxPatterns, range, range.end()),
-            }
-        }
         _ => {}
     }
 }
@@ -465,11 +454,5 @@ mod tests {
             gates(text),
             [(Pre::TryBlocks, "try { 1 }"), (Pre::TryBlocksHeterogeneous, "try bikeshed u8 { 1 }")]
         );
-    }
-
-    #[test]
-    fn a_box_pattern_is_gated_whole_but_a_field_shorthand_at_box() {
-        let text = "fn f() { let box x = 1; let S { box y } = 2; }";
-        assert_eq!(gates(text), [(Pre::BoxPatterns, "box x"), (Pre::BoxPatterns, "box")]);
     }
 }

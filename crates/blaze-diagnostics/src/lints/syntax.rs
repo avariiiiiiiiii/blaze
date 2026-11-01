@@ -106,7 +106,8 @@ impl Emitted {
     /// The lint `diag` of `phase`, its level decided at `at`, emitted in `pass` as rustc's walk
     /// comes to `at`.
     pub(crate) fn new(diag: Diag, phase: Phase, pass: Pass, at: InFile<SyntaxNodePtr>) -> Emitted {
-        Emitted { found: Found::lint(diag, phase, at), pass, stage: Stage::default(), place: Some(at) }
+        let found = Found { pre_expansion: pass == Pass::PreExpansion, ..Found::lint(diag, phase, at) };
+        Emitted { found, pass, stage: Stage::default(), place: Some(at) }
     }
 
     /// `diag`, an error or warning that is no lint's, emitted in `pass` as rustc's walk comes

@@ -91,20 +91,24 @@ impl Reads {
         self.check_view(storage);
         let start = span::start(self.span);
         for at in start..start + span::len(self.span) {
-            let (index, id, field) = key_parts(storage.key_of(storage.edge(at)));
-            let kind = match ingredient::kind(index) {
-                Some(Kind::Input) => ReadKind::InputField(field),
-                Some(Kind::Tracked) => ReadKind::TrackedField(field),
-                Some(Kind::Interned) => ReadKind::Interned,
-                Some(Kind::Function) | None => ReadKind::Function,
-            };
-            if let ControlFlow::Break(it) = f(Read { key: DatabaseKeyIndex::new(index, id), kind })
-            {
+            if let ControlFlow::Break(it) = f(read_of_key(storage.key_of(storage.edge(at)))) {
                 return Some(it);
             }
         }
         None
     }
+}
+
+/// The read a node's key word names.
+pub(crate) fn read_of_key(key: u64) -> Read {
+    let (index, id, field) = key_parts(key);
+    let kind = match ingredient::kind(index) {
+        Some(Kind::Input) => ReadKind::InputField(field),
+        Some(Kind::Tracked) => ReadKind::TrackedField(field),
+        Some(Kind::Interned) => ReadKind::Interned,
+        Some(Kind::Function) | None => ReadKind::Function,
+    };
+    Read { key: DatabaseKeyIndex::new(index, id), kind }
 }
 
 /// Drops an unclosed capture (an unwind out of its `f`): its reads stay the query's, but the

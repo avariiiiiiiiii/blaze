@@ -105,6 +105,7 @@ walks every module's inherent impls inline in inference). It is refused.
 | `impl_value_item`, `trait_value_item` | I | `Fields(impl or trait)` | as `ImplItems::of` and `TraitItems` |
 | `impl_type_aliases`, `trait_type_aliases` | I | `Fields(impl or trait)` | the associated types in order, a function of the members' kinds and names `Fields` hashes |
 | `closure_exprs` of the body's own store | I | covered (with the identity's own-body reads) | its closures are of its HIR |
+| `line_literals` of the body's own | M | covered (with the identity's own-body reads) | which literals `line!()` made is of the HIR and of each literal's macro call, which the entries hash with its macro |
 | `failed_expansion` of the body's own | M | covered (with the identity's own-body reads) | whether each macro call expanded as rustc parses it is of the calls the entries hash; a body refused for one builds no MIR to store |
 | `const_eval_query` of a const without generics, with no arguments and no environment | I M | `ConstValue(const)` | the evaluation lane items hashes |
 | `infer_body_query` of the body itself, from M or B | M B | `StepInfer(body)` (0x1803), valued by `hir_ty::body_store::step_value` | the earlier step's answer, as the store encodes it |

@@ -1,6 +1,6 @@
 //! The dense query engine: queries keyed by [`Id`], memos in place in pages by ID, a warm hit of
 //! four dependent loads, durability kinds, early cutoff by `==`, single flight through
-//! `blaze_graph`'s plane, fixpoint cycles, captured reads, and LRU eviction. What the front end
+//! `blaze_graph`'s plane, fixpoint cycles, captured reads, LRU eviction, and provenance. What the front end
 //! runs on (`#[blaze_query::tracked]` and the rest generate against it, see `plumbing`); the
 //! content-keyed engine of the crate root is a separate thing.
 //!
@@ -8,7 +8,8 @@
 //! `dense` (columns and the page heap), `row` (a memo in place: the value-in-place rule),
 //! `storage` (the database's tables, graph and view), `local` (the thread's query stack),
 //! `function` (hit, verify, run, cycles, eviction), `verify` (the claim-free walk), `input`,
-//! `interned`, `tracked`, `capture`, `value`.
+//! `interned`, `tracked`, `capture`, `value`, `provenance` (what each memo did in a view, and
+//! why it ran).
 
 use std::{fmt, panic::UnwindSafe};
 
@@ -20,6 +21,7 @@ mod ingredient;
 mod input;
 mod interned;
 mod local;
+mod provenance;
 mod row;
 mod storage;
 #[cfg(test)]
@@ -32,6 +34,7 @@ pub use capture::{Read, ReadKind, Reads, capture_reads, replay_reads, unshareabl
 pub use id::{AsId, FromId, FromIdIn, Id};
 pub use input::Setter;
 pub use interned::NamesIds;
+pub use provenance::{Cause, Outcome, Provenance};
 pub use storage::{Database, Durability, Hook, Storage, View};
 pub use value::Value;
 

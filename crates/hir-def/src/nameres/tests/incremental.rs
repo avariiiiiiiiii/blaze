@@ -290,8 +290,8 @@ fn f() { foo }
                 "real_span_map",
                 "MacroCallId::macro_arg",
                 "EditionedFileId::parse_errors",
-                "MacroCallId::proc_macro_expansion",
                 "MacroCallId::parse_macro_expansion",
+                "MacroCallId::proc_macro_expansion",
                 "HirFileId::ast_id_map",
                 "file_item_tree_query",
             ]

@@ -95,6 +95,9 @@ pub(super) struct Match<'a> {
     pub(super) bindings: Bindings<'a>,
     /// We currently just keep the first error and count the rest to compare matches.
     pub(super) err: Option<ExpandError>,
+    /// Whether `err` is a fragment's that took tokens and then failed (the new matcher's
+    /// `MatchError::Fragment`).
+    pub(super) err_in_fragment: bool,
     pub(super) err_count: usize,
     /// How many top-level token trees were left to match.
     pub(super) unmatched_tts: usize,
@@ -501,6 +504,9 @@ fn match_loop_inner<'t>(
                             }
                         }
                         Some(err) => {
+                            if res.err.is_none() {
+                                res.err_in_fragment = !match_res.value.is_empty();
+                            }
                             res.add_err(err);
                             if !match_res.value.is_empty() {
                                 bindings_builder.push_fragment(

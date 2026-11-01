@@ -995,6 +995,11 @@ impl<'db, 'f> StepSink<'db, 'f> {
             data: cx.data.clone(),
         };
         env.install(&mut def_map);
+        // The crate's own `#[prelude_import]` (core's `prelude::v1`), as each component has it:
+        // the env has only the injected std prelude.
+        if let Some(prelude) = super::unit::round_prelude(db, round) {
+            def_map.prelude = Some(prelude);
+        }
         StepSink {
             db,
             frame,

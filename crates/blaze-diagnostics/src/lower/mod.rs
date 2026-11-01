@@ -175,16 +175,19 @@ pub struct Found {
     /// For a lint: the node whose attributes, and those of what is around it, decide its
     /// level (rustc's `HirId` it is emitted at).
     pub lint_at: Option<InFile<SyntaxNodePtr>>,
+    /// For a lint of rustc's pre-expansion lint pass: its level is of `lint_at`'s file alone
+    /// ([`hir_lint_levels::Levels::set_of_in_file`]).
+    pub pre_expansion: bool,
 }
 
 impl Found {
     pub fn new(diag: Diag, phase: Phase) -> Found {
-        Found { diag, phase, lint_at: None }
+        Found { diag, phase, lint_at: None, pre_expansion: false }
     }
 
     /// A lint's diagnostic, its level decided at `at`.
     pub fn lint(diag: Diag, phase: Phase, at: InFile<SyntaxNodePtr>) -> Found {
-        Found { diag, phase, lint_at: Some(at) }
+        Found { diag, phase, lint_at: Some(at), pre_expansion: false }
     }
 }
 

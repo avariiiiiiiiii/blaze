@@ -1926,7 +1926,8 @@ impl<'a, 'f, 'db> MirLowerCtx<'a, 'f, 'db> {
                     && let Expr::Literal(&hir_def::hir::Literal::Int(value, kind)) =
                         self.store.expr(expr)
                 {
-                    let negated = hir_def::hir::Literal::Int(-value, kind);
+                    // `2^127` is stored as `i128::MIN`, and `-2^127i128` is that same value.
+                    let negated = hir_def::hir::Literal::Int(value.wrapping_neg(), kind);
                     let ty = self.expr_ty_without_adjust(expr);
                     let mut operand = self.lower_literal_to_operand(ty, &negated)?;
                     operand.span = Some(expr_id.into());

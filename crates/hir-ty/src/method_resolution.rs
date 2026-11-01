@@ -400,6 +400,11 @@ impl<'db> InferenceTable<'db> {
             BoundRegionConversionTime::FnCall,
             fn_sig,
         );
+        // An operator's output is an associated type of its trait (`Index::Output`): left an
+        // alias, `a[i][j] += 1` sees no integer on its left and checks `AddAssign` on it.
+        let (fn_sig, normalizing) =
+            crate::next_solver::normalize::normalize(self.at(&obligation.cause), fn_sig);
+        obligations.extend(normalizing);
 
         // Register obligations for the parameters. This will include the
         // `Self` parameter, which in turn has a bound of the main trait,

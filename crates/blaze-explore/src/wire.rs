@@ -4,6 +4,8 @@
 
 use serde_json::{Map, Value};
 
+use crate::tiles::Lane;
+
 /// Every op, as the page names it.
 pub const OPS: [&str; 8] = ["hello", "builds", "sql", "views", "view", "spans", "tiles", "world"];
 
@@ -27,8 +29,16 @@ pub enum Request {
     },
     /// The `spans` rows of build `build` overlapping `[t0_ns, t1_ns)`.
     Spans { build: u64, t0_ns: i64, t1_ns: i64 },
-    /// The `tiles` of build `build` over `[t0_ns, t1_ns)`, `bucket_ns` a bucket.
-    Tiles { build: u64, t0_ns: i64, t1_ns: i64, bucket_ns: i64 },
+    /// The `tiles` of build `build` over `[t0_ns, t1_ns)`, `bucket_ns` a bucket: a lane per
+    /// thread, or with `"lane": "job"` the `job_tiles`, a lane per fiber job.
+    Tiles {
+        build: u64,
+        t0_ns: i64,
+        t1_ns: i64,
+        bucket_ns: i64,
+        #[serde(default)]
+        lane: Lane,
+    },
     /// Flecs's REST over the build's world: `path` as Flecs takes it, `/entity/...`, `/query?...`.
     World { path: String },
 }
@@ -165,7 +175,11 @@ mod tests {
         assert_eq!((name.as_str(), args.get("n")), ("slowest", Some(&Value::from(5))));
         assert_eq!(
             parse(br#"{"op":"tiles","build":3,"t0_ns":-5,"t1_ns":100,"bucket_ns":10}"#),
-            Ok(Request::Tiles { build: 3, t0_ns: -5, t1_ns: 100, bucket_ns: 10 })
+            Ok(Request::Tiles { build: 3, t0_ns: -5, t1_ns: 100, bucket_ns: 10, lane: Lane::Thread })
+        );
+        assert_eq!(
+            parse(br#"{"op":"tiles","build":3,"t0_ns":0,"t1_ns":100,"bucket_ns":10,"lane":"job"}"#),
+            Ok(Request::Tiles { build: 3, t0_ns: 0, t1_ns: 100, bucket_ns: 10, lane: Lane::Job })
         );
         assert_eq!(
             parse(br#"{"op":"world","path":"/query?expr=Function"}"#),

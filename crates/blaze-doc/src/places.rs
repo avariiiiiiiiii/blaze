@@ -440,11 +440,11 @@ pub(crate) fn macro_kind(db: &Db, it: Macro) -> Option<Kind> {
 
 /// Places every item of every crate, in parallel over the crates.
 pub(crate) fn place(db: &Db, crates: Vec<Documented>, test_only: TestOnly) -> Places {
-    use blaze_graph::par;
     // A worker waiting on a query runs other jobs of the pool, which may be another database's:
     // each item puts back the database attached below it.
-    let placed: Vec<Vec<Placed>> =
-        par::map(&crates, |documented| hir::attach_db_allow_change(db, || Walker::new(db, documented).walk()));
+    let placed: Vec<Vec<Placed>> = base_db::par_map(crates.len(), |at| {
+        hir::attach_db_allow_change(db, || Walker::new(db, &crates[at]).walk())
+    });
     let mut canonical: FxHashMap<ModuleDef, ((u8, usize), (usize, usize))> = FxHashMap::default();
     let mut own: Vec<FxHashMap<ModuleDef, usize>> = vec![];
     for (krate, list) in placed.iter().enumerate() {

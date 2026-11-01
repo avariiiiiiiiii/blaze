@@ -1,7 +1,7 @@
 {
   "id": "01440",
   "from_lane": "sched",
-  "owner": "core",
+  "owner": "sched",
   "paths": [
     "crates/blaze-graph/src/pool.rs",
     "crates/blaze-graph/src/pump.rs",

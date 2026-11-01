@@ -8,10 +8,10 @@ mod db;
 static ALLOC: blaze_alloc_count::Counting = blaze_alloc_count::Counting;
 
 use base_db::relevant_crates;
-use hir_def::{FunctionId, ModuleDefId, nameres::crate_def_map, signatures::FunctionSignature};
+use hir_def::{FunctionId, HasModule, ModuleDefId, nameres::crate_def_map, signatures::FunctionSignature};
 use hir_expand::EditionedFileId;
-use hir_ty::{InferBodyId, mir::MirSpan};
-use hir_ty_mir::mir::{Plain, Site, run_function};
+use hir_ty::{InferBodyId, ParamEnvAndCrate, db::HirDatabase, mir::MirSpan, next_solver::GenericArgs};
+use hir_ty_mir::mir::{Plain, Site, print_mir_body, run_function};
 use hir_ty_ub::{
     Config, Found, Outcome, Ub,
     check::{Checker, Sites},
@@ -146,8 +146,26 @@ fn ub(fixture: &str, expect: &str) -> (Found, String) {
 fn pass(fixture: &str) {
     match run(fixture) {
         Outcome::Passed { .. } => {}
-        other => panic!("expected a pass, got {other:?}"),
+        other => panic!("expected a pass, got {other:?}\n{}", main_mir(fixture)),
     }
+}
+
+/// `main`'s MIR as the evaluator runs it (`run_function`'s body), for a failure's message.
+fn main_mir(fixture: &str) -> String {
+    let fx = fixture::db(fixture);
+    let file = fx.only_file();
+    let db = fx.into_db();
+    hir_ty::attach_db(&db, || {
+        let main = main_of(&db, file);
+        let env = ParamEnvAndCrate {
+            param_env: db.trait_environment(main.into()),
+            krate: main.module(&db).krate(&db),
+        };
+        match db.monomorphized_runtime_mir_body(main.into(), GenericArgs::empty().store(), env.store()) {
+            Ok(body) => print_mir_body(&db, &body, "main"),
+            Err(e) => format!("no MIR for `main`: {e:?}"),
+        }
+    })
 }
 
 // --- Memory: tests/fail/dangling_pointers/ ---

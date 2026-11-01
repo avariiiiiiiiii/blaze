@@ -67,6 +67,12 @@ export const rules = [
 		link: "docs/cargo.md#build-scripts-and-proc-macros-run-in-a-sandbox",
 	},
 	{
+		id: "bump-allocate",
+		info: "Allocate by lifetime, never from the global heap by default: a collection that lives within one task (a query run, a codegen unit, a maintainer pass) names its allocator, `Vec::new_in(frame)` / `Box::new_in(.., frame)` from `blaze_mem::frame::current`, and longer lifetimes use the request, revision or image allocator. A global allocation (`Vec::new`, `vec![]`, `collect` into a heap `Vec`, `Box::new`, `to_owned`) needs `// alloc: <why>` on its line. `blaze::hot_alloc` enforces this wherever `blaze::hot` is denied.",
+		reason: "\"Allocate like a highly optimized game\" (Andrew, 2026-10-29, decisions.md). Andrew, 2026-10-31, on a fan-out that collected results into a heap Vec it did not need: heavily bump allocate, always give the Vec its allocator, and lint it.",
+		link: "docs/v2/plan/design/memory.md",
+	},
+	{
 		id: "best-long-term-design",
 		info: "Pick the best long-term design, not the least work: own the layer or port rustc's rule properly, and spend the effort on proving it right: real crates' own test suites passing under blaze, and fuzzing of blaze's own invariants.",
 		reason: "Agents write most of blaze, so the amount of code a design takes is not what limits it; what stays expensive is proving it right. Andrew, 2026-10-30, deleting the harnesses that compared blaze with rustc or cargo: \"we use other ppl['s] test[s] [of] the other crates ... it over-constrains us\".",

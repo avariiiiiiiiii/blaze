@@ -41,43 +41,50 @@ then `bun tools/agents/rules.ts --write`). Skills: .agents/skills/.
    are the documented manifest opt-outs and `BLAZE_SANDBOX=off`; nothing new that runs user code
    runs outside by default. See
    [docs/cargo.md#build-scripts-and-proc-macros-run-in-a-sandbox](docs/cargo.md#build-scripts-and-proc-macros-run-in-a-sandbox).
-8. **best-long-term-design**: Pick the best long-term design, not the least work: own the layer or port
+8. **bump-allocate**: Allocate by lifetime, never from the global heap by default: a collection that
+   lives within one task (a query run, a codegen unit, a maintainer pass) names its allocator,
+   `Vec::new_in(frame)` / `Box::new_in(.., frame)` from `blaze_mem::frame::current`, and longer
+   lifetimes use the request, revision or image allocator. A global allocation (`Vec::new`,
+   `vec![]`, `collect` into a heap `Vec`, `Box::new`, `to_owned`) needs `// alloc: <why>` on its
+   line. `blaze::hot_alloc` enforces this wherever `blaze::hot` is denied. See
+   [docs/v2/plan/design/memory.md](docs/v2/plan/design/memory.md).
+9. **best-long-term-design**: Pick the best long-term design, not the least work: own the layer or port
    rustc's rule properly, and spend the effort on proving it right: real crates' own test suites
    passing under blaze, and fuzzing of blaze's own invariants. See
    [docs/contributing.md#rules-for-code](docs/contributing.md#rules-for-code).
-9. **semantics-in-front-end**: Language semantics (MIR building and passes, borrow checking, const
-   eval, layout, code-identity hashes) go in the front end's salsa crates in `crates/` (`hir-ty`,
-   `hir-def` and the rest, derived from rust-analyzer but no longer synced with it), in a crate of
-   their own where possible. Codegen, the store, the daemon, cargo integration and the runtime stay
-   outside the front end. See
-   [docs/contributing.md#where-new-code-goes](docs/contributing.md#where-new-code-goes).
-10. **no-mcp**: No MCP. Agent-facing interfaces are a Unix socket or HTTP with one versioned schema in
+10. **semantics-in-front-end**: Language semantics (MIR building and passes, borrow checking, const
+    eval, layout, code-identity hashes) go in the front end's salsa crates in `crates/` (`hir-ty`,
+    `hir-def` and the rest, derived from rust-analyzer but no longer synced with it), in a crate of
+    their own where possible. Codegen, the store, the daemon, cargo integration and the runtime stay
+    outside the front end. See
+    [docs/contributing.md#where-new-code-goes](docs/contributing.md#where-new-code-goes).
+11. **no-mcp**: No MCP. Agent-facing interfaces are a Unix socket or HTTP with one versioned schema in
     deterministic CBOR; the CLI is a client of the same API. See
     [docs/roadmap.md#8-the-agent-api](docs/roadmap.md#8-the-agent-api).
-11. **work-in-ix-vms**: Builds, tests, benchmarks and experiments run in an ix VM, one per lane (`ix
+12. **work-in-ix-vms**: Builds, tests, benchmarks and experiments run in an ix VM, one per lane (`ix
     new`, `ix shell`, `ix rm`), never on the Mac or AWS. Where an ix VM can't do it, stop and say
     what is missing. See
     [docs/contributing.md#working-in-parallel](docs/contributing.md#working-in-parallel).
-12. **worktree-per-lane**: One uniquely named worktree per lane with its own `CARGO_TARGET_DIR`; never
+13. **worktree-per-lane**: One uniquely named worktree per lane with its own `CARGO_TARGET_DIR`; never
     `git stash`.
-13. **land-through-pr**: Land small and often through a pull request: `python3 .github/scripts/land.py
+14. **land-through-pr**: Land small and often through a pull request: `python3 .github/scripts/land.py
     "what the branch does"` opens it, turns on auto-merge and waits for the merge gate (`--wait`
     resumes). Harnesses run after merge in the release train. Never push to main. See
     [docs/contributing.md#landing-a-change](docs/contributing.md#landing-a-change).
-14. **own-prs-to-merge**: Any agent may take any open pull request or issue to done (merge main, resolve
+15. **own-prs-to-merge**: Any agent may take any open pull request or issue to done (merge main, resolve
     conflicts, fix its gate, finish a draft) rather than hand it back; tell the owning lane what
     changed. Close one only when it is wrong, saying why.
-15. **clean-up-lane**: When a lane is done, delete its worktree, target directory, ix VM and merged
+16. **clean-up-lane**: When a lane is done, delete its worktree, target directory, ix VM and merged
     branch.
-16. **credit-people**: A commit or pull request built on someone's suggestion, diagnosis or patch gets a
+17. **credit-people**: A commit or pull request built on someone's suggestion, diagnosis or patch gets a
     `Co-authored-by: Name <id+login@users.noreply.github.com>` trailer for each of them and says
     where it came from. See [docs/contributing.md#credit](docs/contributing.md#credit).
-17. **docs-say-what-they-are**: Every doc under `docs/` has front matter: `current` (kept true), `plan`,
+18. **docs-say-what-they-are**: Every doc under `docs/` has front matter: `current` (kept true), `plan`,
     `record` (dated history) or `superseded` (naming its replacement). Trust current docs; read
     plans and records as of their date. A change that makes a current doc untrue fixes it or marks
     it superseded in the same change; `python3 tools/docs.py check` holds them to the tree. See
     [docs/contributing.md#documents](docs/contributing.md#documents).
-18. **scripts-take-typed-input**: A script takes one JSON value (a file path, `-` or inline), parsed
+19. **scripts-take-typed-input**: A script takes one JSON value (a file path, `-` or inline), parsed
     into a frozen dataclass that refuses unknown fields, not a set of flags or hidden environment
     variables. An existing script moves to this when next changed.
 

@@ -22,6 +22,8 @@ pub(crate) struct Asked {
     pub env: Vec<(String, String)>,
     pub host: String,
     pub library: String,
+    /// [`crate::query::BuildConfig::std`].
+    pub std: String,
     pub packages: Vec<String>,
     pub workspace: bool,
     pub exclude: Vec<String>,
@@ -187,6 +189,7 @@ fn configure(bytes: &[u8]) -> Configured {
         env,
         host: config.host,
         library: config.library,
+        std: config.std,
         ..Asked::default()
     };
     asked.command = Some(invocation.command);
@@ -480,6 +483,7 @@ mod tests {
             mounts: vec![],
             host: "x86_64-unknown-linux-gnu".to_owned(),
             library: "/rustc/0/library".to_owned(),
+            std: "/s/std".to_owned(),
         };
         let configured = configure(&config.encode());
         let asked = configured.asked.unwrap();

@@ -6,21 +6,22 @@ use hir_def::{
     AssocItemId,
     signatures::{ConstSignature, TypeAliasSignature},
 };
-use rustc_hash::{FxHashMap, FxHashSet};
+use rustc_hash::FxHashMap;
 use rustc_next_trait_solver::{delegate::SolverDelegate, solve::SearchStorage};
 use rustc_type_ir::{
     AliasTyKind, CanonicalizerState, ClausePolarity, GenericArgKind, InferCtxtLike, InferTy,
     Interner, TypeFlags, TypeSuperVisitable, TypeVisitable, TypeVisitableExt, TypeVisitor,
+    data_structures::SsoHashSet,
     inherent::{GenericArg as _, GenericArgs as _, IntoKind, Term as _, Ty as _},
     lang_items::SolverTraitLangItem,
     solve::{
         ComputeGoalFastPathOutcome, FastPathDepth, FetchEligibleAssocItemResponse, GoalStalledOn,
-        GoalStalledOnOpaques, MaybeInfo, NoSolution, SucceededInErased, TyOrConstInferVar,
-        VisibleForLeakCheck,
+        GoalStalledOnOpaques, MaybeInfo, NoSolution, StalledVars, SubRoots, SucceededInErased,
+        TyOrConstInferVar, VisibleForLeakCheck,
     },
     transmute::Answer,
 };
-use thin_vec::{ThinVec, thin_vec};
+use smallvec::smallvec;
 use tracing::debug;
 
 use crate::{
@@ -108,7 +109,7 @@ impl<'db> SolverContext<'db> {
                     // FIXME: Properly consider opaques here.
                     && self.known_no_opaque_types_in_storage()
                 {
-                    goal_stalled_on_args_or_nonempty_opaques(thin_vec![TyOrConstInferVar::Ty(vid)]) // alloc: `GoalStalledOn` owns a `ThinVec`
+                    goal_stalled_on_args_or_nonempty_opaques(smallvec![TyOrConstInferVar::Ty(vid)])
                 } else if trait_pred.polarity() == ClausePolarity::Positive {
                     match interner.as_trait_lang_item(trait_pred.def_id()) {
                         Some(SolverTraitLangItem::Sized | SolverTraitLangItem::MetaSized) => {
@@ -171,16 +172,7 @@ impl<'db> SolverContext<'db> {
                 if ty.has_non_region_infer() {
                     let mut infers = CollectNonRegionInfer::default();
                     ty.visit_with(&mut infers);
-                    return goal_stalled_on_args(
-                        infers
-                            .infers
-                            .into_iter()
-                            .map(|arg| {
-                                TyOrConstInferVar::maybe_from_generic_arg::<DbInterner<'db>>(arg)
-                                    .expect("collected an inference variable")
-                            })
-                            .collect(), // alloc: `GoalStalledOn` owns a `ThinVec`
-                    );
+                    return goal_stalled_on_args(infers.infers);
                 }
                 InferCtxtLike::register_ty_outlives(&self.0, outlives.0, outlives.1, span);
                 Outcome::TriviallyHolds
@@ -196,7 +188,7 @@ impl<'db> SolverContext<'db> {
                         TyKind::Infer(InferTy::TyVar(b_vid)),
                     ) => {
                         self.sub_unify_ty_vids_raw(a_vid, b_vid);
-                        goal_stalled_on_args(thin_vec![ // alloc: `GoalStalledOn` owns a `ThinVec`
+                        goal_stalled_on_args(smallvec![
                             TyOrConstInferVar::Ty(a_vid),
                             TyOrConstInferVar::Ty(b_vid),
                         ])
@@ -209,7 +201,7 @@ impl<'db> SolverContext<'db> {
                     return Outcome::NoFastPath;
                 }
                 match self.shallow_resolve_const(ct).ct_vid() {
-                    Some(vid) => goal_stalled_on_args(thin_vec![TyOrConstInferVar::Const(vid)]), // alloc: `GoalStalledOn` owns a `ThinVec`
+                    Some(vid) => goal_stalled_on_args(smallvec![TyOrConstInferVar::Const(vid)]),
                     None => Outcome::NoFastPath,
                 }
             }
@@ -221,7 +213,7 @@ impl<'db> SolverContext<'db> {
                 if arg.is_trivially_wf(interner) {
                     Outcome::TriviallyHolds
                 } else if arg.is_infer() {
-                    goal_stalled_on_args(thin_vec![ // alloc: `GoalStalledOn` owns a `ThinVec`
+                    goal_stalled_on_args(smallvec![
                         TyOrConstInferVar::maybe_from_term::<DbInterner<'db>>(arg)
                             .expect("an inference variable"),
                     ])
@@ -236,12 +228,12 @@ impl<'db> SolverContext<'db> {
 
 /// A fast-path answer: the goal is stalled on `stalled_vars` alone.
 fn goal_stalled_on_args<'db>(
-    stalled_vars: ThinVec<TyOrConstInferVar>,
+    stalled_vars: StalledVars,
 ) -> ComputeGoalFastPathOutcome<DbInterner<'db>> {
     ComputeGoalFastPathOutcome::TriviallyStalled {
         stalled_on: GoalStalledOn {
             stalled_vars,
-            sub_roots: ThinVec::new(),
+            sub_roots: SubRoots::new(),
             stalled_maybe_info: MaybeInfo::AMBIGUOUS,
             opaques: GoalStalledOnOpaques::No,
         },
@@ -252,12 +244,12 @@ fn goal_stalled_on_args<'db>(
 /// becoming non-empty. Only for a context that is not in erased mode, which
 /// [`SolverContext::known_no_opaque_types_in_storage`] checks.
 fn goal_stalled_on_args_or_nonempty_opaques<'db>(
-    stalled_vars: ThinVec<TyOrConstInferVar>,
+    stalled_vars: StalledVars,
 ) -> ComputeGoalFastPathOutcome<DbInterner<'db>> {
     ComputeGoalFastPathOutcome::TriviallyStalled {
         stalled_on: GoalStalledOn {
             stalled_vars,
-            sub_roots: ThinVec::new(),
+            sub_roots: SubRoots::new(),
             stalled_maybe_info: MaybeInfo::AMBIGUOUS,
             opaques: GoalStalledOnOpaques::Yes {
                 num_opaques_in_storage: 0,
@@ -270,8 +262,18 @@ fn goal_stalled_on_args_or_nonempty_opaques<'db>(
 /// Every type and const inference variable in a type, in visiting order.
 #[derive(Default)]
 struct CollectNonRegionInfer<'db> {
-    infers: ThinVec<GenericArg<'db>>,
-    visited: FxHashSet<Ty<'db>>,
+    infers: StalledVars,
+    visited: SsoHashSet<Ty<'db>>,
+}
+
+impl<'db> CollectNonRegionInfer<'db> {
+    fn push(&mut self, arg: GenericArg<'db>) {
+        // alloc: past two variables `StalledVars` spills.
+        self.infers.push(
+            TyOrConstInferVar::maybe_from_generic_arg::<DbInterner<'db>>(arg)
+                .expect("collected an inference variable"),
+        );
+    }
 }
 
 impl<'db> TypeVisitor<DbInterner<'db>> for CollectNonRegionInfer<'db> {
@@ -282,7 +284,7 @@ impl<'db> TypeVisitor<DbInterner<'db>> for CollectNonRegionInfer<'db> {
             return;
         }
         match ty.kind() {
-            TyKind::Infer(_) => self.infers.push(ty.into()),
+            TyKind::Infer(_) => self.push(ty.into()),
             _ => ty.super_visit_with(self),
         }
         self.visited.insert(ty);
@@ -290,7 +292,7 @@ impl<'db> TypeVisitor<DbInterner<'db>> for CollectNonRegionInfer<'db> {
 
     fn visit_const(&mut self, ct: Const<'db>) {
         match ct.kind() {
-            ConstKind::Infer(_) => self.infers.push(ct.into()),
+            ConstKind::Infer(_) => self.push(ct.into()),
             _ => ct.super_visit_with(self),
         }
     }

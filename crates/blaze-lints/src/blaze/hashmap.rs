@@ -52,6 +52,11 @@ impl Std {
         self.random == Some(adt)
     }
 
+    /// Whether `adt` is std's map or set, with any hasher.
+    pub(super) fn is_map_or_set(self, adt: AdtId) -> bool {
+        self.hasher_at(adt).is_some()
+    }
+
     /// Whether `ty` is std's map or set hashing with `RandomState`.
     pub(super) fn is_random_map(self, ty: Ty<'_>) -> bool {
         let Some((adt, args)) = ty.as_adt() else { return false };
@@ -111,17 +116,24 @@ pub(super) fn check_construct(
         return None;
     }
     let (adt, _) = ty.as_adt()?;
-    let constructs = match callee.loc(k.db).container {
+    let name = match Some(adt) == k.std.set {
+        true => "HashSet",
+        false => "HashMap",
+    };
+    constructs(k, callee, adt)
+        .then(|| format!("this makes a std `{name}`, which hashes with SipHash (`RandomState`)"))
+}
+
+/// Whether a call of `callee` whose value is an `adt` makes it: `callee` is a trait's method
+/// other than `clone` (`Default::default()`, `.collect()`) or a method of `adt`'s own impl
+/// (`HashMap::new()`), not a function that hands a value on (`mem::take`).
+pub(super) fn constructs(k: &Known<'_>, callee: FunctionId, adt: AdtId) -> bool {
+    match callee.loc(k.db).container {
         ItemContainerId::TraitId(it) => k.clone.is_none_or(|(clone, _)| clone != it),
         ItemContainerId::ImplId(it) => {
             let self_ty = hir::Impl::from(it).self_ty(k.db);
             self_ty.as_adt().is_some_and(|it| AdtId::from(it) == adt)
         }
         _ => false,
-    };
-    let name = match Some(adt) == k.std.set {
-        true => "HashSet",
-        false => "HashMap",
-    };
-    constructs.then(|| format!("this makes a std `{name}`, which hashes with SipHash (`RandomState`)"))
+    }
 }

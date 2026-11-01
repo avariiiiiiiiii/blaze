@@ -13,6 +13,7 @@
 //! | objects retired while readers may hold them | [`pool::Limbo`]: kept in their slots until their grace passes, then back to the pool |
 //! | tables, interners and columns | [`RegionVec`] (one owner), [`AppendVec`] (one writer, lock-free readers) and [`Column`] (any number of appenders): address space reserved up front, pages committed as they grow, never moved; the big, randomly read ones on huge pages ([`huge`]) |
 //! | per-call scratch | [`scratch`]: buffers per worker, grown once to their high-water mark, lent for a closure or until dropped |
+//! | tables made and dropped whole, grown by a new one twice the last | [`blocks`]: power-of-two blocks from a region per size class, recycled through lock-free stacks; [`blocks::Slice`] is `Box<[T]>` in one |
 //!
 //! Every allocator is tagged with its subsystem ([`Tag`]); [`tag`] keeps live bytes, the
 //! high-water mark and the bytes handed out per tag, which memory admission and the agent API
@@ -28,8 +29,9 @@
 //! SwissTable group probe every interner shares is [`swiss`]'s.
 //!
 //! Unsafe code is confined to [`os`] (the kernel's virtual memory), [`vm`] (that memory for a
-//! caller that lays out its own reservation, over `os`) and the few lines in each
-//! allocator that turn a committed address into a typed place; every block says which
+//! caller that lays out its own reservation, over `os`), the few lines in each
+//! allocator that turn a committed address into a typed place, and [`lock`]'s guard (a lock
+//! that never allocates, which `std`'s does on macOS); every block says which
 //! invariant holds and where it is upheld (docs/v2/plan/design/unsafe.md).
 
 #![feature(allocator_api, allocator_ext)]
@@ -37,12 +39,14 @@
 pub mod align;
 pub mod append;
 pub mod arena;
+pub mod blocks;
 pub mod chunks;
 pub mod column;
 mod error;
 pub mod frame;
 pub mod handle;
 pub mod huge;
+pub mod lock;
 mod os;
 pub mod pool;
 pub mod region;

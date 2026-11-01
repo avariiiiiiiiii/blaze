@@ -335,6 +335,10 @@ fn old_match_attr_flags(
                         }
                         _ => {}
                     },
+                    "blaze" => match &*second_segment {
+                        "may_suspend" => attr_flags.insert(AttrFlags::MAY_SUSPEND),
+                        _ => {}
+                    },
                     _ => {}
                 },
             }
@@ -353,6 +357,7 @@ fn gating_flags(root: view::Node<'_>, meta: &ast::Meta) -> AttrFlags {
         ("link_section", AttrFlags::HAS_LINK_SECTION),
         ("linkage", AttrFlags::HAS_LINKAGE),
         ("rustc_diagnostic_item", AttrFlags::HAS_DIAGNOSTIC_ITEM),
+        ("must_not_suspend", AttrFlags::MUST_NOT_SUSPEND),
     ];
     // Every word flag set for one segment only, the old walk had none of them.
     const WORD: &[(&str, AttrFlags)] = &[
@@ -372,6 +377,7 @@ fn gating_flags(root: view::Node<'_>, meta: &ast::Meta) -> AttrFlags {
         ("rustc_deny_explicit_impl", AttrFlags::RUSTC_DENY_EXPLICIT_IMPL),
         ("rustc_no_mir_inline", AttrFlags::RUSTC_NO_MIR_INLINE),
         ("cold", AttrFlags::COLD),
+        ("must_not_suspend", AttrFlags::MUST_NOT_SUSPEND),
     ];
     const TOKEN_TREE: &[(&str, AttrFlags)] = &[
         ("sanitize", AttrFlags::HAS_SANITIZE),
@@ -419,7 +425,8 @@ const GATING: AttrFlags = AttrFlags::HAS_EXPORT_NAME
     .union(AttrFlags::RUSTC_NO_MIR_INLINE)
     .union(AttrFlags::COLD)
     .union(AttrFlags::OPTIMIZE_NONE)
-    .union(AttrFlags::HAS_INSTRUCTION_SET);
+    .union(AttrFlags::HAS_INSTRUCTION_SET)
+    .union(AttrFlags::MUST_NOT_SUSPEND);
 
 /// `attr` on a function, parsed.
 fn parse_of(attr: &str) -> Parse<SourceFile> {
@@ -478,6 +485,7 @@ fn corpus() -> Vec<String> {
             format!("#[rust_analyzer::{name}]"),
             format!("#[rust_analyzer::{name}(braces)]"),
             format!("#[diagnostic::{name}]"),
+            format!("#[blaze::{name}]"),
             format!("#[unsafe({name})]"),
         ] {
             corpus.push(form);
@@ -1174,6 +1182,61 @@ pub fn two_segments() {}
     }
     assert!(!flags("NotInsignificant").contains(AttrFlags::RUSTC_INSIGNIFICANT_DTOR));
     assert!(!flags("two_segments").contains(AttrFlags::RUSTC_AS_PTR));
+}
+
+/// `#[blaze::may_suspend]` on a function or a field, and rustc's `#[must_not_suspend]` (a word
+/// or `= "reason"`) on an ADT, are the bits hir-ty-suspend tests; neither in another shape.
+#[test]
+fn suspend_attributes_are_flags() {
+    let db = fixture::db(
+        r#"
+#[blaze::may_suspend]
+pub fn parks() {}
+#[may_suspend]
+pub fn one_segment() {}
+#[a::blaze::may_suspend]
+pub fn three_segments() {}
+#[blaze::may_suspend(x)]
+pub fn with_arguments() {}
+pub struct Holder {
+    #[blaze::may_suspend] f: fn(),
+    g: fn(),
+}
+#[must_not_suspend]
+pub struct Guard;
+#[must_not_suspend = "a lock is held"]
+pub enum Reasoned { A }
+#[a::must_not_suspend]
+pub struct TwoSegments;
+"#,
+    )
+    .into_db();
+    let def_map = crate_def_map(&db, db.fetch_test_crate());
+    let scope = def_map.module(&db, def_map.root).scope(&db);
+    let def = |name: &str| {
+        let (_, per_ns) = scope.entries().find(|(it, _)| it.as_str() == name).unwrap();
+        match per_ns.take_types().or(per_ns.take_values()).unwrap() {
+            ModuleDefId::AdtId(it) => AttrDefId::AdtId(it),
+            ModuleDefId::FunctionId(it) => AttrDefId::FunctionId(it),
+            it => panic!("{it:?}"),
+        }
+    };
+    let flags = |name: &str| AttrFlags::query(&db, def(name));
+    assert!(flags("parks").contains(AttrFlags::MAY_SUSPEND));
+    for name in ["one_segment", "three_segments", "with_arguments"] {
+        assert!(!flags(name).contains(AttrFlags::MAY_SUSPEND), "{name}");
+    }
+    let AttrDefId::AdtId(AdtId::StructId(holder)) = def("Holder") else { panic!("Holder") };
+    let field = |at: u32| {
+        let local_id = Idx::from_raw(RawIdx::from_u32(at));
+        AttrFlags::query_field(&db, FieldId { parent: VariantId::StructId(holder), local_id })
+    };
+    assert_eq!(field(0), AttrFlags::MAY_SUSPEND);
+    assert_eq!(field(1), AttrFlags::empty());
+    for name in ["Guard", "Reasoned"] {
+        assert!(flags(name).contains(AttrFlags::MUST_NOT_SUSPEND), "{name}");
+    }
+    assert!(!flags("TwoSegments").contains(AttrFlags::MUST_NOT_SUSPEND));
 }
 
 /// The items of the root module of `db`'s test crate, their enums' variants and its impls.

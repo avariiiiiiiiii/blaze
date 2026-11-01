@@ -162,6 +162,22 @@ WHERE build_id = $build
 GROUP BY name
 ORDER BY total_ms DESC
 
+-- name: frame_copies_per_query_kind
+-- says: the query kinds whose task frames copied most to grow blocks in a build: moves, KiB copied, and how many of their runs copied at all
+SELECT
+    query_kind,
+    count(*) AS runs,
+    count(*) FILTER (WHERE frame_grow_copies > 0) AS runs_that_copied,
+    sum(frame_grow_copies) AS copies,
+    round(sum(frame_copied_bytes) / 1024, 1) AS copied_kib,
+    max(frame_copied_bytes) AS most_bytes_one_run,
+    round(sum(frame_copied_bytes) / sum(alloc_bytes), 4) AS copied_per_allocated_byte
+FROM queries
+WHERE build_id = $build AND frame_grow_copies IS NOT NULL
+GROUP BY query_kind
+ORDER BY sum(frame_copied_bytes) DESC
+LIMIT $limit
+
 -- name: jobs_by_stack_high_water
 -- says: a build's jobs ranked by how deep they went on their fiber's stack and past it, in KiB, beside what the fiber reserved
 SELECT

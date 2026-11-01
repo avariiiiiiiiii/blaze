@@ -17,7 +17,7 @@ use arrow_schema::{ArrowError, DataType, SchemaRef};
 use rustc_hash::FxHashMap;
 
 use crate::{
-    flight::{self, CounterRow, Read, SpanRow, ThreadNow},
+    flight::{self, CounterRow, Read, SpanRow, SwitchRow, ThreadNow, WaitedOn},
     sampler::Sample,
     schema::{self, Table},
 };
@@ -42,12 +42,11 @@ impl Process<'static> {
 
 /// The Arrow schema of `table`, made once a process.
 pub fn schema_of(table: &'static Table) -> SchemaRef {
-    const ALL: usize = schema::TABLES.len() + 2;
+    const ALL: usize = schema::TABLES.len() + schema::RESULTS.len();
     static SCHEMAS: [OnceLock<SchemaRef>; ALL] = [const { OnceLock::new() }; ALL];
-    let results = [&schema::TILES, &schema::OPEN];
     let at = schema::TABLES
         .iter()
-        .chain(&results)
+        .chain(&schema::RESULTS)
         .position(|it| it.name == table.name)
         .unwrap_or_else(|| unreachable!("{} is a table of the schema", table.name));
     let it = &SCHEMAS[at];
@@ -163,6 +162,8 @@ pub fn spans(spans: &[SpanRow], process: Process<'_>) -> Result<RecordBatch, Arr
         crates.finish(UInt32Array::from(crate_keys))?,
         column(StringArray::from(functions)),
         column(StringArray::from(units)),
+        column(UInt64Array::from_iter(spans.iter().map(|it| it.copied.map(|it| it.copies)))),
+        column(UInt64Array::from_iter(spans.iter().map(|it| it.copied.map(|it| it.bytes)))),
     ];
     RecordBatch::try_new(schema_of(&schema::SPANS), columns)
 }
@@ -238,6 +239,36 @@ pub(crate) fn samples(
         column(UInt64Array::new_null(rows)),
     ];
     RecordBatch::try_new(schema, columns)
+}
+
+/// The `switches` rows of `switches`, all from `process`.
+pub fn switches(switches: &[SwitchRow], process: Process<'_>) -> Result<RecordBatch, ArrowError> {
+    let rows = switches.len();
+    let (mut threads, mut events, mut kinds) = (Dict::new(), Dict::new(), Dict::new());
+    // alloc: a batch's keys, once a read
+    let (mut thread_keys, mut event_keys, mut kind_keys) =
+        (Vec::with_capacity(rows), Vec::with_capacity(rows), Vec::with_capacity(rows));
+    for row in switches {
+        thread_keys.push(threads.key(u64::from(row.thread_name), || flight::name(row.thread_name).unwrap_or("?")));
+        event_keys.push(events.key(row.event as u64, || row.event.name()));
+        kind_keys.push(row.waited.map(|(on, _)| kinds.key(on as u64, || on.name())));
+    }
+    let value = |row: &SwitchRow| row.waited.filter(|(on, _)| *on != WaitedOn::Moved).map(|(_, value)| value);
+    // alloc: a batch's list of columns, once a read
+    let columns: Vec<ArrayRef> = vec![
+        column(UInt64Array::from_iter(switches.iter().map(|it| build_id(it.build)))),
+        column(UInt32Array::from_value(process.pid, rows)),
+        column(UInt32Array::from_iter_values(switches.iter().map(|it| it.thread))),
+        threads.finish(UInt32Array::from(thread_keys))?,
+        column(Int64Array::from_iter_values(switches.iter().map(|it| it.t_ns))),
+        events.finish(UInt32Array::from(event_keys))?,
+        column(UInt64Array::from_iter_values(switches.iter().map(|it| it.job))),
+        column(UInt32Array::from_iter_values(switches.iter().map(|it| it.fiber))),
+        column(UInt32Array::from_iter_values(switches.iter().map(|it| it.core))),
+        kinds.finish(UInt32Array::from(kind_keys))?,
+        column(UInt64Array::from_iter(switches.iter().map(value))),
+    ];
+    RecordBatch::try_new(schema_of(&schema::SWITCHES), columns)
 }
 
 /// Both tables of a read: `spans` then `counters`.

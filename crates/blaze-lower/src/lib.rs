@@ -841,7 +841,7 @@ fn checked<'a>(crates: &'a Crates, run: usize, ran: &Ran) -> Result<(&'a Lowerin
     Ok((lowering, cfgs))
 }
 
-const IDENTITY: &str = "blaze v2 cargo unit identity 1";
+const IDENTITY: &str = "blaze v2 cargo unit identity 2";
 
 /// [`Lowered::identity`] of `krate`, each crate of its closure worked out once into `known`,
 /// dependencies first, with a stack of its own rather than the thread's.
@@ -863,7 +863,13 @@ fn identity_of(db: &Db, krate: Crate, known: &mut FxHashMap<Crate, ContentId>) -
         }
         let root = db.file_source_root(data.root_file_id).source_root_id(db);
         let mut hasher = Hasher::new(IDENTITY);
-        hasher.id(&at.content(db)).id(&db.source_root(root).content(db)).id(&process);
+        hasher.id(&at.content(db)).id(&db.source_root(root).content(db));
+        // The standard library's crates read no variable of the process (`env!` of one is
+        // their crate's alone, as a std built elsewhere has it), so a workspace's
+        // environment names no std crate apart.
+        if !data.origin.is_lang() {
+            hasher.id(&process);
+        }
         hasher.update(&(data.dependencies.len() as u64).to_le_bytes());
         for dep in &data.dependencies {
             hasher.id(&known[&dep.crate_id]);

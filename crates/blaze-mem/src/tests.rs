@@ -844,6 +844,61 @@ fn frame_interleaved_vecs_keep_their_contents() {
     assert_eq!(*boxed, [7; 32]);
 }
 
+/// What `f`'s task's frame copied growing blocks, as the task's end reports it.
+fn copied_by_task(f: impl FnOnce(&Frame)) -> tag::Copied {
+    let before = tag::copied_on_thread();
+    frame::task(Tag::Infer, f);
+    let after = tag::copied_on_thread();
+    tag::Copied { copies: after.copies - before.copies, bytes: after.bytes - before.bytes }
+}
+
+#[test]
+fn two_frame_vecs_growing_interleaved_in_one_task_report_copies_and_one_alone_none() {
+    let alone = copied_by_task(|frame| {
+        let mut a: Vec<u64, &Frame> = Vec::new_in(frame);
+        for i in 0..10_000 {
+            a.push(i);
+        }
+        assert_eq!(a.len(), 10_000);
+    });
+    assert_eq!(alone, tag::Copied::default(), "a vector growing alone is the frame's last block and grows in place");
+
+    let line_before = tag::snapshot().get(Tag::Infer);
+    let mut last_capacity = 0;
+    let interleaved = copied_by_task(|frame| {
+        let mut a: Vec<u64, &Frame> = Vec::new_in(frame);
+        let mut b: Vec<u64, &Frame> = Vec::new_in(frame);
+        for i in 0..10_000 {
+            a.push(i);
+            b.push(i);
+        }
+        assert!(a.iter().zip(&b).enumerate().all(|(i, (&a, &b))| a == i as u64 && b == i as u64));
+        last_capacity = a.capacity().min(b.capacity());
+    });
+    assert!(interleaved.copies >= 2, "each vector moved when it grew under the other: {interleaved:?}");
+    // The last move of the vector below copied at least half its final capacity.
+    assert!(interleaved.bytes >= (last_capacity / 2 * size_of::<u64>()) as u64, "{interleaved:?}");
+    let line_after = tag::snapshot().get(Tag::Infer);
+    assert!(line_after.grow_copies - line_before.grow_copies >= interleaved.copies, "the tag's line counts them too");
+    assert!(line_after.grow_copied - line_before.grow_copied >= interleaved.bytes);
+
+    let mut frame = Frame::new(Tag::Infer).expect("reserve");
+    {
+        let mut a: Vec<u8, &Frame> = Vec::new_in(&frame);
+        let mut b: Vec<u8, &Frame> = Vec::new_in(&frame);
+        for i in 0..1000 {
+            a.push(i as u8);
+            b.push(i as u8);
+        }
+    }
+    let copied = frame.copied();
+    assert!(copied.copies > 0);
+    let before = tag::copied_on_thread();
+    frame.reset();
+    assert_eq!(frame.copied(), tag::Copied::default(), "a reset starts the count again");
+    assert_eq!(tag::copied_on_thread().copies - before.copies, copied.copies, "a reset reports the frame's copies");
+}
+
 #[test]
 fn frame_values_are_aligned_and_disjoint() {
     let frame = Frame::new(Tag::Mir).expect("reserve");

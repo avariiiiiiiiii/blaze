@@ -40,8 +40,16 @@ const RANGES: usize = 8;
 ///
 /// `item(at)` for distinct `at` below `len()`, each called once, from any threads at once, gives
 /// items that no other call's item aliases mutably and that may be used on the calling thread.
+/// When [`Source::AGAIN`], `item(at)` may be called once more after the call that took `at`
+/// unwound, and gives an item as sound as the first.
 pub unsafe trait Source: Sync {
     type Item;
+
+    /// Whether an index may be taken again once the call that took it unwound: a borrowed
+    /// item may, as nothing of the first is left; an owned one may not, as the unwind dropped
+    /// it. A loop runs an item that gave way ([`crate::Cancelled`] for a cycle) on another
+    /// worker again on its caller's thread only when this holds.
+    const AGAIN: bool = false;
 
     fn len(&self) -> usize;
 
@@ -77,6 +85,8 @@ pub struct Slice<'a, T>(&'a [T]);
 unsafe impl<'a, T: Sync> Source for Slice<'a, T> {
     type Item = &'a T;
 
+    const AGAIN: bool = true;
+
     fn len(&self) -> usize {
         self.0.len()
     }
@@ -104,9 +114,12 @@ impl<'a, T> SliceMut<'a, T> {
     }
 }
 
-// SAFETY: as for `Sync`: `item` is called once per index, so each `&mut T` is the only one.
+// SAFETY: as for `Sync`: `item` is called once per index, or again once the first call's
+// reference is gone with its unwind, so each `&mut T` is the only one.
 unsafe impl<'a, T: Send> Source for SliceMut<'a, T> {
     type Item = &'a mut T;
+
+    const AGAIN: bool = true;
 
     fn len(&self) -> usize {
         self.len
@@ -174,6 +187,8 @@ pub struct Indices(Range<usize>);
 unsafe impl Source for Indices {
     type Item = usize;
 
+    const AGAIN: bool = true;
+
     fn len(&self) -> usize {
         self.0.len()
     }
@@ -190,6 +205,8 @@ pub struct Zip<A, B>(A, B);
 // longer's items are dropped by `rest`.
 unsafe impl<A: Source, B: Source> Source for Zip<A, B> {
     type Item = (A::Item, B::Item);
+
+    const AGAIN: bool = A::AGAIN && B::AGAIN;
 
     fn len(&self) -> usize {
         self.0.len().min(self.1.len())
@@ -215,6 +232,8 @@ pub struct Enumerate<S>(S);
 // SAFETY: as `S`'s.
 unsafe impl<S: Source> Source for Enumerate<S> {
     type Item = (usize, S::Item);
+
+    const AGAIN: bool = S::AGAIN;
 
     fn len(&self) -> usize {
         self.0.len()

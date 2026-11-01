@@ -64,6 +64,20 @@ outermost first. `?` marks a nullable column.
 | crate | dict? | the crate it was of, from its field `crate` |
 | function | utf8? | the function it was of, from its field `function` or `subject` |
 | unit | utf8? | the codegen unit it was of, from its field `unit` |
+| frame_grow_copies | u64? | blocks its thread's task frames moved to grow them while it was open; null when not counted or closed on another thread |
+| frame_copied_bytes | u64? | bytes those moves copied |
+
+A `Vec` in a frame grows in place while it is the frame's last block. Once something is
+allocated after it, it moves when it grows, copied whole. blaze-mem counts those moves per
+frame in two `Cell`s, on the slow path only. The frame reports them at task end
+(`tag::task_ended`), to the tag's totals (`Counters::grow_copies` and `grow_copied`) and to the
+thread's running total (`tag::copied_on_thread`). A span's part is the difference across it,
+noted only when the span closes on the thread it began on.
+- A span that copied gets one extra ring row after its own, so a span that copied nothing
+  costs nothing more.
+- The columns are at the end of the table so that adding them keeps the schema version.
+- `frame_copies_per_query_kind` ranks query kinds by bytes copied. That ranking decides
+  whether blaze needs a second growth frame per worker.
 
 ### `counters`: one row a value of a counter at an instant
 

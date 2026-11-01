@@ -10,10 +10,13 @@
 //! a task waits for the task that runs the key it asked ([`Flights::get_or_run`]), a task that
 //! pumped waits for the job above it on its thread, and a task in a scope
 //! ([`crate::pool::Scope`], so every loop of [`crate::par`]) waits for each job of it that has
-//! started, wherever it runs. A wait whose edge would close a cycle is refused.
+//! started, wherever it runs. A scope's owner holds across that wait only the runs it began
+//! before the scope, so a wait reaches its jobs only through such a run; a run it began inside
+//! the scope (in an item it runs itself) ends before it waits. A wait whose edge would close a
+//! cycle is refused.
 //!
 //! The graph costs nothing until a task waits. Each thread publishes its stack in a [`Stack`]
-//! of its own (512 bytes, 128-byte aligned, written by its thread alone): starting a job is
+//! of its own (768 bytes, 128-byte aligned, written by its thread alone): starting a job is
 //! four stores to it and ending one a fifth, and the edge to the job above is read from it.
 //! A wait's own edge, to the runner it waits for, sits beside the task in the same slot. Only
 //! a wait takes the one process-wide lock ([`WAITS`]), to check and add its edge as one step; a
@@ -38,7 +41,7 @@ use std::{
 };
 
 use blaze_mem::{Column, Tag as MemTag};
-use rustc_hash::{FxBuildHasher, FxHashSet};
+use rustc_hash::{FxBuildHasher, FxHashMap};
 
 use crate::{
     Cancelled, Key,
@@ -91,18 +94,27 @@ const DEPTH_MASK: u64 = (1 << (THREAD_SHIFT - DEPTH_SHIFT)) - 1;
 const CLIENT: u64 = DEPTH_MASK;
 const _: () = assert!(PUMP_DEPTH < CLIENT as usize);
 
-/// A task as the cycle check sees it: its id (0 for none), the runner of the key it waits
-/// for (0 for none; written under [`WAITS`]) and the task that waits for it to end, the one
-/// that submitted it as a scope's job (0 for none; see [`waited_by`]). 24 bytes.
+/// A task as the cycle check sees it: its id (0 for none); the runner of the key it waits for
+/// and when that run began ([`next_seq`] on the runner's thread), 0 for none, both written under
+/// [`WAITS`]; and, for a scope's job, the scope's owner, which waits for it to end, and when
+/// the scope began (0 for none; see [`waited_by`]). 40 bytes.
 struct Published {
     task: AtomicU64,
     on: AtomicU64,
+    on_since: AtomicU64,
     parent: AtomicU64,
+    parent_since: AtomicU64,
 }
 
 impl Published {
     const fn new() -> Published {
-        Published { task: AtomicU64::new(0), on: AtomicU64::new(0), parent: AtomicU64::new(0) }
+        Published {
+            task: AtomicU64::new(0),
+            on: AtomicU64::new(0),
+            on_since: AtomicU64::new(0),
+            parent: AtomicU64::new(0),
+            parent_since: AtomicU64::new(0),
+        }
     }
 }
 
@@ -122,7 +134,7 @@ struct Stack {
 }
 
 #[cfg(not(blaze_check))]
-const _: () = assert!(size_of::<Stack>() == 512);
+const _: () = assert!(size_of::<Stack>() == 768);
 
 impl Stack {
     fn new() -> Stack {
@@ -263,13 +275,45 @@ pub(crate) fn current() -> u64 {
     })
 }
 
+thread_local! {
+    static SEQ: Cell<u64> = const { Cell::new(0) };
+    static GAVE_WAY: Cell<u64> = const { Cell::new(0) };
+}
+
+/// How many waits on this thread have given way ([`Cancelled`] for a cycle): a loop tells an
+/// item that unwound because it gave way, which it may run again where the cycle is its own,
+/// from one that failed.
+pub(crate) fn gave_way() -> u64 {
+    GAVE_WAY.with(Cell::get)
+}
+
+fn give_way() -> Cancelled {
+    GAVE_WAY.with(|it| it.set(it.get() + 1));
+    Cancelled
+}
+
+/// A number larger than every one this thread gave before (from 1): orders the start of a
+/// task's runs against the start of its scopes, all on the task's own thread.
+pub(crate) fn next_seq() -> u64 {
+    SEQ.with(|seq| {
+        let next = seq.get() + 1;
+        seq.set(next);
+        next
+    })
+}
+
 /// Says the task this thread runs now (a scope's job, at its start) is waited for by `parent`,
-/// the task that submitted it and waits in its scope for it to end. The edge needs no check:
-/// a task just started waits for nobody yet, so no cycle runs through it.
-pub(crate) fn waited_by(parent: u64) {
+/// the scope's owner, which waits in the scope for it to end, and that the scope began at
+/// `since` ([`next_seq`] on the owner's thread). The owner holds across that wait only the
+/// runs it began before `since`; a run it began after (in an item it runs itself) ends before
+/// it waits. The edge needs no check: a task just started waits for nobody yet, so no cycle
+/// runs through it.
+pub(crate) fn waited_by(parent: u64, since: u64) {
     ME.with(|me| {
         if let Some(len) = (me.stack.len.load(Ordering::Relaxed) as usize).checked_sub(1) {
-            me.stack.tasks[len].parent.store(parent, Ordering::Release);
+            let entry = &me.stack.tasks[len];
+            entry.parent_since.store(since, Ordering::Relaxed);
+            entry.parent.store(parent, Ordering::Release);
         }
     });
 }
@@ -303,36 +347,52 @@ fn edges(task: u64) -> (u64, u64) {
     (entry.on.load(Ordering::Relaxed), above)
 }
 
+/// When the run `task` waits for began, 0 when it waits for none or has ended.
+fn on_since(task: u64) -> u64 {
+    published(task).map_or(0, |entry| entry.on_since.load(Ordering::Relaxed))
+}
+
 /// The cycle check's scratch, kept between checks.
 struct Walk {
-    next: Vec<u64>,
-    seen: FxHashSet<u64>,
-    /// Each live scope job as (the task that waits for it, the job), read at the check's start.
-    children: Vec<(u64, u64)>,
+    /// Tasks to visit, each with when the run it was reached for began (0 when reached as a
+    /// job some task waits for whole: the job above a pump, a scope's job).
+    next: Vec<(u64, u64)>,
+    /// Each task visited, with the earliest run it was reached for.
+    seen: FxHashMap<u64, u64>,
+    /// Each live scope job as (its scope's owner, when the scope began, the job), read at the
+    /// check's start.
+    children: Vec<(u64, u64, u64)>,
 }
 
 impl Walk {
-    /// Whether `from` waits, through any chain, for `to`. The graph without the edge being
-    /// checked has no cycle (each edge was checked as it was added, and an edge to a job just
-    /// pumped or just started for a scope cannot close one), so the walk ends.
-    fn reaches(&mut self, from: u64, to: u64) -> bool {
+    /// Whether `from`, the runner of a run begun at `since`, waits through any chain for `to`.
+    /// A scope's owner reached for a run waits for the scope's jobs only when the run began
+    /// before the scope: one begun after ends before the owner waits. The graph without the
+    /// edge being checked has no cycle (each edge was checked as it was added, and an edge to a
+    /// job just pumped or just started for a scope cannot close one), so the walk ends.
+    fn reaches(&mut self, from: u64, since: u64, to: u64) -> bool {
         self.next.clear();
         self.seen.clear();
         self.read_children();
-        self.next.push(from);
-        while let Some(task) = self.next.pop() {
+        self.next.push((from, since));
+        while let Some((task, came)) = self.next.pop() {
             if task == to {
                 return true;
             }
-            if task == 0 || !self.seen.insert(task) {
+            if task == 0 {
                 continue;
             }
+            match self.seen.entry(task) {
+                Entry::Occupied(mut was) if came < *was.get() => _ = was.insert(came),
+                Entry::Occupied(_) => continue,
+                Entry::Vacant(slot) => _ = slot.insert(came),
+            }
             let (on, above) = edges(task);
-            self.next.push(on);
-            self.next.push(above);
-            for &(parent, child) in &self.children {
-                if parent == task {
-                    self.next.push(child);
+            self.next.push((on, on_since(task)));
+            self.next.push((above, 0));
+            for &(parent, scope, child) in &self.children {
+                if parent == task && came < scope {
+                    self.next.push((child, 0));
                 }
             }
         }
@@ -349,8 +409,9 @@ impl Walk {
             for entry in &stack.tasks[..len] {
                 let task = entry.task.load(Ordering::Acquire);
                 let parent = entry.parent.load(Ordering::Acquire);
+                let scope = entry.parent_since.load(Ordering::Relaxed);
                 if task != 0 && parent != 0 && entry.task.load(Ordering::Acquire) == task {
-                    self.children.push((parent, task));
+                    self.children.push((parent, scope, task));
                 }
             }
         }
@@ -361,7 +422,7 @@ impl Walk {
 static WAITS: Lock<Walk> = Lock::new(Walk {
     // alloc: none, empty: the check's scratch, kept for the process
     next: Vec::new(),
-    seen: FxHashSet::with_hasher(FxBuildHasher),
+    seen: FxHashMap::with_hasher(FxBuildHasher),
     // alloc: none, empty: as `next`
     children: Vec::new(),
 });
@@ -437,10 +498,18 @@ struct Waiters<V>(*const Waiter<V>);
 // runner once it took the list out, and the runner sends it a `V` (hence `V: Send`).
 unsafe impl<V: Send> Send for Waiters<V> {}
 
-/// A run under way, in its key's shard: 16 bytes beside its key.
+/// A run under way, in its key's shard: 24 bytes beside its key.
 struct InFlight<V> {
     runner: u64,
+    /// When the run began, on its runner's thread ([`next_seq`]).
+    since: u64,
     waiters: Waiters<V>,
+}
+
+impl<V> InFlight<V> {
+    fn new(runner: u64) -> InFlight<V> {
+        InFlight { runner, since: next_seq(), waiters: Waiters(ptr::null()) }
+    }
 }
 
 /// One shard of the runs under way, by key. 128-byte aligned, so no two shards' locks share
@@ -560,7 +629,7 @@ impl<V: Clone + Send + Sync + 'static> Flights<V> {
         let me = on_fiber.map_or_else(current, fiber_task);
         match self.shard(&key).lock().entry(key) {
             Entry::Vacant(slot) => {
-                slot.insert(InFlight { runner: me, waiters: Waiters(ptr::null()) });
+                slot.insert(InFlight::new(me));
                 if on_fiber.is_some() {
                     self.claim_flight(key, me);
                 }
@@ -616,7 +685,7 @@ impl<V: Clone + Send + Sync + 'static> Flights<V> {
         let mut shard = self.shard(&key).lock();
         let entry = match shard.entry(key) {
             Entry::Vacant(slot) => {
-                slot.insert(InFlight { runner: me, waiters: Waiters(ptr::null()) });
+                slot.insert(InFlight::new(me));
                 self.claim_flight(key, me);
                 return None;
             }
@@ -639,21 +708,22 @@ impl<V: Clone + Send + Sync + 'static> Flights<V> {
         let mut shard = self.shard(&key).lock();
         let entry = match shard.entry(key) {
             Entry::Vacant(slot) => {
-                slot.insert(InFlight { runner: me, waiters: Waiters(ptr::null()) });
+                slot.insert(InFlight::new(me));
                 return Ok(false);
             }
             Entry::Occupied(slot) => slot.into_mut(),
         };
-        let runner = entry.runner;
+        let (runner, since) = (entry.runner, entry.since);
         if runner == me {
             panic!("key {} is asked by the task that runs it: its value depends on itself", hex(&key));
         }
         {
             let mut waits = waits();
-            if waits.reaches(runner, me) {
-                return Err(Cancelled);
+            if waits.reaches(runner, since, me) {
+                return Err(give_way());
             }
             if let Some(mine) = published(me) {
+                mine.on_since.store(since, Ordering::Relaxed);
                 mine.on.store(runner, Ordering::Relaxed);
             }
         }
@@ -733,7 +803,7 @@ struct Ending<'a, V: Clone + Send + Sync + 'static> {
 impl<V: Clone + Send + Sync + 'static> Ending<'_, V> {
     fn end(&mut self, value: Option<&V>) {
         self.ended = true;
-        let Some(InFlight { runner, waiters }) = self.flights.shard(&self.key).lock().remove(&self.key)
+        let Some(InFlight { runner, waiters, .. }) = self.flights.shard(&self.key).lock().remove(&self.key)
         else {
             return;
         };
@@ -811,7 +881,7 @@ fn wait_on_fiber<V>(waiter: &Waiter<V>, flight: Key) -> Result<Option<V>, Cancel
     while waiter.state.load(Ordering::Acquire) == RUNNING {
         match fiber::wait(Wait::Key(flight)) {
             Some(Ok(())) => {}
-            Some(Err(_)) => return Err(Cancelled),
+            Some(Err(_)) => return Err(give_way()),
             None => unreachable!("a fiber task waits on its fiber"),
         }
         if waiter.state.load(Ordering::Acquire) == RUNNING {

@@ -9,6 +9,7 @@ mod const_check_drops;
 mod db;
 mod erase_regions;
 mod foreign;
+mod held_across_calls;
 #[path = "../../src/mir/optimize/inline/fixtures.rs"]
 mod inline;
 mod machine;

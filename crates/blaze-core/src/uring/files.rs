@@ -1203,7 +1203,7 @@ impl Uring {
             let cold = self.ops.cold(id);
             (cold.names[made_for(hot.kind)], cold.at as usize)
         };
-        let pushed = scratch::with_bytes(|dir| {
+        let pushed = scratch::with_bytes(|dir| -> io::Result<Option<(u32, usize)>> {
             // SAFETY: `path` is the request's name `made_for` its kind, a path its push put
             // NUL-terminated in `arena`, which the request holds while in flight.
             let path = unsafe { self.paths.name(arena, path) }.to_bytes();

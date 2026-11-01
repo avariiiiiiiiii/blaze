@@ -128,6 +128,63 @@
     "version": "2.13.2"
    },
    {
+    "name": "blaze-bytes",
+    "version": "0.0.0"
+   },
+   {
+    "dependencies": [
+     "blaze-rng",
+     "libc",
+     "rustc-hash 2.1.3",
+     "windows-sys 0.61.2"
+    ],
+    "name": "blaze-check",
+    "version": "0.0.0"
+   },
+   {
+    "dependencies": [
+     "blaze-bytes",
+     "blaze-mem",
+     "libc",
+     "windows-sys 0.61.2"
+    ],
+    "name": "blaze-inproc",
+    "version": "0.0.0"
+   },
+   {
+    "dependencies": [
+     "blaze-inproc",
+     "blaze-sha256"
+    ],
+    "name": "blaze-live",
+    "version": "0.1.0"
+   },
+   {
+    "dependencies": [
+     "blaze-check",
+     "blaze-reclaim",
+     "libc",
+     "windows-sys 0.61.2"
+    ],
+    "name": "blaze-mem",
+    "version": "0.0.0"
+   },
+   {
+    "dependencies": [
+     "blaze-check"
+    ],
+    "name": "blaze-reclaim",
+    "version": "0.0.0"
+   },
+   {
+    "name": "blaze-rng",
+    "version": "0.0.0"
+   },
+   {
+    "name": "blaze-sha256",
+    "version": "0.0.0"
+   },
+   {
     "checksum": "2c132eebf10f5cad5289222520a4a058514204aed6d791f1cf4fe8088b82d15f",
     "dependencies": [
      "objc2 0.5.3"
@@ -1077,8 +1134,8 @@
    },
    {
     "dependencies": [
-     "eframe",
-     "blaze-live"
+     "blaze-live",
+     "eframe"
     ],
     "name": "life",
     "version": "0.1.0"
@@ -1799,10 +1856,6 @@
     "name": "r-efi",
     "source": "registry+https://github.com/rust-lang/crates.io-index",
     "version": "6.0.0"
-   },
-   {
-    "name": "blaze-live",
-    "version": "0.1.0"
    },
    {
     "checksum": "20675572f6f24e9e76ef639bc5552774ed45f1c30e2951e1e99c59888861c539",
@@ -3185,6 +3238,57 @@
    },
    "version": "2.13.2"
   },
+  "blaze-bytes@0.0.0": {
+   "authors": "blaze contributors",
+   "description": "blaze v2's held bytes and text: a heap Arc, a range of a mapped image or a static, checked UTF-8 once and lent as &str, never copied; and the one copy of little-endian reads at an offset",
+   "homepage": "",
+   "license": "MIT OR Apache-2.0",
+   "license_file": "",
+   "links": null,
+   "name": "blaze-bytes",
+   "readme": "",
+   "repository": "https://github.com/indexable-inc/blaze",
+   "rust_version": "1.101",
+   "source": {
+    "dir": "crates/blaze-bytes",
+    "kind": "path"
+   },
+   "version": "0.0.0"
+  },
+  "blaze-check@0.0.0": {
+   "authors": "blaze contributors",
+   "description": "blaze's model checker for lock-free code: std's atomics, locks and threads as coroutines on one OS thread, explored under every interleaving to a preemption bound (loom's bounded DPOR) and every value a load may read under C11 (docs/v2/plan/lanes/safety/model.md)",
+   "homepage": "",
+   "license": "MIT OR Apache-2.0",
+   "license_file": "",
+   "links": null,
+   "name": "blaze-check",
+   "readme": "",
+   "repository": "https://github.com/indexable-inc/blaze",
+   "rust_version": "1.101",
+   "source": {
+    "dir": "crates/blaze-check",
+    "kind": "path"
+   },
+   "version": "0.0.0"
+  },
+  "blaze-inproc@0.0.0": {
+   "authors": "blaze contributors",
+   "description": "blaze v2's dev runs patched with one store: the executable written once per content key and started by the kernel, its code laid over before main by a code memory mapped writable in the daemon and executable in the run, fences for running threads, and the channel between them",
+   "homepage": "",
+   "license": "MIT OR Apache-2.0",
+   "license_file": "",
+   "links": null,
+   "name": "blaze-inproc",
+   "readme": "",
+   "repository": "https://github.com/indexable-inc/blaze",
+   "rust_version": "1.101",
+   "source": {
+    "dir": "crates/blaze-inproc",
+    "kind": "path"
+   },
+   "version": "0.0.0"
+  },
   "blaze-live@0.1.0": {
    "authors": "Indexable, Inc.",
    "description": "Applies blaze's edits to a program while it runs",
@@ -3201,6 +3305,74 @@
     "kind": "path"
    },
    "version": "0.1.0"
+  },
+  "blaze-mem@0.0.0": {
+   "authors": "blaze contributors",
+   "description": "blaze v2's memory, the way a game engine manages it: frame allocators per worker, request and revision arenas, pools with worker caches, reserved regions that never move, generational handles, and per-subsystem counters (docs/v2/plan/design/memory.md)",
+   "homepage": "",
+   "license": "MIT OR Apache-2.0",
+   "license_file": "",
+   "links": null,
+   "name": "blaze-mem",
+   "readme": "",
+   "repository": "https://github.com/indexable-inc/blaze",
+   "rust_version": "1.101",
+   "source": {
+    "dir": "crates/blaze-mem",
+    "kind": "path"
+   },
+   "version": "0.0.0"
+  },
+  "blaze-reclaim@0.0.0": {
+   "authors": "blaze contributors",
+   "description": "blaze v2's memory reclamation at task boundaries: a value unlinked from a shared table is freed once every thread that could still read it has ended its task (docs/v2/plan/design/concurrency.md)",
+   "homepage": "",
+   "license": "MIT OR Apache-2.0",
+   "license_file": "",
+   "links": null,
+   "name": "blaze-reclaim",
+   "readme": "",
+   "repository": "https://github.com/indexable-inc/blaze",
+   "rust_version": "1.101",
+   "source": {
+    "dir": "crates/blaze-reclaim",
+    "kind": "path"
+   },
+   "version": "0.0.0"
+  },
+  "blaze-rng@0.0.0": {
+   "authors": "blaze contributors",
+   "description": "blaze v2's one seeded SplitMix64, for tests, simulations and jitter; no dependencies, so the crates below blaze-ids use it too",
+   "homepage": "",
+   "license": "MIT OR Apache-2.0",
+   "license_file": "",
+   "links": null,
+   "name": "blaze-rng",
+   "readme": "",
+   "repository": "https://github.com/indexable-inc/blaze",
+   "rust_version": "1.101",
+   "source": {
+    "dir": "crates/blaze-rng",
+    "kind": "path"
+   },
+   "version": "0.0.0"
+  },
+  "blaze-sha256@0.0.0": {
+   "authors": "blaze contributors",
+   "description": "blaze's one SHA-256 (FIPS 180-4), in the processor's SHA-256 instructions where it has them; no dependencies, so build scripts take it as a build-dependency",
+   "homepage": "",
+   "license": "MIT OR Apache-2.0",
+   "license_file": "",
+   "links": null,
+   "name": "blaze-sha256",
+   "readme": "",
+   "repository": "https://github.com/indexable-inc/blaze",
+   "rust_version": "1.101",
+   "source": {
+    "dir": "crates/blaze-sha256",
+    "kind": "path"
+   },
+   "version": "0.0.0"
   },
   "block2@0.5.1": {
    "authors": "Steven Sheldon:Mads Marquart <mads@marquart.dk>",
@@ -8160,9 +8332,71 @@
      "src": "src/lib.rs",
      "target": "bitflags"
     },
-    "blaze-live@0.1.0 lib blaze_live build": {
+    "blaze-bytes@0.0.0 lib blaze_bytes build": {
      "crate_type": "lib",
      "deps": [],
+     "edition": "2024",
+     "features": [],
+     "kind": "lib",
+     "mode": "build",
+     "pkg": "blaze-bytes@0.0.0",
+     "profile": {
+      "codegen_units": null,
+      "debug_assertions": false,
+      "debuginfo": 0,
+      "name": "release",
+      "opt_level": "3",
+      "overflow_checks": false,
+      "panic": "unwind"
+     },
+     "src": "src/lib.rs",
+     "target": "blaze_bytes"
+    },
+    "blaze-inproc@0.0.0 lib blaze_inproc build": {
+     "crate_type": "lib",
+     "deps": [
+      {
+       "name": "blaze_bytes",
+       "unit": "blaze-bytes@0.0.0 lib blaze_bytes build"
+      },
+      {
+       "name": "blaze_mem",
+       "unit": "blaze-mem@0.0.0 lib blaze_mem build"
+      },
+      {
+       "name": "libc",
+       "unit": "libc@0.2.191 lib libc build"
+      }
+     ],
+     "edition": "2024",
+     "features": [],
+     "kind": "lib",
+     "mode": "build",
+     "pkg": "blaze-inproc@0.0.0",
+     "profile": {
+      "codegen_units": null,
+      "debug_assertions": false,
+      "debuginfo": 0,
+      "name": "release",
+      "opt_level": "3",
+      "overflow_checks": false,
+      "panic": "unwind"
+     },
+     "src": "src/lib.rs",
+     "target": "blaze_inproc"
+    },
+    "blaze-live@0.1.0 lib blaze_live build": {
+     "crate_type": "lib",
+     "deps": [
+      {
+       "name": "blaze_inproc",
+       "unit": "blaze-inproc@0.0.0 lib blaze_inproc build"
+      },
+      {
+       "name": "blaze_sha256",
+       "unit": "blaze-sha256@0.0.0 lib blaze_sha256 build"
+      }
+     ],
      "edition": "2024",
      "features": [],
      "kind": "lib",
@@ -8179,6 +8413,75 @@
      },
      "src": "src/lib.rs",
      "target": "blaze_live"
+    },
+    "blaze-mem@0.0.0 lib blaze_mem build": {
+     "crate_type": "lib",
+     "deps": [
+      {
+       "name": "blaze_reclaim",
+       "unit": "blaze-reclaim@0.0.0 lib blaze_reclaim build"
+      },
+      {
+       "name": "libc",
+       "unit": "libc@0.2.191 lib libc build"
+      }
+     ],
+     "edition": "2024",
+     "features": [],
+     "kind": "lib",
+     "mode": "build",
+     "pkg": "blaze-mem@0.0.0",
+     "profile": {
+      "codegen_units": null,
+      "debug_assertions": false,
+      "debuginfo": 0,
+      "name": "release",
+      "opt_level": "3",
+      "overflow_checks": false,
+      "panic": "unwind"
+     },
+     "src": "src/lib.rs",
+     "target": "blaze_mem"
+    },
+    "blaze-reclaim@0.0.0 lib blaze_reclaim build": {
+     "crate_type": "lib",
+     "deps": [],
+     "edition": "2024",
+     "features": [],
+     "kind": "lib",
+     "mode": "build",
+     "pkg": "blaze-reclaim@0.0.0",
+     "profile": {
+      "codegen_units": null,
+      "debug_assertions": false,
+      "debuginfo": 0,
+      "name": "release",
+      "opt_level": "3",
+      "overflow_checks": false,
+      "panic": "unwind"
+     },
+     "src": "src/lib.rs",
+     "target": "blaze_reclaim"
+    },
+    "blaze-sha256@0.0.0 lib blaze_sha256 build": {
+     "crate_type": "lib",
+     "deps": [],
+     "edition": "2024",
+     "features": [],
+     "kind": "lib",
+     "mode": "build",
+     "pkg": "blaze-sha256@0.0.0",
+     "profile": {
+      "codegen_units": null,
+      "debug_assertions": false,
+      "debuginfo": 0,
+      "name": "release",
+      "opt_level": "3",
+      "overflow_checks": false,
+      "panic": "unwind"
+     },
+     "src": "src/lib.rs",
+     "target": "blaze_sha256"
     },
     "block2@0.5.1 lib block2 build": {
      "crate_type": "lib",
@@ -12617,9 +12920,71 @@
      "src": "src/lib.rs",
      "target": "bitflags"
     },
-    "blaze-live@0.1.0 lib blaze_live build": {
+    "blaze-bytes@0.0.0 lib blaze_bytes build": {
      "crate_type": "lib",
      "deps": [],
+     "edition": "2024",
+     "features": [],
+     "kind": "lib",
+     "mode": "build",
+     "pkg": "blaze-bytes@0.0.0",
+     "profile": {
+      "codegen_units": null,
+      "debug_assertions": false,
+      "debuginfo": 0,
+      "name": "release",
+      "opt_level": "3",
+      "overflow_checks": false,
+      "panic": "unwind"
+     },
+     "src": "src/lib.rs",
+     "target": "blaze_bytes"
+    },
+    "blaze-inproc@0.0.0 lib blaze_inproc build": {
+     "crate_type": "lib",
+     "deps": [
+      {
+       "name": "blaze_bytes",
+       "unit": "blaze-bytes@0.0.0 lib blaze_bytes build"
+      },
+      {
+       "name": "blaze_mem",
+       "unit": "blaze-mem@0.0.0 lib blaze_mem build"
+      },
+      {
+       "name": "libc",
+       "unit": "libc@0.2.191 lib libc build"
+      }
+     ],
+     "edition": "2024",
+     "features": [],
+     "kind": "lib",
+     "mode": "build",
+     "pkg": "blaze-inproc@0.0.0",
+     "profile": {
+      "codegen_units": null,
+      "debug_assertions": false,
+      "debuginfo": 0,
+      "name": "release",
+      "opt_level": "3",
+      "overflow_checks": false,
+      "panic": "unwind"
+     },
+     "src": "src/lib.rs",
+     "target": "blaze_inproc"
+    },
+    "blaze-live@0.1.0 lib blaze_live build": {
+     "crate_type": "lib",
+     "deps": [
+      {
+       "name": "blaze_inproc",
+       "unit": "blaze-inproc@0.0.0 lib blaze_inproc build"
+      },
+      {
+       "name": "blaze_sha256",
+       "unit": "blaze-sha256@0.0.0 lib blaze_sha256 build"
+      }
+     ],
      "edition": "2024",
      "features": [],
      "kind": "lib",
@@ -12636,6 +13001,75 @@
      },
      "src": "src/lib.rs",
      "target": "blaze_live"
+    },
+    "blaze-mem@0.0.0 lib blaze_mem build": {
+     "crate_type": "lib",
+     "deps": [
+      {
+       "name": "blaze_reclaim",
+       "unit": "blaze-reclaim@0.0.0 lib blaze_reclaim build"
+      },
+      {
+       "name": "libc",
+       "unit": "libc@0.2.191 lib libc build"
+      }
+     ],
+     "edition": "2024",
+     "features": [],
+     "kind": "lib",
+     "mode": "build",
+     "pkg": "blaze-mem@0.0.0",
+     "profile": {
+      "codegen_units": null,
+      "debug_assertions": false,
+      "debuginfo": 0,
+      "name": "release",
+      "opt_level": "3",
+      "overflow_checks": false,
+      "panic": "unwind"
+     },
+     "src": "src/lib.rs",
+     "target": "blaze_mem"
+    },
+    "blaze-reclaim@0.0.0 lib blaze_reclaim build": {
+     "crate_type": "lib",
+     "deps": [],
+     "edition": "2024",
+     "features": [],
+     "kind": "lib",
+     "mode": "build",
+     "pkg": "blaze-reclaim@0.0.0",
+     "profile": {
+      "codegen_units": null,
+      "debug_assertions": false,
+      "debuginfo": 0,
+      "name": "release",
+      "opt_level": "3",
+      "overflow_checks": false,
+      "panic": "unwind"
+     },
+     "src": "src/lib.rs",
+     "target": "blaze_reclaim"
+    },
+    "blaze-sha256@0.0.0 lib blaze_sha256 build": {
+     "crate_type": "lib",
+     "deps": [],
+     "edition": "2024",
+     "features": [],
+     "kind": "lib",
+     "mode": "build",
+     "pkg": "blaze-sha256@0.0.0",
+     "profile": {
+      "codegen_units": null,
+      "debug_assertions": false,
+      "debuginfo": 0,
+      "name": "release",
+      "opt_level": "3",
+      "overflow_checks": false,
+      "panic": "unwind"
+     },
+     "src": "src/lib.rs",
+     "target": "blaze_sha256"
     },
     "bytemuck@1.25.2 lib bytemuck build": {
      "crate_type": "lib",
@@ -18315,9 +18749,71 @@
      "src": "src/lib.rs",
      "target": "bitflags"
     },
-    "blaze-live@0.1.0 lib blaze_live build": {
+    "blaze-bytes@0.0.0 lib blaze_bytes build": {
      "crate_type": "lib",
      "deps": [],
+     "edition": "2024",
+     "features": [],
+     "kind": "lib",
+     "mode": "build",
+     "pkg": "blaze-bytes@0.0.0",
+     "profile": {
+      "codegen_units": null,
+      "debug_assertions": false,
+      "debuginfo": 0,
+      "name": "release",
+      "opt_level": "3",
+      "overflow_checks": false,
+      "panic": "unwind"
+     },
+     "src": "src/lib.rs",
+     "target": "blaze_bytes"
+    },
+    "blaze-inproc@0.0.0 lib blaze_inproc build": {
+     "crate_type": "lib",
+     "deps": [
+      {
+       "name": "blaze_bytes",
+       "unit": "blaze-bytes@0.0.0 lib blaze_bytes build"
+      },
+      {
+       "name": "blaze_mem",
+       "unit": "blaze-mem@0.0.0 lib blaze_mem build"
+      },
+      {
+       "name": "libc",
+       "unit": "libc@0.2.191 lib libc build"
+      }
+     ],
+     "edition": "2024",
+     "features": [],
+     "kind": "lib",
+     "mode": "build",
+     "pkg": "blaze-inproc@0.0.0",
+     "profile": {
+      "codegen_units": null,
+      "debug_assertions": false,
+      "debuginfo": 0,
+      "name": "release",
+      "opt_level": "3",
+      "overflow_checks": false,
+      "panic": "unwind"
+     },
+     "src": "src/lib.rs",
+     "target": "blaze_inproc"
+    },
+    "blaze-live@0.1.0 lib blaze_live build": {
+     "crate_type": "lib",
+     "deps": [
+      {
+       "name": "blaze_inproc",
+       "unit": "blaze-inproc@0.0.0 lib blaze_inproc build"
+      },
+      {
+       "name": "blaze_sha256",
+       "unit": "blaze-sha256@0.0.0 lib blaze_sha256 build"
+      }
+     ],
      "edition": "2024",
      "features": [],
      "kind": "lib",
@@ -18334,6 +18830,75 @@
      },
      "src": "src/lib.rs",
      "target": "blaze_live"
+    },
+    "blaze-mem@0.0.0 lib blaze_mem build": {
+     "crate_type": "lib",
+     "deps": [
+      {
+       "name": "blaze_reclaim",
+       "unit": "blaze-reclaim@0.0.0 lib blaze_reclaim build"
+      },
+      {
+       "name": "libc",
+       "unit": "libc@0.2.191 lib libc build"
+      }
+     ],
+     "edition": "2024",
+     "features": [],
+     "kind": "lib",
+     "mode": "build",
+     "pkg": "blaze-mem@0.0.0",
+     "profile": {
+      "codegen_units": null,
+      "debug_assertions": false,
+      "debuginfo": 0,
+      "name": "release",
+      "opt_level": "3",
+      "overflow_checks": false,
+      "panic": "unwind"
+     },
+     "src": "src/lib.rs",
+     "target": "blaze_mem"
+    },
+    "blaze-reclaim@0.0.0 lib blaze_reclaim build": {
+     "crate_type": "lib",
+     "deps": [],
+     "edition": "2024",
+     "features": [],
+     "kind": "lib",
+     "mode": "build",
+     "pkg": "blaze-reclaim@0.0.0",
+     "profile": {
+      "codegen_units": null,
+      "debug_assertions": false,
+      "debuginfo": 0,
+      "name": "release",
+      "opt_level": "3",
+      "overflow_checks": false,
+      "panic": "unwind"
+     },
+     "src": "src/lib.rs",
+     "target": "blaze_reclaim"
+    },
+    "blaze-sha256@0.0.0 lib blaze_sha256 build": {
+     "crate_type": "lib",
+     "deps": [],
+     "edition": "2024",
+     "features": [],
+     "kind": "lib",
+     "mode": "build",
+     "pkg": "blaze-sha256@0.0.0",
+     "profile": {
+      "codegen_units": null,
+      "debug_assertions": false,
+      "debuginfo": 0,
+      "name": "release",
+      "opt_level": "3",
+      "overflow_checks": false,
+      "panic": "unwind"
+     },
+     "src": "src/lib.rs",
+     "target": "blaze_sha256"
     },
     "block2@0.5.1 lib block2 build": {
      "crate_type": "lib",
@@ -22772,9 +23337,71 @@
      "src": "src/lib.rs",
      "target": "bitflags"
     },
-    "blaze-live@0.1.0 lib blaze_live build": {
+    "blaze-bytes@0.0.0 lib blaze_bytes build": {
      "crate_type": "lib",
      "deps": [],
+     "edition": "2024",
+     "features": [],
+     "kind": "lib",
+     "mode": "build",
+     "pkg": "blaze-bytes@0.0.0",
+     "profile": {
+      "codegen_units": null,
+      "debug_assertions": false,
+      "debuginfo": 0,
+      "name": "release",
+      "opt_level": "3",
+      "overflow_checks": false,
+      "panic": "unwind"
+     },
+     "src": "src/lib.rs",
+     "target": "blaze_bytes"
+    },
+    "blaze-inproc@0.0.0 lib blaze_inproc build": {
+     "crate_type": "lib",
+     "deps": [
+      {
+       "name": "blaze_bytes",
+       "unit": "blaze-bytes@0.0.0 lib blaze_bytes build"
+      },
+      {
+       "name": "blaze_mem",
+       "unit": "blaze-mem@0.0.0 lib blaze_mem build"
+      },
+      {
+       "name": "libc",
+       "unit": "libc@0.2.191 lib libc build"
+      }
+     ],
+     "edition": "2024",
+     "features": [],
+     "kind": "lib",
+     "mode": "build",
+     "pkg": "blaze-inproc@0.0.0",
+     "profile": {
+      "codegen_units": null,
+      "debug_assertions": false,
+      "debuginfo": 0,
+      "name": "release",
+      "opt_level": "3",
+      "overflow_checks": false,
+      "panic": "unwind"
+     },
+     "src": "src/lib.rs",
+     "target": "blaze_inproc"
+    },
+    "blaze-live@0.1.0 lib blaze_live build": {
+     "crate_type": "lib",
+     "deps": [
+      {
+       "name": "blaze_inproc",
+       "unit": "blaze-inproc@0.0.0 lib blaze_inproc build"
+      },
+      {
+       "name": "blaze_sha256",
+       "unit": "blaze-sha256@0.0.0 lib blaze_sha256 build"
+      }
+     ],
      "edition": "2024",
      "features": [],
      "kind": "lib",
@@ -22791,6 +23418,75 @@
      },
      "src": "src/lib.rs",
      "target": "blaze_live"
+    },
+    "blaze-mem@0.0.0 lib blaze_mem build": {
+     "crate_type": "lib",
+     "deps": [
+      {
+       "name": "blaze_reclaim",
+       "unit": "blaze-reclaim@0.0.0 lib blaze_reclaim build"
+      },
+      {
+       "name": "libc",
+       "unit": "libc@0.2.191 lib libc build"
+      }
+     ],
+     "edition": "2024",
+     "features": [],
+     "kind": "lib",
+     "mode": "build",
+     "pkg": "blaze-mem@0.0.0",
+     "profile": {
+      "codegen_units": null,
+      "debug_assertions": false,
+      "debuginfo": 0,
+      "name": "release",
+      "opt_level": "3",
+      "overflow_checks": false,
+      "panic": "unwind"
+     },
+     "src": "src/lib.rs",
+     "target": "blaze_mem"
+    },
+    "blaze-reclaim@0.0.0 lib blaze_reclaim build": {
+     "crate_type": "lib",
+     "deps": [],
+     "edition": "2024",
+     "features": [],
+     "kind": "lib",
+     "mode": "build",
+     "pkg": "blaze-reclaim@0.0.0",
+     "profile": {
+      "codegen_units": null,
+      "debug_assertions": false,
+      "debuginfo": 0,
+      "name": "release",
+      "opt_level": "3",
+      "overflow_checks": false,
+      "panic": "unwind"
+     },
+     "src": "src/lib.rs",
+     "target": "blaze_reclaim"
+    },
+    "blaze-sha256@0.0.0 lib blaze_sha256 build": {
+     "crate_type": "lib",
+     "deps": [],
+     "edition": "2024",
+     "features": [],
+     "kind": "lib",
+     "mode": "build",
+     "pkg": "blaze-sha256@0.0.0",
+     "profile": {
+      "codegen_units": null,
+      "debug_assertions": false,
+      "debuginfo": 0,
+      "name": "release",
+      "opt_level": "3",
+      "overflow_checks": false,
+      "panic": "unwind"
+     },
+     "src": "src/lib.rs",
+     "target": "blaze_sha256"
     },
     "bytemuck@1.25.2 lib bytemuck build": {
      "crate_type": "lib",

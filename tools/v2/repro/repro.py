@@ -1,4 +1,4 @@
-"""Turns a failure blaze hits building a real crate into a minimal crate (docs/v2/plan/lanes/repro.md).
+"""Turns a failure blaze hits building a real crate into a minimal crate.
 
     PYTHONPATH=python/typed-input/src python3 tools/v2/repro/repro.py '<json>'
 

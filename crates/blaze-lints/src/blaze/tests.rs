@@ -52,6 +52,11 @@ pub mod alloc {
             alloc(size)
         }
     }
+    impl<A: Allocator> Allocator for &A {
+        fn allocate(&self, size: usize) -> *mut u8 {
+            (**self).allocate(size)
+        }
+    }
     #[lang = "exchange_malloc"]
     unsafe fn exchange_malloc(size: usize, _align: usize) -> *mut u8 {
         alloc(size)
@@ -121,6 +126,9 @@ pub mod vec {
         }
     }
     impl<T, A: Allocator> Vec<T, A> {
+        pub const fn new_in(alloc: A) -> Vec<T, A> {
+            Vec { ptr: 0 as *mut T, cap: 0, alloc }
+        }
         pub fn with_capacity_in(cap: usize, alloc: A) -> Vec<T, A> {
             let ptr = alloc.allocate(cap) as *mut T;
             Vec { ptr, cap, alloc }
@@ -292,7 +300,7 @@ const HOT_ATTR: &str = "#[deny(blaze::hot)]";
 fn lint_of(message: &str) -> Option<&'static str> {
     if message.starts_with("this `clone` of") {
         Some("hot_clone")
-    } else if message.contains("reaches the global allocator") {
+    } else if message.contains("the global allocator") {
         Some("hot_alloc")
     } else if message.contains("goes through the vtable") {
         Some("hot_dyn")
@@ -433,14 +441,14 @@ impl Iterator for Count {
 
 #[deny(blaze::hot)]
 fn hot(s: &str, v: &[u32], buf: &mut Vec<u32>) {
-    let _ = String::new();
+    let _ = String::new(); //~ hot_alloc
     let _ = String::from("x"); //~ hot_alloc
     let _ = s.to_string(); //~ hot_alloc
     let _ = s.to_owned(); //~ hot_alloc
     let _ = format!("x"); //~ hot_alloc
     let _ = format!("{}", 1); //~ hot_alloc
-    let _: Vec<u32> = Vec::new();
-    let _: Vec<u32> = vec![];
+    let _: Vec<u32> = Vec::new(); //~ hot_alloc
+    let _: Vec<u32> = vec![]; //~ hot_alloc
     let _ = vec![1u32, 2]; //~ hot_alloc
     let _ = v.to_vec(); //~ hot_alloc
     let _ = Vec::<u32>::with_capacity(4); //~ hot_alloc
@@ -496,6 +504,39 @@ fn exempt(s: &str) {
 }
 "#,
     );
+}
+
+/// A crate that denies `hot_alloc` (`[lints.blaze] hot_alloc = "deny"` gives the flag) fails on
+/// a fresh `Vec::new()`, `vec![]` or `String::new()`: each is an error, though none allocates
+/// until it grows. A `Vec` that names its allocator, and a line saying why it needs the global
+/// heap, pass.
+#[test]
+fn a_fresh_global_vec_in_a_crate_denying_hot_alloc_is_an_error() {
+    let main = r#"
+use std::alloc::Allocator;
+struct Frame;
+impl Allocator for Frame {
+    fn allocate(&self, _size: usize) -> *mut u8 {
+        0 as *mut u8
+    }
+}
+
+pub fn task(frame: &Frame) -> usize {
+    let fresh: Vec<u32> = Vec::new(); //~ hot_alloc
+    let empty: Vec<u32> = vec![]; //~ hot_alloc
+    let text = String::new(); //~ hot_alloc
+    let framed: Vec<u32, &Frame> = Vec::new_in(frame);
+    let kept: Vec<u32> = Vec::new(); // alloc: handed to the caller, who outlives the task
+    let _ = (fresh, empty, text, framed, kept);
+    0
+}
+"#;
+    let main = main.trim_start_matches('\n');
+    let fixture = format!("{MINICORE}{ALLOC_STD}{MAIN}{main}");
+    let out = lint(&fixture, "-A clippy::all --deny=blaze::hot_alloc");
+    assert_eq!(found(&out), expected(main), "the findings of:\n{main}\nwere:\n{out}");
+    let errors = out.lines().filter(|it| it.starts_with("error: ")).count();
+    assert_eq!(errors, 3, "each finding is an error:\n{out}");
 }
 
 #[test]
@@ -578,14 +619,14 @@ fn hot(m: &HashMap<u32, u32>) { //~ std_hashmap
     let _ = Pairs.collect::<HashMap<u32, u32>>(); //~ std_hashmap
     let _: HashMap<u32, u32> = Pairs.collect(); //~ std_hashmap std_hashmap
     let _: HashMap<u32, u32, RandomState> = HashMap::with_hasher(RandomState::new()); //~ std_hashmap std_hashmap
-    let _: FxHashMap<u32, u32> = FxHashMap::default();
-    let _: HashMap<u32, u32, FxBuildHasher> = HashMap::with_hasher(FxBuildHasher);
-    let _: FxHashMap<u32, u32> = Pairs.collect();
+    let _: FxHashMap<u32, u32> = FxHashMap::default(); //~ hot_alloc
+    let _: HashMap<u32, u32, FxBuildHasher> = HashMap::with_hasher(FxBuildHasher); //~ hot_alloc
+    let _: FxHashMap<u32, u32> = Pairs.collect(); //~ hot_alloc
 }
 
 #[deny(blaze::hot)]
 fn generic<S: Default>() -> HashMap<u32, u32, S> {
-    HashMap::with_hasher(S::default())
+    HashMap::with_hasher(S::default()) //~ hot_alloc
 }
 
 #[allow(blaze::hot)]

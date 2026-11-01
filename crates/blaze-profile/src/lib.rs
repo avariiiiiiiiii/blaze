@@ -249,7 +249,51 @@ pub fn child_env() -> Option<(&'static str, PathBuf)> {
 /// [`from_env`], or later).
 pub fn install() {
     _ = tracing::subscriber::set_global_default(Recorder);
+    carry_with_fiber_jobs();
     from_env();
+}
+
+/// Moves each fiber job's open spans and build with it when it resumes on another thread
+/// (`blaze_graph::sched::fiber::carry`), and records its switches. Once a process, before any
+/// driver runs: [`install`] calls it.
+fn carry_with_fiber_jobs() {
+    use blaze_graph::sched::fiber;
+    static CARRIED: std::sync::Once = std::sync::Once::new();
+    CARRIED.call_once(|| {
+        fiber::carry(fiber::Carried { take: flight::take_open, put: flight::put_open });
+        _ = fiber::observe(observed);
+    });
+}
+
+/// A switch of `blaze_graph`'s fiber driver, as a row of the recorder's.
+fn observed(switch: blaze_graph::sched::Switch) {
+    use blaze_graph::sched::{SwitchEvent, Wait};
+    use flight::{Switched, WaitedOn};
+    let (event, waited) = match switch.event {
+        SwitchEvent::Started => (Switched::Started, None),
+        SwitchEvent::Resumed => (Switched::Resumed, None),
+        SwitchEvent::Ended => (Switched::Ended, None),
+        SwitchEvent::Parked(None) => (Switched::Parked, Some((WaitedOn::Moved, 0))),
+        SwitchEvent::Parked(Some(on)) => (
+            Switched::Parked,
+            Some(match on {
+                Wait::Job(job) => (WaitedOn::Job, u64::from(job.0)),
+                Wait::Key(key) => {
+                    let [a, b, c, d, e, f, g, h, ..] = key.0;
+                    (WaitedOn::Key, u64::from_le_bytes([a, b, c, d, e, f, g, h]))
+                }
+                Wait::Counter(counter) => (WaitedOn::Counter, u64::from(counter.0)),
+                Wait::Until(at) => (WaitedOn::Until, at),
+            }),
+        ),
+    };
+    flight::switched(flight::Switch {
+        event,
+        job: u64::from(switch.generation) << 32 | u64::from(switch.job.0),
+        fiber: switch.fiber,
+        core: switch.core.0,
+        waited,
+    });
 }
 
 /// What the plane counted of a build that ended: its number and how its nodes settled.

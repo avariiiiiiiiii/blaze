@@ -13,8 +13,13 @@ mod impl_ {
 }
 
 #[cfg(not(feature = "nightly"))]
+mod sso;
+
+#[cfg(not(feature = "nightly"))]
 mod impl_ {
-    pub use std::collections::{HashMap as SsoHashMap, HashSet as SsoHashSet};
+    pub use std::collections::HashMap as SsoHashMap;
+
+    pub use super::sso::SsoHashSet;
 }
 
 pub use delayed_map::{DelayedMap, DelayedSet};

@@ -469,6 +469,165 @@ fn a_missing_layer_stops_the_store() {
     assert_eq!(store.broken().unwrap().file, name("nowhere/head"));
 }
 
+fn writer(n: u64) -> ContentId {
+    ContentId::of("blaze v2 store test writer 1", &n.to_le_bytes())
+}
+
+/// Writer `n` of the shared directory `shared`, with tags of its own.
+fn shared(n: u64) -> SharedConfig {
+    SharedConfig { root: name("shared"), writer: writer(n), tags: (1 << 40) + (n << 33) }
+}
+
+fn writer_file(n: u64, file: &str) -> FileName {
+    name(&format!("shared/w-{:x}/{file}", writer(n)))
+}
+
+fn open_shared(sim: &mut Sim, n: u64) -> Store {
+    let mut effects = Vec::new();
+    let mut store = Store::open_shared(shared(n), &mut effects);
+    drive(sim, &mut store, &mut effects);
+    assert!(store.ready(), "{:?}", store.broken());
+    store
+}
+
+/// Runs everything asked for, handing each store its completions.
+fn drive_all(sim: &mut Sim, stores: &mut [&mut Store], effects: &mut Vec<Effect>) {
+    run_until_idle(sim, effects, |completion, effects| {
+        if let Some(store) = stores.iter_mut().find(|it| it.owns(completion.tag)) {
+            store.complete(completion, effects);
+        }
+    });
+}
+
+/// A get as a daemon makes it of a shared store: a miss looks again, and gets once that look
+/// is in.
+fn get_after_miss(sim: &mut Sim, store: &mut Store, key: &Key) -> Option<Vec<u8>> {
+    if let Some(bytes) = bytes_of(store, key) {
+        return Some(bytes);
+    }
+    let mut effects = Vec::new();
+    let look = store.look_again(&mut effects);
+    drive(sim, store, &mut effects);
+    assert!(store.looked() >= look, "{:?}", store.broken());
+    bytes_of(store, key)
+}
+
+#[test]
+fn two_processes_committing_at_once_lose_neither_commit() {
+    let mut sim = Sim::new(13, quiet());
+    let mut a = open_shared(&mut sim, 1);
+    let mut b = open_shared(&mut sim, 2);
+    for n in 0..60 {
+        a.put(key(n), Kind::Code, text(n, 300)).unwrap();
+        b.put(key(1000 + n), Kind::Code, text(1000 + n, 300)).unwrap();
+    }
+    // One key with its one bytes, put by both before either sees the other's.
+    a.put(key(5000), Kind::Output, text(5000, 300)).unwrap();
+    b.put(key(5000), Kind::Output, text(5000, 300)).unwrap();
+    let mut effects = Vec::new();
+    a.flush(&mut effects);
+    b.flush(&mut effects);
+    drive_all(&mut sim, &mut [&mut a, &mut b], &mut effects);
+    assert!(a.broken().is_none() && b.broken().is_none(), "{:?} {:?}", a.broken(), b.broken());
+    drop((a, b));
+    let a = open_shared(&mut sim, 1);
+    let c = open_shared(&mut sim, 3);
+    for store in [&a, &c] {
+        for n in (0..60).chain(1000..1060).chain([5000]) {
+            assert_eq!(bytes_of(store, &key(n)), Some(text(n, 300)), "{n}");
+        }
+        assert_eq!(store.verify(None), Vec::new());
+    }
+}
+
+#[test]
+fn a_reader_sees_the_others_commit_after_a_miss() {
+    let mut sim = Sim::new(14, quiet());
+    let mut a = open_shared(&mut sim, 1);
+    let mut b = open_shared(&mut sim, 2);
+    b.put(key(1), Kind::Code, b"from b".to_vec()).unwrap();
+    flush(&mut sim, &mut b);
+    assert_eq!(bytes_of(&a, &key(1)), None, "not before it looks");
+    assert_eq!(get_after_miss(&mut sim, &mut a, &key(1)).unwrap(), b"from b");
+    // A writer that came after it opened, and one that moved on past a new index table.
+    let mut d = open_shared(&mut sim, 4);
+    d.put(key(2), Kind::Code, b"from d".to_vec()).unwrap();
+    flush(&mut sim, &mut d);
+    for n in 10..70 {
+        b.put(key(n), Kind::Query, text(n, 200)).unwrap();
+    }
+    flush(&mut sim, &mut b);
+    assert_eq!(get_after_miss(&mut sim, &mut a, &key(2)).unwrap(), b"from d");
+    for n in 10..70 {
+        assert_eq!(get_after_miss(&mut sim, &mut a, &key(n)), Some(text(n, 200)), "{n}");
+    }
+    assert_eq!(bytes_of(&a, &key(1)).unwrap(), b"from b");
+    assert_eq!(get_after_miss(&mut sim, &mut a, &key(9999)), None);
+    assert_eq!(a.verify(None), Vec::new());
+}
+
+#[test]
+fn a_value_another_writer_committed_is_one_entry() {
+    let mut sim = Sim::new(15, quiet());
+    let mut a = open_shared(&mut sim, 1);
+    a.put(key(1), Kind::Code, b"made once".to_vec()).unwrap();
+    flush(&mut sim, &mut a);
+    let mut b = open_shared(&mut sim, 2);
+    let ticket = b.put(key(1), Kind::Code, b"made once".to_vec()).unwrap();
+    assert!(b.durable(ticket));
+    assert_ne!(b.found_of(&key(1)).tier, 0);
+    assert!(b.put(key(1), Kind::Code, b"other".to_vec()).is_err());
+    flush(&mut sim, &mut b);
+    assert!(!sim.exists(&writer_file(2, "pack-000000")));
+}
+
+#[test]
+fn a_damaged_value_in_another_writers_store_is_never_served() {
+    let mut sim = Sim::new(16, quiet());
+    let mut a = open_shared(&mut sim, 1);
+    a.put(key(1), Kind::Query, vec![b'a'; 1000]).unwrap();
+    a.put(key(2), Kind::Query, vec![b'b'; 1000]).unwrap();
+    flush(&mut sim, &mut a);
+    let loc = a.loc_of(&key(2));
+    drop(a);
+    let pack = writer_file(1, "pack-000000");
+    let mut bytes = sim.contents(&pack);
+    bytes[(loc.offset + RECORD_HEADER) as usize + 500] ^= 1;
+    sim.change(&pack, &bytes);
+    let b = open_shared(&mut sim, 2);
+    assert_eq!(bytes_of(&b, &key(1)).unwrap(), vec![b'a'; 1000]);
+    let corrupt = b.get(&key(2)).unwrap_err();
+    assert_eq!(corrupt.pack, pack);
+    assert!(corrupt.what.contains("hash"), "{corrupt}");
+}
+
+#[test]
+fn another_writers_head_that_cannot_be_read_stops_the_store_naming_it() {
+    let mut sim = Sim::new(17, quiet());
+    let mut a = open_shared(&mut sim, 1);
+    a.put(key(1), Kind::Code, b"from a".to_vec()).unwrap();
+    flush(&mut sim, &mut a);
+    drop(a);
+    let head = writer_file(1, HEAD_FILE);
+    sim.change(&head, b"not a head");
+    let mut effects = Vec::new();
+    let mut b = Store::open_shared(shared(2), &mut effects);
+    drive(&mut sim, &mut b, &mut effects);
+    assert!(!b.ready());
+    assert_eq!(b.broken().unwrap().file, head);
+}
+
+#[test]
+fn a_shared_directory_others_can_write_to_is_refused() {
+    let mut sim = Sim::new(18, quiet());
+    sim.set_access(&name("shared"), blaze_core::Access::OthersWrite);
+    let mut effects = Vec::new();
+    let mut store = Store::open_shared(shared(1), &mut effects);
+    drive(&mut sim, &mut store, &mut effects);
+    assert!(!store.ready());
+    assert_eq!(store.broken().unwrap().file, name("shared"));
+}
+
 /// Opened, and refused with what of it is not the user's alone and why; nothing in it is read.
 fn refused(sim: &mut Sim) -> Broken {
     let mut effects = Vec::new();

@@ -29,6 +29,40 @@ SELECT * FROM read_parquet(@alloc_samples, union_by_name = true);
 CREATE OR REPLACE VIEW heap_by_owner AS
 SELECT * FROM read_parquet(@heap_by_owner, union_by_name = true);
 
+CREATE OR REPLACE VIEW switches AS
+SELECT * FROM read_parquet(@switches, union_by_name = true);
+
+-- One row a time a job on a fiber parked: its `parked` switch and the `resumed` one after it,
+-- with the thread before and after; `resumed_ns` and `thread_after` are null while it still
+-- waits. `moved` says it resumed on another thread. A `wait_kind` of moved is the scheduler
+-- moving it to another core, not a wait.
+CREATE OR REPLACE VIEW job_waits AS
+SELECT
+    build_id, process, job, fiber, wait_kind, wait_value, parked_ns, resumed_ns,
+    resumed_ns - parked_ns AS waited_ns, thread_before, thread_after,
+    thread_before <> thread_after AS moved
+FROM (
+    SELECT
+        build_id, process, job, fiber, wait_kind, wait_value, event, t_ns AS parked_ns,
+        thread AS thread_before,
+        lead(t_ns) OVER (PARTITION BY process, job ORDER BY t_ns) AS resumed_ns,
+        lead(thread) OVER (PARTITION BY process, job ORDER BY t_ns) AS thread_after
+    FROM switches
+)
+WHERE event = 'parked';
+
+-- `spans` with the fiber job each ran in: the job running on the span's thread when it began
+-- (that thread's last `started` or `resumed` switch before it, unless a `parked` or `ended` one
+-- came after); null for a span outside any job. The explorer's job lanes are these spans by
+-- `job` in place of `thread`.
+CREATE OR REPLACE VIEW job_spans AS
+SELECT spans.*, runs.job AS job
+FROM spans ASOF LEFT JOIN (
+    SELECT process, thread, t_ns, CASE WHEN event = 'started' OR event = 'resumed' THEN job END AS job
+    FROM switches
+) AS runs
+    ON spans.process = runs.process AND spans.thread = runs.thread AND spans.start_ns >= runs.t_ns;
+
 -- One row a span of a query, with what the memo did with that query when provenance has it:
 -- `memo` is verified, reran or reran-same-output, matched on the build, the query's kind and
 -- its key (the span's `function` field); null where provenance has no row for it.

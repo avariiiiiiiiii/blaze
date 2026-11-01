@@ -32,7 +32,7 @@ use std::{
     ptr,
     sync::{
         Arc, Mutex, MutexGuard, Once, OnceLock,
-        atomic::{AtomicBool, AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering},
     },
     thread::{self, JoinHandle, Thread},
     time::{Duration, Instant},
@@ -133,8 +133,12 @@ enum Want {
     Job(Handle),
 }
 
-/// A fiber: a coroutine that runs job after job, never ending until told to.
-struct Fiber<J>(Coroutine<In<J>, Out, (), DefaultStack>);
+/// A fiber: a coroutine that runs job after job, never ending until told to, and its number
+/// ([`Switch::fiber`]).
+struct Fiber<J>(Coroutine<In<J>, Out, (), DefaultStack>, u32);
+
+/// Fibers made in the process: the next one's number.
+static FIBERS: AtomicU32 = AtomicU32::new(0);
 
 // SAFETY: a fiber is moved to another thread only while suspended (in the idle pool, or parked
 // in its job's slot), never while it runs. Its stack then holds the driver's frames (an
@@ -271,7 +275,8 @@ fn new_fiber<W: Work>(shared: &Arc<Shared<W>>) -> Result<Fiber<W::Job>, DriverEr
     // The stack has at least `bytes` above its guard page, which `Stack::limit` counts in.
     let limit = stack.base().get() - bytes;
     let shared = Arc::clone(shared); // clone: one per fiber made, held for its life
-    Ok(Fiber(Coroutine::with_stack(stack, move |yielder, first| body(&shared, limit, yielder, first))))
+    let number = FIBERS.fetch_add(1, Ordering::Relaxed);
+    Ok(Fiber(Coroutine::with_stack(stack, move |yielder, first| body(&shared, limit, yielder, first)), number))
 }
 
 /// A fiber's life: run each job it is started with, report its end, and wait for the next.
@@ -637,6 +642,47 @@ fn put_carried(taken: &Taken) {
     }
 }
 
+/// A job's switch on its fiber, as the observer ([`observe`]) is told it: on the thread it
+/// happens on, under the driver's lock, so the observer must not call into the driver.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct Switch {
+    pub event: SwitchEvent,
+    pub job: JobId,
+    /// The job's slot's generation: with `job`, one job of the driver's life ([`Handle`]).
+    pub generation: u32,
+    pub fiber: u32,
+    pub core: CoreId,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum SwitchEvent {
+    /// The job's first run, on a fiber from the idle pool.
+    Started,
+    /// The job parked: waiting for `Some(on)`, or `None` moving to another core. Told before
+    /// its carried thread-locals are taken, so they are still the job's.
+    Parked(Option<Wait>),
+    /// A parked job runs again, on this thread; told after its thread-locals are put back.
+    Resumed,
+    /// The job ended; its fiber goes back to the idle pool.
+    Ended,
+}
+
+static OBSERVER: OnceLock<fn(Switch)> = OnceLock::new();
+
+/// Has `observer` told of every job's switches (the profiler's). Once a process; a second is
+/// refused.
+pub fn observe(observer: fn(Switch)) -> Result<(), fn(Switch)> {
+    OBSERVER.set(observer)
+}
+
+#[inline]
+fn switched<W: Work>(st: &State<W>, event: SwitchEvent, job: JobId, fiber: u32, me: u32) {
+    if let Some(observer) = OBSERVER.get() {
+        let generation = st.generation[job.0 as usize];
+        observer(Switch { event, job, generation, fiber, core: CoreId(me) });
+    }
+}
+
 /// A region that must not wait (a lock held, a thread-local borrowed): a wait inside it
 /// panics, naming the job, instead of moving the region to another thread.
 pub struct NoWait(());
@@ -968,11 +1014,13 @@ fn run<'a, W: Work>(
                     }
                 },
             };
+            switched(&st, SwitchEvent::Started, job, fiber.1, me);
             (fiber, In::Start(job, payload))
         }
         Slot::Parked(fiber, taken) => {
             put_carried(&taken);
             st.spare_taken.push(taken);
+            switched(&st, SwitchEvent::Resumed, job, fiber.1, me);
             (fiber, In::Go(Answer::Ready))
         }
         Slot::Running => panic!("job {} run on core {me} while it runs", job.0),
@@ -1002,6 +1050,7 @@ fn run<'a, W: Work>(
                     None | Some(Ok(Suspend::Ready)) => In::Go(Answer::Ready),
                     Some(Err(cycle)) => In::Go(Answer::Cycle(cycle)),
                     Some(Ok(Suspend::Waiting)) => {
+                        switched(&st, SwitchEvent::Parked(on), job, fiber.1, me);
                         let taken = park_carried(&mut st);
                         st.slots[j] = Slot::Parked(fiber, taken);
                         let next = shared.dispatch(&mut st, Some(me));
@@ -1012,6 +1061,7 @@ fn run<'a, W: Work>(
             Out::Move => match st.sched.yielded(job) {
                 Yielded::Stay => In::Go(Answer::Ready),
                 Yielded::Moved => {
+                    switched(&st, SwitchEvent::Parked(None), job, fiber.1, me);
                     let taken = park_carried(&mut st);
                     st.slots[j] = Slot::Parked(fiber, taken);
                     let next = shared.dispatch(&mut st, Some(me));
@@ -1019,6 +1069,7 @@ fn run<'a, W: Work>(
                 }
             },
             Out::Done(panicked) => {
+                switched(&st, SwitchEvent::Ended, job, fiber.1, me);
                 st.sched.done(job);
                 st.slots[j] = Slot::Free;
                 st.generation[j] = st.generation[j].wrapping_add(1);

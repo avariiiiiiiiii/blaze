@@ -176,6 +176,9 @@ pub struct BuildConfig {
     /// Where the standard library's `library/` is named (`/rustc/<commit>/library`, as
     /// rustc's paths into it are), a mount of `mounts`.
     pub library: String,
+    /// Where the daemon places the standard library's builds (`<state>/std`), absolute: one
+    /// directory of each [`StdKey`], the same whatever workspace asks for it.
+    pub std: String,
 }
 
 impl BuildConfig {
@@ -583,6 +586,7 @@ mod tests {
             ],
             host: "aarch64-unknown-linux-gnu".to_owned(),
             library: "/rustc/0123/library".to_owned(),
+            std: "/s/std".to_owned(),
         };
         assert_eq!(BuildConfig::decode(&config.encode()).unwrap(), config);
         assert!(BuildConfig::decode(b"\xff").is_err());

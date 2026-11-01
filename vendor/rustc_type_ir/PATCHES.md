@@ -127,6 +127,43 @@ interner's (`DbInterner::krate`) and an id alone can't say whether it is local. 
 trait ref counted as local, and coherence (`TypingMode::Coherence`) never saw an upstream or
 downstream crate's possible impl.
 
+### 0009-small-sets-and-stalled-lists-inline
+
+What:
+- Without `nightly`, `data_structures::SsoHashSet` is `data_structures/sso.rs`'s set: up to 8
+  elements inline, searched linearly, then an `FxHashSet`, as `rustc_data_structures::sso` is.
+  It was `std::collections::HashSet`. `SsoHashMap` is unchanged (nothing uses it).
+- `universe::MaxUniverse`'s cache is an `SsoHashSet`, not a `HashSet`.
+- `solve::GoalStalledOn`'s `stalled_vars` and `sub_roots` are `StalledVars`
+  (`SmallVec<[TyOrConstInferVar; 2]>`) and `SubRoots` (`SmallVec<[TyVid; 2]>`), not `ThinVec`s.
+  `rustc_next_trait_solver`'s patch `0007-solver-temporaries-kept` builds them.
+
+Why: blaze holds the solver's warm paths to zero allocations (`docs/v2/plan/lanes/mem/db-solver.md`,
+items 8 and 10). A `HashSet` allocates on its first insert, so `ValidateBoundVars` (every
+`Binder::bind_with_vars` and `map_bound` with debug assertions), `TypeWalker`, the outlives
+collector and `MaxUniverse` each allocated where rustc's own build, with `nightly`, keeps the
+set inline. A stalled goal waits on one or two variables almost always, and its `ThinVec`s
+(rust-lang/rust#160005, for a small `GoalEvaluation`) allocated twice per stalled goal and per
+probe clone. The inline lists cost 24 to 40 bytes more per nested goal.
+
+### 0010-solver-cache-in-blocks
+
+What: `search_graph::global_cache` (patch `0003-shared-solver-cache`) keeps its chunks, shards,
+writers and probe tables in `blaze_mem::blocks::Slice`s (power-of-two blocks of OS memory, given
+back to their size class when the cache drops) instead of `Box<[T]>`s, and its shard and writer
+locks are `blaze_mem::lock::SpinLock`s instead of `std::sync::Mutex`es. `Cargo.toml` (blaze's)
+depends on `blaze-mem` for it.
+
+Why: blaze makes a cache per interner, and drops it when the interner's generation is evicted
+(`hir-ty`'s `next_solver::interner::tls_cache`). In `Box`es a fresh cache made about two dozen
+heap allocations the first time it was used, so re-solving an unchanged body allocated
+(`docs/v2/plan/lanes/mem/db-solver.md`, items 8 and 10). On macOS a `std` mutex boxes a pthread
+mutex the first time it is locked, which cost one more allocation per shard and writer used.
+Blocks come from reserved regions, so a fresh cache's tables cost the global allocator nothing,
+and the blocks of an evicted cache are the next cache's, already backed by pages. Lookups and
+inserts are unchanged; an insert's critical section is a few instructions, so a spin lock that
+yields is enough.
+
 ## Dropped since the previous base (ra-ap-rustc_type_ir 0.166.0, rustc `ce89c898`)
 
 - The backport of rust-lang/rust#159228 (the retry with twice the recursion limit:

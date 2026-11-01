@@ -38,6 +38,7 @@ mod driven;
 mod flags;
 mod handle;
 mod index;
+mod peers;
 mod read;
 pub mod remote;
 mod segment;
@@ -69,6 +70,7 @@ use crate::disk::{
 };
 pub use crate::disk::content_of;
 pub use crate::handle::Handle;
+pub use crate::peers::SharedConfig;
 #[cfg(any(target_os = "linux", target_os = "macos", windows))]
 pub use crate::driven::Driven;
 use crate::flags::{FLAGS, Flag, Row};
@@ -461,6 +463,8 @@ pub struct Store {
     periods: u32,
     /// The encodings of each schema whose values it keeps in columns.
     columns: Arc<Encodings>,
+    /// The other writers of its directory's shared one ([`Store::open_shared`]).
+    peers: Option<peers::Peers>,
 }
 
 /// A way to read a store from any thread, with no lock: [`Store::reader`].
@@ -597,6 +601,10 @@ enum Op {
     Clear { asked: Tag, from: FileName, to: FileName },
     Place { asked: Tag, to: FileName },
     Fetch { key: Key },
+    /// The shared directory listed, for the other writers' stores in it.
+    Peers,
+    /// Its own empty head written, so the other writers find a store in its directory.
+    Announce,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -641,6 +649,9 @@ struct Tier {
     /// Each unit's crate version by its number less one, and the number of each.
     units: Vec<ContentId>,
     unit_of: ByHash<ContentId, Unit>,
+    /// Another writer's store as it was last open, which readers read while it is opened again
+    /// as its head now says.
+    before: Option<Box<Tier>>,
 }
 
 impl Tier {
@@ -663,6 +674,7 @@ impl Tier {
             // alloc: empty, allocates nothing
             units: Vec::new(),
             unit_of: ByHash::default(),
+            before: None,
         }
     }
 
@@ -679,6 +691,9 @@ impl Tier {
     /// It as readers see it. Made once a published view (an opening, a commit's mappings, an
     /// index swap, a dictionary or encoding given), never per get or put; readers share it.
     fn view(&self) -> TierView {
+        if let Some(before) = &self.before {
+            return before.view();
+        }
         TierView {
             // clone: the published view owns its names; once per view
             dir: self.dir.clone(),
@@ -852,6 +867,12 @@ fn describe(done: &Done) -> String {
 impl Store {
     /// A store that is opening: it asks to map its index and packs.
     pub fn open(config: Config, effects: &mut Vec<Effect>) -> Store {
+        let mut store = Store::new(config, None);
+        store.ask_private(effects);
+        store
+    }
+
+    fn new(config: Config, peers: Option<peers::Peers>) -> Store {
         // alloc: setup, once per store
         let mut tiers = vec![Tier::new(config.dir.clone())];
         tiers.extend(config.layers.iter().cloned().map(Tier::new));
@@ -865,7 +886,7 @@ impl Store {
         shared.add_segment(own.segment().clone());
         // clone: setup, once per store
         let drains = vec![Drain::new(own.segment().clone())];
-        let mut store = Store {
+        Store {
             tags: Tags { range: blaze_core::Tags::new(config.tags), ops: FxHashMap::default() },
             config,
             tiers,
@@ -895,19 +916,19 @@ impl Store {
             epoch: 0,
             periods: 0,
             columns,
-        };
-        store.ask_private(effects);
-        store
+            peers,
+        }
     }
 
     /// Asks that the store's directory be made the user's alone, and checked to be with all in
     /// it: it keeps machine code that is run, and a value is checked against its own hash,
     /// never against what its key says made it, so whoever else may write there could plant
-    /// code under any key. A layer is read-only and may be shared, so is not asked of.
+    /// code under any key. A layer is read-only and may be shared, so is not asked of. A
+    /// shared store asks it of the shared directory, every other writer's store in it.
     fn ask_private(&mut self, effects: &mut Vec<Effect>) {
         let tag = self.tags.ask(Op::Private);
         // clone: setup, once per open
-        effects.push(Effect::Private { dir: self.config.dir.clone(), tag });
+        effects.push(Effect::Private { dir: self.private_dir().clone(), tag });
     }
 
     fn read_heads(&mut self, effects: &mut Vec<Effect>) {
@@ -920,7 +941,7 @@ impl Store {
 
     /// Whether it has mapped what it needs to answer gets.
     pub fn ready(&self) -> bool {
-        self.broken.is_none() && self.tiers.iter().all(|it| it.opened)
+        self.broken.is_none() && self.peers_ready().unwrap_or_else(|| self.tiers.iter().all(|it| it.opened))
     }
 
     /// Why it stopped, if it has.
@@ -1640,7 +1661,7 @@ impl Store {
                 }
                 done => {
                     // clone: the name of what failed, on an error path
-                    let dir = self.config.dir.clone();
+                    let dir = self.private_dir().clone();
                     if self.retry(&dir, &done) {
                         self.ask_private(effects);
                     }
@@ -1649,7 +1670,10 @@ impl Store {
             Op::Head { tier } => match done {
                 Done::Read(bytes) => {
                     self.failures = 0;
-                    self.read_head(tier, bytes, effects);
+                    match self.peers.is_some() {
+                        true => self.peer_head(tier, bytes, effects),
+                        false => self.read_head(tier, bytes, effects),
+                    }
                 }
                 done => {
                     let file = self.tiers[tier].file(HEAD_FILE);
@@ -1661,6 +1685,7 @@ impl Store {
             },
             Op::Map { tier, file, what } => match done {
                 Done::Mapped(mapping) => self.install(tier, file, what, mapping),
+                done if self.is_peer(tier) => self.peer_failed(tier, file, describe(&done)),
                 done => {
                     if self.retry(&file, &done) {
                         self.ask_map(tier, file, what, effects);
@@ -1697,8 +1722,11 @@ impl Store {
                     ));
                 }
             }
+            Op::Peers => self.peers_listed(done, effects),
+            Op::Announce => self.announced(done, effects),
             op => return self.step(op, done, effects),
         }
+        self.peers_ask(effects);
         // alloc: empty, allocates nothing
         Vec::new()
     }
@@ -2398,6 +2426,7 @@ impl Store {
         let file = self.tiers[at].file(HEAD_FILE);
         let head = match (bytes.is_empty(), at) {
             (true, 0) => Head::default(),
+            (true, at) if self.is_peer(at) => Head::default(),
             (true, _) => return self.fail(file, "it is not there: a layer is a store"),
             (false, _) => match Head::decode(&bytes) {
                 Ok(head) => head,
@@ -2502,7 +2531,8 @@ impl Store {
         match what {
             Mapped::Pack { pack, usable, batch } => {
                 if len < usable {
-                    return self.fail(
+                    return self.tier_failed(
+                        at,
                         file,
                         // alloc: the error that breaks the store
                         format!("it is {len} bytes, shorter than the {usable} its head names"),
@@ -2520,7 +2550,8 @@ impl Store {
                 if let Some(external) = tier.externals.get_mut(&content) {
                     let named = external.len;
                     if len != named {
-                        return self.fail(
+                        return self.tier_failed(
+                            at,
                             file,
                             // alloc: the error that breaks the store
                             format!("it is {len} bytes, not the {named} its head names"),
@@ -2535,7 +2566,7 @@ impl Store {
                 let index = match Index::new(mapping) {
                     // alloc: once per index table mapped (opening, or every `INDEX_AFTER` records)
                     Ok(index) => Arc::new(index),
-                    Err(why) => return self.fail(file, why),
+                    Err(why) => return self.tier_failed(at, file, why.into()),
                 };
                 match covers {
                     None => tier.index = Some(index),
@@ -2559,10 +2590,15 @@ impl Store {
     fn finish_open(&mut self, at: usize) {
         match open_tier(&mut self.tiers[at]) {
             Ok(()) => {
-                self.tiers[at].opened = true;
+                let tier = &mut self.tiers[at];
+                tier.opened = true;
+                tier.before = None;
                 self.publish();
+                if self.is_peer(at) {
+                    self.peer_settled(at);
+                }
             }
-            Err((file, why)) => self.fail(file, why),
+            Err((file, why)) => self.tier_failed(at, file, why),
         }
     }
 

@@ -422,6 +422,7 @@ fn match_attr_flags(attr_flags: &mut AttrFlags, attr: ast::Meta<'_>) -> ControlF
                 Some(Word::link_section) => AttrFlags::HAS_LINK_SECTION,
                 Some(Word::linkage) => AttrFlags::HAS_LINKAGE,
                 Some(Word::rustc_diagnostic_item) => AttrFlags::HAS_DIAGNOSTIC_ITEM,
+                Some(Word::must_not_suspend) => AttrFlags::MUST_NOT_SUSPEND,
                 _ => return ControlFlow::Continue(()),
             };
             attr_flags.insert(flag);
@@ -611,6 +612,7 @@ fn match_attr_flags(attr_flags: &mut AttrFlags, attr: ast::Meta<'_>) -> ControlF
                     }
                     Some(Word::rustc_no_mir_inline) if single => AttrFlags::RUSTC_NO_MIR_INLINE,
                     Some(Word::cold) if single => AttrFlags::COLD,
+                    Some(Word::must_not_suspend) if single => AttrFlags::MUST_NOT_SUSPEND,
                     _ => return ControlFlow::Continue(()),
                 };
                 attr_flags.insert(flag);
@@ -624,6 +626,7 @@ fn match_attr_flags(attr_flags: &mut AttrFlags, attr: ast::Meta<'_>) -> ControlF
                 (Some(Word::diagnostic), Some(Word::do_not_recommend)) => {
                     AttrFlags::DIAGNOSTIC_DO_NOT_RECOMMEND
                 }
+                (Some(Word::blaze), Some(Word::may_suspend)) => AttrFlags::MAY_SUSPEND,
                 _ => return ControlFlow::Continue(()),
             };
             attr_flags.insert(flag);
@@ -785,6 +788,7 @@ name_set! {
     enum Word {
     automatically_derived,
     bench,
+    blaze,
     cold,
     completions,
     default,
@@ -807,6 +811,8 @@ name_set! {
     macro_style,
     marker,
     may_dangle,
+    may_suspend,
+    must_not_suspend,
     must_use,
     naked,
     no_mangle,
@@ -1015,6 +1021,12 @@ bitflags::bitflags! {
         const OPTIMIZE_NONE = 1 << 88;
         /// `#[instruction_set(..)]`, any argument.
         const HAS_INSTRUCTION_SET = 1 << 89;
+        /// `#[blaze::may_suspend]`, a word, on a function or a field: a blaze extension, read by
+        /// `hir-ty-suspend` (a call of it may park its fiber).
+        const MAY_SUSPEND = 1 << 90;
+        /// rustc's `#[must_not_suspend]`, one segment, a word or `= "reason"`, on an ADT: a value
+        /// of it must not be held across a suspend.
+        const MUST_NOT_SUSPEND = 1 << 91;
     }
 }
 

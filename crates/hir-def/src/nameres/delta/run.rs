@@ -403,9 +403,17 @@ impl<'db> Sink<'db> for RegionSink<'db, '_> {
     fn collecting_expansion(&mut self, call: hir_expand::MacroCallId) {
         let db = self.unit.db();
         let file = hir_expand::HirFileId::from(call).original_file(db).file_id(db);
+        // A declarative macro's body is an input too, and its file may be another crate's,
+        // whose edit changes no binding when the macro keeps its id.
+        let def = match call.loc(db).def.kind {
+            hir_expand::MacroDefKind::Declarative(ast, _) => Some(ast.file_id.original_file(db).file_id(db)),
+            _ => None,
+        };
         let files = &mut self.out().expansion_files;
-        if !files.contains(&file) {
-            files.push(file);
+        for file in std::iter::once(file).chain(def) {
+            if !files.contains(&file) {
+                files.push(file);
+            }
         }
     }
 }

@@ -17,6 +17,8 @@ use crate::stdlib::{library_at, library_mount};
 pub(crate) const HOST: &str = "x86_64-unknown-linux-gnu";
 pub(crate) const WS: &str = "/home/u/ws";
 pub(crate) const COMMIT: &str = "16d1ffac17ad8b739e32483ac2e65fe7e1804977";
+/// [`crate::query::BuildConfig::std`]: outside every workspace.
+pub(crate) const STD: &str = "/home/u/.cache/blaze/v2/std";
 const CRATES_IO: &str = "registry+https://github.com/rust-lang/crates.io-index";
 const CRATES_IO_SRC: &str = "/home/u/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f";
 const CRATES_IO_INDEX: &str = "/home/u/.cargo/registry/index/index.crates.io-1949cf8c6b5b557f";
@@ -149,6 +151,7 @@ impl Fixture {
             mounts,
             host: HOST.to_owned(),
             library: library_at(COMMIT),
+            std: STD.to_owned(),
         };
         self.db.open_with(View { root: self.tree.root(&files) }, &config.encode())
     }
@@ -358,6 +361,42 @@ fn std_is_built_as_an_rlib_not_a_dylib() {
     let outputs = &units.plans[at].outputs;
     assert!(outputs.iter().any(|it| it.ends_with(".rlib")), "{outputs:?}");
     assert!(!outputs.iter().any(|it| it.contains(".dylib") || it.ends_with(".so")), "{outputs:?}");
+}
+
+/// The standard library's units of one workspace, by package, target and mode.
+fn std_plans(units: &Units) -> Vec<((&str, &str, Mode), &UnitPlan)> {
+    let mut plans: Vec<_> = units
+        .graph
+        .units
+        .iter()
+        .zip(&units.plans)
+        .filter(|(unit, _)| unit.is_std)
+        .map(|(unit, plan)| ((unit.pkg_id.as_str(), unit.target.name.as_str(), unit.mode), plan))
+        .collect();
+    plans.sort_by(|a, b| a.0.cmp(&b.0));
+    plans
+}
+
+// Two workspaces of other packages, target directories and environments, with one profile and
+// target, plan the same standard library: placed in the daemon's directory of its key, so
+// the second compiles none of it.
+#[test]
+fn a_second_workspace_plans_the_standard_library_the_first_did() {
+    let fixture = Fixture::new();
+    let first = [("ws/Cargo.toml", A), ("ws/src/lib.rs", "pub fn f() {}\n")];
+    let first = ready(fixture.plan(fixture.open(&ask(&first))));
+    let b = "[package]\nname = \"b\"\nversion = \"0.2.0\"\nedition = \"2021\"\n";
+    let second = [("ws/Cargo.toml", b), ("ws/src/main.rs", "fn main() {}\n")];
+    let env = [("CARGO_TARGET_DIR", "/home/u/elsewhere"), ("TERM", "dumb")];
+    let second = ready(fixture.plan(fixture.open(&Ask { env: &env, ..ask(&second) })));
+    assert_eq!(second.target_dir, "/home/u/elsewhere");
+
+    let (first, second) = (std_plans(&first), std_plans(&second));
+    assert!(!first.is_empty());
+    assert_eq!(first, second);
+    for (_, plan) in &first {
+        assert!(plan.outputs.iter().all(|it| it.starts_with(&format!("{STD}/"))), "{plan:?}");
+    }
 }
 
 #[test]

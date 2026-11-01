@@ -67,9 +67,10 @@ call is an error when its type, monomorphized, is
   `Rc`, a `&T` with `T: !Sync` (a reference into a thread-local's `Cell` or `RefCell`), std's lock
   guards, raw pointers; or
 - an ADT marked `#[must_not_suspend]` (rustc's own attribute, which std puts on `MutexGuard`,
-  `MappedMutexGuard`, the `RwLock` guards, and core on `RefCell`'s `Ref` and `RefMut`), at any
-  depth of its fields as rustc's `check_must_not_suspend_ty` walks them (through tuples, arrays,
-  `Box`, references and ADT fields; `dyn` and `impl Trait` stop it).
+  `MappedMutexGuard`, the `RwLock` guards, and core on `RefCell`'s `Ref` and `RefMut`), the
+  value itself or held as rustc's `check_must_not_suspend_ty` looks: through `Box`, tuples,
+  arrays, slices and references, never into another ADT's fields (a struct holding a guard is
+  caught by `Send` when the guard is `!Send`, as std's are).
 
 **Held across the call** is exactly what rustc's coroutine transform keeps across a yield,
 computed by blaze's port of it (`hir_ty::mir::held`: `MaybeBorrowedLocals`,
@@ -112,8 +113,8 @@ undefined behavior, like a data race. It costs nothing for a crate whose graph h
 
 | Path | What |
 |---|---|
-| `crates/hir-ty-suspend/` (new, this lane) | a front-end crate (semantics-in-front-end): `root`, the root's `FunctionId`; `dispatch`, a call's targets as codegen dispatches them; `summary`, the may-suspend query per instance; `check`, the held-across check per body and the promise checks; `Held`, `Broken` and `Path`, what blaze-diagnostics lowers |
-| `crates/hir-ty/src/mir/held.rs` (codegen) | one added entry: `MirBody::held_across_in(frame, points)`, the same analyses with given suspend points |
+| `crates/hir-ty-suspend/` (new, this lane) | a front-end crate (semantics-in-front-end): `root`, the root's `FunctionId`; `dispatch`, a call's targets as codegen dispatches them; `summary`, the may-suspend query per instance; `check`, the held-across check per body and the promise checks; `suspend_check(db, krate) -> Found` (its `Held` and `Broken`), what blaze-diagnostics lowers |
+| `crates/hir-ty/src/mir/held.rs` (codegen) | one added entry: `MirBody::held_across_calls_in(frame, points)`, the same analyses with given suspend points |
 | `crates/hir-def/src/attrs.rs` (db) | two flags: `#[blaze::may_suspend]` (functions and fields) and `#[must_not_suspend]` (ADTs, word or `= "reason"`) |
 | `crates/blaze-diagnostics/` (diagnostics) | lowering of `hir_ty_suspend::Held` and `Broken` into errors, and the call from a crate's check |
 | `crates/blaze-graph/src/sched/fiber.rs` (sched) | `#[blaze::may_suspend]` on `Here::wait` and `Here::relocate`; `register_tool(blaze)` in `blaze-graph`'s `lib.rs`; `Cx: Sync` with the own-fiber check |
@@ -144,7 +145,10 @@ std's `Mutex`/`MutexGuard` (`#[must_not_suspend]`), `RefCell`, `Rc` and `Cell`.
   `let p: fn()`, rejected.
 - `recursion_reaches_its_fixpoint`: two functions calling each other, one of them suspending:
   both are may-suspend.
-- `no_corosensei_no_walk`: a crate graph without it asks for no summary (counted).
+- `a_call_through_a_marked_field_suspends_its_caller`: a guard across `(here.wait)(db)` where
+  `wait` is a `#[blaze::may_suspend]` field is rejected.
+- `no_corosensei_no_walk`: a crate graph without it finds no root, and the check returns before
+  asking for any MIR.
 
 ## Not in scope
 

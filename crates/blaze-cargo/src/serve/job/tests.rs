@@ -20,7 +20,7 @@ fn targets() -> Targets {
 }
 
 fn setup(runs: u64, runs_end: u64) -> Setup {
-    Setup { views: "/v".into(), host: "h".into(), env: Vec::new(), color: false, tags: 6 << 32, runs, runs_end }
+    Setup { views: "/v".into(), std: "/s/std".into(), host: "h".into(), env: Vec::new(), color: false, tags: 6 << 32, runs, runs_end }
 }
 
 fn opened(root: u8) -> Opened {
@@ -45,6 +45,8 @@ fn job(views: Vec<Opened>) -> Job<Real> {
         built: None,
         borrowed: Vec::new(),
         placing: 0,
+        busy: FxHashMap::default(),
+        held: Vec::new(),
         runs: 0,
         over: None,
         stats: RequestStats::default(),
@@ -383,6 +385,34 @@ fn jobs_are_walked_in_the_order_they_started_whatever_their_slots() {
     assert_eq!(roots(&jobs), [0, 1, 3, 4, 5]);
     let stale = JobId { slot: 9, generation: 1 };
     assert!(jobs.jobs.get(key_of(stale)).is_none(), "an id of another generation finds nothing");
+}
+
+/// A path is not all there while any effect placing it is in flight (a placement, then its
+/// mode, then the look at what was placed): what a build script's run waits on before it runs
+/// its program.
+#[test]
+fn a_path_is_placed_once_every_effect_placing_it_has_ended() {
+    let mut jobs = Jobs::<Real>::new(setup(0, 0)).unwrap();
+    let id = JobId { slot: 0, generation: 0 };
+    assert!(jobs.jobs.put(key_of(id), job(Vec::new())).is_ok());
+    jobs.begin_placing(id, 4);
+    jobs.begin_placing(id, 4);
+    jobs.begin_placing(id, 5);
+    let busy = |jobs: &Jobs<Real>| {
+        let job = jobs.jobs.get(key_of(id)).unwrap();
+        let mut busy: Vec<u32> = job.busy.keys().copied().collect();
+        busy.sort_unstable();
+        (job.placing, busy)
+    };
+    assert_eq!(busy(&jobs), (3, vec![4, 5]));
+    jobs.end_placing(id, 4);
+    assert_eq!(busy(&jobs), (2, vec![4, 5]), "one of path 4's two is in flight");
+    jobs.end_placing(id, 5);
+    jobs.end_placing(id, 4);
+    assert_eq!(busy(&jobs), (0, vec![]));
+    let gone = JobId { slot: 1, generation: 0 };
+    jobs.begin_placing(gone, 4);
+    assert!(jobs.end_placing(gone, 4).is_none(), "a job no longer there counts nothing");
 }
 
 #[test]

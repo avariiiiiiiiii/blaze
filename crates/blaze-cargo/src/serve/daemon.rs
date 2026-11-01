@@ -654,6 +654,7 @@ impl<D: Driver, S: Steps> Daemon<D, S> {
         let server = Server::new(server_config, &mut effects);
         let jobs = Jobs::new(Setup {
             views: format!("/{state}/views"),
+            std: format!("/{state}/std"),
             host: options.host,
             env: options.env,
             color: options.color,

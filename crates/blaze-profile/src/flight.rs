@@ -333,6 +333,170 @@ impl Drop for Building {
     }
 }
 
+// --- Jobs on fibers -----------------------------------------------------------------------
+
+/// What the recorder keeps of a job in its thread-locals, moved with the job when its fiber
+/// parks and resumes on another thread: the spans its thread was inside (the enter stack, the
+/// parents of the spans it makes next) and the build it works for.
+#[derive(Clone, Copy)]
+struct Carried {
+    depth: u32,
+    build: u32,
+    entered: [u64; OPEN_MAX],
+}
+
+/// The carried state of each parked job, by the number [`take_open`] gave it, less one; and the
+/// numbers free again.
+struct Parked {
+    jobs: Vec<Carried>,
+    free: Vec<usize>,
+}
+
+// alloc: none here; grows to the most jobs parked at once, then is kept.
+static PARKED: Mutex<Parked> = Mutex::new(Parked { jobs: Vec::new(), free: Vec::new() });
+
+/// Moves the parking job's enter stack and build off this thread, leaving it inside no span and
+/// working for no build: the `take` of `blaze_graph::sched::fiber::carry` ([`crate::install`]
+/// registers it). 0 for a job inside no span and of no build: nothing to move.
+#[inline(never)]
+pub fn take_open() -> usize {
+    let build = BUILD.with(|it| it.replace(0));
+    let ring = MINE.with(Cell::get);
+    let depth = ring.map_or(0, |it| it.depth.load(Ordering::Relaxed));
+    if depth == 0 && build == 0 {
+        return 0;
+    }
+    let mut carried = Carried { depth, build, entered: [0; OPEN_MAX] };
+    if let Some(ring) = ring {
+        for (to, from) in carried.entered.iter_mut().zip(&ring.entered[..(depth as usize).min(OPEN_MAX)]) {
+            *to = from.load(Ordering::Relaxed);
+        }
+        ring.depth.store(0, Ordering::Release);
+    }
+    let mut parked = lock(&PARKED);
+    let at = match parked.free.pop() {
+        Some(at) => {
+            parked.jobs[at] = carried;
+            at
+        }
+        None => {
+            // alloc: once per job parked at once past the most so far
+            parked.jobs.push(carried);
+            parked.jobs.len() - 1
+        }
+    };
+    at + 1
+}
+
+/// Puts what [`take_open`] took back on this thread, the one resuming the job: the `put` of
+/// `blaze_graph::sched::fiber::carry`. The thread was left inside no span by the job it ran
+/// before, so the job's stack replaces an empty one.
+#[inline(never)]
+pub fn put_open(taken: usize) {
+    let Some(at) = taken.checked_sub(1) else { return };
+    let carried = {
+        let mut parked = lock(&PARKED);
+        let Some(&carried) = parked.jobs.get(at) else { return };
+        // alloc: none past the most jobs parked at once
+        parked.free.push(at);
+        carried
+    };
+    BUILD.with(|it| it.set(carried.build));
+    if let Some(ring) = ring() {
+        let named = (carried.depth as usize).min(OPEN_MAX);
+        for (to, from) in ring.entered[..named].iter().zip(&carried.entered) {
+            to.store(*from, Ordering::Relaxed);
+        }
+        ring.depth.store(carried.depth, Ordering::Release);
+    }
+}
+
+/// A job's switch on its fiber ([`switched`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(u8)]
+pub enum Switched {
+    Started = 1,
+    Parked,
+    Resumed,
+    Ended,
+}
+
+impl Switched {
+    pub const fn name(self) -> &'static str {
+        match self {
+            Switched::Started => "started",
+            Switched::Parked => "parked",
+            Switched::Resumed => "resumed",
+            Switched::Ended => "ended",
+        }
+    }
+
+    fn of(byte: u64) -> Option<Switched> {
+        [Switched::Started, Switched::Parked, Switched::Resumed, Switched::Ended].into_iter().find(|it| *it as u64 == byte)
+    }
+}
+
+/// What a parked job waits for ([`SwitchRow::waited`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(u8)]
+pub enum WaitedOn {
+    /// A job's end: the value is the job's number (its slot; the job it holds then).
+    Job = 1,
+    /// A key's flight: the value is the key's hash, its first eight bytes.
+    Key,
+    /// A parallel map's counter: the value is the counter's number.
+    Counter,
+    /// The driver's clock reaching the value, in its nanoseconds.
+    Until,
+    /// Nothing: the job moves to another core. No value.
+    Moved,
+}
+
+impl WaitedOn {
+    pub const fn name(self) -> &'static str {
+        match self {
+            WaitedOn::Job => "job",
+            WaitedOn::Key => "key",
+            WaitedOn::Counter => "counter",
+            WaitedOn::Until => "until",
+            WaitedOn::Moved => "moved",
+        }
+    }
+
+    fn of(byte: u64) -> Option<WaitedOn> {
+        [WaitedOn::Job, WaitedOn::Key, WaitedOn::Counter, WaitedOn::Until, WaitedOn::Moved]
+            .into_iter()
+            .find(|it| *it as u64 == byte)
+    }
+}
+
+/// A switch as the fiber driver tells it ([`crate::install`] turns `blaze_graph`'s into this).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Switch {
+    pub event: Switched,
+    /// The job: its slot's generation << 32 | its slot, one job of a driver's life.
+    pub job: u64,
+    pub fiber: u32,
+    pub core: u32,
+    /// For [`Switched::Parked`], what it waits for and its value.
+    pub waited: Option<(WaitedOn, u64)>,
+}
+
+/// The plot byte of a [`switched`] row.
+const SWITCH_ROW: u64 = 0xfd;
+
+/// Notes `switch` now, in this thread's ring: one row, the `switches` table's.
+#[inline]
+pub fn switched(switch: Switch) {
+    if let Some(ring) = ring() {
+        let build = u64::from(BUILD.with(Cell::get));
+        let (waited, value) = switch.waited.map_or((0, 0), |(on, value)| (on as u64, value));
+        let what = KIND_PLOT << 62 | waited << 16 | (switch.event as u64) << 8 | SWITCH_ROW;
+        let where_ = u64::from(switch.core) << 32 | u64::from(switch.fiber);
+        ring.put([clock::ticks(), switch.job, value, where_, what, 0, build, 0]);
+    }
+}
+
 // --- Allocations --------------------------------------------------------------------------
 
 /// What a thread has allocated so far: bytes and allocations, never decreasing.
@@ -358,6 +522,36 @@ fn allocated() -> Option<Allocated> {
     ALLOCATED.get().map(|read| read())
 }
 
+/// What the frames of a thread's ended tasks copied to grow blocks so far, never decreasing:
+/// `blaze_mem::tag::copied_on_thread`.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct FrameCopied {
+    pub copies: u64,
+    pub bytes: u64,
+}
+
+/// The reader of the calling thread's [`FrameCopied`], given by the binary that links
+/// blaze-mem, once.
+static FRAME_COPIED: OnceLock<fn() -> FrameCopied> = OnceLock::new();
+
+/// Has every span note what its thread's task frames copied growing blocks while it was open,
+/// read by `read`. Without it `frame_grow_copies` and `frame_copied_bytes` are null. Once a
+/// process; a second call is refused.
+pub fn count_frame_copies(read: fn() -> FrameCopied) -> Result<(), fn() -> FrameCopied> {
+    FRAME_COPIED.set(read)
+}
+
+#[inline]
+fn frame_copied() -> FrameCopied {
+    FRAME_COPIED.get().map_or_else(FrameCopied::default, |read| read())
+}
+
+/// The plot byte of the row that follows a span's row when the span's frames copied: the
+/// copies and bytes, and the span's id. A span closed on another thread than it began on has
+/// one with `UNCOUNTED` set: the two threads' counts don't subtract.
+const SPAN_COPIED_ROW: u64 = 0xfe;
+const UNCOUNTED: u64 = 1;
+
 // --- Rings ------------------------------------------------------------------------------
 
 /// Who wrote a ring from row `from` on: rings outlive threads and go to the next thread.
@@ -382,6 +576,8 @@ struct Slot {
     unit: AtomicU64,
     alloc_bytes: AtomicU64,
     allocs: AtomicU64,
+    frame_copies: AtomicU64,
+    frame_bytes: AtomicU64,
 }
 
 impl Slot {
@@ -395,6 +591,8 @@ impl Slot {
         unit: AtomicU64::new(0),
         alloc_bytes: AtomicU64::new(0),
         allocs: AtomicU64::new(0),
+        frame_copies: AtomicU64::new(0),
+        frame_bytes: AtomicU64::new(0),
     };
 }
 
@@ -409,6 +607,7 @@ struct Opened {
     of: u64,
     unit: u64,
     alloc: Allocated,
+    copied: FrameCopied,
 }
 
 pub(crate) struct Ring {
@@ -529,6 +728,10 @@ impl Ring {
             alloc: Allocated {
                 bytes: slot.alloc_bytes.load(Ordering::Relaxed),
                 count: slot.allocs.load(Ordering::Relaxed),
+            },
+            copied: FrameCopied {
+                copies: slot.frame_copies.load(Ordering::Relaxed),
+                bytes: slot.frame_bytes.load(Ordering::Relaxed),
             },
         };
         fence(Ordering::Acquire);
@@ -739,6 +942,7 @@ pub(crate) fn opened(span: &tracing::span::Attributes<'_>, site: u16) -> u64 {
     let slot = &ring.open[at];
     let build = BUILD.with(Cell::get);
     let alloc = allocated().unwrap_or_default();
+    let copied = frame_copied();
     slot.start.store(clock::ticks(), Ordering::Relaxed);
     slot.parent.store(parent, Ordering::Relaxed);
     slot.what.store(u64::from(build) << 32 | u64::from(depth.min(0xffff)) << 16 | u64::from(site), Ordering::Relaxed);
@@ -746,6 +950,8 @@ pub(crate) fn opened(span: &tracing::span::Attributes<'_>, site: u16) -> u64 {
     slot.unit.store(u64::from(fields.unit), Ordering::Relaxed);
     slot.alloc_bytes.store(alloc.bytes, Ordering::Relaxed);
     slot.allocs.store(alloc.count, Ordering::Relaxed);
+    slot.frame_copies.store(copied.copies, Ordering::Relaxed);
+    slot.frame_bytes.store(copied.bytes, Ordering::Relaxed);
     slot.refs.store(1, Ordering::Relaxed);
     slot.id.store(id, Ordering::Release);
     id
@@ -837,6 +1043,19 @@ pub(crate) fn closed(id: u64) -> Option<u64> {
     let build_unit = u64::from(opened.build) << 32 | opened.unit;
     let ring = ring()?;
     ring.put([now, opened.start, id, opened.parent, what, opened.of, build_unit, bytes]);
+    if FRAME_COPIED.get().is_some() {
+        let copied = frame_copied();
+        let row = if ring.number != made_by.number {
+            Some([0, 0, UNCOUNTED])
+        } else if copied.copies != opened.copied.copies {
+            Some([copied.copies - opened.copied.copies, copied.bytes - opened.copied.bytes, 0])
+        } else {
+            None
+        };
+        if let Some([copies, bytes, flags]) = row {
+            ring.put([now, copies, bytes, id, KIND_PLOT << 62 | SPAN_COPIED_ROW, flags, 0, 0]);
+        }
+    }
     ring.spans.store(ring.spans.load(Ordering::Relaxed) + 1, Ordering::Relaxed);
     Some(now.wrapping_sub(opened.start))
 }
@@ -879,6 +1098,9 @@ pub struct SpanRow {
     pub dur_ns: i64,
     /// `None` when allocations are not counted ([`count_allocations`]).
     pub alloc: Option<Allocated>,
+    /// What its thread's task frames copied growing blocks while it was open: `None` when not
+    /// counted ([`count_frame_copies`]) or when it closed on another thread than it began on.
+    pub copied: Option<FrameCopied>,
     pub krate: Sym,
     pub function: Sym,
     pub unit: Sym,
@@ -895,6 +1117,20 @@ pub struct CounterRow {
     pub fiber: Option<(u32, u64)>,
 }
 
+/// A row of the schema's `switches` table: a [`switched`] row, on the thread it happened on.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SwitchRow {
+    pub build: u32,
+    pub thread: u32,
+    pub thread_name: Sym,
+    pub t_ns: i64,
+    pub event: Switched,
+    pub job: u64,
+    pub fiber: u32,
+    pub core: u32,
+    pub waited: Option<(WaitedOn, u64)>,
+}
+
 /// A build's end, as [`crate::built`] noted it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct BuildEnd {
@@ -908,6 +1144,7 @@ pub struct BuildEnd {
 pub struct Read {
     pub spans: Vec<SpanRow>,
     pub counters: Vec<CounterRow>,
+    pub switches: Vec<SwitchRow>,
     pub ends: Vec<BuildEnd>,
     /// Rows written over before this reader read them: it fell behind by that many.
     pub skipped: u64,
@@ -925,6 +1162,7 @@ impl Read {
     pub fn clear(&mut self) {
         self.spans.clear();
         self.counters.clear();
+        self.switches.clear();
         self.ends.clear();
         self.skipped = 0;
     }
@@ -962,6 +1200,7 @@ pub fn window(window: Duration, into: &mut Read) {
     });
     into.spans.retain(|it| it.start_ns + it.dur_ns >= since);
     into.counters.retain(|it| it.t_ns >= since);
+    into.switches.retain(|it| it.t_ns >= since);
     into.ends.retain(|it| it.t_ns >= since);
 }
 
@@ -972,6 +1211,7 @@ fn take(into: &mut Read, mut rows: impl FnMut(&Ring, &mut Vec<(u64, [u64; WORDS]
     let rings = lock(&RINGS).clone();
     let mut scratch = std::mem::take(&mut into.scratch);
     let mut lost = RINGLESS.load(Ordering::Relaxed);
+    let counting_copies = FRAME_COPIED.get().is_some();
     for ring in rings {
         lost += ring.lost.load(Ordering::Relaxed);
         scratch.clear();
@@ -1001,10 +1241,34 @@ fn take(into: &mut Read, mut rows: impl FnMut(&Ring, &mut Vec<(u64, [u64; WORDS]
                         start_ns: scale.mono(row[1]),
                         dur_ns: scale.ns(row[0].wrapping_sub(row[1])) as i64,
                         alloc: (allocs != 0).then(|| Allocated { bytes: row[7], count: allocs - 1 }),
+                        copied: counting_copies.then_some(FrameCopied::default()),
                         krate: (row[5] >> 32) as u32,
                         function: row[5] as u32,
                         unit: row[6] as u32,
                     });
+                }
+                KIND_PLOT if row[4] & 0xff == SWITCH_ROW => {
+                    let Some(event) = Switched::of(row[4] >> 8 & 0xff) else { continue };
+                    into.switches.push(SwitchRow {
+                        build: row[6] as u32,
+                        thread: by.tid,
+                        thread_name: by.name,
+                        t_ns: scale.mono(row[0]),
+                        event,
+                        job: row[1],
+                        fiber: row[3] as u32,
+                        core: (row[3] >> 32) as u32,
+                        waited: WaitedOn::of(row[4] >> 16 & 0xff).map(|on| (on, row[2])),
+                    });
+                }
+                KIND_PLOT if row[4] & 0xff == SPAN_COPIED_ROW => {
+                    // Written right after its span's row, by the same thread: the span read
+                    // last, unless the ring wrote over that row first.
+                    if let Some(span) = into.spans.last_mut()
+                        && span.span_id == row[3]
+                    {
+                        span.copied = (row[5] & UNCOUNTED == 0).then_some(FrameCopied { copies: row[1], bytes: row[2] });
+                    }
                 }
                 KIND_PLOT if row[4] & 0xff == FIBER_STACK_ROW => {
                     let fiber = Some(((row[4] >> 8) as u32, row[7]));
@@ -1326,6 +1590,58 @@ mod tests {
         assert!(row.dur_ns >= 0);
         // Its thread ended, so the ring that made it names that thread or the next to take it.
         assert!(row.thread == tid || row.thread != 0);
+    }
+
+    thread_local! {
+        static TEST_COPIED: Cell<FrameCopied> = const { Cell::new(FrameCopied { copies: 0, bytes: 0 }) };
+    }
+
+    fn test_copied() -> FrameCopied {
+        TEST_COPIED.with(Cell::get)
+    }
+
+    fn copy(copies: u64, bytes: u64) {
+        TEST_COPIED.with(|it| {
+            let was = it.get();
+            it.set(FrameCopied { copies: was.copies + copies, bytes: was.bytes + bytes });
+        });
+    }
+
+    #[test]
+    fn a_span_has_the_frame_copies_made_while_it_was_open_on_its_thread() {
+        crate::install();
+        // The one test that counts copies: a process takes one reader.
+        count_frame_copies(test_copied).expect("no other test gives a reader");
+        let (copying, quiet, outer, moved) = std::thread::spawn(|| {
+            copy(1, 10);
+            let outer = tracing::info_span!(target: "blaze", "copies outer").entered();
+            let outer_id = outer.id().unwrap().into_u64();
+            let copying = {
+                let it = tracing::info_span!(target: "blaze", "copies inner").entered();
+                copy(2, 300);
+                it.id().unwrap().into_u64()
+            };
+            let quiet = {
+                let it = tracing::info_span!(target: "blaze", "copies none").entered();
+                it.id().unwrap().into_u64()
+            };
+            copy(1, 7);
+            drop(outer);
+            let moved = tracing::info_span!(target: "blaze", "copies moved");
+            (copying, quiet, outer_id, moved)
+        })
+        .join()
+        .unwrap();
+        let moved_id = moved.id().unwrap().into_u64();
+        copy(5, 5);
+        drop(moved);
+        let mut read = Read::default();
+        window(Duration::from_secs(60), &mut read);
+        let copied = |id: u64| read.spans.iter().find(|it| it.span_id == id).expect("the span is a row").copied;
+        assert_eq!(copied(copying), Some(FrameCopied { copies: 2, bytes: 300 }));
+        assert_eq!(copied(quiet), Some(FrameCopied::default()), "counted, and none were made");
+        assert_eq!(copied(outer), Some(FrameCopied { copies: 3, bytes: 307 }), "a span counts those of the spans in it");
+        assert_eq!(copied(moved_id), None, "two threads' counts don't subtract");
     }
 
     #[test]

@@ -125,6 +125,7 @@ pub(super) fn check(asked: &Asked<'_>, shown: &str, source: &str, library: &Libr
         mounts,
         host: asked.host.to_owned(),
         library: stdlib::library_at(&library.commit),
+        std: format!("{DIR}/std"),
     };
     let view = db.open_with(View { root: tree.view }, &config.encode());
     let planned = db

@@ -221,6 +221,7 @@ fn config(view: ContentId, library: ContentId) -> BuildConfig {
         ],
         host: HOST.to_owned(),
         library: LIBRARY.to_owned(),
+        std: "/s/std".to_owned(),
     }
 }
 

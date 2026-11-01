@@ -51,6 +51,7 @@ fn open(db: &Database, tree: &MemTree, files: &[(&str, &str)]) -> ViewId {
         mounts: vec![Mount { at: WS.to_owned(), origin: Origin::View, under: "ws".to_owned() }],
         host: "x86_64-unknown-linux-gnu".to_owned(),
         library: "/rustc/0/library".to_owned(),
+        std: "/s/std".to_owned(),
     };
     db.open_with(View { root: tree.root(&files) }, &config.encode())
 }

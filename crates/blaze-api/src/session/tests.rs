@@ -517,6 +517,8 @@ fn counters() -> Snapshot {
             high_water: 20 + at,
             allocated: 30 + at,
             task_peak: 40 + at,
+            grow_copies: 0,
+            grow_copied: 0,
             budget: u64::MAX,
         };
     }

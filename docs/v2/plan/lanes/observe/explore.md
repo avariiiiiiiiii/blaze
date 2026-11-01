@@ -96,7 +96,7 @@ page resets the stream or sends STOP_SENDING.
 | `views` | | one row a view: `name`, `title`, `sql`, `args` (the JSON Schema of its arguments) |
 | `view` | `name`, `args` | the view's result; the SQL it became in the header |
 | `spans` | `build`, `t0_ns`, `t1_ns` | the build's spans overlapping the range, by process, thread and start |
-| `tiles` | `build`, `t0_ns`, `t1_ns`, `bucket_ns` | the `tiles` table; `buckets`, `spans`, `sql_ns`, `tiles_ns` |
+| `tiles` | `build`, `t0_ns`, `t1_ns`, `bucket_ns`, optional `lane` (`thread` or `job`) | the `tiles` table, or `job_tiles` (a lane per fiber job, from `job_spans`) for `lane: job`; `lane`, `buckets`, `spans`, `sql_ns`, `tiles_ns` |
 | `world` | `path` | Flecs's REST answer to `GET <path>` as JSON in the header's `world`; no table |
 
 `sql` and `view` run through observe-history's `blaze_profile::sql::run` (the pinned DuckDB

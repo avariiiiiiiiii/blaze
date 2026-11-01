@@ -15,7 +15,7 @@ use std::{collections::VecDeque, sync::Arc};
 
 use arrow_array::{
     Array, ArrayRef, DictionaryArray, Int64Array, LargeStringArray, RecordBatch, StringArray,
-    StringViewArray, UInt16Array, UInt32Array,
+    StringViewArray, UInt16Array, UInt32Array, UInt64Array,
     cast::AsArray,
     types::{Int32Type, Int64Type, UInt16Type, UInt32Type, UInt64Type},
 };
@@ -114,10 +114,37 @@ impl std::fmt::Display for TilesError {
 
 impl std::error::Error for TilesError {}
 
-/// A span of the range, clipped to it, its track packed: `group` is process << 32 | thread.
+/// Whose lane a tile is of: a thread's (`tiles`) or a fiber job's (`job_tiles`, from the
+/// `job_spans` view, whose `job` column takes the place of `thread`).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde_derive::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Lane {
+    #[default]
+    Thread,
+    Job,
+}
+
+impl Lane {
+    /// The spans' column that names the lane, and the output's.
+    pub const fn column(self) -> &'static str {
+        match self {
+            Lane::Thread => "thread",
+            Lane::Job => "job",
+        }
+    }
+
+    pub const fn table(self) -> &'static schema::Table {
+        match self {
+            Lane::Thread => &schema::TILES,
+            Lane::Job => &schema::JOB_TILES,
+        }
+    }
+}
+
+/// A span of the range, clipped to it, and its track: (process, thread or job).
 #[derive(Clone, Copy, Debug)]
 struct Span {
-    group: u64,
+    group: (u32, u64),
     depth: u16,
     s: i64,
     e: i64,
@@ -234,7 +261,7 @@ impl<'a> NameTable<'a> {
 #[derive(Default)]
 struct Out {
     process: Vec<u32>,
-    thread: Vec<u32>,
+    lane: Vec<u64>,
     depth: Vec<u16>,
     t0: Vec<i64>,
     t1: Vec<i64>,
@@ -244,12 +271,12 @@ struct Out {
 }
 
 impl Out {
-    fn push(&mut self, range: Range, group: u64, depth: u16, bucket: u64, acc: Acc) {
+    fn push(&mut self, range: Range, group: (u32, u64), depth: u16, bucket: u64, acc: Acc) {
         if acc.count == 0 {
             return;
         }
-        self.process.push((group >> 32) as u32);
-        self.thread.push(group as u32);
+        self.process.push(group.0);
+        self.lane.push(group.1);
         self.depth.push(depth);
         self.t0.push(range.start(bucket));
         self.t1.push(range.end(bucket));
@@ -262,6 +289,12 @@ impl Out {
 /// The `tiles` of the spans in `spans` (batches with the schema's `spans` columns `process`,
 /// `thread`, `depth`, `name`, `start_ns` and `dur_ns`; others are not read) over `range`.
 pub fn tiles(spans: &[RecordBatch], range: Range) -> Result<RecordBatch, TilesError> {
+    tiles_by(spans, range, Lane::Thread)
+}
+
+/// [`tiles`] with a lane per `lane`: for [`Lane::Job`], the spans have `job` in place of
+/// `thread` and the output is `job_tiles`.
+pub fn tiles_by(spans: &[RecordBatch], range: Range, lane: Lane) -> Result<RecordBatch, TilesError> {
     let mut table = NameTable::default();
     let rows: usize = spans.iter().map(RecordBatch::num_rows).sum();
     // alloc: once a request, the spans of its range
@@ -269,7 +302,7 @@ pub fn tiles(spans: &[RecordBatch], range: Range) -> Result<RecordBatch, TilesEr
     // alloc: once a request, grown to the largest dictionary of a batch
     let mut keyed: Vec<u32> = Vec::new();
     for batch in spans {
-        let (process, thread, depth) = (ints(batch, "process")?, ints(batch, "thread")?, ints(batch, "depth")?);
+        let (process, lanes, depth) = (ints(batch, "process")?, ints(batch, lane.column())?, ints(batch, "depth")?);
         let (start, dur, names) = (ints(batch, "start_ns")?, ints(batch, "dur_ns")?, names(batch)?);
         keyed.clear();
         if let Names::DictU32(_, values) | Names::DictI32(_, values) = &names {
@@ -285,7 +318,11 @@ pub fn tiles(spans: &[RecordBatch], range: Range) -> Result<RecordBatch, TilesEr
                 continue;
             }
             let process = process.get(row).and_then(|it| u32::try_from(it).ok()).ok_or_else(|| at("process"))?;
-            let thread = thread.get(row).and_then(|it| u32::try_from(it).ok()).ok_or_else(|| at("thread"))?;
+            let of = lanes.get(row).and_then(|it| match lane {
+                Lane::Thread => u32::try_from(it).ok().map(u64::from),
+                Lane::Job => u64::try_from(it).ok(),
+            });
+            let of = of.ok_or_else(|| at(lane.column()))?;
             let depth = depth.get(row).and_then(|it| u16::try_from(it).ok()).ok_or_else(|| at("depth"))?;
             let name = match &names {
                 Names::DictU32(keys, values) => dict_name(&mut table, &mut keyed, values, keys[row] as usize),
@@ -299,7 +336,7 @@ pub fn tiles(spans: &[RecordBatch], range: Range) -> Result<RecordBatch, TilesEr
             }
             .ok_or_else(|| at("name"))?;
             kept.push(Span {
-                group: u64::from(process) << 32 | u64::from(thread),
+                group: (process, of),
                 depth,
                 s: start.max(range.t0_ns),
                 e: end.min(range.t1_ns),
@@ -325,9 +362,13 @@ pub fn tiles(spans: &[RecordBatch], range: Range) -> Result<RecordBatch, TilesEr
     let values = StringArray::from(table.names);
     let name = DictionaryArray::<UInt32Type>::try_new(UInt32Array::from(out.name), Arc::new(values))
         .map_err(TilesError::Arrow)?;
+    let lanes: ArrayRef = match lane {
+        Lane::Thread => Arc::new(UInt32Array::from_iter_values(out.lane.iter().map(|it| *it as u32))),
+        Lane::Job => Arc::new(UInt64Array::from(out.lane)),
+    };
     let columns: Vec<ArrayRef> = vec![
         Arc::new(UInt32Array::from(out.process)),
-        Arc::new(UInt32Array::from(out.thread)),
+        lanes,
         Arc::new(UInt16Array::from(out.depth)),
         Arc::new(Int64Array::from(out.t0)),
         Arc::new(Int64Array::from(out.t1)),
@@ -335,7 +376,7 @@ pub fn tiles(spans: &[RecordBatch], range: Range) -> Result<RecordBatch, TilesEr
         Arc::new(Int64Array::from(out.busy)),
         Arc::new(name),
     ];
-    RecordBatch::try_new(schema_of(&schema::TILES), columns).map_err(TilesError::Arrow)
+    RecordBatch::try_new(schema_of(lane.table()), columns).map_err(TilesError::Arrow)
 }
 
 /// The output's number of the name at `key` of a batch's dictionary `values`, looked up once a

@@ -118,9 +118,18 @@ pub fn module_body_owners(db: &Db, module: ModuleId) -> Vec<DefWithBodyId> {
 
 /// The items with a body declared in the modules of `krate`, outside any body. Lowers no body.
 pub fn crate_body_owners(db: &Db, krate: Crate) -> Vec<DefWithBodyId> {
-    // alloc: the query's result, once per execution (per crate or per body)
-    let mut owners = Vec::new();
-    for (_, module) in crate_def_map(db, krate).modules(db) {
+    let def_map = crate_def_map(db, krate);
+    // Counted first, so the result is allocated once at any number of bodies.
+    let mut count = 0;
+    for (_, module) in def_map.modules(db) {
+        let _ = visit_scope_body_owners(db, module.scope(db), |_| {
+            count += 1;
+            ControlFlow::Continue(())
+        });
+    }
+    // alloc: the result, once per call, at its length
+    let mut owners = Vec::with_capacity(count);
+    for (_, module) in def_map.modules(db) {
         push_scope_body_owners(db, module.scope(db), &mut owners);
     }
     owners

@@ -14,7 +14,7 @@ use blaze_profile::{sql, views};
 use serde_json::{Map, Value};
 
 use crate::{
-    tiles::{self, Range, TilesError},
+    tiles::{self, Lane, Range, TilesError},
     wire::{Kind, Request, WireError},
 };
 
@@ -107,11 +107,15 @@ pub(crate) fn answer(cx: &Context, request: Request, stop: &AtomicBool) -> Resul
             }
             Ok(answer.with("build", build))
         }
-        Request::Tiles { build, t0_ns, t1_ns, bucket_ns } => {
+        Request::Tiles { build, t0_ns, t1_ns, bucket_ns, lane } => {
             let range = Range::new(t0_ns, t1_ns, bucket_ns).map_err(|it| tiles_error(&it))?;
+            let (from, of) = match lane {
+                Lane::Thread => ("spans", "thread"),
+                Lane::Job => ("job_spans", "job"),
+            };
             let sql = format!(
-                "SELECT process, thread, depth, name, start_ns, dur_ns FROM spans WHERE {} \
-                 ORDER BY process, thread, depth, start_ns",
+                "SELECT process, {of}, depth, name, start_ns, dur_ns FROM {from} WHERE {} AND {of} IS NOT NULL \
+                 ORDER BY process, {of}, depth, start_ns",
                 overlapping(build, t0_ns, t1_ns)
             );
             let started = Instant::now();
@@ -120,9 +124,10 @@ pub(crate) fn answer(cx: &Context, request: Request, stop: &AtomicBool) -> Resul
                 known_build(cx, build, stop)?;
             }
             let sql_ns = started.elapsed().as_nanos() as u64;
-            let tiles = tiles::tiles(&spans, range).map_err(|it| tiles_error(&it))?;
+            let tiles = tiles::tiles_by(&spans, range, lane).map_err(|it| tiles_error(&it))?;
             let tiles_ns = started.elapsed().as_nanos() as u64 - sql_ns;
             let answer = Answer::new("tiles")
+                .with("lane", lane.column())
                 .with("sql", sql)
                 .with("build", build)
                 .with("bucket_ns", bucket_ns)
@@ -306,7 +311,7 @@ mod tests {
     fn a_backwards_range_is_bad_args_before_any_query() {
         let spans = answer(&cx(), Request::Spans { build: 1, t0_ns: 9, t1_ns: 9 });
         assert_eq!(spans.err().map(|it| it.kind), Some(Kind::BadArgs));
-        let tiles = answer(&cx(), Request::Tiles { build: 1, t0_ns: 0, t1_ns: 10, bucket_ns: 0 });
+        let tiles = answer(&cx(), Request::Tiles { build: 1, t0_ns: 0, t1_ns: 10, bucket_ns: 0, lane: Lane::Thread });
         assert_eq!(tiles.err().map(|it| it.kind), Some(Kind::BadArgs));
     }
 

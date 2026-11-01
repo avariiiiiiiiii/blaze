@@ -95,14 +95,21 @@ pub(crate) fn instance_ref(
     if let InstanceDef::Fn(func) = instance.def
         && !FunctionSignature::of(db, func).has_body()
     {
-        return bodyless(db, func).map(FrontRef::Extern);
+        return bodyless(db, func, instance.args.as_ref(), env).map(FrontRef::Extern);
     }
     let env = homes.home(db, &instance, env);
     Ok(FrontRef::Function(HirInstance(Kind::Code(instance, env))))
 }
 
-/// The symbol a function without a body of Rust is: an item of an `extern` block.
-fn bodyless(db: &Db, func: FunctionId) -> Result<String, String> {
+/// The symbol a function without a body of Rust is: an item of an `extern` block. A trait's
+/// method without a default body, called with `args` in `env`, is an error naming why no
+/// impl's method was found ([`crate::no_impl_method`]).
+fn bodyless(
+    db: &Db,
+    func: FunctionId,
+    args: GenericArgs<'_>,
+    env: &StoredParamEnvAndCrate,
+) -> Result<String, String> {
     let name = FunctionSignature::of(db, func).name.as_str();
     match func.lookup(db).container {
         ItemContainerId::ExternBlockId(_) => {
@@ -116,10 +123,11 @@ fn bodyless(db: &Db, func: FunctionId) -> Result<String, String> {
             }
             Ok(symbol)
         }
-        ItemContainerId::TraitId(_) => {
+        ItemContainerId::TraitId(_) => match db.lookup_impl_method_or_why(env.as_ref(db), func, args) {
+            Err(why) => Err(crate::no_impl_method(db, func, args, why)),
             // alloc: the error's message
-            Err(format!("a call of the trait method `{name}`, which no impl was found for"))
-        }
+            Ok(_) => Err(format!("a call of the trait method `{name}`, not of the impl's method it resolves to")),
+        },
         _ if FunctionSignature::is_intrinsic(db, func) => {
             // alloc: the error's message
             Err(format!("a call of the intrinsic `{name}`, which has no fallback body"))

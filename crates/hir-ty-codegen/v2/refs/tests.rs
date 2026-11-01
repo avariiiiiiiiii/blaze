@@ -318,6 +318,29 @@ fn a_dyn_coercion_lists_its_vtable() {
     assert!(count(&reached, |def| *def == InstanceDef::DropGlue) >= 1, "{reached:?}");
 }
 
+const DYN_PROVIDED: &str = r#"
+//- minicore: sized, unsize, coerce_unsized, dispatch_from_dyn
+pub trait P {
+    fn distance(&self) -> u32;
+    fn twice(&self) -> u32 { self.distance() * 2 }
+}
+pub struct Inherits(pub u32);
+impl P for Inherits { fn distance(&self) -> u32 { self.0 } }
+pub fn roots(x: u32) -> u32 {
+    let inherits = Inherits(x);
+    let p: &dyn P = &inherits;
+    p.twice() + inherits.twice()
+}
+"#;
+
+/// An impl that leaves out a provided method (`Write::write_fmt` of `Stderr`) fills its
+/// vtable slot and its direct calls with the trait's provided method.
+#[test]
+fn a_provided_method_an_impl_inherits_fills_its_vtable_slot() {
+    let (db, reached) = reach_from(DYN_PROVIDED, "roots");
+    assert_reached(&db, &reached, &["distance", "twice"]);
+}
+
 const DYN_FN: &str = r#"
 //- minicore: sized, copy, unsize, coerce_unsized, dispatch_from_dyn, fn, drop
 pub struct Held(pub u32);

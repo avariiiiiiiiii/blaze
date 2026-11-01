@@ -206,9 +206,6 @@ struct FnNode<I, S> {
     /// Whose code the walk first asked for it as: what describing it again takes.
     requester: Origin,
     described: Described<I, S>,
-    /// The name and origin of a later describer of its key that made it the image's where
-    /// `described` made it the workspace's: what a refusal of its references names.
-    owned_as: Option<(String, Origin)>,
     /// [`digests::debug_name_digest`] of `described.name`, made where it is described.
     name_digest: ContentId,
     /// This build's targets of `described.refs`.
@@ -599,12 +596,21 @@ enum Whence {
     Store(Key),
     /// The memo's, of a compile of the same shape.
     Shape(ContentId),
+    /// The body folded for a group, kept in the store or the memo by this key: the function
+    /// is the group's (its key [`fold::Group::key`]), named by its first member.
+    Folded(Key),
 }
 
 /// Function `key` (`item`, called `name`) could not be made of the template from `whence`.
 fn unfit(key: InstanceKey, item: ItemKey, name: &str, whence: Whence, why: TemplateError) -> CodegenError {
+    let what = match whence {
+        // alloc: an error
+        Whence::Folded(_) => format!("the body folded for the group of `{name}` ({key:?}, the group's key)"),
+        // alloc: an error
+        Whence::Store(_) | Whence::Shape(_) => format!("`{name}` ({key:?})"),
+    };
     // alloc: an error
-    error(key, item, format!("`{name}` ({key:?}), of the template {whence:?}: {why}"))
+    error(key, item, format!("{what}, of the template {whence:?}: {why}"))
 }
 
 /// The function of instance `key` with `refs` in a stored template blob, read in place: its
@@ -695,7 +701,6 @@ impl<'a, B: Prepare> Build<'a, B> {
             requester,
             name_digest: digests::debug_name_digest(&described.name),
             described,
-            owned_as: None,
             // alloc: none, empty until the walk resolves them
             refs: Vec::new(),
             // alloc: none, empty until the walk resolves them
@@ -801,12 +806,12 @@ impl<'a, B: Prepare> Build<'a, B> {
                     }
                     // One key described twice (an `asm!` function asked for by a dependency
                     // and the workspace, a generic made for arguments its code reads alike)
-                    // is the image's if either says so.
+                    // is the image's if either says so, and then is the image's describer's
+                    // whole: its code is the key's either way, and the image's copy refers
+                    // to what that describer's references are, never the workspace's.
                     std::collections::hash_map::Entry::Occupied(mut it) => {
-                        let kept = it.get_mut();
-                        if node.described.owner < kept.described.owner {
-                            kept.described.owner = node.described.owner;
-                            kept.owned_as = Some((node.described.name, node.described.origin));
+                        if node.described.owner < it.get().described.owner {
+                            it.insert(node);
                         }
                     }
                 }
@@ -1025,7 +1030,6 @@ impl<'a, B: Prepare> Build<'a, B> {
                 refs: &node.refs,
                 name: &node.described.name,
                 origin: node.described.origin,
-                owned_as: node.owned_as.as_ref().map(|(name, origin)| (name.as_str(), *origin)),
             }),
             statics.keys.iter().zip(&statics.values).map(|(id, node)| owners::StaticOf {
                 id: *id,
@@ -1494,7 +1498,7 @@ impl<'a, B: Prepare> Build<'a, B> {
                 Read::Hit(body) if thunks.len() == group.members.len() => {
                     out.stats.stored += 1 + thunks.len();
                     out.stats.folded += group.members.len();
-                    let whence = Whence::Store(keys::folded(&key));
+                    let whence = Whence::Folded(keys::folded(&key));
                     out.instantiate(&first.unit, &first.described.name, key, whence, &body, &first.refs);
                     for (member, thunk) in group.members.iter().zip(&thunks) {
                         let node = &nodes[member];
@@ -1620,7 +1624,7 @@ impl<'a, B: Prepare> Build<'a, B> {
                     let kept = self.memo.put(body_at.0, body);
                     out.used(body_at.0);
                     out.template(body_at, kept);
-                    let whence = Whence::Store(body_at);
+                    let whence = Whence::Folded(body_at);
                     out.instantiate(&first.unit, &first.described.name, key, whence, kept, &first.refs);
                 }
                 None => whole = false,
@@ -1681,7 +1685,7 @@ impl<'a, B: Prepare> Build<'a, B> {
         out.stats.folded += group.members.len();
         out.used(body_at.0);
         out.template(body_at, body);
-        out.instantiate(&first.unit, &first.described.name, key, Whence::Store(body_at), body, &first.refs);
+        out.instantiate(&first.unit, &first.described.name, key, Whence::Folded(body_at), body, &first.refs);
         for (member, at, thunk) in thunks {
             let node = &nodes[member];
             out.used(at.0);

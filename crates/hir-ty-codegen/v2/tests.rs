@@ -1006,3 +1006,120 @@ fn a_line_is_read_from_the_location_where_it_is_written() {
         assert_eq!(lines(&llvm(2)), [written], "inlined `Location::caller` reads the same");
     });
 }
+
+/// A trait method's call that no impl holds for, its arguments concrete, stops naming the
+/// trait, the method, the arguments and why; one a where clause proves names the trait's own
+/// method, whose impl is chosen once its arguments are known; one whose impl inherits the
+/// trait's provided method (`Write::write_fmt` of `Stderr`) is of that provided method.
+#[test]
+fn a_trait_call_no_impl_holds_for_stops_with_why_and_a_provided_method_is_inherited() {
+    use hir_def::{AdtId, ModuleDefId};
+    use hir_expand::name::Name;
+    use hir_ty::{
+        ParamEnvAndCrate,
+        next_solver::{DbInterner, GenericArgs, Ty},
+    };
+    use rustc_type_ir::inherent::{GenericArgs as _, Ty as _};
+    let (db, _) = frontend(
+        r#"
+pub trait P {
+    fn distance(&self) -> usize;
+    fn twice(&self) -> usize { self.distance() * 2 }
+}
+pub struct S;
+pub struct Inherits;
+impl P for Inherits {
+    fn distance(&self) -> usize { 1 }
+}
+pub fn concrete(_: &S) {}
+pub fn bounded<T: P>(at: &T) -> usize {
+    at.distance()
+}
+"#,
+    );
+    let krate = fixture::test_crate(db);
+    let declared = hir_def::test_items::declarations(db, krate);
+    let p = declared.iter().find_map(|it| match it {
+        ModuleDefId::TraitId(it) => Some(*it),
+        _ => None,
+    });
+    let structs: Vec<_> = declared
+        .iter()
+        .filter_map(|it| match it {
+            ModuleDefId::AdtId(AdtId::StructId(it)) => Some(*it),
+            _ => None,
+        })
+        .collect();
+    let p = p.expect("the trait `P`");
+    let [s, inherits] = structs[..] else { panic!("the structs `S` and `Inherits`: {structs:?}") };
+    let method = |name: &str| p.trait_items(db).method_by_name(&Name::new_root(name)).expect("`P`'s method");
+    let (distance, twice) = (method("distance"), method("twice"));
+    let (concrete, bounded) = (function(db, "concrete"), function(db, "bounded"));
+    hir_ty::attach_db(db, || {
+        let interner = DbInterner::new_with(db, krate);
+        let env = |def: FunctionId| ParamEnvAndCrate { param_env: db.trait_environment(def.into()), krate };
+        let s = Ty::new_adt(interner, AdtId::StructId(s), GenericArgs::empty());
+        let why = crate::impl_method(db, env(concrete), distance, GenericArgs::new_from_slice(&[s.into()]))
+            .expect_err("no impl of `P` is for `S`");
+        assert!(why.starts_with("trait P method distance for [S"), "{why}");
+        assert!(why.ends_with(": no impl holds"), "{why}");
+
+        let param = GenericArgs::identity_for_item(interner, bounded.into()).type_at(0);
+        let (found, _) = crate::impl_method(db, env(bounded), distance, GenericArgs::new_from_slice(&[param.into()]))
+            .expect("a where clause proves `T: P`");
+        assert_eq!(found, either::Either::Left(distance));
+
+        let inherits = Ty::new_adt(interner, AdtId::StructId(inherits), GenericArgs::empty());
+        let (found, _) = crate::impl_method(db, env(concrete), twice, GenericArgs::new_from_slice(&[inherits.into()]))
+            .expect("`Inherits` inherits `P::twice`");
+        assert_eq!(found, either::Either::Left(twice));
+    });
+}
+
+/// The drop glues of two types of one layout, each with its own `Drop`, are two instances:
+/// one key would make one compile and one template serve both bodies.
+#[test]
+fn drop_glues_of_two_types_have_two_keys() {
+    use blaze_codegen::backend::Frontend as _;
+    let (db, frontend) = frontend(
+        r#"
+//- minicore: sized, drop
+pub struct A(pub u32);
+impl Drop for A { fn drop(&mut self) {} }
+pub struct B(pub u32);
+impl Drop for B { fn drop(&mut self) {} }
+pub fn roots(x: u32) {
+    let _a = A(x);
+    let _b = B(x);
+}
+"#,
+    );
+    // A failure's message formats instances, whose types are the database's.
+    hir_ty::attach_db(db, || {
+        let policy = policy(OptLevel::O0);
+        let root = frontend.root(function(db, "roots"));
+        let origin = frontend.with(|hir, _| frontend.origin(hir, fixture::test_crate(&db)));
+        let key = |instance: &HirInstance| {
+            let described = (frontend.describe(instance, &origin))
+                .unwrap_or_else(|e| panic!("{instance:?}: {}", e.what));
+            let choice = policy.choose(&described.origin, described.overflow_checks).expect("the plan");
+            UnitInstance { code: described.code, args: described.args, settings: choice.first.settings() }.key()
+        };
+        let glues: Vec<HirInstance> = frontend.with(|hir, homes| {
+            refs::walk(hir, &root, false, homes)
+                .expect("the walk of the root")
+                .into_iter()
+                .filter_map(|it| match it {
+                    FrontRef::Function(instance)
+                        if matches!(&instance.0, Kind::Code(it, _) if it.def == InstanceDef::DropGlue) =>
+                    {
+                        Some(instance)
+                    }
+                    _ => None,
+                })
+                .collect()
+        });
+        let [a, b] = &glues[..] else { panic!("{glues:?}") };
+        assert_ne!(key(a), key(b), "{a:?} and {b:?}");
+    });
+}

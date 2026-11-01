@@ -2894,13 +2894,17 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
                     let from =
                         field.ty().instantiate(self.interner(), current_subst).skip_norm_wip();
                     let to = field.ty().instantiate(self.interner(), target_subst).skip_norm_wip();
-                    if from != to {
-                        if changed.replace((from, to)).is_some() {
-                            not_supported!("unsizing a struct whose cast changes two fields");
-                        }
-                    } else if self.layout(from)?.size.bytes_usize() != 0 {
+                    // A zero-sized field (`Unique<T>`'s `PhantomData<T>`, which rustc's rule
+                    // skips) has no bytes for the cast to change.
+                    if self.layout(from)?.size.bytes_usize() == 0 {
+                        continue;
+                    }
+                    if from == to {
                         // The cast widens the value's bytes as one pointer.
                         not_supported!("unsizing a struct with bytes beside its pointer");
+                    }
+                    if changed.replace((from, to)).is_some() {
+                        not_supported!("unsizing a struct whose cast changes two fields");
                     }
                 }
                 match changed {

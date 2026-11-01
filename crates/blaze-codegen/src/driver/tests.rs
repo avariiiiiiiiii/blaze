@@ -32,6 +32,12 @@ struct Function {
     /// The outside symbol it calls, its last reference: no part of its code hash, so two
     /// builds can differ in it with every key the same.
     outside: &'static str,
+    /// The function whose code it is, itself when `None`: two of one code have one key, as
+    /// two instances of a generic whose code reads their arguments alike do.
+    code_of: Option<u32>,
+    /// Its owner, its origin's ([`Owner::of`]) when `None`: a dependency's generic made for a
+    /// workspace type is the workspace's.
+    owner: Option<Owner>,
 }
 
 #[derive(Default)]
@@ -56,6 +62,8 @@ impl Program {
             symbol: None,
             built_in: Vec::new(),
             outside: "memcpy",
+            code_of: None,
+            owner: None,
         };
         self.functions.insert(id, function);
         self.functions.get_mut(&id).unwrap()
@@ -85,13 +93,15 @@ impl Frontend for Program {
             .collect();
         // The code takes callees by their interface, here their number: not their bodies.
         let mut code = Hasher::new("blaze v2 test code 1");
-        code.update(&id.to_le_bytes()).update(&[function.body]);
-        for callee in &function.calls {
-            code.update(&callee.to_le_bytes());
+        code.update(&function.code_of.unwrap_or(*id).to_le_bytes()).update(&[function.body]);
+        if function.code_of.is_none() {
+            for callee in &function.calls {
+                code.update(&callee.to_le_bytes());
+            }
         }
         let code = CodeHash(code.finish());
         Ok(Described {
-            owner: Owner::of(&function.origin),
+            owner: function.owner.unwrap_or(Owner::of(&function.origin)),
             identity: ContentId::of("blaze v2 test identity 1", &id.to_le_bytes()),
             bound: Ok(code.0),
             item: item(*id),
@@ -765,3 +775,29 @@ mod later;
 mod masks;
 mod pieces;
 mod stop;
+
+/// Two instances of one key, the first a workspace's and the second a dependency's (cc's
+/// `RawTable<(.., ToolFamily)>::reserve_rehash::{closure#1}` and its `RawTable<(Box<str>,
+/// Arc<str>)>` one), are the dependency's: its references are the dependency's instance's,
+/// each the image's, so the image never refers to the workspace's code.
+#[test]
+fn a_key_the_image_s_describer_shares_is_the_image_s_with_its_references() {
+    let policy = policy(OptLevel::O0, Mode::Output);
+    let mut program = Program::default();
+    program.function(1, 0x11, &[2, 3]).symbol = Some("main".to_owned());
+    let workspace = program.function(2, 0x22, &[4]);
+    workspace.code_of = Some(9);
+    let dependency = program.function(3, 0x22, &[5]);
+    (dependency.code_of, dependency.owner) = (Some(9), Some(Owner::Dependency));
+    program.function(4, 0x44, &[]);
+    program.function(5, 0x55, &[]).owner = Some(Owner::Dependency);
+    let built = build(&program, &Machine::default(), &policy, &Memo::new(), &Store::default())
+        .unwrap_or_else(|errors| panic!("{errors:?}"));
+    assert_eq!(built.stats.instances, 4, "2 and 3 are one key");
+    let key_of = |body: u8| built.functions.iter().find(|it| it.code[0] == body).map(|it| it.key);
+    let (shared, callee) = (key_of(0x22).unwrap(), key_of(0x55).unwrap());
+    let owner = |key| built.owners.iter().find(|it| it.0 == key).map(|it| it.1);
+    assert_eq!((owner(shared), owner(callee)), (Some(Owner::Dependency), Some(Owner::Dependency)));
+    let made = built.functions.iter().find(|it| it.key == shared).unwrap();
+    assert!(made.relocs.targets().contains(&Target::Direct(callee)), "{:?}", made.relocs);
+}

@@ -646,7 +646,13 @@ impl MacroCallId {
         let _p = tracing::info_span!("parse_macro_expansion").entered();
         blaze_mem::frame::task(blaze_mem::Tag::Expand, |frame| {
             let loc = self.loc(db);
-            let expand_to = loc.expand_to();
+            // A refused call's empty tree is no expression, pattern or type: parsed as one it
+            // would add a parse error to the refusal. As statements it is an empty list, which
+            // is no node of the kind its caller casts to, so the caller has none there.
+            let expand_to = match self.arg_refusal(db, &loc.kind) {
+                Some(_) if !matches!(loc.expand_to(), ExpandTo::Items) => ExpandTo::Statements,
+                _ => loc.expand_to(),
+            };
             let mbe::ValueResult { value: (tt, matched_arm, made), err } =
                 self.macro_expand(db, frame, loc);
 
@@ -683,7 +689,7 @@ impl MacroCallId {
         db: &'db Db,
         kind: &MacroCallKind,
     ) -> MacroArg<'db> {
-        let (tt, undo_info, span) = match kind {
+        let (tt, undo_info, span, _) = match kind {
             // Get the macro arg for the derive macro
             MacroCallKind::Derive { derive_macro_id, .. } => derive_macro_id.macro_arg(db),
             MacroCallKind::FnLike { eager: Some(_), .. } => {
@@ -695,6 +701,18 @@ impl MacroCallId {
             _ => self.macro_arg(db),
         };
         (tt, undo_info, *span)
+    }
+
+    /// Why the call is not expanded at all: its argument's delimiters do not pair or it has
+    /// none, so [`MacroCallId::macro_arg`] holds an empty tree where the argument would be.
+    #[expect(deprecated, reason = "we are `macro_arg_considering_derives`'s companion")]
+    fn arg_refusal(self, db: &Db, kind: &MacroCallKind) -> Option<ExpandError> {
+        let refusal = match kind {
+            MacroCallKind::Derive { derive_macro_id, .. } => &derive_macro_id.macro_arg(db).3,
+            MacroCallKind::FnLike { eager: Some(_), .. } => return None,
+            _ => &self.macro_arg(db).3,
+        };
+        refusal.clone() // clone: an `Option<ExpandError>`: an `Arc` count, only when refused
     }
 
     /// Lowers syntactic macro call to a token tree representation. That's a firewall
@@ -721,7 +739,7 @@ impl MacroCallId {
                     .map_or_else(|| node.syntax().text_range(), |path| path.syntax().text_range());
                 let span = map.span_for_range(path_range);
 
-                let dummy_tt = |kind| {
+                let refused = |kind, why: &str| {
                     (
                         tt::TopSubtree::from_token_trees(
                             tt::Delimiter { open: span, close: span, kind },
@@ -729,11 +747,15 @@ impl MacroCallId {
                         ),
                         SyntaxFixupUndoInfo::default(),
                         span,
+                        Some(ExpandError::other(span, why)),
                     )
                 };
 
                 let Some(tt) = node.token_tree() else {
-                    return dummy_tt(tt::DelimiterKind::Invisible);
+                    return refused(
+                        tt::DelimiterKind::Invisible,
+                        "this macro call has no `(..)`, `[..]` or `{..}` argument, so it is not expanded",
+                    );
                 };
                 let first = tt.left_delimiter_token().map(|it| it.kind()).unwrap_or(T!['(']);
                 let last = tt.right_delimiter_token().map(|it| it.kind()).unwrap_or(T![.]);
@@ -743,12 +765,8 @@ impl MacroCallId {
                     (T!['('], T![')']) | (T!['['], T![']']) | (T!['{'], T!['}'])
                 );
                 if mismatched_delimiters {
-                    // Don't expand malformed (unbalanced) macro invocations. This is
-                    // less than ideal, but trying to expand unbalanced  macro calls
-                    // sometimes produces pathological, deeply nested code which breaks
-                    // all kinds of things.
-                    //
-                    // So instead, we'll return an empty subtree here
+                    // An unbalanced call is not expanded: matching its tokens can make
+                    // pathological, deeply nested code. The expansion is refused, with why.
                     cov_mark::hit!(issue9358_bad_macro_stack_overflow);
 
                     let kind = match first {
@@ -758,7 +776,19 @@ impl MacroCallId {
                         T!['{'] => tt::DelimiterKind::Brace,
                         _ => tt::DelimiterKind::Invisible,
                     };
-                    return dummy_tt(kind);
+                    // alloc: an error's message, on the error path
+                    let why = match tt.right_delimiter_token() {
+                        None => format!(
+                            "this macro call's `{}` is never closed, so it is not expanded",
+                            first.text()
+                        ),
+                        Some(_) => format!(
+                            "this macro call opens with `{}` and closes with `{}`, so it is not expanded",
+                            first.text(),
+                            last.text()
+                        ),
+                    };
+                    return refused(kind, &why);
                 }
 
                 let mode = if loc.def.is_proc_macro() {
@@ -785,7 +815,7 @@ impl MacroCallId {
                     // proc macros expect their inputs without parentheses, MBEs expect it with them included
                     tt.set_top_subtree_delimiter_kind(tt::DelimiterKind::Invisible);
                 }
-                return (tt, SyntaxFixupUndoInfo::NONE, span);
+                return (tt, SyntaxFixupUndoInfo::NONE, span, None);
             }
             // MacroCallKind::Derive should not be here. As we are getting the argument for the derive macro
             MacroCallKind::Derive { .. } => {
@@ -826,7 +856,7 @@ impl MacroCallId {
             tt.set_top_subtree_delimiter_kind(tt::DelimiterKind::Invisible);
         }
 
-        (tt, undo_info, span)
+        (tt, undo_info, span, None)
     }
 
     fn macro_expand<'db, 'f>(
@@ -848,6 +878,12 @@ impl MacroCallId {
             _ => {
                 let (macro_arg, undo_info, span) =
                     self.macro_arg_considering_derives(db, &loc.kind);
+                if let Some(refusal) = self.arg_refusal(db, &loc.kind) {
+                    return ExpandResult::new(
+                        (Expansion::Borrowed(macro_arg), None, mbe::MadeIdents::new()),
+                        refusal,
+                    );
+                }
 
                 let arg = macro_arg;
                 let res = match loc.def.kind {
@@ -925,6 +961,10 @@ impl MacroCallId {
     ) -> (ExpandResult<tt::TopSubtree>, proc_macro::ExpansionReads) {
         let loc = self.loc(db);
         let (macro_arg, undo_info, _) = self.macro_arg_considering_derives(db, &loc.kind);
+        if let Some(refusal) = self.arg_refusal(db, &loc.kind) {
+            let empty = tt::TopSubtree::empty(macro_arg.top_subtree().delimiter.delim_span());
+            return (ExpandResult::new(empty, refusal), proc_macro::ExpansionReads::Nothing);
+        }
 
         let (ast, expander) = match loc.def.kind {
             MacroDefKind::ProcMacro(ast, expander, _) => (ast, expander),

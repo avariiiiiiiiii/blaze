@@ -8,9 +8,9 @@
 //! to the workspace's, or the image would change with workspace code: the build checks every
 //! reference of the dependency's code and refuses one to the workspace's, naming both.
 
+use blaze_graph::par;
 use blaze_ids::ContentId;
 use blaze_items::{CodeHash, ItemKey};
-use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 
 use crate::{CodegenError, InstanceKey, Target, plan::Origin};
@@ -106,23 +106,19 @@ where
         .chain(statics.filter(|it| it.owner == Owner::Dependency).map(|it| (it.unit, it.id.0, it.refs)))
         // alloc: per build, the dependency's code, a key pair and a slice each
         .collect();
-    let found: Vec<CodegenError> = checked
-        .par_iter()
-        .with_min_len(1024)
-        .filter_map(|&(unit, item, refs)| {
-            let target = refs.iter().find(|it| owner_of(*it) == Some(Owner::Workspace))?;
-            Some(CodegenError {
-                unit,
-                item,
-                // alloc: an error
-                what: format!(
-                    "is a dependency's, so it goes in the dependency image, and it refers to \
-                     {target:?}, which is the workspace's: the image would change with workspace code"
-                ),
-            })
+    // alloc: the errors, none for a build that has none
+    let found: Vec<CodegenError> = par::filter_map(&checked, |&(unit, item, refs)| {
+        let target = refs.iter().find(|it| owner_of(*it) == Some(Owner::Workspace))?;
+        Some(CodegenError {
+            unit,
+            item,
+            // alloc: an error
+            what: format!(
+                "is a dependency's, so it goes in the dependency image, and it refers to \
+                 {target:?}, which is the workspace's: the image would change with workspace code"
+            ),
         })
-        // alloc: the errors, none for a build that has none
-        .collect();
+    });
     errors.extend(found);
     owned
 }

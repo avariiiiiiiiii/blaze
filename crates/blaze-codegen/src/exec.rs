@@ -393,14 +393,10 @@ struct SpanIds {
 
 impl SpanIds {
     fn new(spans: &[(ContentId, Vec<u8>)]) -> SpanIds {
-        use rayon::prelude::*;
+        use blaze_graph::par;
         assert!(spans.len() < u32::MAX as usize, "fewer span tables than 2^32 - 1");
-        let ids: Vec<(ContentId, ContentId)> = spans
-            .par_iter()
-            .with_min_len(64)
-            .map(|(anchor, bytes)| (*anchor, ContentId::of(SPAN_TABLE_DOMAIN, bytes)))
-            // alloc: once per test binary linked, an ID per span table
-            .collect();
+        // alloc: once per test binary linked, an ID per span table
+        let ids: Vec<(ContentId, ContentId)> = par::map(spans, |(anchor, bytes)| (*anchor, ContentId::of(SPAN_TABLE_DOMAIN, bytes)));
         let capacity = (ids.len() * 2).next_power_of_two().max(2);
         // alloc: once per test binary linked, the table's slots
         let mut slots = vec![0u32; capacity];
@@ -560,7 +556,7 @@ impl ExecTable {
         beside: ContentId,
         tests: impl IntoIterator<Item = (String, usize)>,
     ) -> Result<ExecTable, ExecError> {
-        use rayon::prelude::*;
+        use blaze_graph::par;
         assert_eq!(built.versions.len(), built.inputs.len(), "a build gives a version per instance");
         let count = built.inputs.len();
         assert!(count < ExecTable::EMPTY as usize, "fewer functions than `EMPTY`");
@@ -570,27 +566,23 @@ impl ExecTable {
         );
         let spans = SpanIds::new(spans);
         // Each function's on every core, in key order.
-        let placed: Vec<Result<ContentId, ExecError>> = (0..count)
-            .into_par_iter()
-            .with_min_len(256)
-            // alloc: per worker, the anchors and statics of one function, reused
-            .map_init(|| (Vec::new(), Vec::new()), |(anchors, named), at| {
-                let function = built.inputs[at].0;
-                let bound = match &built.versions[at].1 {
-                    Ok(it) => *it,
-                    // clone: an error
-                    Err(why) => return Err(ExecError::Unbound { function, why: why.clone() }),
-                };
-                let runs = built.deduped.merged.get(&function).unwrap_or(&function);
-                let Ok(code) = built.functions.binary_search_by_key(runs, |it| it.key) else {
-                    return Err(ExecError::NotCompiled { function });
-                };
-                named_by(&built.functions[code], &statics, anchors, named)
-                    .map_err(|why| ExecError::Unbound { function, why })?;
-                placed(bound, named, anchors, &spans).map_err(|anchor| ExecError::NoSpans { function, anchor })
-            })
-            // alloc: once per test binary, a bound per function
-            .collect();
+        // alloc: per worker, the anchors and statics of one function, reused
+        // alloc: once per test binary, a bound per function
+        let placed: Vec<Result<ContentId, ExecError>> = par::map_init(0..count, || (Vec::new(), Vec::new()), |(anchors, named), at| {
+            let function = built.inputs[at].0;
+            let bound = match &built.versions[at].1 {
+                Ok(it) => *it,
+                // clone: an error
+                Err(why) => return Err(ExecError::Unbound { function, why: why.clone() }),
+            };
+            let runs = built.deduped.merged.get(&function).unwrap_or(&function);
+            let Ok(code) = built.functions.binary_search_by_key(runs, |it| it.key) else {
+                return Err(ExecError::NotCompiled { function });
+            };
+            named_by(&built.functions[code], &statics, anchors, named)
+                .map_err(|why| ExecError::Unbound { function, why })?;
+            placed(bound, named, anchors, &spans).map_err(|anchor| ExecError::NoSpans { function, anchor })
+        });
         // alloc: once per test binary, the identity order
         let mut order: Vec<u32> = (0..count as u32).collect();
         // By place too, so that of two functions with one `FnId` the later is named.

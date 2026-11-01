@@ -11,9 +11,9 @@ use std::collections::hash_map::Entry;
 
 use blaze_codegen::Arch;
 use blaze_format::cursor::Put;
+use blaze_graph::par;
 use blaze_ids::radix;
 use object::elf;
-use rayon::prelude::*;
 use rustc_hash::FxHashMap;
 
 use super::{
@@ -30,7 +30,7 @@ const DYNAMIC_FIXED: u64 = 25;
 const SYM: u64 = 24;
 const RELA: u64 = 24;
 
-/// Items per rayon task: below this a split costs more than the work it shares.
+/// Items per pool task: below this a split costs more than the work it shares.
 pub(crate) const CHUNK: usize = 4096;
 
 /// The first error in input order, so a failed link names the same place on any core count.
@@ -366,7 +366,7 @@ impl Tables {
         let (buckets, mask_words) = gnu_hash_shape(exports.len() as u64);
         let mut hashes = Vec::with_capacity(exports.len());
         if exports.len() >= CHUNK {
-            hashes.par_extend(exports.par_iter().with_min_len(CHUNK).map(|it| gnu_hash(it.name.as_bytes())));
+            par::extend(&mut hashes, exports, |it| gnu_hash(it.name.as_bytes()));
         } else {
             hashes.extend(exports.iter().map(|it| gnu_hash(it.name.as_bytes())));
         }
@@ -717,7 +717,7 @@ fn patch_relative(writer: &Elf, placed: &Placed<'_>, delta: &Delta<'_>, kept: &m
 
 /// Each relocation's `Elf64_Rela`, in parallel chunks.
 fn put_relas(relocations: &[Rela], out: &mut [u8]) {
-    out.par_chunks_mut(RELA as usize * CHUNK).zip(relocations.par_chunks(CHUNK)).for_each(|(out, chunk)| {
+    par::for_each(par::zip(par::chunks_mut(out, RELA as usize * CHUNK), par::chunks(relocations, CHUNK)), |(out, chunk)| {
         for (out, it) in out.chunks_exact_mut(RELA as usize).zip(chunk) {
             out.copy_from_slice(&it.bytes());
         }
@@ -753,16 +753,15 @@ fn relocations(writer: &Elf, placed: &Placed<'_>, shared: bool) -> Result<(Vec<R
     let other_cells = placed.binds.len() + 2 * placed.got.len();
     let mut relative = Vec::with_capacity(placed.rebase.len() + other_cells);
     relative.resize(placed.rebase.len(), Rela::default());
-    let results: Vec<Result<(), LinkError>> = relative
-        .par_chunks_mut(CHUNK)
-        .zip(placed.rebase.par_chunks(CHUNK))
-        .map(|(out, ats)| {
+    let results: Vec<Result<(), LinkError>> = par::map(
+        par::zip(par::chunks_mut(&mut relative, CHUNK), par::chunks(placed.rebase, CHUNK)),
+        |(out, ats)| {
             for (out, &at) in out.iter_mut().zip(ats) {
                 *out = slid(placed, at, relative_type)?;
             }
             Ok(())
-        })
-        .collect(); // alloc: once per image, one result per chunk of slid addresses
+        },
+    ); // alloc: once per image, one result per chunk of slid addresses
     first_error(results)?;
     let in_order = sort_rela(&mut relative);
     let count = relative.len();
@@ -944,7 +943,7 @@ fn fdes_start_records(placed: &Placed<'_>, table: &[(u64, u64)]) -> bool {
     }
     let Some((index, region)) = placed.region(&Class::EhFrame) else { return true };
     let (section, end) = (region.addr, region.addr + placed.len(index) as u64);
-    placed.functions.par_iter().with_min_len(CHUNK).all(|it| match it.fde {
+    par::all(placed.functions, |it| match it.fde {
         Some(fde) if fde > section && fde < end => table.binary_search_by_key(&fde, |it| it.1).is_ok(),
         _ => true,
     })
@@ -1065,17 +1064,16 @@ fn build_hdr(placed: &Placed<'_>, hdr: u64) -> Result<(Vec<u8>, Vec<(u64, u64)>,
     bytes.put_u32(rel32(eh_frame_addr, hdr + 4, ".eh_frame from .eh_frame_hdr")?);
     bytes.put_u32(u32::try_from(table.len()).map_err(|_| error("more FDEs than .eh_frame_hdr counts".into()))?);
     bytes.resize(12 + 8 * table.len(), 0);
-    let results: Vec<Result<(), LinkError>> = bytes[12..]
-        .par_chunks_mut(8 * CHUNK)
-        .zip(table.par_chunks(CHUNK))
-        .map(|(out, chunk)| {
+    let results: Vec<Result<(), LinkError>> = par::map(
+        par::zip(par::chunks_mut(&mut bytes[12..], 8 * CHUNK), par::chunks(&table, CHUNK)),
+        |(out, chunk)| {
             for (out, &(pc, fde)) in out.chunks_exact_mut(8).zip(chunk) {
                 out[..4].copy_from_slice(&rel32(pc, hdr, "a function from .eh_frame_hdr")?.to_le_bytes());
                 out[4..].copy_from_slice(&rel32(fde, hdr, "an FDE from .eh_frame_hdr")?.to_le_bytes());
             }
             Ok(())
-        })
-        .collect(); // alloc: once per image, one result per chunk of FDEs
+        },
+    ); // alloc: once per image, one result per chunk of FDEs
     first_error(results)?;
     let unchanged = in_order && table.len() == inside;
     Ok((bytes, table, cies, unchanged))

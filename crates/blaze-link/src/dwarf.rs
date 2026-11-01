@@ -10,8 +10,8 @@
 
 use std::ops::Range;
 
+use blaze_graph::par;
 use blaze_ids::radix;
-use rayon::prelude::*;
 
 use crate::unwind::{concat, sleb, uleb};
 
@@ -112,9 +112,9 @@ pub(crate) fn sections(
     // parallel, each at its names' offset, and joined in order.
     // alloc: once per link, one slice per piece
     let chunks: Vec<&[u32]> = order.chunks(CHUNK).collect();
-    let named: Vec<usize> = (chunks.par_iter())
-        .map(|chunk| chunk.iter().filter_map(|at| functions[*at as usize].name).map(|it| it.len() + 1).sum())
-        .collect(); // alloc: once per link, one count per piece
+    let named: Vec<usize> = par::map(&chunks, |chunk| {
+        chunk.iter().filter_map(|at| functions[*at as usize].name).map(|it| it.len() + 1).sum()
+    }); // alloc: once per link, one count per piece
     // alloc: once per link, one offset per piece
     let mut string_at = Vec::with_capacity(chunks.len());
     let mut names = PRODUCER.len();
@@ -154,7 +154,7 @@ pub(crate) fn sections(
         (subprograms(), sequences(chunk, functions, rows, files.len(), address_size, &addr))
     };
     // alloc: once per link, one result per piece
-    let pieces: Vec<_> = (chunks.par_iter().copied()).zip(string_at.par_iter().copied()).map(piece).collect();
+    let pieces: Vec<_> = par::map(par::zip(&chunks, &string_at), |(&chunk, &at)| piece((chunk, at)));
     // alloc: once per link, the unit's header
     let mut head = Vec::with_capacity(11 + 32 + asz);
     head.extend_from_slice(&[0; 4]);

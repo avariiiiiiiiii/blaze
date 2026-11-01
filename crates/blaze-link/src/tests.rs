@@ -1296,7 +1296,7 @@ fn calls(n: u8, fixups: u32) -> CompiledFunction {
 /// replacement grows have grown. The replacement makes `fixups` calls. One worker thread, so
 /// the per-thread count sees all the stage's work.
 fn staged(fillers: u32, fixups: u32) -> blaze_alloc_count::Used {
-    let pool = rayon::ThreadPoolBuilder::new().num_threads(1).build().unwrap();
+    let pool = blaze_graph::pool::Pool::new(&blaze_graph::topology::Topology::flat(1), false).unwrap();
     pool.install(|| {
         let (start, g) = program(Target::Function);
         let others: Vec<CompiledFunction> =
@@ -1350,7 +1350,7 @@ fn relocation_allocates_nothing_per_fixup() {
 /// its PC table `pcs` entries, in an incremental image of `_start` and `g` (covered from the
 /// first link, so the image has the sections), `g` already replaced once. One worker thread.
 fn staged_covered(pcs: u32) -> blaze_alloc_count::Used {
-    let pool = rayon::ThreadPoolBuilder::new().num_threads(1).build().unwrap();
+    let pool = blaze_graph::pool::Pool::new(&blaze_graph::topology::Topology::flat(1), false).unwrap();
     pool.install(|| {
         let covered = |n: u8| CompiledFunction {
             coverage: Some(Covered { counters: pcs, flags: 0, guards: 0, pcs: vec![(0, 0); pcs as usize] }),
@@ -1826,7 +1826,7 @@ mod resolution {
     fn resolution_is_the_same_on_any_number_of_threads() {
         let object: std::sync::Arc<[u8]> = object(&[("c_one", 1), ("c_two", 2)], &[]).into();
         let run = |threads: usize| {
-            let pool = rayon::ThreadPoolBuilder::new().num_threads(threads).build().unwrap();
+            let pool = blaze_graph::pool::Pool::new(&blaze_graph::topology::Topology::flat(threads), false).unwrap();
             pool.install(|| {
                 let mut image = Image::new(name(TO), incremental()).unwrap();
                 let mut disk = Disk::default();

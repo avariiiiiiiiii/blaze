@@ -16,8 +16,8 @@
 
 use std::collections::hash_map::Entry;
 
+use blaze_graph::par;
 use blaze_ids::radix;
-use rayon::prelude::*;
 use rustc_hash::FxHashMap;
 
 use super::code::{Header, NOTHING, Sig};
@@ -152,13 +152,13 @@ fn functions<'a>(placed: &'a Placed<'a>, across: &'a mut Vec<u8>) -> Result<Vec<
         let functions = placed.functions;
         ctors_first
             && last.zip(functions.first()).is_none_or(|(ctors, first)| ctors < first.addr)
-            && functions.par_windows(2).all(|it| it[0].addr < it[1].addr)
+            && par::all(par::windows(functions, 2), |it| it[0].addr < it[1].addr)
     };
     let lead = if ordered { ctors } else { 0 };
     // Each function's slot made first, filled in parallel: one exact allocation.
     let mut units: Vec<Unit<'a>> = Vec::with_capacity(placed.functions.len() + ctors);
     units.resize(lead, Unit { addr: 0, name: None, header: None });
-    units.par_extend(placed.functions.par_iter().map(|_| Unit { addr: 0, name: None, header: None }));
+    par::extend(&mut units, placed.functions, |_| Unit { addr: 0, name: None, header: None });
     // `Placed` is not `Sync` (its `symbol` lookup isn't): the closure takes its contents.
     let (contents, paged) = (placed.contents, placed.paged);
     // Where a function's bytes are: its region's view and its offset and length there.
@@ -191,17 +191,23 @@ fn functions<'a>(placed: &'a Placed<'a>, across: &'a mut Vec<u8>) -> Result<Vec<
             // alloc: error path
             .map_err(|e| format!("the function {}: {e}", name.unwrap_or("?")))
     };
-    units[lead..].par_iter_mut().zip(placed.functions.par_iter()).try_for_each(|(unit, function)| {
-        let name = function.name.as_deref();
-        let (bytes, at, size) = piece(function)?;
-        *unit = Unit { addr: function.addr, name, header: None };
-        if let Some(held) = bytes.slice(at, size) {
-            unit.header = Some(parse(held, name)?);
-        }
-        Ok::<(), String>(())
-    })?;
+    let failure = par::find_map_first(par::zip(&mut units[lead..], placed.functions), |(unit, function)| {
+        let result = (|| {
+            let name = function.name.as_deref();
+            let (bytes, at, size) = piece(function)?;
+            *unit = Unit { addr: function.addr, name, header: None };
+            if let Some(held) = bytes.slice(at, size) {
+                unit.header = Some(parse(held, name)?);
+            }
+            Ok::<(), String>(())
+        })();
+        result.err()
+    });
+    if let Some(error) = failure {
+        return Err(error);
+    }
     // The functions across pages: their bytes one after another in `across`, then their headers.
-    if units[lead..].par_iter().any(|it| it.header.is_none()) {
+    if par::any(&units[lead..], |it| it.header.is_none()) {
         across.clear();
         for (_, function) in units[lead..].iter().zip(placed.functions).filter(|it| it.0.header.is_none()) {
             let (bytes, at, size) = piece(function)?;
@@ -227,7 +233,7 @@ fn functions<'a>(placed: &'a Placed<'a>, across: &'a mut Vec<u8>) -> Result<Vec<
     } else {
         units.extend(ctors_units);
         radix::sort_copy_by_key(&mut units, |it| it.addr);
-        if let Some(pair) = units.par_windows(2).find_first(|it| it[0].addr == it[1].addr) {
+        if let Some(pair) = par::find_map_first(par::windows(&units, 2), |it| (it[0].addr == it[1].addr).then_some(it)) {
             // alloc: error path
             return Err(format!("two functions at {} in the code space", pair[0].addr));
         }
@@ -244,7 +250,7 @@ fn functions<'a>(placed: &'a Placed<'a>, across: &'a mut Vec<u8>) -> Result<Vec<
             let mut before = units[..at].iter().rev().filter_map(|it| Some((it.addr, it.header?)));
             before.next().map_or(0, |(addr, header)| (addr - region.addr) as usize + header.len())
         };
-        let failed = (0..units.len()).into_par_iter().find_map_first(|at| {
+        let failed = par::find_map_first(0..units.len(), |at| {
             let (unit, end) = (&units[at], end_before(at));
             unit.header?;
             let start = (unit.addr - region.addr) as usize;
@@ -802,12 +808,12 @@ pub(super) fn write(wasm: &Wasm, placed: &Placed<'_>) -> Result<Vec<u8>, String>
     }
     let imports = imports(placed, &arena, &spans);
     // The core keeps one import per name: a function that says another must not call it.
-    if units.par_iter().any(|it| it.header.is_some_and(|it| it.imports().next().is_some())) {
+    if par::any(&units, |it| it.header.is_some_and(|it| it.imports().next().is_some())) {
         let names = placed.imports.iter().map(|it| it.name.as_str());
         let mut by_name: FxHashMap<&str, Imported<'_>> =
             FxHashMap::with_capacity_and_hasher(imports.len(), Default::default());
         by_name.extend(names.zip(imports.iter().copied()));
-        let conflict = units.par_iter().find_map_first(|unit| {
+        let conflict = par::find_map_first(&units, |unit| {
             unit.header?.imports().find_map(|(name, module, field, ty)| {
                 let it = by_name.get(name)?;
                 ((it.module, it.field, it.ty) != (module, field, ty)).then(|| {
@@ -835,11 +841,9 @@ pub(super) fn write(wasm: &Wasm, placed: &Placed<'_>) -> Result<Vec<u8>, String>
     // pass over the imports and then the functions in order first meets it.
     let ctors_len = ctors.as_ref().map_or(0, Vec::len);
     let mut pieces: Vec<Result<Piece<'_>, String>> = Vec::with_capacity(units.len().div_ceil(PIECE));
-    units
-        .par_chunks(PIECE)
-        .enumerate()
-        .map(|(at, units)| piece(units, imported + (at * PIECE) as u32, ctors_len))
-        .collect_into_vec(&mut pieces);
+    par::extend(&mut pieces, par::enumerate(par::chunks(&units, PIECE)), |(at, units)| {
+        piece(units, imported + (at * PIECE) as u32, ctors_len)
+    });
     let mut pieces = pieces.into_iter().collect::<Result<Vec<Piece<'_>>, String>>()?;
     let ctors = ctors?;
     let mut types = Types::with_capacity(imports.len() + 64);
@@ -850,7 +854,7 @@ pub(super) fn write(wasm: &Wasm, placed: &Placed<'_>) -> Result<Vec<u8>, String>
         // alloc: one per piece of 4096 functions, its distinct types' indices
         remaps.push(piece.types.iter().map(|&it| types.of(it)).collect());
     }
-    pieces.par_iter_mut().zip(remaps.par_iter()).for_each(|(piece, remap)| {
+    par::for_each(par::zip(&mut pieces, &remaps), |(piece, remap)| {
         for it in piece.function_types.iter_mut().chain(&mut piece.fixup_types) {
             *it = remap[*it as usize];
         }
@@ -931,9 +935,8 @@ pub(super) fn write(wasm: &Wasm, placed: &Placed<'_>) -> Result<Vec<u8>, String>
             }
         }
     }
-    let exported = units.par_iter().enumerate().filter_map(|(at, unit)| Some((at, unit.header?.export()?)));
     // alloc: once per link, the functions whose headers export them, found in parallel
-    let exported: Vec<(usize, &str)> = exported.collect();
+    let exported: Vec<(usize, &str)> = par::filter_map(par::enumerate(&units), |(at, unit)| Some((at, unit.header?.export()?)));
     for (at, name) in exported {
         export(&mut named, &mut exports, name, EXPORT_FUNCTION, imported + at as u32, true)?;
     }
@@ -1175,7 +1178,7 @@ pub(super) fn write(wasm: &Wasm, placed: &Placed<'_>) -> Result<Vec<u8>, String>
         jobs.push((place, run));
     }
     let piece_units = |at: usize| &units[at * PIECE..((at + 1) * PIECE).min(units.len())];
-    jobs.into_par_iter().for_each(|(place, run)| match run {
+    par::for_each(jobs, |(place, run)| match run {
         Run::Head(range) => place.copy_from_slice(&head[range]),
         Run::Copy(bytes) => place.copy_from_slice(bytes),
         Run::Zeros(_) => {}
@@ -1554,7 +1557,7 @@ mod tests {
     }
 
     fn on_threads<R: Send>(threads: usize, run: impl FnOnce() -> R + Send) -> R {
-        rayon::ThreadPoolBuilder::new().num_threads(threads).build().unwrap().install(run)
+        blaze_graph::pool::Pool::new(&blaze_graph::topology::Topology::flat(threads), false).unwrap().install(run)
     }
 
     #[test]

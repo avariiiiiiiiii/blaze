@@ -9,7 +9,7 @@
 use std::ops::Range;
 
 use blaze_format::cursor::{self, Put, Reader};
-use rayon::prelude::*;
+use blaze_graph::par;
 use rustc_hash::FxHashMap;
 use smallvec::SmallVec;
 
@@ -556,7 +556,7 @@ pub(crate) fn scan<T: Copy + Default + Send + Sync>(
         return Ok(Scan { items, cies: walked.cies.into_vec(), end });
     }
     // alloc: once per image, one result per piece
-    let mut pieces: Vec<(Vec<T>, Walked)> = (0..splits.len() + 1).into_par_iter().map(piece).collect();
+    let mut pieces: Vec<(Vec<T>, Walked)> = par::map(0..splits.len() + 1, piece);
     // The pieces the one walk reaches: up to the first that ends the section or fails. A piece's
     // first FDE naming no CIE met before is its first error: the walk went on past it.
     // alloc: once per image, the CIEs
@@ -589,7 +589,7 @@ pub(crate) fn concat<T: Copy + Default + Send + Sync>(parts: &[&[T]]) -> Vec<T> 
     let len = parts.iter().map(|it| it.len()).sum();
     // alloc: once per table, its exact length
     let mut items: Vec<T> = Vec::with_capacity(len);
-    items.par_extend((0..len).into_par_iter().with_min_len(4096).map(|_| T::default()));
+    par::extend(&mut items, 0..len, |_| T::default());
     let mut rest = &mut items[..];
     // alloc: once per table, one slice per part
     let mut jobs = Vec::with_capacity(parts.len());
@@ -598,7 +598,7 @@ pub(crate) fn concat<T: Copy + Default + Send + Sync>(parts: &[&[T]]) -> Vec<T> 
         jobs.push((these, part));
         rest = after;
     }
-    jobs.into_par_iter().for_each(|(out, part)| out.copy_from_slice(part));
+    par::for_each(jobs, |(out, part)| out.copy_from_slice(part));
     items
 }
 

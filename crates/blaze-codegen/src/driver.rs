@@ -24,8 +24,8 @@ use std::{
 use blaze_cas::{Key, Kind};
 use blaze_ids::{ContentId, Hasher};
 use blaze_items::{CodeHash, ItemKey};
+use blaze_graph::par::{self, IntoSource, Source};
 use blaze_mem::{Tag, frame};
-use rayon::prelude::*;
 use rustc_hash::{FxHashMap, FxHashSet};
 
 use crate::{
@@ -678,18 +678,14 @@ impl<'a, B: Prepare> Build<'a, B> {
                 break;
             }
             self.frontend.reached(&level, &static_level);
-            let described: Vec<_> = level
-                .par_iter()
-                .map(|(instance, requester)| {
-                    self.frontend.describe(instance, requester).and_then(|it| self.node(instance, *requester, it))
-                })
-                // alloc: per build, sized by its units
-                .collect();
-            let described_statics: Vec<_> = static_level
-                .par_iter()
-                .map(|value| self.frontend.describe_static(value).and_then(|it| self.static_node(value, it)))
-                // alloc: per build, sized by its units
-                .collect();
+            // alloc: per build, sized by its units
+            let described: Vec<_> = par::map(&level, |(instance, requester)| {
+                self.frontend.describe(instance, requester).and_then(|it| self.node(instance, *requester, it))
+            });
+            // alloc: per build, sized by its units
+            let described_statics: Vec<_> = par::map(&static_level, |value| {
+                self.frontend.describe_static(value).and_then(|it| self.static_node(value, it))
+            });
             // alloc: per build, sized by its units
             let (mut next, mut next_statics) = (Vec::new(), Vec::new());
             for (asked_for, node) in std::mem::take(&mut level).into_iter().zip(described) {
@@ -824,21 +820,15 @@ impl<'a, B: Prepare> Build<'a, B> {
     /// end says the build stopped ([`Frontend::stopped`], a relaxed load against a function's
     /// 50 to 200 µs): a stopped build gives each thread back within the one function it is in.
     /// Any left undone is one [`stopped`] error in `errors`.
-    fn until_stopped<I, R>(
-        &self,
-        items: I,
-        errors: &mut Vec<CodegenError>,
-        work: impl Fn(I::Item) -> R + Sync + Send,
-    ) -> Vec<R>
+    fn until_stopped<I, R>(&self, items: I, errors: &mut Vec<CodegenError>, work: impl Fn(I::Item) -> R + Sync) -> Vec<R>
     where
-        I: IndexedParallelIterator,
+        I: IntoSource,
         R: Send,
     {
+        let items = items.into_source();
         let len = items.len();
-        let done: Vec<R> = items
-            .filter_map(|it| (!self.frontend.stopped()).then(|| work(it)))
-            // alloc: per build, sized by its units
-            .collect();
+        // alloc: per build, sized by its units
+        let done: Vec<R> = par::filter_map(items, |it| (!self.frontend.stopped()).then(|| work(it)));
         if done.len() < len {
             errors.push(stopped());
         }
@@ -852,7 +842,7 @@ impl<'a, B: Prepare> Build<'a, B> {
         keys: &[InstanceKey],
         errors: &mut Vec<CodegenError>,
     ) -> Vec<(InstanceKey, Result<(Shape, B::Prepared), CodegenError>)> {
-        self.until_stopped(keys.par_iter(), errors, |key| {
+        self.until_stopped(keys, errors, |key| {
             let node = &nodes[key];
             let made = self.backend.prepare(self.frontend, &node.unit, &node.spec, &node.instance, &node.refs);
             (*key, made)
@@ -1033,17 +1023,12 @@ impl<'a, B: Prepare> Build<'a, B> {
             }),
         );
         // Each instance's two hashes are its own: on every core, in key order.
-        let versions = nodes
-            .values
-            .par_iter()
-            .with_min_len(256)
-            .map(|node| {
-                let id = crate::exec::fn_id(node.described.identity, node.unit.instance.settings);
-                let item_of = |key: &InstanceKey| nodes.get(key).map(|it| it.unit.item);
-                (id, crate::exec::bound(&node.described.bound, &node.refs, item_of))
-            })
-            // alloc: per build, what it gives the test binary's table
-            .collect();
+        // alloc: per build, what it gives the test binary's table
+        let versions = par::map(&nodes.values, |node| {
+            let id = crate::exec::fn_id(node.described.identity, node.unit.instance.settings);
+            let item_of = |key: &InstanceKey| nodes.get(key).map(|it| it.unit.item);
+            (id, crate::exec::bound(&node.described.bound, &node.refs, item_of))
+        });
         out.used.extend(lazily.shapes.values().copied());
         let Finished { functions, statics: compiled_statics, puts, stats, errors, used } = out.finish();
         self.last = Later { nodes, shapes: lazily.shapes };
@@ -1325,7 +1310,7 @@ impl<'a, B: Prepare> Build<'a, B> {
                 }
             }
         }
-        let emitted = self.until_stopped(to_emit.into_par_iter(), &mut out.errors, |(key, shape, made)| {
+        let emitted = self.until_stopped(to_emit, &mut out.errors, |(key, shape, made)| {
             let node = &nodes[&key];
             (key, shape, self.backend.emit(&node.unit, &node.spec, made, &node.refs, None))
         });
@@ -1504,7 +1489,7 @@ impl<'a, B: Prepare> Build<'a, B> {
                 jobs.push((group, flight, members));
             }
         }
-        let merged = self.until_stopped(jobs.into_par_iter(), &mut out.errors, |(group, flight, members)| {
+        let merged = self.until_stopped(jobs, &mut out.errors, |(group, flight, members)| {
             (group, flight, self.backend.merge(group, members))
         });
         // alloc: per batch of store misses, sized by it
@@ -1617,7 +1602,7 @@ impl<'a, B: Prepare> Build<'a, B> {
         let prepare = |names: &[InstanceKey],
                        errors: &mut Vec<CodegenError>|
          -> Vec<(InstanceKey, Result<(Shape, B::Prepared), CodegenError>)> {
-            self.until_stopped(names.par_iter(), errors, |name| {
+            self.until_stopped(names, errors, |name| {
                 let job = by_name[name];
                 let made = self.backend.prepare(self.frontend, &job.unit, job.spec, &job.node.instance, &job.node.refs);
                 (*name, made)
@@ -1649,7 +1634,7 @@ impl<'a, B: Prepare> Build<'a, B> {
         }
         let summarize = |made: Vec<(InstanceKey, Result<(Shape, B::Prepared), CodegenError>)>,
                          errors: &mut Vec<CodegenError>| {
-            self.until_stopped(made.into_par_iter(), errors, |(name, made)| {
+            self.until_stopped(made, errors, |(name, made)| {
                 let job = by_name[&name];
                 let summarized = made.and_then(|(_, mut made)| {
                     let (summary, export) = self.backend.summarize(&job.unit, job.spec, &mut made, &job.node.refs)?;
@@ -1824,7 +1809,7 @@ impl<'a, B: Prepare> Build<'a, B> {
                     compiles.push((name, imports, refs, blob_key, made));
                 }
             }
-            let emitted = self.until_stopped(compiles.into_par_iter(), &mut out.errors, |(name, imports, refs, blob_key, made)| {
+            let emitted = self.until_stopped(compiles, &mut out.errors, |(name, imports, refs, blob_key, made)| {
                 let job = by_name[&name];
                 let list: Option<Vec<Import<'_, B::Export>>> = imports
                     .imported
@@ -1977,17 +1962,14 @@ impl<'a, B: Prepare> Build<'a, B> {
         }
         out.stats.stored += hits.len();
         // Each value and its digest on all cores, where it is made.
-        let instantiated: Vec<_> = hits
-            .into_par_iter()
-            .map(|(id, node, template)| {
-                let made = template.instantiate(id.0, id.1, &node.refs).map(|value| {
-                    let digest = digests::static_definition(&value);
-                    (value, digest)
-                });
-                (id, node, made)
-            })
-            // alloc: per build, sized by its statics
-            .collect();
+        // alloc: per build, sized by its statics
+        let instantiated: Vec<_> = par::map(hits, |(id, node, template)| {
+            let made = template.instantiate(id.0, id.1, &node.refs).map(|value| {
+                let digest = digests::static_definition(&value);
+                (value, digest)
+            });
+            (id, node, made)
+        });
         for (id, node, made) in instantiated {
             match made {
                 Ok((value, digest)) => out.push_static(value, digest),
@@ -1995,7 +1977,7 @@ impl<'a, B: Prepare> Build<'a, B> {
                 Err(why) => out.errors.push(error(unit_of(node).instance.key(), id.0, why.to_string())),
             }
         }
-        let compiled = self.until_stopped(missing.into_par_iter(), &mut out.errors, |(id, node, key)| {
+        let compiled = self.until_stopped(missing, &mut out.errors, |(id, node, key)| {
             let made = self.backend.compile_static(self.frontend, &node.spec, &node.value, &node.refs);
             let made = made.map(|value| {
                 let digest = digests::static_definition(&value);

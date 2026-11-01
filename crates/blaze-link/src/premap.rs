@@ -25,10 +25,10 @@
 
 use blaze_codegen::{Arch, CompiledFunction, InstanceKey, Static, Target};
 use blaze_core::FileName;
+use blaze_graph::par;
 use blaze_ids::ContentId;
 use blaze_items::ItemKey;
 use blaze_mem::align::checked_align_up_u64;
-use rayon::prelude::*;
 use rustc_hash::FxHashSet;
 
 use crate::arena::{FrameVec, collect_in};
@@ -409,7 +409,7 @@ impl Placed {
             consumed = offset + len;
             self.carve(at, segment, &mut jobs)?;
         }
-        jobs.into_par_iter().for_each(|(space, at, out)| space.bytes.copy_to(at, out));
+        par::for_each(jobs, |(space, at, out)| space.bytes.copy_to(at, out));
         Ok(())
     }
 

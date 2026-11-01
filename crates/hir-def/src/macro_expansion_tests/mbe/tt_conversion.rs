@@ -101,7 +101,7 @@ macro_rules! m1 { ($x:ident) => { ($x } }
 macro_rules! m2 { ($x:ident) => {} }
 
 fn f1() { (x); }
-fn f2() { /* error: expected ident */ }
+fn f2() { /* error: this macro call's `(` is never closed, so it is not expanded */ }
 "#]],
     )
 }

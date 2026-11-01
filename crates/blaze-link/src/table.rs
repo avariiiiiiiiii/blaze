@@ -21,8 +21,8 @@
 //! argument register, the stack's arguments and the flags reach the function as they were.
 
 use blaze_codegen::Arch;
+use blaze_graph::par;
 use blaze_live::patch::exec;
-use rayon::prelude::*;
 
 use crate::model::Apply;
 
@@ -113,7 +113,7 @@ pub(crate) fn stubs(arch: Arch, out: &mut [u8]) {
     if size == 0 {
         return;
     }
-    out.par_chunks_mut(size).with_min_len(4096).enumerate().for_each(|(slot, out)| {
+    par::for_each(par::enumerate(par::chunks_mut(out, size)), |(slot, out)| {
         write_stub(arch, slot as u32, out);
     });
 }
@@ -287,7 +287,7 @@ pub(crate) fn log_stubs(arch: Arch, slots: u64, out: &mut [u8]) {
         Arch::Wasm32 => {}
     }
     let end = slots * size as u64;
-    stubs.par_chunks_mut(size).with_min_len(4096).enumerate().for_each(|(slot, out)| {
+    par::for_each(par::enumerate(par::chunks_mut(stubs, size)), |(slot, out)| {
         write_log_stub(arch, slot as u32, end - slot as u64 * size as u64, out);
     });
 }

@@ -269,7 +269,7 @@ fn the_debug_sections_are_the_cores_not_copies() {
         let index = image.index(&class);
         image.contents[index] = bytes;
     }
-    let pool = rayon::ThreadPoolBuilder::new().num_threads(1).build().unwrap();
+    let pool = blaze_graph::pool::Pool::new(&blaze_graph::topology::Topology::flat(1), false).unwrap();
     let used = [3usize, 1 << 20].map(|len| {
         let line: Vec<u8> = (0..len).map(|it| (it * 7 % 251) as u8).collect();
         image.debug = vec![(".debug_line", line), (".debug_str", Vec::new()), (".debug_info", vec![9; len / 3 + 1])];
@@ -1248,7 +1248,7 @@ fn many_symbols(n: usize) -> Fixture {
 /// `Arc` of each region's `CowBytes`, which the core no longer makes when it takes them.
 #[test]
 fn dynamic_tables_allocate_nothing_per_symbol() {
-    let pool = rayon::ThreadPoolBuilder::new().num_threads(1).build().unwrap();
+    let pool = blaze_graph::pool::Pool::new(&blaze_graph::topology::Topology::flat(1), false).unwrap();
     let used = |n: usize| {
         let image = many_symbols(n);
         pool.install(|| {

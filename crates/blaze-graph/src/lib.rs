@@ -16,9 +16,11 @@
 //! wait inside a task (#1301): the waiting thread runs other work, and a wait that would close
 //! a cycle is [`Cancelled`] and its task posted again. [`build`] says a build's nodes:
 //! the workspace load, codegen with its store writes, links and test runs (docs/driver.md
-//! steps 4 to 7).
+//! steps 4 to 7). [`par`] is the parallel loops of every crate, on the same pool: blaze has no
+//! other.
 //!
-//! Unsafe code is in [`exec`]'s slot table, [`pool`]'s jobs and queues and [`pump`]'s waiter
+//! Unsafe code is in [`exec`]'s slot table, [`pool`]'s jobs and queues, [`par`]'s item
+//! sources and [`pump`]'s waiter
 //! lists (lock-free structures whose safe versions would take a lock or an `Arc` per job or
 //! waiter, each with model tests under `--cfg blaze_check`), and in `arena`'s allocator hook and
 //! the kernel calls of `arena` and [`topology`], each in a small module of its own.
@@ -32,6 +34,8 @@ pub mod build;
 pub mod exec;
 pub mod history;
 pub mod machine;
+#[allow(unsafe_code)]
+pub mod par;
 pub mod plane;
 #[allow(unsafe_code)]
 pub mod pool;

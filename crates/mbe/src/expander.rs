@@ -94,9 +94,12 @@ pub(crate) fn expand_rules_in<'t, A: Allocator>(
         let rule = &rules[idx];
         let ExpandResult { value: (tree, made), err: transcribe_err } =
             transcriber::transcribe(&rule.rhs, &match_.bindings, frame, build, marker, call_site);
-        // What rustc says when no rule matches; its ambiguity errors are the matcher's own.
-        let match_err = match_.err.map(|err| {
-            matcher::match_failure(db, frame, rules, input, call_style).unwrap_or_else(|| err.build())
+        // What rustc says when no rule matches; its ambiguity errors are the matcher's own. A
+        // fragment that failed inside is reported where its parse failed.
+        let match_err = match_.err.map(|err| match err {
+            matcher::MatchError::Fragment(it) => it,
+            err => matcher::match_failure(db, frame, rules, input, call_style)
+                .unwrap_or_else(|| err.build()),
         });
         ExpandResult {
             value: (tree, idx.try_into().ok(), made),

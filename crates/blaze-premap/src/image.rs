@@ -21,7 +21,7 @@ use blaze_codegen::{Arch, InstanceKey};
 use blaze_ids::ContentId;
 use blaze_items::ItemKey;
 use blaze_link::Format;
-use rayon::prelude::*;
+use blaze_graph::par;
 
 use crate::PremapError;
 use crate::key::{ImageKey, format_tag};
@@ -236,10 +236,9 @@ pub(crate) fn encode(meta: &Meta, prelink: &impl Placed, pieces: &Pieces<'_>) ->
     let head = out;
     // Zeroed by the allocator's fresh pages, not a pass of its own: only the bytes copied in are written.
     let mut out = vec![0u8; end]; // alloc: once per image made: its value
-    out[..head.len()]
-        .par_chunks_mut(COPY_PIECE)
-        .zip(head.par_chunks(COPY_PIECE))
-        .for_each(|(into, from)| into.copy_from_slice(from));
+    par::for_each(par::zip(par::chunks_mut(&mut out[..head.len()], COPY_PIECE), par::chunks(&head, COPY_PIECE)), |(into, from)| {
+        into.copy_from_slice(from);
+    });
     prelink.write_into(&mut out, &placed)?;
     Ok(out)
 }

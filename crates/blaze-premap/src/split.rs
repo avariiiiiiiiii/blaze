@@ -29,7 +29,7 @@ use blaze_ids::ContentId;
 use blaze_items::{CodeHash, ItemKey};
 use blaze_link::{Native, NativeKind};
 use blaze_mem::{Tag, frame, frame::Frame};
-use rayon::prelude::*;
+use blaze_graph::par;
 
 use crate::PremapError;
 use crate::image::View;
@@ -197,7 +197,7 @@ fn image_part_in<'a>(
     };
     let error = match functions.len() <= CHUNK {
         true => functions.iter().find_map(|it| refers(it)),
-        false => functions.par_iter().with_min_len(CHUNK).find_map_first(|it| refers(it)),
+        false => par::find_map_first(&functions, |it| refers(it)),
     };
     if let Some(error) = error {
         return Err(error);
@@ -548,7 +548,7 @@ fn static_classes<'f>(
     Ok(Ok(out))
 }
 
-/// The class of each index below `len`, on rayon's threads for a long list, in a frame buffer.
+/// The class of each index below `len`, on the pool's threads for a long list, in a frame buffer.
 fn classes<'f>(len: usize, class: impl Fn(usize) -> u8 + Sync, frame: &'f Frame) -> Vec<u8, &'f Frame> {
     let mut out = Vec::with_capacity_in(len, frame);
     out.resize(len, WORKSPACE);
@@ -560,7 +560,7 @@ fn classes<'f>(len: usize, class: impl Fn(usize) -> u8 + Sync, frame: &'f Frame)
     if len <= CHUNK {
         run((0, out.as_mut_slice()));
     } else {
-        out.par_chunks_mut(CHUNK).enumerate().for_each(run);
+        par::for_each(par::enumerate(par::chunks_mut(out.as_mut_slice(), CHUNK)), run);
     }
     out
 }

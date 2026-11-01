@@ -383,7 +383,7 @@ fn counter_is_the_offset_in_the_code_memory_where_the_code_counts() {
 /// What staging a tier-up of a counting function allocates, its code adding `adds` times to
 /// its calls word, in an incremental dev run already holding one. One worker thread.
 fn staged_counting(adds: u32) -> blaze_alloc_count::Used {
-    let pool = rayon::ThreadPoolBuilder::new().num_threads(1).build().unwrap();
+    let pool = blaze_graph::pool::Pool::new(&blaze_graph::topology::Topology::flat(1), false).unwrap();
     pool.install(|| {
         let case = Case::Elf;
         let many = |n: u8| {

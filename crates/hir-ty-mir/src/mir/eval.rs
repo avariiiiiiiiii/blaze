@@ -1944,6 +1944,10 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
     /// A frame of `body` with `locals` starts: the machine sees the call, the protected
     /// places (the `Operand::Move` arguments, and `return_place`, the caller's destination the
     /// frame's `_0` is copied to), and the arguments written to its parameters.
+    // Miri: interpret/call.rs, `init_fn_call` protects the return place before the frame, and
+    // `pass_argument` an in-place argument's place only after copying it to the parameter:
+    // protecting writes it uninitialized through a new tag, which the copy's read through the
+    // caller's tag would hit.
     fn enter_frame(
         &mut self,
         body: &'db MirBody<'db>,
@@ -1953,16 +1957,20 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
     ) -> Result<'db, ()> {
         if M::CHECKS {
             self.machine.call()?;
-            for moved in mem::take(&mut self.moved_args) {
-                self.machine.protect(self.ptr(moved.addr), moved.size as u64)?;
-            }
             if let Some(ret) = return_place
                 && ret.size != 0
             {
                 self.machine.protect(self.ptr(ret.addr), ret.size as u64)?;
             }
         }
-        self.fill_locals_for_body(body, locals, args)
+        let moved = mem::take(&mut self.moved_args);
+        self.fill_locals_for_body(body, locals, args)?;
+        for moved in &moved {
+            self.machine.protect(self.ptr(moved.addr), moved.size as u64)?;
+        }
+        self.moved_args = moved;
+        self.moved_args.clear();
+        Ok(())
     }
 
     fn fill_locals_for_body(
@@ -3185,7 +3193,12 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
         else {
             return Ok(None);
         };
-        Ok(match (crate::mir::location::placed(self.db, owner, expr), ty.kind()) {
+        let placed = match crate::mir::location::placed(self.db, owner, expr) {
+            None => None,
+            Some(Ok(text)) => Some(text),
+            Some(Err(why)) => not_supported!("{why}"),
+        };
+        Ok(match (placed, ty.kind()) {
             (Some(text), TyKind::Ref(_, to, _)) if to.is_str() => {
                 let at = self.heap_allocate(text.len(), 1)?;
                 self.write_memory(at, text.as_bytes())?;
@@ -5026,8 +5039,22 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
                 def,
                 generic_args,
             );
-            let Either::Left(imp) = imp else {
-                not_supported!("evaluating builtin derive impls is not supported")
+            let imp = match imp {
+                Either::Left(imp) => imp,
+                // A database that records builtin derives instead of expanding them has no
+                // body for the method (`hir_def::nameres::set_expand_builtin_derives`).
+                Either::Right((impl_, method)) => {
+                    let derive = impl_.loc(self.db).trait_.name();
+                    let self_ty = generic_args.as_slice().first().copied();
+                    let shown = crate::attach_db(self.db, || format!("{self_ty:?}")); // alloc: error path
+                    not_supported!(
+                        "`{}::{}` of `{shown}`, which `#[derive({})]` implements: builtin derives \
+                         are recorded unexpanded in this database, so the method has no body",
+                        derive.as_str(),
+                        method.name().as_str(),
+                        derive.as_str()
+                    )
+                }
             };
 
             let mir_body = super::optimize::interpreted_body(

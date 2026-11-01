@@ -16,13 +16,13 @@ doctest = false
 [dependencies]
 blaze-cas.workspace = true
 blaze-format.workspace = true
+blaze-graph.workspace = true
 blaze-hashcons.workspace = true
 blaze-ids.workspace = true
 blaze-items.workspace = true
 blaze-mem.workspace = true
 blaze-query.workspace = true
 hashbrown.workspace = true
-rayon.workspace = true
 rustc-hash.workspace = true
 serde = { workspace = true, features = ["derive"] }
 serde_json.workspace = true

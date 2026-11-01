@@ -473,6 +473,43 @@ fn outer() {
     ),
 ];
 
+/// A `#[derive]` in a crate whose `#[prelude_import]` is a module of its own, as minicore's
+/// `core` has it: `fmt` has a module named `derive` too, which `fmt::rt` globs. The old
+/// collector and the maintained map resolve these derives through the prelude, and
+/// `facts::collect_crate` left them unresolved in round 15's derive fixtures: one variant
+/// without the module, one with it, one through the glob, to tell which part it misses.
+#[test]
+fn a_derive_through_the_crates_own_prelude() {
+    let crate_ = |fmt: &str| {
+        format!(
+            r#"
+//- /lib.rs crate:core
+#[prelude_import]
+use prelude::v1::*;
+pub mod prelude {{ pub mod v1 {{ pub use crate::macros::builtin::derive; pub use crate::clone::Clone; }} }}
+pub mod macros {{ pub(crate) mod builtin {{ #[rustc_builtin_macro] pub macro derive($item:item) {{}} }} }}
+pub mod clone {{ pub trait Clone {{}} #[rustc_builtin_macro] pub macro Clone($item:item) {{}} }}
+pub mod fmt {{
+{fmt}
+}}
+"#
+        )
+    };
+    let variants = [
+        ("own_prelude_derive", crate_("    #[derive(Clone)] pub struct S;")),
+        ("own_prelude_derive_beside_a_derive_module", crate_("    pub(crate) mod derive {}\n    #[derive(Clone)] pub struct S;")),
+        (
+            "own_prelude_derive_through_a_glob_of_a_derive_module",
+            crate_("    pub(crate) mod derive {}\n    mod rt { use super::*; #[derive(Clone)] pub struct R; }"),
+        ),
+    ];
+    let mut failures = String::new();
+    for (name, fixture) in &variants {
+        compare_fixture(name, fixture, &Exempt::NONE, &mut failures);
+    }
+    assert!(failures.is_empty(), "old and new def maps differ:\n{failures}");
+}
+
 #[test]
 fn own_fixtures() {
     let mut failures = String::new();

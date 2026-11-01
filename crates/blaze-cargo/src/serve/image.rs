@@ -20,11 +20,7 @@
 
 #![forbid(unsafe_code)]
 
-use std::{
-    fmt,
-    panic::resume_unwind,
-    sync::{Arc, Mutex},
-};
+use std::{fmt, sync::Arc};
 
 use blaze_core::{Completion, Done, Effect, FileName, IoError, Mapping, Tag};
 use blaze_history::{DecodeError, History, section::HistoryError};
@@ -276,24 +272,11 @@ impl Images {
     }
 }
 
-/// [`blaze_image::Jobs`] on the process's worker pool: `job(0)` to `job(n - 1)`, back once all
-/// ran; a job's panic is resumed here.
+/// [`blaze_image::Jobs`] on the worker pool ([`blaze_graph::par`]): `job(0)` to `job(n - 1)`,
+/// back once all ran; a job's panic is resumed here.
 // dyn: the shape of `blaze_image::Jobs`; one call per section job of an image, each a whole section's work
 pub fn on_pool(n: usize, job: &(dyn Fn(usize) + Sync)) {
-    let panicked = Mutex::new(None);
-    blaze_graph::exec::shared().scope(|scope| {
-        for at in 0..n {
-            let panicked = &panicked;
-            scope.submit(None, move || job(at), move |ran| {
-                if let Err(panic) = ran {
-                    panicked.lock().unwrap_or_else(|it| it.into_inner()).get_or_insert(panic);
-                }
-            });
-        }
-    });
-    if let Some(panic) = panicked.into_inner().unwrap_or_else(|it| it.into_inner()) {
-        resume_unwind(panic);
-    }
+    blaze_graph::par::for_each(0..n, job);
 }
 
 #[cfg(test)]

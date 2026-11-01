@@ -630,6 +630,21 @@ fn pass_box() {
     pass(program!(
         "sized, drop",
         r#"
+#[rustc_intrinsic]
+unsafe fn size_of_val<T: ?Sized>(ptr: *const T) -> usize;
+#[rustc_intrinsic]
+unsafe fn align_of_val<T: ?Sized>(ptr: *const T) -> usize;
+
+// A box's drop glue drops what it holds, then runs this, which frees it, as std's does.
+impl<T: ?Sized> Drop for Box<T> {
+    fn drop(&mut self) {
+        unsafe {
+            let (size, align) = (size_of_val(self.inner), align_of_val(self.inner));
+            __rust_dealloc(self.inner as *mut u8, size, align);
+        }
+    }
+}
+
 fn main() {
     let mut b = box_new(41i32);
     *b += 1;
@@ -944,7 +959,7 @@ fn main() {
 macro_rules! simd {
     ($body:literal) => {
         concat!(
-            "//- minicore: sized, copy\n",
+            "//- minicore: sized, copy, index\n",
             prelude!(),
             r#"
 #[repr(simd)]

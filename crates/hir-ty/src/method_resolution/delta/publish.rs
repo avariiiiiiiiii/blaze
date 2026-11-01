@@ -152,9 +152,13 @@ fn empty_hash(domain: &'static str) -> ContentId {
 /// read. The slice's hash covers its own rows; the impls of the body modules it lists are hashed
 /// by [`super::read::body_impl_set_hash`], which this folds in.
 pub fn impl_set_hash(db: &Db, krate: Crate, trait_: TraitId) -> ContentId {
+    // A slice left with no rows after an edit is the empty set, which a fresh database has no
+    // slice for: the two must hash the same.
     let own = match trait_slice(db, krate, trait_) {
-        Some(slice) => trait_slice_hash(db, slice),
-        None => empty_hash(IMPL_SET_DOMAIN),
+        Some(slice) if !slice.rows(db).impls.is_empty() || !slice.rows(db).derives.is_empty() => {
+            trait_slice_hash(db, slice)
+        }
+        _ => empty_hash(IMPL_SET_DOMAIN),
     };
     let bodies = super::read::body_impl_set_hash(db, krate, trait_);
     let mut hasher = SliceHasher::new(IMPL_SET_DOMAIN);
@@ -167,8 +171,8 @@ pub fn impl_set_hash(db: &Db, krate: Crate, trait_: TraitId) -> ContentId {
 /// `krate`'s modules with an associated item of that name.
 pub fn candidate_set_hash(db: &Db, krate: Crate, name: Name) -> ContentId {
     match candidate_slice(db, krate, name) {
-        Some(slice) => candidate_slice_hash(db, slice),
-        None => empty_hash(CANDIDATE_SET_DOMAIN),
+        Some(slice) if !slice.rows(db).traits.is_empty() => candidate_slice_hash(db, slice),
+        _ => empty_hash(CANDIDATE_SET_DOMAIN),
     }
 }
 

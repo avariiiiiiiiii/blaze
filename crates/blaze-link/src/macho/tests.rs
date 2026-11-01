@@ -1493,7 +1493,7 @@ fn an_archive_index_read_is_bounded_by_its_index() {
 #[test]
 fn signing_allocates_nothing_per_page() {
     // One worker, measured on it: the pages are hashed on the thread that signs.
-    let pool = rayon::ThreadPoolBuilder::new().num_threads(1).build().unwrap();
+    let pool = blaze_graph::pool::Pool::new(&blaze_graph::topology::Topology::flat(1), false).unwrap();
     for pages in [3, 300] {
         let file: Vec<u8> = (0..pages * sign::PAGE + 100).map(|it| (it * 31 % 251) as u8).collect();
         // Two parts, so the page across them is gathered.
@@ -1529,7 +1529,7 @@ fn linkedit_encodes_into_one_buffer() {
     const IMPORTS: [&[u8]; 4] = [b"_malloc", b"_free", b"_open", b"_close"];
     let spans = spans();
     // One worker, measured on it: the rebases are checked on the pool's threads.
-    let pool = rayon::ThreadPoolBuilder::new().num_threads(1).build().unwrap();
+    let pool = blaze_graph::pool::Pool::new(&blaze_graph::topology::Topology::flat(1), false).unwrap();
     for n in [100u64, 2000] {
         // In order, as `Placed` lists them.
         let rebases: Vec<u64> = (0..n).map(|it| 0x1_0000_8000 + 8 * it).collect();
@@ -1748,7 +1748,7 @@ fn a_bind_added_rewrites_two_slots() {
 /// a hash per page) whatever their size.
 #[test]
 fn the_debug_sections_are_the_cores_not_copies() {
-    let pool = rayon::ThreadPoolBuilder::new().num_threads(1).build().unwrap();
+    let pool = blaze_graph::pool::Pool::new(&blaze_graph::topology::Topology::flat(1), false).unwrap();
     let sizes = [1usize << 20, 3 << 20];
     let used = sizes.map(|size| {
         let mut parts = hello(executable(Arch::Aarch64));

@@ -867,7 +867,7 @@ fn base_relocations_are_the_same_bytes_in_any_number_of_pieces() {
         let split = f.placed(|placed| image::relocations(Image::of(placed), &extra, piece)).unwrap();
         assert_eq!(split, whole, "pieces of {piece}");
     }
-    let threads = rayon::ThreadPoolBuilder::new().num_threads(1).build().unwrap();
+    let threads = blaze_graph::pool::Pool::new(&blaze_graph::topology::Topology::flat(1), false).unwrap();
     let one = threads.install(|| f.placed(|placed| image::relocations(Image::of(placed), &extra, 7))).unwrap();
     assert_eq!(one, whole);
 
@@ -979,7 +979,7 @@ fn pdata_in_pieces_is_the_sorted_merge() {
     let built = pe(exe());
     let whole = table(&built, &f, 0, None, PDATA);
     assert_eq!(whole, expected(&f));
-    let threads = rayon::ThreadPoolBuilder::new().num_threads(1).build().unwrap();
+    let threads = blaze_graph::pool::Pool::new(&blaze_graph::topology::Topology::flat(1), false).unwrap();
     assert_eq!(threads.install(|| table(&built, &f, 0, None, PDATA)), whole);
 
     let kept = incremental();
@@ -1728,7 +1728,7 @@ fn archive_read_allocates_its_three_columns() {
 fn import_library_read_allocates_per_member() {
     let pe = pe(exe());
     // One worker, measured on it: the members are parsed and grouped on the pool's threads.
-    let pool = rayon::ThreadPoolBuilder::new().num_threads(1).build().unwrap();
+    let pool = blaze_graph::pool::Pool::new(&blaze_graph::topology::Topology::flat(1), false).unwrap();
     let read = |members: usize| {
         let bytes = import_archive(members, 3);
         let used = pool

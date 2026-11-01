@@ -112,7 +112,7 @@ pub fn expand_eager_macro_input_view(
     };
     let arg_id = MacroCallId::new(db, loc);
     #[expect(deprecated, reason = "builtin eager macros are never derives")]
-    let (_, _, span) = arg_id.macro_arg(db);
+    let (_, _, span, _) = arg_id.macro_arg(db);
     let expand_to = match expand_to {
         Ok(it) => it,
         Err(parent) => {

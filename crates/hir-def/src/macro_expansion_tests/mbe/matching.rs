@@ -49,7 +49,7 @@ m!(&k");
 "#,
         expect![[r#"
 macro_rules! m { ($i:literal) => {}; }
-/* error: no rules expected `&` */"#]],
+/* error: this macro call's `(` is never closed, so it is not expanded */"#]],
     );
 }
 
@@ -110,11 +110,11 @@ macro_rules! m {
     ($($s:stmt)*) => (stringify!($($s |)*);)
 }
 stringify!(;
-| ;
-|92| ;
-|let x = 92| ;
+|;
+|92|;
+|let x = 92|;
 |loop {}
-| ;
+|;
 |);
 "#]],
     );

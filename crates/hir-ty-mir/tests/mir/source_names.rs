@@ -35,7 +35,13 @@ fn file_follows_the_names_the_build_gives() {
     let fx = fixture::db(PROGRAM);
     let _ = fx.only_file();
     let mut db = fx.into_db();
-    goal(&db);
+    // Before the build names files, the evaluator refuses: no placeholder for a path.
+    let unnamed = hir_ty::attach_db(&db, || {
+        db.const_eval(constant(&db, "GOAL"), GenericArgs::empty(), None)
+            .map(|_| ())
+            .map_err(|error| format!("{error:?}"))
+    });
+    assert!(unnamed.as_ref().is_err_and(|it| it.contains("name_sources")), "{unnamed:?}");
     name_sources(&mut db, "first", |_, _| Some("src/first.rs".to_owned()));
     assert_eq!(goal(&db), "src/first.rs");
     name_sources(&mut db, "second", |_, _| Some("src/second.rs".to_owned()));

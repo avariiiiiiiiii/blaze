@@ -32,7 +32,7 @@ stdx.workspace = true
 
 [dev-dependencies]
 blaze-alloc-count.workspace = true
-rayon.workspace = true
+blaze-graph.workspace = true
 expect-test.workspace = true
 rustc_apfloat.workspace = true
 

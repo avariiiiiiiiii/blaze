@@ -13,8 +13,8 @@
 
 use std::sync::Arc;
 
+use blaze_graph::par;
 use blaze_ids::radix;
-use rayon::prelude::*;
 use smallvec::SmallVec;
 
 use crate::arena::{FrameVec, collect_in};
@@ -184,7 +184,7 @@ fn runs(ranges: &[(u64, u64)]) -> Vec<(u64, u64)> {
 /// The bytes of `ranges` of `layout`'s file, built in parallel.
 fn fill(layout: &Layout<'_>, ranges: &[(u64, u64)]) -> Vec<(u64, Vec<u8>)> {
     let mut out = Vec::with_capacity(ranges.len());
-    out.par_extend(ranges.par_iter().with_min_len(4).map(|&(at, len)| (at, layout.bytes(at, len))));
+    par::extend(&mut out, ranges, |&(at, len)| (at, layout.bytes(at, len)));
     out
 }
 

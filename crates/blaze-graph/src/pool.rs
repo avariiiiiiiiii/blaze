@@ -674,6 +674,38 @@ impl Pool {
     pub fn scope<'env, R>(&self, f: impl FnOnce(&Scope<'env>) -> R) -> R {
         scope_in(&self.shared, f)
     }
+
+    /// Runs `f` on one of this pool's workers and gives back what it made, its panic raised
+    /// here: the loops of [`crate::par`] it runs split across this pool.
+    pub fn install<R: Send>(&self, f: impl FnOnce() -> R + Send) -> R {
+        let mut f = Some(f);
+        let f = &mut f;
+        let mut out = None;
+        self.scope(|scope| {
+            scope.submit(None, move || f.take().expect("a scope's job runs once")(), |it| out = Some(it));
+        });
+        match out.expect("a scope runs its job before it returns") {
+            Ok(it) => it,
+            Err(panic) => resume_unwind(panic),
+        }
+    }
+}
+
+/// [`Pool::scope`] on the pool this thread is a worker of, or on the process's
+/// ([`crate::exec::shared`]) from a thread of no pool.
+pub(crate) fn scope_here<'env, R>(f: impl FnOnce(&Scope<'env>) -> R) -> R {
+    let at = LOCAL.get();
+    // SAFETY: as in `with_local`: `work` points it at its own `Local`, which lives until `work`
+    // returns, and this call is on that thread, inside `work`.
+    match unsafe { at.as_ref() } {
+        Some(local) => scope_in(&local.shared, f),
+        None => crate::exec::shared().scope(f),
+    }
+}
+
+/// The workers of the pool [`scope_here`] runs on.
+pub(crate) fn threads_here() -> usize {
+    with_local(|local| local.shared.slots.len()).unwrap_or_else(|| crate::exec::shared().workers())
 }
 
 /// [`Pool::scope`] on the pool `shared` is of, which outlives the call.

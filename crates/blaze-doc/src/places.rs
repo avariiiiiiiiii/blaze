@@ -440,11 +440,8 @@ pub(crate) fn macro_kind(db: &Db, it: Macro) -> Option<Kind> {
 
 /// Places every item of every crate, in parallel over the crates.
 pub(crate) fn place(db: &Db, crates: Vec<Documented>, test_only: TestOnly) -> Places {
-    use rayon::prelude::*;
-    let placed: Vec<Vec<Placed>> = crates
-        .par_iter()
-        .map(|documented| hir::attach_db(db, || Walker::new(db, documented).walk()))
-        .collect();
+    use blaze_graph::par;
+    let placed: Vec<Vec<Placed>> = par::map(&crates, |documented| hir::attach_db(db, || Walker::new(db, documented).walk()));
     let mut canonical: FxHashMap<ModuleDef, ((u8, usize), (usize, usize))> = FxHashMap::default();
     let mut own: Vec<FxHashMap<ModuleDef, usize>> = vec![];
     for (krate, list) in placed.iter().enumerate() {

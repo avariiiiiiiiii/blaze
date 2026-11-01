@@ -1,8 +1,8 @@
 //! `ar` archives of ELF objects: GNU, GNU 64-bit and BSD.
 
 use blaze_codegen::Arch;
+use blaze_graph::par;
 use object::read::archive::{ArchiveFile, ArchiveKind};
-use rayon::prelude::*;
 
 use super::strings::Table;
 use crate::model::{Archive, Member, Name, Names};
@@ -121,13 +121,10 @@ pub(super) fn read(arch: Arch, name: &str, bytes: &[u8]) -> Result<Archive, Stri
             // What lld does without a symbol table: read every member, in parallel, and keep
             // member order. The member is named only in an error ([`in_member`]). One result
             // column for the archive, and one offsets column per member, each a file read once.
-            let defined: Vec<Result<(&[u8], Vec<u32>), String>> = members
-                .par_iter()
-                .map(|member| {
-                    let at = &bytes[member.bytes.start..member.bytes.end];
-                    super::defined(arch, "", at).map_err(in_member(name, &names, member))
-                })
-                .collect(); // alloc: once per archive without an index, in member order
+            let defined: Vec<Result<(&[u8], Vec<u32>), String>> = par::map(&members, |member| {
+                let at = &bytes[member.bytes.start..member.bytes.end];
+                super::defined(arch, "", at).map_err(in_member(name, &names, member))
+            }); // alloc: once per archive without an index, in member order
             index.reserve(defined.iter().map(|it| it.as_ref().map_or(0, |(_, offsets)| offsets.len())).sum());
             // Then the names, in member order, each string of a member's `.strtab` pushed once:
             // the arena is at most the archive (`limit` holds without a check), and at most

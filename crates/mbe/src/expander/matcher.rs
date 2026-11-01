@@ -85,7 +85,7 @@ pub(super) use self::failure::match_failure;
 use self::failure::Tracker;
 use super::{Binding, Bindings, Fragment, NONE, TokensOrigin};
 use crate::{
-    ExpandError, ExpandErrorKind, MetaTemplate, ValueResult, expect_fragment,
+    ExpandError, ExpandErrorKind, ExpandResult, MetaTemplate, ValueResult, expect_fragment,
     parser::{Binder, ExprKind, MetaVarKind, NO_BINDER, Op, RepeatKind, Separator},
 };
 
@@ -341,15 +341,29 @@ pub(super) enum MatchError {
     Built(ExpandError),
     /// A fragment's binding error, `what` the fragment it expected.
     Expected { span: span::Span, what: &'static str },
+    /// A fragment whose parse took tokens and then failed: the parser's error, where it was,
+    /// which says more than the token the fragment started at.
+    Fragment(ExpandError),
 }
 
 impl MatchError {
     pub(super) fn build(self) -> ExpandError {
         match self {
-            MatchError::Built(it) => it,
+            MatchError::Built(it) | MatchError::Fragment(it) => it,
             MatchError::Expected { span, what } => ExpandError::binding_error(span, what),
         }
     }
+}
+
+/// A fragment's parse, its error a [`MatchError::Fragment`] when the parse took tokens first.
+fn fragment_parsed(
+    parsed: ExpandResult<tt::TokenTreesView<'_>>,
+) -> ValueResult<tt::TokenTreesView<'_>, MatchError> {
+    let inside = !parsed.value.is_empty();
+    parsed.map_err(|err| match inside {
+        true => MatchError::Fragment(err),
+        false => MatchError::Built(err),
+    })
 }
 
 impl From<ExpandError> for MatchError {
@@ -1136,14 +1150,12 @@ fn match_meta_var<'t>(
 ) -> ValueResult<Fragment<'t>, MatchError> {
     let fragment = match kind {
         MetaVarKind::Path => {
-            return expect_fragment(db, input, parser::PrefixEntryPoint::Path, delim_span)
-                .map(Fragment::Path)
-                .map_err(MatchError::Built);
+            return fragment_parsed(expect_fragment(db, input, parser::PrefixEntryPoint::Path, delim_span))
+                .map(Fragment::Path);
         }
         MetaVarKind::Ty => {
-            return expect_fragment(db, input, parser::PrefixEntryPoint::Ty, delim_span)
-                .map(Fragment::Ty)
-                .map_err(MatchError::Built);
+            return fragment_parsed(expect_fragment(db, input, parser::PrefixEntryPoint::Ty, delim_span))
+                .map(Fragment::Ty);
         }
         MetaVarKind::Expr(expr) => {
             // `expr_2021` should not match underscores, let expressions, or inline const.
@@ -1170,9 +1182,8 @@ fn match_meta_var<'t>(
                 }
                 _ => {}
             };
-            return expect_fragment(db, input, parser::PrefixEntryPoint::Expr, delim_span)
-                .map(Fragment::Expr)
-                .map_err(MatchError::Built);
+            return fragment_parsed(expect_fragment(db, input, parser::PrefixEntryPoint::Expr, delim_span))
+                .map(Fragment::Expr);
         }
         MetaVarKind::Ident | MetaVarKind::Tt | MetaVarKind::Lifetime | MetaVarKind::Literal => {
             let span = input.next_span();
@@ -1216,9 +1227,8 @@ fn match_meta_var<'t>(
         MetaVarKind::Vis => (parser::PrefixEntryPoint::Vis, TokensOrigin::Ast),
     };
     let (entry_point, origin) = fragment;
-    expect_fragment(db, input, entry_point, delim_span)
+    fragment_parsed(expect_fragment(db, input, entry_point, delim_span))
         .map(|tree| Fragment::Tokens { tree, origin })
-        .map_err(MatchError::Built)
 }
 
 /// Whether `tree` is what an earlier expansion put in for one of its metavariables.

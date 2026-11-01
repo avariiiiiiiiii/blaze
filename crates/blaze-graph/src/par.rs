@@ -28,10 +28,7 @@ use std::{
 };
 
 pub use crate::pool::Scope;
-use crate::{
-    pool::{self, Pool},
-    pump::Lock,
-};
+use crate::{pool, pump::Lock};
 
 /// Ranges per worker a loop splits its items into: enough that a worker that drew slow items
 /// leaves the rest to the others, few enough that claiming one stays far below its work.
@@ -429,6 +426,20 @@ pub fn scope<'env, R>(f: impl FnOnce(&Scope<'env>) -> R) -> R {
     pool::scope_here(f)
 }
 
+/// `a` on the pool beside `b` on this thread, both made before it returns; `a`'s panic is
+/// raised here once `b` is done.
+pub fn join<A: Send, B>(a: impl FnOnce() -> A + Send, b: impl FnOnce() -> B) -> (A, B) {
+    let mut first = None;
+    let second = pool::scope_here(|scope| {
+        scope.submit(None, a, |made| first = Some(made));
+        b()
+    });
+    match first.expect("a scope runs its job before it returns") {
+        Ok(first) => (first, second),
+        Err(panic) => resume_unwind(panic),
+    }
+}
+
 /// Runs `run` over ranges that cover `0..len` once, each with the state its thread's
 /// `init` made (once per thread that claims a range), on the pool a loop called here runs on.
 fn split<St>(len: usize, init: impl Fn() -> St + Sync, run: impl Fn(&mut St, Range<usize>) + Sync) {
@@ -619,23 +630,6 @@ pub fn all<I: IntoSource>(items: I, f: impl Fn(I::Item) -> bool + Sync) -> bool 
     !any(items, |it| !f(it))
 }
 
-impl Pool {
-    /// Runs `f` on one of this pool's workers and gives back what it made, its panic raised
-    /// here: the loops of this module it runs split across this pool.
-    pub fn install<R: Send>(&self, f: impl FnOnce() -> R + Send) -> R {
-        let mut f = Some(f);
-        let f = &mut f;
-        let mut out = None;
-        self.scope(|scope| {
-            scope.submit(None, move || f.take().expect("a scope's job runs once")(), |it| out = Some(it));
-        });
-        match out.expect("a scope runs its job before it returns") {
-            Ok(it) => it,
-            Err(panic) => resume_unwind(panic),
-        }
-    }
-}
-
 #[cfg(all(test, not(blaze_check)))]
 #[allow(clippy::disallowed_types, reason = "a test's own bookkeeping, off every hot path")]
 mod tests {
@@ -751,6 +745,9 @@ mod tests {
             );
             assert_eq!(made, items);
             assert!(inits.load(Ordering::Relaxed) <= super::threads(), "one state per thread at most");
+
+            let (sum, count) = super::join(|| items.iter().sum::<u64>(), || items.len());
+            assert_eq!((sum, count), (items.iter().sum::<u64>(), len));
         };
         for seed in 0..20 {
             check(seed);
@@ -812,7 +809,8 @@ mod tests {
             });
         }));
         let panic = caught.expect_err("the item's panic reaches the caller");
-        assert_eq!(panic.downcast_ref::<String>().map(String::as_str), Some("assertion `left != right` failed: item five thousand\n  left: 5000\n right: 5000"));
+        let text = panic.downcast_ref::<String>().map_or("", String::as_str);
+        assert!(text.contains("item five thousand"), "{text}");
         assert!(*ran.lock().unwrap() < 10_000);
         assert_eq!(pool.install(|| super::map(0..100usize, |it| it + 1)), (1..101).collect::<Vec<_>>());
     }

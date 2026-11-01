@@ -84,12 +84,39 @@ pub enum ShareDef {
     ReifyShim { receiver: bool },
 }
 
+/// The body it runs: whose a query keyed by it is (`blaze_query::db::Storage::ids_of`, read by
+/// `crates/hir-firewall`). A shim runs none of its own.
+impl blaze_query::db::NamesIds for ShareDef {
+    fn names_ids(&self, out: &mut Vec<blaze_query::db::Id>) {
+        use blaze_query::db::AsId;
+        match *self {
+            ShareDef::Fn(it) | ShareDef::VtableShim(it) => out.push(it.as_id()),
+            ShareDef::Closure(it) | ShareDef::Coroutine(it) | ShareDef::CoroutineByMove(it) => {
+                out.push(it)
+            }
+            ShareDef::DropGlue
+            | ShareDef::CallOnceShim
+            | ShareDef::FnPointerShim
+            | ShareDef::ReifyShim { .. } => {}
+        }
+    }
+}
+
 /// An instance: what it runs and its generic arguments (a closure's or coroutine's are its
 /// parent's, as the code generator's are).
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct ShareInstance {
     pub def: ShareDef,
     pub args: StoredGenericArgs,
+}
+
+/// What it runs and the closures, coroutines and opaque types its arguments name.
+impl blaze_query::db::NamesIds for ShareInstance {
+    fn names_ids(&self, out: &mut Vec<blaze_query::db::Id>) {
+        use blaze_query::db::NamesIds;
+        self.def.names_ids(out);
+        self.args.names_ids(out);
+    }
 }
 
 /// A set of [`MirOptions`], one bit for each of the twenty-four (three levels, UB checks or

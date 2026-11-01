@@ -16,9 +16,9 @@
 
 use std::sync::Arc;
 
+use blaze_graph::par;
 use blaze_ids::radix;
 use blaze_mem::align::align_up_u64;
-use rayon::prelude::*;
 use rustc_hash::FxHashSet;
 
 use crate::arena::{FrameVec, collect_in};
@@ -135,12 +135,11 @@ impl Totals {
 
     /// Every live piece's, in parallel.
     pub fn all(symbols: &Symbols, state: &State) -> Totals {
-        (0..state.piece_count())
-            .into_par_iter()
-            .with_min_len(4096)
-            .filter_map(|id| state.piece(id))
-            .map(|piece| Totals::of(symbols, state, piece))
-            .reduce(Totals::default, Totals::add)
+        par::filter_map(0..state.piece_count() as usize, |id| {
+            state.piece(id as PieceId).map(|piece| Totals::of(symbols, state, piece))
+        })
+        .into_iter()
+        .fold(Totals::default(), Totals::add)
     }
 }
 
@@ -496,7 +495,7 @@ impl<'a> Stage<'a> {
         {
             let symbols: &Symbols = self.symbols;
             let state = &self.new;
-            groups.par_iter_mut().enumerate().for_each(|(class, ids)| {
+            par::for_each(par::enumerate(&mut groups), |(class, ids)| {
                 if iat.is_some_and(|it| it.0 as usize == class) {
                     return;
                 }

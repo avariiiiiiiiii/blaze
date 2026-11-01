@@ -20,10 +20,10 @@ test = false
 
 [dependencies]
 blaze-core.workspace = true
+blaze-graph.workspace = true
 blaze-ids.workspace = true
 blaze-protocol.workspace = true
 blaze-query.workspace = true
-rayon.workspace = true
 serde = { workspace = true, features = ["derive"] }
 serde_json.workspace = true
 

@@ -28,7 +28,7 @@ use blaze_cas::Kind;
 use blaze_ids::ContentId;
 use blaze_items::{CodeHash, ItemKey};
 use blaze_mem::{Tag, frame};
-use rayon::prelude::*;
+use blaze_graph::par;
 use rustc_hash::{FxHashMap, FxHashSet};
 
 use super::{
@@ -523,18 +523,15 @@ impl<B: Prepare> Build<'_, B> {
                 Err(why) => out.errors.push(error(*key, node.unit.item, format!("reading the store's {at:?}: {why}"))),
             }
         }
-        let unread: Vec<CodegenError> = kept
-            .par_iter()
-            .filter_map(|(key, node, at, bytes)| {
-                let why = frame::task(Tag::Codegen, |frame| blob::decode_view(bytes, frame).err())?;
-                // alloc: an error
-                Some(error(*key, node.unit.item, format!("the store's {at:?}: {why}")))
-            })
-            // alloc: none but for the errors
-            .collect();
+        // alloc: none but for the errors
+        let unread: Vec<CodegenError> = par::filter_map(&kept, |(key, node, at, bytes)| {
+            let why = frame::task(Tag::Codegen, |frame| blob::decode_view(bytes, frame).err())?;
+            // alloc: an error
+            Some(error(*key, node.unit.item, format!("the store's {at:?}: {why}")))
+        });
         out.errors.extend(unread);
         let checked: Vec<(InstanceKey, Result<ContentId, CodegenError>)> =
-            self.until_stopped(unchecked.par_iter(), &mut out.errors, |key| {
+            self.until_stopped(&unchecked, &mut out.errors, |key| {
                 let node = &nodes[key];
                 let made = self.backend.prepare(self.frontend, &node.unit, &node.spec, &node.instance, &node.refs);
                 // The IR is let go here, on the thread that built it: only its shape is kept.
@@ -565,7 +562,7 @@ impl<B: Prepare> Build<'_, B> {
                 Err(why) => out.errors.push(why),
             }
         }
-        let compiled = self.until_stopped(missing.par_iter(), &mut out.errors, |node| {
+        let compiled = self.until_stopped(&missing, &mut out.errors, |node| {
             let made = claimed(self.backend, self.frontend, self.memo, nodes, node, &node.unit, &node.spec, || Ok(()));
             (node.unit.instance.code, made)
         });

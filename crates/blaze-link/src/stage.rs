@@ -17,10 +17,10 @@ use std::sync::Arc;
 
 use blaze_codegen::{Arch, CompiledFunction, Covered, Data, Init, InstanceKey, Relocs, Static, Target, Unwind};
 use blaze_format::cursor::{self, Reader};
+use blaze_graph::par;
 use blaze_ids::{Hasher, radix};
 use blaze_live::patch::exec;
 use blaze_mem::Frame;
-use rayon::prelude::*;
 use rustc_hash::{FxHashMap, FxHashSet};
 
 use crate::arena::{FrameVec, collect_in};
@@ -714,7 +714,7 @@ impl<'a> Stage<'a> {
             rest = after;
         }
         let table = self.table;
-        parts.par_iter_mut().zip(todo.par_iter()).for_each(|(out, function)| function_keys(*function, table, &mut **out));
+        par::for_each(par::zip(&mut parts[..], &todo[..]), |(out, function)| function_keys(*function, table, &mut **out));
         drop(parts);
         let syms = self.symbols.intern_wide(keys);
         let mut at = 0;

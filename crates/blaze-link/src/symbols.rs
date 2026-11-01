@@ -19,10 +19,10 @@ use std::hash::Hasher as _;
 use blaze_codegen::InstanceKey;
 use blaze_format::SpanRef;
 use blaze_format::cursor::Put;
+use blaze_graph::par;
 use blaze_ids::{ContentId, radix};
 use blaze_items::ItemKey;
 use blaze_mem::MemError;
-use rayon::prelude::*;
 use rustc_hash::FxHasher;
 use smallvec::SmallVec;
 
@@ -247,7 +247,8 @@ where
         return;
     }
     let mut hashed: Vec<(u32, u64)> = Vec::with_capacity(keys.len());
-    keys.par_iter().enumerate().map(|(at, key)| (at as u32, hash(*key))).collect_into_vec(&mut hashed);
+    hashed.clear();
+    par::extend(&mut hashed, par::enumerate(keys), |(at, key)| (at as u32, hash(*key)));
     // Stable, so each shard's keys keep the batch's order; one 8-bit pass.
     radix::sort_copy_by_key(&mut hashed, |it| shard_of(it.1) as u8);
     let mut parts: SmallVec<[&mut [(u32, u64)]; SHARDS]> = SmallVec::new();
@@ -258,7 +259,7 @@ where
         parts.push(part);
         rest = tail;
     }
-    shards.par_iter_mut().zip(parts.as_mut_slice().par_iter_mut()).enumerate().for_each(|(shard, (it, items))| {
+    par::for_each(par::enumerate(par::zip(shards, parts.as_mut_slice())), |(shard, (it, items))| {
         for item in items.iter_mut() {
             item.1 = u64::from(join(shard, it.get_or_insert(item.1, keys[item.0 as usize])));
         }

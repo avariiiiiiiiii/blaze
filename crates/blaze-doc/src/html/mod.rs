@@ -77,7 +77,7 @@ fn hash(text: &str) -> String {
 /// Every page of `model`, made in parallel: item pages, each module's `sidebar-items.js`,
 /// source pages, each crate's `all.html` and search index, and the stylesheet and script.
 pub fn pages(model: &Model) -> Pages {
-    use rayon::prelude::*;
+    use blaze_graph::par;
     let statics = Statics {
         css: format!("static.files/blaze-{}.css", hash(CSS)),
         js: format!("static.files/blaze-{}.js", hash(JS)),
@@ -92,20 +92,17 @@ pub fn pages(model: &Model) -> Pages {
         .enumerate()
         .flat_map(|(k, krate)| (0..krate.items.len()).map(move |i| (k, i)))
         .collect();
-    let items: Vec<Vec<Page>> = jobs
-        .par_iter()
-        .map(|&(k, i)| {
-            let krate = &model.crates[k];
-            let item = &krate.items[i];
-            let writer = Writer::new(model, &names, &statics, k, page_dir(krate, item));
-            let mut out = vec![page(page_path(krate, item), writer.item_page(i))];
-            if item.kind == Kind::Module {
-                let path = format!("{}/sidebar-items.js", module_dir(krate, item));
-                out.push(page(path, sidebar_items(krate, item)));
-            }
-            out
-        })
-        .collect();
+    let items: Vec<Vec<Page>> = par::map(&jobs, |&(k, i)| {
+        let krate = &model.crates[k];
+        let item = &krate.items[i];
+        let writer = Writer::new(model, &names, &statics, k, page_dir(krate, item));
+        let mut out = vec![page(page_path(krate, item), writer.item_page(i))];
+        if item.kind == Kind::Module {
+            let path = format!("{}/sidebar-items.js", module_dir(krate, item));
+            out.push(page(path, sidebar_items(krate, item)));
+        }
+        out
+    });
     let pages = items.len();
     files.extend(items.into_iter().flatten());
     let sources: Vec<(usize, usize)> = model
@@ -114,32 +111,24 @@ pub fn pages(model: &Model) -> Pages {
         .enumerate()
         .flat_map(|(k, krate)| (0..krate.sources.len()).map(move |f| (k, f)))
         .collect();
-    let source_files: Vec<Page> = sources
-        .par_iter()
-        .map(|&(k, f)| {
-            let krate = &model.crates[k];
-            let file = &krate.sources[f];
-            let mut dir = vec!["src".to_owned(), krate.name.clone()];
-            dir.extend(file.path.split('/').map(str::to_owned));
-            dir.pop();
-            let writer = Writer::new(model, &names, &statics, k, dir);
-            page(format!("src/{}/{}.html", krate.name, file.path), writer.source_page(f))
-        })
-        .collect();
+    let source_files: Vec<Page> = par::map(&sources, |&(k, f)| {
+        let krate = &model.crates[k];
+        let file = &krate.sources[f];
+        let mut dir = vec!["src".to_owned(), krate.name.clone()];
+        dir.extend(file.path.split('/').map(str::to_owned));
+        dir.pop();
+        let writer = Writer::new(model, &names, &statics, k, dir);
+        page(format!("src/{}/{}.html", krate.name, file.path), writer.source_page(f))
+    });
     let source_pages = source_files.len();
     files.extend(source_files);
-    let per_crate: Vec<[Page; 2]> = model
-        .crates
-        .par_iter()
-        .enumerate()
-        .map(|(k, krate)| {
-            let writer = Writer::new(model, &names, &statics, k, vec![krate.name.clone()]);
-            [
-                page(format!("{}/all.html", krate.name), writer.all_items()),
-                page(format!("search-index/{}.js", krate.name), search_index(krate)),
-            ]
-        })
-        .collect();
+    let per_crate: Vec<[Page; 2]> = par::map(par::enumerate(&model.crates), |(k, krate)| {
+        let writer = Writer::new(model, &names, &statics, k, vec![krate.name.clone()]);
+        [
+            page(format!("{}/all.html", krate.name), writer.all_items()),
+            page(format!("search-index/{}.js", krate.name), search_index(krate)),
+        ]
+    });
     files.extend(per_crate.into_iter().flatten());
     Pages { files, written: Written { pages: pages + model.crates.len(), source_pages } }
 }

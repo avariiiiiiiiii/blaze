@@ -21,6 +21,7 @@ use std::sync::Mutex;
 
 use blaze_bytes::le::{get_u16 as u16_at, get_u32 as u32_at, get_u64 as u64_at};
 use blaze_core::decimal::decimal;
+use blaze_graph::par;
 use blaze_ids::radix;
 use blaze_mem::scratch::{self, Lent};
 use object::LittleEndian as LE;
@@ -28,7 +29,6 @@ use object::pe;
 use object::read::SymbolIndex;
 use object::read::archive::{ArchiveFile, ArchiveKind};
 use object::read::coff::{CoffHeader, SectionTable, Symbol as _, SymbolTable};
-use rayon::prelude::*;
 use rustc_hash::FxHashMap;
 
 use super::{OBJ_PDATA, Pe};
@@ -404,25 +404,21 @@ fn import_library(pe: &Pe, name: Input<'_>, bytes: &[u8]) -> Result<Shared, Stri
     let input_of = |it: &Member| Input { file: name.file, member: Some(archive.name(it.name)) };
     let mut parsed: Vec<Result<Option<(Cow<'_, str>, Imported<'_>)>, String>> =
         Vec::with_capacity(archive.members.len());
-    archive
-        .members
-        .par_iter()
-        .map(|it| {
-            let input = input_of(it);
-            match member(pe, Dlls::Library(&descriptors), input, &bytes[it.bytes.start..it.bytes.end])? {
-                Parsed::Import(dll, import) => Ok(Some((dll, import))),
-                Parsed::Object(object) if object.sections.is_empty() => Ok(None),
-                Parsed::Object(_) => Err(fail(
-                    input,
-                    "an object in a library linked as a DLL's import library; a library with \
-                     objects is linked as an archive",
-                )),
-            }
-        })
-        .collect_into_vec(&mut parsed);
+    par::extend(&mut parsed, &archive.members, |it| {
+        let input = input_of(it);
+        match member(pe, Dlls::Library(&descriptors), input, &bytes[it.bytes.start..it.bytes.end])? {
+            Parsed::Import(dll, import) => Ok(Some((dll, import))),
+            Parsed::Object(object) if object.sections.is_empty() => Ok(None),
+            Parsed::Object(_) => Err(fail(
+                input,
+                "an object in a library linked as a DLL's import library; a library with \
+                 objects is linked as an archive",
+            )),
+        }
+    });
     // The members before the first that fails to parse are added; its error is given unless
     // adding one of them fails.
-    let failed = match parsed.par_iter().position_first(Result::is_err) {
+    let failed = match par::find_map_first(par::enumerate(&parsed), |(at, it)| it.is_err().then_some(at)) {
         Some(at) => {
             let error = parsed.swap_remove(at).err();
             parsed.truncate(at);
@@ -431,38 +427,47 @@ fn import_library(pe: &Pe, name: Input<'_>, bytes: &[u8]) -> Result<Shared, Stri
         None => None,
     };
     // Each DLL's imports together, in member order.
-    let mut imports: Vec<(Cow<'_, str>, u32, Imported<'_>)> = parsed
-        .into_par_iter()
-        .enumerate()
-        .filter_map(|(at, it)| match it {
-            Ok(Some((dll, import))) => Some((dll, at as u32, import)),
-            _ => None,
-        })
-        // alloc: once per library: its imports, to sort
-        .collect();
-    imports.par_sort_unstable_by(|a, b| (&a.0, a.1).cmp(&(&b.0, b.1)));
+    let mut imports: Vec<(Cow<'_, str>, u32, Imported<'_>)> = par::filter_map(par::enumerate(parsed), |(at, it)| match it {
+        Ok(Some((dll, import))) => Some((dll, at as u32, import)),
+        _ => None,
+    }); // alloc: once per library: its imports, to sort
+    imports.sort_unstable_by(|a, b| (&a.0, a.1).cmp(&(&b.0, b.1)));
     // Each DLL's `Shared` built on its own thread, keyed by its first member; a failure keyed
     // by the member that failed.
-    let mut built: Vec<(u32, Result<Shared, (u32, String)>)> = imports
-        .par_chunk_by_mut(|a, b| a.0 == b.0)
-        .map(|run| {
-            let first = run[0].1;
-            // alloc: once per DLL: the name its `Shared` owns
-            let mut dll = shared((*run[0].0).to_owned());
-            for (_, at, import) in run.iter_mut() {
-                let import = Imported {
-                    name: std::mem::take(&mut import.name),
-                    version: std::mem::take(&mut import.version),
-                    kind: import.kind,
-                };
-                if let Err(error) = add(&mut dll, input_of(&archive.members[*at as usize]), import) {
-                    return (first, Err((*at, error)));
-                }
+    let mut bounds = Vec::new();
+    let mut start = 0;
+    for at in 1..imports.len() {
+        if imports[at - 1].0 != imports[at].0 {
+            bounds.push(at - start);
+            start = at;
+        }
+    }
+    if start < imports.len() {
+        bounds.push(imports.len() - start);
+    }
+    let mut groups = Vec::with_capacity(bounds.len());
+    let mut rest = imports.as_mut_slice();
+    for len in bounds {
+        let (group, tail) = rest.split_at_mut(len);
+        groups.push(group);
+        rest = tail;
+    }
+    let mut built: Vec<(u32, Result<Shared, (u32, String)>)> = par::map(groups, |run| {
+        let first = run[0].1;
+        // alloc: once per DLL: the name its `Shared` owns
+        let mut dll = shared((*run[0].0).to_owned());
+        for (_, at, import) in run.iter_mut() {
+            let import = Imported {
+                name: std::mem::take(&mut import.name),
+                version: std::mem::take(&mut import.version),
+                kind: import.kind,
+            };
+            if let Err(error) = add(&mut dll, input_of(&archive.members[*at as usize]), import) {
+                return (first, Err((*at, error)));
             }
-            (first, Ok(dll))
-        })
-        // alloc: once per library: one entry per DLL
-        .collect();
+        }
+        (first, Ok(dll))
+    }); // alloc: once per library: one entry per DLL
     if let Some((_, error)) = built.iter_mut().filter_map(|(_, it)| it.as_mut().err()).min_by_key(|it| it.0) {
         return Err(std::mem::take(error));
     }
@@ -470,7 +475,7 @@ fn import_library(pe: &Pe, name: Input<'_>, bytes: &[u8]) -> Result<Shared, Stri
         return Err(error);
     }
     // The DLLs in the order each is first met in the library, as one pass numbers them.
-    built.par_sort_unstable_by_key(|it| it.0);
+    built.sort_unstable_by_key(|it| it.0);
     let mut dlls = built.into_iter().filter_map(|(_, it)| it.ok());
     let Some(mut first) = dlls.next() else {
         return Err(fail(name, "an import library importing nothing"));

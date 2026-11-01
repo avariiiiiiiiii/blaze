@@ -157,7 +157,8 @@ fn check_error_with(
     crate::attach_db(&db, || {
         let file_id = *file_ids.last().unwrap();
         let e = eval_main(&db, file_id).unwrap_err();
-        assert!(expect_err(e));
+        let shown = format!("{e:?}");
+        assert!(expect_err(e), "unexpected error: {shown}");
     })
 }
 
@@ -1504,22 +1505,21 @@ fn main() {
 }
 "#,
     );
-    // A macro of the crate's own: rustc's `semicolon_in_expressions_from_macros` is an error.
-    check_error_with(
+    // A macro of the crate's own has the same value. rustc's `semicolon_in_expressions_from_macros`
+    // denies it by default and `#[allow]` lets it build: a lint, reported by blaze-diagnostics
+    // (`lints/syntax/early/macros.rs`), not a refusal of the evaluator.
+    check_pass(
         r#"
+//- minicore: panic
 macro_rules! val { () => { 5u32; } }
 
 fn main() {
-    let _v: u32 = { val!() };
+    let v: u32 = { val!() };
+    if v != 5 {
+        panic!();
+    }
 }
 "#,
-        |e| {
-            matches!(
-                e,
-                MirEvalError::MirLowerError(_, MirLowerError::NotSupported(why))
-                    if why.contains("semicolon_in_expressions_from_macros")
-            )
-        },
     );
 }
 
@@ -1553,7 +1553,8 @@ fn main() {
 "#,
     );
     // Where the outer call is an expression, so is one last in its expansion: rustc rejects
-    // `outer!()` as the value of a block when it expands to a call of several statements.
+    // `outer!()` as the value of a block when it expands to a call of several statements, whose
+    // expansion does not parse as the expression it is expanded as.
     check_error_with(
         r#"
 macro_rules! two { ($($t:tt)*) => { $($t)* $($t)* } }
@@ -1564,13 +1565,7 @@ fn main() {
     let _ = { outer!() };
 }
 "#,
-        |e| {
-            matches!(
-                e,
-                MirEvalError::MirLowerError(_, MirLowerError::NotSupported(why))
-                    if why.starts_with("macro call in parentheses or brackets with no `;` after it")
-            )
-        },
+        |e| matches!(e, MirEvalError::MirLowerError(_, MirLowerError::HasErrors)),
     );
 }
 

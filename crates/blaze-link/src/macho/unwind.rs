@@ -22,8 +22,8 @@ use std::borrow::Cow;
 
 use blaze_bytes::le::{u32 as u32_at, u64 as u64_at};
 use blaze_codegen::Arch;
+use blaze_graph::par;
 use blaze_ids::radix;
-use rayon::prelude::*;
 
 use crate::LinkError;
 use crate::cow::CowBytes;
@@ -208,11 +208,11 @@ fn full(
     let fdes = fdes(placed, keep.as_deref_mut())?;
     let Compact { mut covered, mut ends, personalities, bytes: compact_bytes } =
         compact(placed, dwarf_mode, &fdes, keep.as_deref_mut())?;
-    ends.par_extend(fdes.par_iter().map(|it| it.end));
+    par::extend(&mut ends, &fdes, |it| it.end);
     if !covered.is_sorted_by_key(|it| it.addr) {
         radix::sort_copy_by_key(&mut covered, |it| it.addr);
     }
-    if !ends.par_windows(2).all(|it| it[0] <= it[1]) {
+    if !par::all(par::windows(&ends, 2), |it| it[0] <= it[1]) {
         radix::sort(&mut ends);
     }
     let Rows { rows, lsdas, last: end, sorted } = rows(placed, dwarf_mode, &covered, &fdes, &ends)?;
@@ -229,9 +229,9 @@ fn full(
     // A DWARF-mode row is never counted, and most of a Rust image's are: the others are found
     // in parallel and counted in order.
     // alloc: once per link, one list per piece of rows, empty (no buffer) where all are DWARF mode's
-    let counted: Vec<Vec<u32>> = (rows.par_chunks(CHUNK))
-        .map(|chunk| chunk.iter().filter(|it| it.encoding & MODE_MASK != dwarf_mode).map(|it| it.encoding).collect()) // alloc: per piece, none where all are DWARF mode's
-        .collect(); // alloc: once per link, one list per piece
+    let counted: Vec<Vec<u32>> = par::map(par::chunks(&rows, CHUNK), |chunk| {
+        chunk.iter().filter(|it| it.encoding & MODE_MASK != dwarf_mode).map(|it| it.encoding).collect() // alloc: per piece, none where all are DWARF mode's
+    }); // alloc: once per link, one list per piece
     for &encoding in counted.iter().flatten() {
         encodings.count(encoding);
     }
@@ -322,14 +322,16 @@ fn full(
         let page = slot.0;
         write_page(&mut Out { bytes: &mut *slot.1, at: 0 }, &rows, page, common.len(), &mut encodings, dwarf_mode);
     }
-    (slices.into_par_iter())
-        .filter(|it| !it.0.compressed)
-        .for_each(|(page, out)| write_regular(&mut Out { bytes: out, at: 0 }, &rows, page));
+    par::for_each(slices, |(page, out)| {
+        if !page.compressed {
+            write_regular(&mut Out { bytes: out, at: 0 }, &rows, page);
+        }
+    });
     if let Some(last) = keep {
         last.base = base;
         last.dwarf_mode = dwarf_mode;
         last.functions.clear();
-        last.functions.par_extend(placed.functions.par_iter().map(|it| (it.addr, it.size)));
+        par::extend(&mut last.functions, placed.functions, |it| (it.addr, it.size));
         last.sorted = sorted;
         last.fdes = fdes;
         last.covered = covered;
@@ -1145,10 +1147,8 @@ fn rows(
 ) -> Result<Rows, LinkError> {
     let base = placed.plan.base;
     let functions = placed.functions;
-    let last = (functions.par_iter().with_min_len(CHUNK))
-        .map(|it| it.addr.saturating_add(it.size))
-        .reduce(|| base, u64::max);
-    let sorted = functions.par_windows(2).all(|it| it[0].addr <= it[1].addr);
+    let last = par::map(functions, |it| it.addr.saturating_add(it.size)).into_iter().fold(base, u64::max);
+    let sorted = par::all(par::windows(functions, 2), |it| it[0].addr <= it[1].addr);
     // alloc: only for functions out of address order, which `Placed` lists in order
     let mut held = Vec::new();
     let starts = if sorted {
@@ -1169,7 +1169,7 @@ fn rows(
         return Ok(Rows { rows, lsdas, last: last.max(greatest), sorted });
     }
     // alloc: once per link, one cut per piece
-    let every = (MERGE / 4).max(starts.len().div_ceil(rayon::current_num_threads().max(1)));
+    let every = (MERGE / 4).max(starts.len().div_ceil(par::threads().max(1)));
     let mut cuts: Vec<u64> = Vec::with_capacity(starts.len() / every);
     for k in (every..starts.len()).step_by(every) {
         let at = starts.get(k).expect("a start below the count");
@@ -1192,7 +1192,7 @@ fn rows(
     };
     // alloc: once per link, one result per piece
     let pieces: Vec<Result<(Vec<Row>, Vec<(u32, u32)>, u64), LinkError>> =
-        (0..cuts.len() + 1).into_par_iter().map(piece).collect(); // alloc: once per link, one result per piece
+        par::map(0..cuts.len() + 1, piece); // alloc: once per link, one result per piece
     // alloc: once per link, one entry per piece
     let mut done = Vec::with_capacity(pieces.len());
     for piece in pieces {
@@ -1562,10 +1562,10 @@ fn fdes(placed: &Placed<'_>, mut keep: Option<&mut Last>) -> Result<Vec<Fde>, Li
             live_fdes(&last.records)
         }
     };
-    if !fdes.par_windows(2).all(|it| it[0].addr <= it[1].addr) {
+    if !par::all(par::windows(&fdes, 2), |it| it[0].addr <= it[1].addr) {
         radix::sort_copy_by_key(&mut fdes, |it| it.addr);
     }
-    let dups = fdes.par_windows(2).any(|it| it[0].addr == it[1].addr);
+    let dups = par::any(par::windows(&fdes, 2), |it| it[0].addr == it[1].addr);
     if dups {
         fdes.dedup_by_key(|it| it.addr);
     }
@@ -1594,11 +1594,11 @@ fn covers(at: usize, pc: u64, len: u64) -> Result<(u64, u64), String> {
 fn live_fdes(records: &[Record]) -> Vec<Fde> {
     let live = |it: &&Record| !it.cie() && it.start != 0;
     // alloc: once per link, a count per piece
-    let counts: Vec<usize> = records.par_chunks(CHUNK).map(|chunk| chunk.iter().filter(live).count()).collect();
+    let counts: Vec<usize> = par::map(par::chunks(records, CHUNK), |chunk| chunk.iter().filter(live).count());
     let len = counts.iter().sum();
     // alloc: once per link, the column, filled in parallel at each piece's place
     let mut fdes: Vec<Fde> = Vec::with_capacity(len);
-    fdes.par_extend((0..len).into_par_iter().with_min_len(CHUNK).map(|_| Fde::default()));
+    par::extend(&mut fdes, 0..len, |_| Fde::default());
     let mut rest = &mut fdes[..];
     // alloc: once per link, one slice per piece
     let mut jobs = Vec::with_capacity(counts.len());
@@ -1607,7 +1607,7 @@ fn live_fdes(records: &[Record]) -> Vec<Fde> {
         jobs.push((these, chunk));
         rest = after;
     }
-    jobs.into_par_iter().for_each(|(out, chunk)| {
+    par::for_each(jobs, |(out, chunk)| {
         for (out, it) in out.iter_mut().zip(chunk.iter().filter(live)) {
             *out = Fde { addr: it.start, end: it.end, offset: it.at };
         }
@@ -2675,7 +2675,7 @@ mod tests {
     #[test]
     fn rows_merged_in_pieces_are_the_one_merges() {
         // Sixteen threads, so the merge is cut into pieces on any machine.
-        rayon::ThreadPoolBuilder::new().num_threads(16).build().unwrap().install(|| {
+        blaze_graph::pool::Pool::new(&blaze_graph::topology::Topology::flat(16), false).unwrap().install(|| {
             for seed in [1u64, 2, 3] {
                 let mut rng = Rng::new(seed);
                 let n = 3 * super::MERGE as u64 + rng.below(5000);

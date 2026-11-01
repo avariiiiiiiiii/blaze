@@ -19,7 +19,7 @@ use std::hash::BuildHasher as _;
 use std::ops::Range;
 
 use blaze_codegen::Arch;
-use rayon::prelude::*;
+use blaze_graph::par;
 use rustc_hash::{FxBuildHasher, FxHashMap, FxHashSet};
 
 use crate::model::{Names, Shared, SharedSymbol, SymbolKind};
@@ -115,21 +115,22 @@ fn parse_all(text: &str, raw: &[RawDoc<'_>], parallel: bool) -> Result<(Tape, Ve
         return Ok((tape, docs, targets));
     }
     let mut parts: Vec<Result<(Tape, Doc, Vec<Target>), String>> = Vec::with_capacity(raw.len());
-    raw.par_iter()
-        .map_init(
-            || (Vec::<Line>::with_capacity(most), Vec::<Piece>::with_capacity(most)),
-            |(lines, pieces), one| -> Result<(Tape, Doc, Vec<Target>), String> {
-                let len = one.lines.end - one.lines.start;
-                // alloc: the document's own tape, once per document
-                let mut tape = Tape { nodes: Vec::with_capacity(len / 16), scratch: String::new() };
-                // alloc: none until the document lists a target, then once per document
-                let mut targets = Vec::new();
-                let root = parse(text, one, &mut tape, lines, pieces)?;
-                let doc = Doc::new(&tape.view(text), one, root, &mut targets)?;
-                Ok((tape, doc, targets))
-            },
-        )
-        .collect_into_vec(&mut parts);
+    parts.clear();
+    par::extend_init(
+        &mut parts,
+        raw,
+        || (Vec::<Line>::with_capacity(most), Vec::<Piece>::with_capacity(most)),
+        |(lines, pieces), one| -> Result<(Tape, Doc, Vec<Target>), String> {
+            let len = one.lines.end - one.lines.start;
+            // alloc: the document's own tape, once per document
+            let mut tape = Tape { nodes: Vec::with_capacity(len / 16), scratch: String::new() };
+            // alloc: none until the document lists a target, then once per document
+            let mut targets = Vec::new();
+            let root = parse(text, one, &mut tape, lines, pieces)?;
+            let doc = Doc::new(&tape.view(text), one, root, &mut targets)?;
+            Ok((tape, doc, targets))
+        },
+    );
     // alloc: the documents' parses, once per file
     let parts: Vec<(Tape, Doc, Vec<Target>)> = parts.into_iter().collect::<Result<_, _>>()?;
 
@@ -152,7 +153,7 @@ fn parse_all(text: &str, raw: &[RawDoc<'_>], parallel: bool) -> Result<(Tape, Ve
             chunks.push(chunk);
             rest = tail;
         }
-        chunks.into_par_iter().zip(parts.par_iter()).zip(bases.par_iter()).for_each(|((chunk, part), &(base, offset, _))| {
+        par::for_each(par::zip(par::zip(chunks, &parts), &bases), |((chunk, part), &(base, offset, _))| {
             for (out, node) in chunk.iter_mut().zip(&part.0.nodes) {
                 *out = match node.kind {
                     Kind::Seq | Kind::Map => Node { at: node.at + base, ..*node },

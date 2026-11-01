@@ -117,7 +117,7 @@ fn stopped_with(result: Result<Built, Vec<CodegenError>>) {
 
 /// What may begin after the stop: one function a core, each already past its check.
 fn within_one_function_a_core(at: usize) -> usize {
-    at + rayon::current_num_threads()
+    at + blaze_graph::par::threads()
 }
 
 #[test]

@@ -6,7 +6,7 @@ use std::{
 use ast::{HasModuleItem, HasName};
 use expect_test::expect_file;
 use parser::Edition;
-use rayon::prelude::*;
+use blaze_graph::par;
 use stdx::format_to_acc;
 use test_utils::{bench, bench_fixture, project_root};
 
@@ -144,16 +144,13 @@ fn self_hosting_parsing() {
         "self_hosting_parsing found too few files - is it running in the right directory?"
     );
 
-    let errors = files
-        .into_par_iter()
-        .filter_map(|file| {
-            let text = read_text(&file);
-            match SourceFile::parse(&text, Edition::CURRENT).ok() {
-                Ok(_) => None,
-                Err(err) => Some((file, err)),
-            }
-        })
-        .collect::<Vec<_>>();
+    let errors = par::filter_map(files, |file| {
+        let text = read_text(&file);
+        match SourceFile::parse(&text, Edition::CURRENT).ok() {
+            Ok(_) => None,
+            Err(err) => Some((file, err)),
+        }
+    });
 
     if !errors.is_empty() {
         let errors = errors.into_iter().fold(String::new(), |mut acc, (path, err)| {
@@ -182,48 +179,47 @@ fn outline_is_the_full_parse() {
     }));
     assert!(files.len() > 100, "the parser's test data and the sources of syntax and parser");
 
-    let lazies: usize = files
-        .into_par_iter()
-        .map(|(path, text)| {
-            let full = SourceFile::parse(&text, Edition::CURRENT);
-            let outline = SourceFile::parse_outline(Text::from(text.as_str()), Edition::CURRENT);
-            let tree = outline.tree.as_ref().unwrap().flat().clone();
-            let _ = outline.errors();
-            assert!(
-                tree.lazies().all(|at| !tree.is_parsed(at)),
-                "{}: `errors` parsed a body",
-                path.display()
-            );
+    let lazies: usize = par::map(files, |(path, text)| {
+        let full = SourceFile::parse(&text, Edition::CURRENT);
+        let outline = SourceFile::parse_outline(Text::from(text.as_str()), Edition::CURRENT);
+        let tree = outline.tree.as_ref().unwrap().flat().clone();
+        let _ = outline.errors();
+        assert!(
+            tree.lazies().all(|at| !tree.is_parsed(at)),
+            "{}: `errors` parsed a body",
+            path.display()
+        );
 
-            let elements = |root: crate::SyntaxNode| {
-                root.preorder_with_tokens()
-                    .filter_map(|event| match event {
-                        crate::WalkEvent::Enter(it) => Some((it.kind(), it.text_range())),
-                        crate::WalkEvent::Leave(_) => None,
-                    })
-                    .collect::<Vec<_>>()
-            };
-            assert_eq!(
-                elements(outline.syntax_node()),
-                elements(full.syntax_node()),
-                "{}: the elements",
-                path.display()
-            );
-            assert_eq!(
-                format!("{:#?}", outline.tree().syntax()),
-                format!("{:#?}", full.tree().syntax()),
-                "{}: the dump",
-                path.display()
-            );
-            assert_eq!(
-                sorted_errors(outline.errors_with_bodies()),
-                sorted_errors(full.errors()),
-                "{}: the errors",
-                path.display()
-            );
-            tree.lazies().count()
-        })
-        .sum();
+        let elements = |root: crate::SyntaxNode| {
+            root.preorder_with_tokens()
+                .filter_map(|event| match event {
+                    crate::WalkEvent::Enter(it) => Some((it.kind(), it.text_range())),
+                    crate::WalkEvent::Leave(_) => None,
+                })
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            elements(outline.syntax_node()),
+            elements(full.syntax_node()),
+            "{}: the elements",
+            path.display()
+        );
+        assert_eq!(
+            format!("{:#?}", outline.tree().syntax()),
+            format!("{:#?}", full.tree().syntax()),
+            "{}: the dump",
+            path.display()
+        );
+        assert_eq!(
+            sorted_errors(outline.errors_with_bodies()),
+            sorted_errors(full.errors()),
+            "{}: the errors",
+            path.display()
+        );
+        tree.lazies().count()
+    })
+    .into_iter()
+    .sum();
     assert!(lazies > 1000, "the outlines left {lazies} bodies lazy");
 }
 

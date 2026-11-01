@@ -15,9 +15,9 @@
 
 use std::borrow::Cow;
 
+use blaze_graph::par;
 use blaze_ids::radix;
 use object::macho;
-use rayon::prelude::*;
 
 /// The fewest addresses a piece of a stream encodes: below two pieces' worth the stream is
 /// encoded whole.
@@ -28,7 +28,7 @@ const CHUNK: usize = 16 * 1024;
 /// the address before). `every` is at least `CHUNK` and makes no more pieces than the pool has
 /// threads, so the pieces run in one round; the bytes are the same for any cuts.
 fn cuts(len: usize, fresh: impl Fn(usize) -> bool) -> Vec<usize> {
-    let every = CHUNK.max(len.div_ceil(rayon::current_num_threads().max(1)));
+    let every = CHUNK.max(len.div_ceil(par::threads().max(1)));
     // alloc: once per table, one cut per piece
     let mut cuts = Vec::with_capacity(len / every + 1);
     cuts.push(0);
@@ -61,7 +61,7 @@ fn join(out: &mut Vec<u8>, pieces: Vec<Result<Vec<u8>, String>>) -> Result<(), S
         jobs.push((these, &piece[..]));
         rest = after;
     }
-    jobs.into_par_iter().for_each(|(out, piece)| out.copy_from_slice(piece));
+    par::for_each(jobs, |(out, piece)| out.copy_from_slice(piece));
     Ok(())
 }
 
@@ -159,7 +159,7 @@ fn segment_of(spans: &[Span], addr: u64, what: &str) -> Result<usize, String> {
 /// segment of the pointer before and 8 past it.
 pub(super) fn rebases(addrs: &[u64], spans: &[Span], out: &mut Vec<u8>) -> Result<usize, String> {
     let addrs = sorted(addrs);
-    if let Some(twice) = addrs.par_windows(2).find_first(|it| it[0] == it[1]) {
+    if let Some(twice) = par::find_map_first(par::windows(&addrs, 2), |it| (it[0] == it[1]).then_some(it)) {
         // alloc: error path
         return Err(format!("the address {:#x} is to be slid twice", twice[0]));
     }
@@ -174,20 +174,17 @@ pub(super) fn rebases(addrs: &[u64], spans: &[Span], out: &mut Vec<u8>) -> Resul
         out.reserve(addrs.len() * 3 + 16);
         rebase_runs(&addrs, None, spans, out)?;
     } else {
-        let pieces = (0..cuts.len())
-            .into_par_iter()
-            .map(|nth| {
-                let (from, to) = (cuts[nth], cuts.get(nth + 1).copied().unwrap_or(addrs.len()));
-                // A pointer in no segment before the cut is an error of the piece before.
-                let cursor = from.checked_sub(1).and_then(|before| {
-                    let addr = addrs[before];
-                    spans.iter().position(|it| (it.start..it.end).contains(&addr)).map(|segment| (segment, addr + 8))
-                });
-                // alloc: once per piece of CHUNK pointers
-                let mut piece = Vec::with_capacity((to - from) * 3 + 16);
-                rebase_runs(&addrs[from..to], cursor, spans, &mut piece).map(|()| piece)
-            })
-            .collect(); // alloc: once per table, one result per piece
+        let pieces = par::map(0..cuts.len(), |nth| {
+            let (from, to) = (cuts[nth], cuts.get(nth + 1).copied().unwrap_or(addrs.len()));
+            // A pointer in no segment before the cut is an error of the piece before.
+            let cursor = from.checked_sub(1).and_then(|before| {
+                let addr = addrs[before];
+                spans.iter().position(|it| (it.start..it.end).contains(&addr)).map(|segment| (segment, addr + 8))
+            });
+            // alloc: once per piece of CHUNK pointers
+            let mut piece = Vec::with_capacity((to - from) * 3 + 16);
+            rebase_runs(&addrs[from..to], cursor, spans, &mut piece).map(|()| piece)
+        }); // alloc: once per table, one result per piece
         join(out, pieces)?;
     }
     out.push(macho::REBASE_OPCODE_DONE.0);
@@ -469,17 +466,14 @@ pub(super) fn function_starts(text: u64, addrs: &[u64], out: &mut Vec<u8>) -> us
         out.reserve(addrs.len() * 2 + 8);
         starts_from(text, text, &addrs, out);
     } else {
-        let pieces = (0..cuts.len())
-            .into_par_iter()
-            .map(|nth| {
-                let (from, to) = (cuts[nth], cuts.get(nth + 1).copied().unwrap_or(addrs.len()));
-                let last = from.checked_sub(1).map(|before| addrs[before]).filter(|it| *it > text).unwrap_or(text);
-                // alloc: once per piece of CHUNK functions
-                let mut piece = Vec::with_capacity((to - from) * 2 + 8);
-                starts_from(text, last, &addrs[from..to], &mut piece);
-                Ok(piece)
-            })
-            .collect(); // alloc: once per table, one result per piece
+        let pieces = par::map(0..cuts.len(), |nth| {
+            let (from, to) = (cuts[nth], cuts.get(nth + 1).copied().unwrap_or(addrs.len()));
+            let last = from.checked_sub(1).map(|before| addrs[before]).filter(|it| *it > text).unwrap_or(text);
+            // alloc: once per piece of CHUNK functions
+            let mut piece = Vec::with_capacity((to - from) * 2 + 8);
+            starts_from(text, last, &addrs[from..to], &mut piece);
+            Ok(piece)
+        }); // alloc: once per table, one result per piece
         join(out, pieces).expect("function starts have no error");
     }
     if out.len() == start {
@@ -616,8 +610,8 @@ mod tests {
         (pieces, one)
     }
 
-    fn sixteen() -> rayon::ThreadPool {
-        rayon::ThreadPoolBuilder::new().num_threads(16).build().unwrap()
+    fn sixteen() -> blaze_graph::pool::Pool {
+        blaze_graph::pool::Pool::new(&blaze_graph::topology::Topology::flat(16), false).unwrap()
     }
 
     #[test]

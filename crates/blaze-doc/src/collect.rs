@@ -30,29 +30,26 @@ use crate::{
 
 /// Builds the model of every crate placed.
 pub(crate) fn build(db: &Db, places: &Places) -> Model {
-    use rayon::prelude::*;
+    use blaze_graph::par;
     let files = Files::new(db, places);
     let std = StdItems::find(db, places);
     let by_trait_arg = impls_by_trait_arg(db, places);
-    let built: Vec<(CrateDoc, Vec<Warning>)> = (0..places.crates.len())
-        .into_par_iter()
-        .map(|krate| {
-            hir::attach_db(db, || {
-                let builder = Builder {
-                    db,
-                    places: places.linking(krate),
-                    files: &files,
-                    std: &std,
-                    by_trait_arg: &by_trait_arg,
-                    krate,
-                    allowed: places.upstream(db, places.crates[krate].krate),
-                    linked: places.linked(db, places.crates[krate].krate),
-                    warnings: RefCell::default(),
-                };
-                builder.build()
-            })
+    let built: Vec<(CrateDoc, Vec<Warning>)> = par::map(0..places.crates.len(), |krate| {
+        hir::attach_db(db, || {
+            let builder = Builder {
+                db,
+                places: places.linking(krate),
+                files: &files,
+                std: &std,
+                by_trait_arg: &by_trait_arg,
+                krate,
+                allowed: places.upstream(db, places.crates[krate].krate),
+                linked: places.linked(db, places.crates[krate].krate),
+                warnings: RefCell::default(),
+            };
+            builder.build()
         })
-        .collect();
+    });
     let mut model = Model::default();
     let mut sources: Vec<_> = files.per_crate.into_iter().map(Some).collect();
     for (at, (mut doc, warnings)) in built.into_iter().enumerate() {

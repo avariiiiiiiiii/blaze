@@ -8,8 +8,8 @@
 //! and names in it; the rest of the tail is small and written whole.
 
 use blaze_format::cursor::Put;
+use blaze_graph::par;
 use object::elf;
-use rayon::prelude::*;
 
 use super::dynamic::{CHUNK, Strings, Sym, info, numbered, shndx, value};
 use super::{
@@ -244,12 +244,9 @@ impl KeptSymtab {
 
 /// By chunk of [`CHUNK`] functions: how many are named and the bytes their names take.
 fn name_counts(functions: &[Function]) -> Vec<(usize, usize)> {
-    functions
-        .par_chunks(CHUNK)
-        .map(|chunk| {
-            (chunk.iter().filter_map(|it| it.name.as_deref())).fold((0, 0), |(count, len), name| (count + 1, len + stored(name)))
-        })
-        .collect() // alloc: once per image, one count per chunk of functions
+    par::map(par::chunks(functions, CHUNK), |chunk| {
+        (chunk.iter().filter_map(|it| it.name.as_deref())).fold((0, 0), |(count, len), name| (count + 1, len + stored(name)))
+    }) // alloc: once per image, one count per chunk of functions
 }
 
 fn local_symbol(regions: &[Region], function: &Function, name: u32) -> Sym {
@@ -725,7 +722,7 @@ pub(crate) fn file(writer: &Elf, placed: &Placed<'_>) -> Result<File, LinkError>
                     name_at += len as u32;
                     sym_at += count as u32;
                 }
-                jobs.into_par_iter().for_each(|(chunk, syms, strs, locals, name_at, sym_at)| {
+                par::for_each(jobs, |(chunk, syms, strs, locals, name_at, sym_at)| {
                     let mut strings = Names { bytes: strs, at: 0, offset: name_at };
                     let mut out = syms.chunks_exact_mut(SYM);
                     let mut sym = sym_at;

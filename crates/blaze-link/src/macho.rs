@@ -46,10 +46,10 @@ use std::sync::Mutex;
 
 use blaze_codegen::Arch;
 use blaze_format::cursor::Put;
+use blaze_graph::par;
 use blaze_ids::radix;
 use blaze_sha256 as sha256;
 use object::macho;
-use rayon::prelude::*;
 
 use crate::cow::CowBytes;
 use crate::model::{
@@ -205,7 +205,7 @@ fn locals_into(
     };
     let sizes: Vec<usize> =
         // alloc: one size per 4,096 locals, per link
-        locals.par_chunks(CHUNK).map(|chunk| chunk.iter().map(|it| spelled_len(it.1)).sum()).collect();
+        par::map(par::chunks(locals, CHUNK), |chunk| chunk.iter().map(|it| spelled_len(it.1)).sum());
     let (names_at, entries_at) = (strings.len(), nlist.len());
     strings.resize(names_at + sizes.iter().sum::<usize>(), 0);
     nlist.resize(entries_at + locals.len() * NLIST, 0);
@@ -217,10 +217,10 @@ fn locals_into(
         jobs.push((at, these));
         (left, at) = (after, at + size);
     }
-    let results: Vec<Result<(), LinkError>> = (locals.par_chunks(CHUNK))
-        .zip(nlist[entries_at..].par_chunks_mut(CHUNK * NLIST))
-        .zip(jobs)
-        .map(|((chunk, entries), (start, names))| {
+    // alloc: one result per 4,096 locals, per link
+    let results: Vec<Result<(), LinkError>> = par::map(
+        par::zip(par::zip(par::chunks(locals, CHUNK), par::chunks_mut(&mut nlist[entries_at..], CHUNK * NLIST)), jobs),
+        |((chunk, entries), (start, names))| {
             let mut written = 0;
             for (&(addr, name), entry) in chunk.iter().zip(entries.chunks_exact_mut(NLIST)) {
                 let (prefix, rest) = spelled(name);
@@ -235,9 +235,8 @@ fn locals_into(
                 written = middle + rest.len() + 1;
             }
             Ok(())
-        })
-        // alloc: one result per 4,096 locals, per link
-        .collect();
+        },
+    );
     for result in results {
         result?;
     }
@@ -1325,7 +1324,7 @@ impl MachO {
             Some((_, len)) => room(out, len),
             None => {
                 // alloc: one buffer per link, of exactly the functions
-                let starts: Vec<u64> = placed.functions.par_iter().map(|it| it.addr).collect();
+                let starts: Vec<u64> = par::map(placed.functions, |it| it.addr);
                 linkedit::function_starts(base, &starts, out)
             }
         };

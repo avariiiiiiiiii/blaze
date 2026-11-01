@@ -271,6 +271,15 @@ pub mod default {
     impl_default! {
         0.0; f16 f32 f64 f128
     }
+    impl_default! {
+        false; bool
+    }
+    impl_default! {
+        '\x00'; char
+    }
+    impl Default for () {
+        fn default() -> Self {}
+    }
     // endregion:builtin_impls
 }
 // endregion:default

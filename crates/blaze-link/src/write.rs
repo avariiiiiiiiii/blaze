@@ -19,8 +19,8 @@ use std::ops::Range;
 use std::sync::Arc;
 
 use blaze_codegen::Arch;
+use blaze_graph::par;
 use blaze_ids::radix;
-use rayon::prelude::*;
 use rustc_hash::FxHashMap;
 
 use crate::arena::{FrameVec, collect_in};
@@ -280,7 +280,7 @@ impl Column {
         radix::sort_copy_by_key(&mut wants.plt, |it| it.0);
         wants.plt.dedup();
         let mut values = Vec::with_capacity(wants.syms.len());
-        values.par_extend(wants.syms.par_iter().with_min_len(1024).map(|it| resolver.value(*it)));
+        par::extend(&mut values, &wants.syms, |it| resolver.value(*it));
         let mut column = Column::sized(&wants.syms, wants.got.len() + wants.plt.len());
         for (sym, value) in wants.syms.iter().zip(values) {
             let slot = match value {
@@ -297,7 +297,7 @@ impl Column {
             *column.slot_mut(*sym) = slot;
         }
         let mut got = Vec::with_capacity(wants.got.len());
-        got.par_extend(wants.got.par_iter().map(|(kind, sym)| resolver.cell(*kind, *sym).unwrap_or(NONE)));
+        par::extend(&mut got, &wants.got, |(kind, sym)| resolver.cell(*kind, *sym).unwrap_or(NONE));
         for ((kind, sym), at) in wants.got.iter().zip(got) {
             column.cells_mut(*sym).got[*kind as usize] = at;
         }
@@ -442,7 +442,7 @@ struct Reloc<'s> {
 }
 
 impl Reloc<'_> {
-    fn run(&self, index: u32, job: Job<'_, '_>, out: &mut Loader) {
+    fn run(&self, index: u32, job: &mut Job<'_, '_>, out: &mut Loader) {
         let (rebase, binds) = (out.rebase.len(), out.binds.len());
         if let Err(it) = self.job(job, out) {
             out.rebase.truncate(rebase);
@@ -455,9 +455,9 @@ impl Reloc<'_> {
         out.records.push((index, rebase as u32, out.rebase.len() as u32, binds as u32, out.binds.len() as u32));
     }
 
-    fn job(&self, job: Job<'_, '_>, out: &mut Loader) -> Result<(), LinkError> {
+    fn job(&self, job: &mut Job<'_, '_>, out: &mut Loader) -> Result<(), LinkError> {
         let piece = self.state.piece(job.piece).expect("a live piece to write");
-        let field = job.field;
+        let field = &mut *job.field;
         let symbols = self.symbols;
         let mismatch = |len: u64| {
             error(
@@ -761,10 +761,9 @@ impl<'a> Stage<'a> {
             let symbols: &Symbols = self.symbols;
             let resolver = Resolver { symbols, state, regions: &regions, base: self.plan.base };
             let got_by_library = self.plan.got_by_library;
-            let wants = ids
-                .par_iter()
-                .with_min_len(64)
-                .fold(Wants::default, |mut wants, &(_, _, id)| {
+            let grain = ids.len().div_ceil(par::threads() * 8).max(1);
+            let wants = par::map(par::chunks(&ids, grain), |ids| {
+                ids.iter().fold(Wants::default(), |mut wants, &(_, _, id)| {
                     let piece = state.piece(id).expect("live");
                     let fixups = piece.fixups();
                     // At most a target, a minus and a GOT target each: one growth per piece at
@@ -791,7 +790,9 @@ impl<'a> Stage<'a> {
                     }
                     wants
                 })
-                .reduce(Wants::default, Wants::join);
+            })
+            .into_iter()
+            .fold(Wants::default(), Wants::join);
             let column = Column::build(&resolver, wants);
             let wasm: &[u64] = if self.output.format == Format::Wasm { self.wasm_code(&regions) } else { &[] };
             if !full {
@@ -878,16 +879,14 @@ impl<'a> Stage<'a> {
                 imports: &state.resolved.imports,
                 wasm,
             };
-            let loaders: Vec<Loader> = jobs
-                .into_par_iter()
-                .enumerate()
-                .with_min_len(8)
-                .fold(Loader::default, |mut out, (index, job)| {
-                    reloc.run(index as u32, job, &mut out);
-                    out
-                })
-                // alloc: one loader per rayon batch of jobs, a few per thread, never one per job
-                .collect();
+            let grain = jobs.len().div_ceil(par::threads() * 8).max(1);
+            let loaders: Vec<Loader> = par::map(par::enumerate(par::chunks_mut(&mut jobs, grain)), |(batch, jobs)| {
+                let mut out = Loader::default();
+                for (at, job) in jobs.iter_mut().enumerate() {
+                    reloc.run((batch * grain + at) as u32, job, &mut out);
+                }
+                out
+            }); // alloc: one loader per pool batch of jobs, a few per thread, never one per job
             loaders
         };
         let mut loaders = loaders;
@@ -1062,13 +1061,7 @@ impl<T: Addr + Clone + Send + Sync> Owned<T> {
         let dropped: Vec<u32> = if drop.is_empty() {
             Vec::new() // alloc: empty, which allocates nothing
         } else {
-            old_owners
-                .par_iter()
-                .enumerate()
-                .with_min_len(SPLICE_GRAIN)
-                .filter(|(_, owner)| drop.contains(**owner))
-                .map(|(at, _)| at as u32)
-                .collect() // alloc: as above
+            par::filter_map(par::enumerate(old_owners), |(at, owner)| drop.contains(*owner).then_some(at as u32)) // alloc: as above
         };
         let gaps = gaps(old, old_owners, &dropped, &entries);
         let len = old.len() - dropped.len() + entries.len();
@@ -1162,13 +1155,13 @@ fn debug_chunks<'r>(mut rows: &'r mut [crate::dwarf::Row], starts: &[usize]) -> 
     out
 }
 
-/// `from` cloned onto `out`, in parallel when it is long: rayon writes an indexed iterator's
+/// `from` cloned onto `out`, in parallel when it is long: `par` writes a source's
 /// items in place, in order.
 fn extend_par<T: Clone + Send + Sync>(out: &mut Vec<T>, from: &[T]) {
     if from.len() < SPLICE_GRAIN {
         out.extend_from_slice(from);
     } else {
-        out.par_extend(from.par_iter().with_min_len(SPLICE_GRAIN / 4).cloned());
+        par::extend(out, from, |it| it.clone());
     }
 }
 
@@ -1417,16 +1410,21 @@ impl Entries<'_> {
     }
 
     /// The entries of `ids`' live pieces, in parallel.
-    fn collect(&self, ids: impl IndexedParallelIterator<Item = PieceId>, want: Want) -> Result<Batch, LinkError> {
+    fn collect(&self, ids: impl IntoIterator<Item = PieceId>, want: Want) -> Result<Batch, LinkError> {
         let state = self.resolver.state;
-        ids.with_min_len(256)
-            .try_fold(Batch::default, |mut out, id| {
+        // alloc: once per collection, the piece ids split into ordered batches
+        let ids: Vec<PieceId> = ids.into_iter().collect();
+        let grain = ids.len().div_ceil(par::threads() * 8).max(1);
+        par::map(par::chunks(&ids, grain), |ids| {
+            ids.iter().try_fold(Batch::default(), |mut out, &id| {
                 if let Some(piece) = state.piece(id) {
                     self.of(piece, want, &mut out)?;
                 }
                 Ok(out)
             })
-            .try_reduce(Batch::default, |a, b| Ok(a.join(b)))
+        })
+        .into_iter()
+        .try_fold(Batch::default(), |a, b: Result<Batch, LinkError>| Ok(a.join(b?)))
     }
 }
 
@@ -1457,7 +1455,7 @@ impl<'a> Stage<'a> {
         let all = Want { loader: true, got: true, functions: true };
         let arena = self.arena;
         let (mut lists, functions_changed, changes) = if self.full || !self.old.laid_out {
-            let batch = entries.collect((0..self.new.piece_count()).into_par_iter(), all)?;
+            let batch = entries.collect(0..self.new.piece_count(), all)?;
             let lists = Lists {
                 rebase: Owned::build(batch.rebase),
                 binds: Owned::build(batch.binds),
@@ -1485,22 +1483,25 @@ impl<'a> Stage<'a> {
                 || !Arc::ptr_eq(&old_resolved.libraries, &new_resolved.libraries)
                 || self.old.tls != self.new.tls
                 || self.old.tls_at != self.new.tls_at;
-            let batch = entries.collect(ids.par_iter().copied(), Want { loader: true, got: !imports, functions: true })?;
+            let batch = entries.collect(ids.iter().copied(), Want { loader: true, got: !imports, functions: true })?;
             let (binds, got) = if imports {
                 let count = self.new.piece_count();
-                let more = entries.collect((0..count).into_par_iter(), Want { loader: false, got: true, functions: false })?;
+                let more = entries.collect(0..count, Want { loader: false, got: true, functions: false })?;
                 let state = &self.new;
-                let binds: Vec<(PieceId, Bind)> = (0..count)
-                    .into_par_iter()
-                    .filter_map(|id| state.piece(id))
-                    .flat_map_iter(|piece| {
-                        piece
-                            .binds()
-                            .iter()
-                            .map(move |(at, import, addend)| (piece.id, Bind { addr: piece.addr + at, import: *import, addend: *addend }))
-                    })
-                    // alloc: only when the imports change: every bind made again, as in a full link
-                    .collect();
+                let binds: Vec<(PieceId, Bind)> = par::map(0..count as usize, |id| {
+                    state.piece(id as PieceId)
+                        .into_iter()
+                        .flat_map(|piece| {
+                            piece.binds().iter().map(move |(at, import, addend)| {
+                                (piece.id, Bind { addr: piece.addr + at, import: *import, addend: *addend })
+                            })
+                        })
+                        .collect::<Vec<_>>()
+                })
+                .into_iter()
+                .flatten()
+                // alloc: only when the imports change: every bind made again, as in a full link
+                .collect();
                 let (binds, got) = (Owned::build(binds), Owned::build(more.got));
                 whole(old.binds.items.len(), binds.items.len(), &mut changes.binds);
                 whole(old.got.items.len(), got.items.len(), &mut changes.got);
@@ -1522,30 +1523,23 @@ impl<'a> Stage<'a> {
                 let is = |sym: Sym| changed.binary_search(&sym).is_ok();
                 let affected = &affected;
                 // alloc: once per stage that changed a symbol, the functions it left stale
-                let found: Vec<PieceId> = old
-                    .functions
-                    .owners
-                    .par_iter()
-                    .with_min_len(SPLICE_GRAIN)
-                    .filter(|owner| {
-                        if affected.contains(**owner) {
-                            return false;
-                        }
-                        let Some(info) = state.piece(**owner).and_then(PieceRef::function) else { return false };
-                        let windows = info
-                            .windows
-                            .is_some_and(|(unwind, handler, lsda)| is(unwind) || handler.is_some_and(is) || lsda.is_some_and(is));
-                        windows || info.fde.is_some_and(is)
-                    })
-                    .copied()
-                    .collect(); // alloc: once per stage, the stale functions found in parallel
+                let found: Vec<PieceId> = par::filter_map(&old.functions.owners[..], |owner| {
+                    if affected.contains(*owner) {
+                        return None;
+                    }
+                    let info = state.piece(*owner).and_then(PieceRef::function)?;
+                    let windows = info
+                        .windows
+                        .is_some_and(|(unwind, handler, lsda)| is(unwind) || handler.is_some_and(is) || lsda.is_some_and(is));
+                    (windows || info.fde.is_some_and(is)).then_some(*owner)
+                }); // alloc: once per stage, the stale functions found in parallel
                 stale.extend(found);
             }
             let mut functions = batch.functions;
             if !stale.is_empty() {
                 let ids = collect_in(stale.iter(), arena);
                 functions.extend(
-                    entries.collect(ids.par_iter().copied(), Want { loader: false, got: false, functions: true })?.functions,
+                    entries.collect(ids.iter().copied(), Want { loader: false, got: false, functions: true })?.functions,
                 );
                 affected.extend(ids);
             }
@@ -1649,17 +1643,11 @@ impl<'a> Stage<'a> {
         let state = &self.new;
         let symbols: &Symbols = self.symbols;
         // alloc: once per stage that makes debug info: the Rust functions in list order
-        let functions: Vec<_> = lists
-            .functions
-            .owners
-            .par_iter()
-            .zip(lists.functions.items.par_iter())
-            .with_min_len(DEBUG_CHUNK)
-            .filter_map(|(owner, function)| Some((state.piece(*owner).and_then(PieceRef::function)?, function)))
-            .collect(); // alloc: as above
+        let functions: Vec<_> = par::filter_map(par::zip(&lists.functions.owners[..], &lists.functions.items[..]), |(owner, function)| {
+            Some((state.piece(*owner).and_then(PieceRef::function)?, function))
+        }); // alloc: as above
         // alloc: as above, each function's line count, then where its rows start
-        let counts: Vec<usize> =
-            functions.par_iter().with_min_len(DEBUG_CHUNK).map(|(info, _)| state.lines(info).len()).collect(); // alloc: as above
+        let counts: Vec<usize> = par::map(&functions, |(info, _)| state.lines(info).len()); // alloc: as above
         let mut starts: Vec<usize> = Vec::with_capacity(functions.len() + 1);
         let mut total = 0;
         starts.push(0);
@@ -1668,25 +1656,19 @@ impl<'a> Stage<'a> {
             starts.push(total);
         }
         // alloc: as above, a view per function
-        let views: Vec<crate::dwarf::DebugFunction<'_>> = functions
-            .par_iter()
-            .enumerate()
-            .with_min_len(DEBUG_CHUNK)
-            .map(|(at, (info, function))| crate::dwarf::DebugFunction {
+        let views: Vec<crate::dwarf::DebugFunction<'_>> =
+            par::map(par::enumerate(&functions), |(at, (info, function))| crate::dwarf::DebugFunction {
                 addr: function.addr,
                 size: function.size,
                 name: state.debug_name(info.id).map(|it| symbols.str(it)),
                 lines: starts[at] as u32..starts[at + 1] as u32,
-            })
-            .collect(); // alloc: as above
+            }); // alloc: as above
         let rows: &mut [crate::dwarf::Row] =
             self.arena.alloc_slice_fill_with(total, |_| crate::dwarf::Row { at: 0, file: 0, line: 0, column: 0 });
         // Each task's files, (anchor, file in its table) and name, in the order it met them.
         type Met<'s> = Vec<((IdNo, u32), &'s str)>;
-        let met: Vec<Result<Met<'_>, LinkError>> = debug_chunks(&mut *rows, &starts)
-            .into_par_iter()
-            .enumerate()
-            .map(|(chunk, out)| {
+        let met: Vec<Result<Met<'_>, LinkError>> =
+            par::map(par::enumerate(debug_chunks(&mut *rows, &starts)), |(chunk, out)| {
                 let from = chunk * DEBUG_CHUNK;
                 // alloc: once per task of DEBUG_CHUNK functions, its files (a few)
                 let mut met: Met<'_> = Vec::new();
@@ -1722,8 +1704,7 @@ impl<'a> Stage<'a> {
                     }
                 }
                 Ok(met)
-            })
-            .collect(); // alloc: once per stage that makes debug info, a result per task
+            }); // alloc: once per stage that makes debug info, a result per task
         // alloc: once per stage that makes debug info, the files and each task's numbers for its own
         let mut files: Vec<&str> = Vec::new();
         let mut file_of: FxHashMap<(IdNo, u32), u32> = FxHashMap::default();
@@ -1742,7 +1723,7 @@ impl<'a> Stage<'a> {
                 .collect(); // alloc: as above, a task's numbers
             renumber.push(numbers);
         }
-        debug_chunks(&mut *rows, &starts).into_par_iter().zip(renumber.par_iter()).for_each(|(out, numbers)| {
+        par::for_each(par::zip(debug_chunks(&mut *rows, &starts), &renumber), |(out, numbers)| {
             for row in out {
                 row.file = numbers[row.file as usize];
             }

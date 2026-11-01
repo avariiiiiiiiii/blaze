@@ -98,7 +98,7 @@ pub(crate) fn expect_fragment<'t>(
     let parser_input = to_matcher_input(buffer, &mut |ctx| ctx.edition(db));
     let tree_traversal = entry_point.parse(&parser_input);
     let mut cursor = buffer.cursor();
-    let mut error = false;
+    let mut error = None;
     for step in tree_traversal.iter() {
         match step {
             parser::Step::Token { kind, mut n_input_tokens } => {
@@ -115,18 +115,20 @@ pub(crate) fn expect_fragment<'t>(
                 cursor.bump_or_end();
             }
             parser::Step::Enter { .. } | parser::Step::Exit => (),
-            parser::Step::Error { .. } => error = true,
+            parser::Step::Error { msg } => {
+                error = error.or_else(|| Some(crate::fragment_error(&cursor, msg, delim_span)));
+            }
         }
     }
 
     cursor.leave_invisible();
-    let err = if error || !cursor.is_root() {
-        Some(ExpandError::binding_error(
+    let err = match error {
+        Some(err) => Some(err),
+        None if !cursor.is_root() => Some(ExpandError::binding_error(
             buffer.cursor().token_tree().map_or(delim_span.close, |tt| tt.first_span()),
             format!("expected {entry_point:?}"),
-        ))
-    } else {
-        None
+        )),
+        None => None,
     };
 
     while !cursor.is_root() {

@@ -31,9 +31,9 @@ use std::ops::Range;
 
 use blaze_bytes::le::{u32 as u32_of, u64 as u64_of};
 use blaze_format::cursor::Put;
+use blaze_graph::par;
 use blaze_ids::radix;
 use object::pe;
-use rayon::prelude::*;
 use smallvec::SmallVec;
 
 use super::coff::ImportName;
@@ -437,9 +437,9 @@ impl Tables {
         let (image, delta) = (Image::of(placed), placed.delta);
         let (pdata, relocations) = match last.as_deref_mut() {
             Some(Last { pdata: kept_pdata, reloc: kept_reloc, .. }) => {
-                rayon::join(|| kept_pdata.of(image, delta), || kept_reloc.of(image, delta, &extra))
+                par::join(|| kept_pdata.of(image, delta), || kept_reloc.of(image, delta, &extra))
             }
-            None => rayon::join(
+            None => par::join(
                 || pdata(image, None).map(CowBytes::from_vec),
                 || relocations(image, &extra, reloc_piece(image.rebase.len())).map(CowBytes::from_vec),
             ),
@@ -986,12 +986,14 @@ fn pdata(image: Image<'_>, mut slots: Option<&mut Vec<u32>>) -> Result<Vec<u8>, 
     // alloc: once per build, zeroed: each piece's pages are first touched by the thread staging it
     let mut staged = vec![0u8; functions.len() * RUNTIME_FUNCTION];
     let mut done: Vec<Result<Staged, LinkError>> = Vec::with_capacity(pieces);
-    staged
-        .par_chunks_mut(PDATA_PIECE * RUNTIME_FUNCTION)
-        .zip(functions.par_chunks(PDATA_PIECE))
-        .zip(chunks(slots.as_deref_mut().map(Vec::as_mut_slice), PDATA_PIECE, pieces))
-        .map(|((out, functions), slots)| stage(image, functions, out, slots))
-        .collect_into_vec(&mut done);
+    par::extend(
+        &mut done,
+        par::zip(
+            par::zip(par::chunks_mut(&mut staged, PDATA_PIECE * RUNTIME_FUNCTION), par::chunks(functions, PDATA_PIECE)),
+            chunks(slots.as_deref_mut().map(Vec::as_mut_slice), PDATA_PIECE, pieces),
+        ),
+        |((out, functions), slots)| stage(image, functions, out, slots),
+    );
     let done = done.into_iter().collect::<Result<Vec<Staged>, LinkError>>()?;
     let native = native_pdata(image)?;
     let count: usize = done.iter().map(|it| it.count as usize).sum();
@@ -1048,10 +1050,10 @@ fn pdata(image: Image<'_>, mut slots: Option<&mut Vec<u32>>) -> Result<Vec<u8>, 
             jobs.push((to, staged_of(index, piece), &native[range.clone()], at, slots));
             at += len as u32;
         }
-        jobs.into_par_iter().for_each(|(to, staged, native, first, slots)| merge(staged, native, to, first, slots));
+        par::for_each(jobs, |(to, staged, native, first, slots)| merge(staged, native, to, first, slots));
     }
     let read = |at: usize| read_entry(&out[at * RUNTIME_FUNCTION..][..RUNTIME_FUNCTION]);
-    if let Some(at) = (1..total).into_par_iter().find_first(|&at| read(at).0 < read(at - 1).1) {
+    if let Some(at) = par::find_map_first(1..total, |at| (read(at).0 < read(at - 1).1).then_some(at)) {
         let ((before, before_end, _), (begin, end, _)) = (read(at - 1), read(at));
         return Err(error(format_args!(
             "the unwind entries of RVAs {before:#x}..{before_end:#x} and {begin:#x}..{end:#x} overlap"
@@ -1218,7 +1220,7 @@ const RELOC_PIECE: usize = 1 << 13;
 /// The rebased addresses per piece of `.reloc` for `addresses` of them: about four pieces a
 /// thread, so a slow thread holds the rest up by a quarter of its share at most.
 fn reloc_piece(addresses: usize) -> usize {
-    addresses.div_ceil(4 * rayon::current_num_threads()).max(RELOC_PIECE)
+    addresses.div_ceil(4 * par::threads()).max(RELOC_PIECE)
 }
 
 fn page_of(addr: u64) -> u64 {
@@ -1302,18 +1304,14 @@ fn build_relocations(
     bounds.push((from..rebase.len(), extra_from..extra.len()));
     let keep = starts.is_some();
     let mut written: Vec<Result<(Vec<u8>, Vec<u32>), LinkError>> = Vec::with_capacity(bounds.len());
-    bounds
-        .par_iter()
-        .zip(split(slots.as_deref_mut(), &bounds))
-        .map(|((addresses, extras), slots)| {
-            // alloc: one buffer a piece (and its block starts for a kept table)
-            let (mut out, mut piece_starts) = (Vec::default(), Vec::new());
-            let starts = keep.then_some(&mut piece_starts);
-            // clone: two `Range`s of two `usize`s
-            blocks(image, &rebase[addresses.clone()], &extra[extras.clone()], &mut out, slots, starts)
-                .map(|()| (out, piece_starts))
-        })
-        .collect_into_vec(&mut written);
+    par::extend(&mut written, par::zip(&bounds, split(slots.as_deref_mut(), &bounds)), |((addresses, extras), slots)| {
+        // alloc: one buffer a piece (and its block starts for a kept table)
+        let (mut out, mut piece_starts) = (Vec::default(), Vec::new());
+        let starts = keep.then_some(&mut piece_starts);
+        // clone: two `Range`s of two `usize`s
+        blocks(image, &rebase[addresses.clone()], &extra[extras.clone()], &mut out, slots, starts)
+            .map(|()| (out, piece_starts))
+    });
     let mut parts = Vec::with_capacity(written.len());
     for piece in written {
         parts.push(piece?);
@@ -1339,7 +1337,7 @@ fn build_relocations(
             jobs.push((to, &bytes[..], slots, starts_to, &piece_starts[..], base as u32));
             base += bytes.len();
         }
-        jobs.into_par_iter().for_each(|(to, from, slots, starts_to, starts_from, base)| {
+        par::for_each(jobs, |(to, from, slots, starts_to, starts_from, base)| {
             to.copy_from_slice(from);
             for slot in slots.into_iter().flatten().filter(|it| **it != NONE) {
                 *slot += base;

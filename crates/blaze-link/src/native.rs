@@ -34,11 +34,11 @@ use std::ops::Range;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
+use blaze_graph::par;
 use blaze_ids::{
     bits::locate,
     radix::{self, Csr},
 };
-use rayon::prelude::*;
 use rustc_hash::{FxHashMap, FxHashSet, FxHasher};
 use smallvec::SmallVec;
 
@@ -1848,17 +1848,19 @@ impl<'a> Stage<'a> {
         let writer = self.writer;
         let listed = &change.natives;
         let mut files: Vec<Result<NativeFile, LinkError>> = Vec::with_capacity(fresh.len());
-        fresh
-            .par_iter()
-            .map(|at| {
+        files.clear();
+        par::extend(
+            &mut files,
+            &fresh,
+            |at| {
                 let native = &listed[*at];
                 // alloc: error path (the message is made only on `Err`)
                 let file = writer.read(native.name, native.bytes, &native.kind).map_err(|it| error(None, format!("{}: {it}", native.name)))?;
                 // alloc: error path (the message is made only on `Err`)
                 check_file(&file, native.bytes.len()).map_err(|it| error(None, format!("{}: {it}", native.name)))?;
                 Ok(file)
-            })
-            .collect_into_vec(&mut files);
+            },
+        );
         let mut bytes: FxHashMap<blaze_ids::ContentId, &'a [u8]> =
             FxHashMap::with_capacity_and_hasher(inputs.len() + fresh.len(), Default::default());
         inputs.reserve(fresh.len());
@@ -1983,9 +1985,11 @@ impl<'a> Stage<'a> {
         let writer = self.writer;
         let (inputs, native, old): (&[Input], &Pass<'a>, &'a State) = (&self.new.inputs[..], &self.native, self.old);
         let mut got: Vec<Result<Got, LinkError>> = Vec::with_capacity(misses.len());
-        misses
-            .par_iter()
-            .map(|at| {
+        got.clear();
+        par::extend(
+            &mut got,
+            misses,
+            |at| {
                 let (input, member) = wanted[*at];
                 let it = &inputs[input as usize];
                 let all = native.input(old, input);
@@ -2035,8 +2039,8 @@ impl<'a> Stage<'a> {
                     }
                 }
                 Ok(Got { file, base, records })
-            })
-            .collect_into_vec(&mut got);
+            },
+        );
         // alloc: one buffer per batch read, the objects of the batch
         let got: Vec<Got> = got.into_iter().collect::<Result<_, _>>()?;
         // One batch for every object's symbols, sections and frame records, and one for the
@@ -2070,10 +2074,11 @@ impl<'a> Stage<'a> {
             name_ids = self.symbols.names_all(&names);
         }
         let mut reads: Vec<Read> = Vec::with_capacity(got.len());
-        got.into_par_iter()
-            .zip(misses.par_iter())
-            .enumerate()
-            .map(|(n, (it, at))| {
+        reads.clear();
+        par::extend(
+            &mut reads,
+            par::enumerate(par::zip(got, misses)),
+            |(n, (it, at))| {
                 if matches!(*it.file, NativeFile::Shared(_)) {
                     return Read::Shared(it.file);
                 }
@@ -2089,8 +2094,8 @@ impl<'a> Stage<'a> {
                 );
                 // alloc: once per object read, shared by every stage after
                 Read::Object(Arc::new(parsed))
-            })
-            .collect_into_vec(&mut reads);
+            },
+        );
         Ok(reads)
     }
 
@@ -2101,9 +2106,11 @@ impl<'a> Stage<'a> {
         objs.extend(lazy.iter().map(|it| self.symbols.obj(&inputs[*it as usize].id, 0)));
         let objects = &*self.objects;
         let mut out: Vec<(u32, Arc<Table>)> = Vec::with_capacity(lazy.len());
-        lazy.par_iter()
-            .zip(objs.par_iter())
-            .map(|(input, obj)| {
+        out.clear();
+        par::extend(
+            &mut out,
+            par::zip(lazy, &objs),
+            |(input, obj)| {
                 let table = match objects.get(obj) {
                     // clone: an `Arc`: the archive's index as the image keeps it
                     Some(Read::Index(it)) => it.clone(),
@@ -2116,8 +2123,8 @@ impl<'a> Stage<'a> {
                     }
                 };
                 (*input, table)
-            })
-            .collect_into_vec(&mut out);
+            },
+        );
         for (obj, (_, table)) in objs.iter().zip(&out) {
             // clone: an `Arc`: the image's handle on the index
             self.objects.entry(*obj).or_insert_with(|| Read::Index(table.clone()));

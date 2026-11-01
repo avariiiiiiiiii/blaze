@@ -165,7 +165,7 @@ mod tests {
     };
 
     use blaze_bytes::Bytes;
-    use rayon::prelude::*;
+    use blaze_graph::par;
     use test_utils::project_root;
 
     use super::{TREE_VERSION, read, write};
@@ -217,7 +217,7 @@ mod tests {
     #[test]
     fn a_stored_parse_reads_back_as_a_fresh_parse() {
         let edition = Edition::CURRENT;
-        corpus().into_par_iter().for_each(|(name, text)| {
+        par::for_each(corpus(), |(name, text)| {
             let text = Text::from(text);
             for outline in [false, true] {
                 let parse = match outline {
@@ -290,7 +290,7 @@ mod tests {
     fn the_tree_version_names_the_trees_parsed() {
         let path = project_root().into_std_path_buf().join("crates/syntax/test_data/tree_version");
         let digests: BTreeMap<String, String> =
-            corpus().into_par_iter().map(|(name, text)| (name, digest(&text))).collect();
+            par::map(corpus(), |(name, text)| (name, digest(&text))).into_iter().collect();
         let stored = fs::read_to_string(&path).unwrap_or_default();
         let mut lines = stored.lines();
         if lines.next() == Some(TREE_VERSION.to_string().as_str()) {

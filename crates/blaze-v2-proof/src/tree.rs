@@ -17,6 +17,7 @@ use std::{
     sync::Mutex,
 };
 
+use blaze_graph::par;
 use blaze_ids::b3;
 
 use crate::bytes::Mapped;
@@ -47,6 +48,8 @@ impl Entry {
 struct Found {
     entries: Mutex<Vec<Entry>>,
     error: Mutex<Option<io::Error>>,
+    dirs: Mutex<Vec<(PathBuf, String)>>,
+    files: Mutex<Vec<Vec<(PathBuf, String)>>>,
 }
 
 impl Found {
@@ -66,9 +69,17 @@ pub fn digest(root: &Path, skip: &[String]) -> io::Result<[u8; 32]> {
         // alloc: once a digest
         entries: Mutex::new(Vec::new()),
         error: Mutex::new(None),
+        dirs: Mutex::new(Vec::new()),
+        files: Mutex::new(Vec::new()),
     };
     // alloc: the walk's paths, once a directory
-    rayon::scope(|scope| walk(scope, root.to_path_buf(), String::new(), skip, &found));
+    let mut dirs = vec![(root.to_path_buf(), String::new())];
+    while !dirs.is_empty() {
+        par::for_each(dirs, |(dir, rel)| walk(dir, rel, skip, &found));
+        let files = std::mem::take(&mut *found.files.lock().expect("a walk's task panicked"));
+        par::for_each(files, |files| hash_files(files, &found));
+        dirs = std::mem::take(&mut *found.dirs.lock().expect("a walk's task panicked"));
+    }
     if let Some(error) = found.error.into_inner().expect("a walk's task panicked") {
         return Err(error);
     }
@@ -109,13 +120,13 @@ pub fn hex(hash: &[u8; 32], out: &mut Vec<u8>) {
     }
 }
 
-fn walk<'s>(scope: &rayon::Scope<'s>, dir: PathBuf, rel: String, skip: &'s [String], found: &'s Found) {
-    if let Err(error) = list(scope, &dir, &rel, skip, found) {
+fn walk(dir: PathBuf, rel: String, skip: &[String], found: &Found) {
+    if let Err(error) = list(&dir, &rel, skip, found) {
         found.fail(error);
     }
 }
 
-fn list<'s>(scope: &rayon::Scope<'s>, dir: &Path, rel: &str, skip: &'s [String], found: &'s Found) -> io::Result<()> {
+fn list(dir: &Path, rel: &str, skip: &[String], found: &Found) -> io::Result<()> {
     // alloc: per directory, its links
     let mut links = Vec::new();
     // alloc: per directory, its files until a task takes them
@@ -147,17 +158,17 @@ fn list<'s>(scope: &rayon::Scope<'s>, dir: &Path, rel: &str, skip: &'s [String],
             // alloc: per link, its target
             links.push(Entry::Link { rel: child, to: to.to_owned() });
         } else if kind.is_dir() {
-            scope.spawn(move |scope| walk(scope, path, child, skip, found));
+            found.dirs.lock().expect("a walk's task panicked").push((path, child));
         } else if kind.is_file() {
             files.push((path, child));
             if files.len() == FILES_A_TASK {
                 let taken = std::mem::take(&mut files);
-                scope.spawn(move |_| hash_files(taken, found));
+                found.files.lock().expect("a walk's task panicked").push(taken);
             }
         }
     }
     if !files.is_empty() {
-        scope.spawn(move |_| hash_files(files, found));
+        found.files.lock().expect("a walk's task panicked").push(files);
     }
     if !links.is_empty() {
         found.add(links);

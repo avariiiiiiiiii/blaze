@@ -211,36 +211,56 @@ fn file_source_path<'db>(db: &'db Db, file: base_db::FileText) -> Option<String>
 
 /// The text of the literal `expr` of `owner` when it is what `file!()`, or a `concat!` with
 /// `file!()` among its arguments, expanded to: the expander gives a placeholder for the path,
-/// and a constant is evaluated from what the build names the file.
-pub fn placed(db: &Db, owner: DefWithBodyId, expr: ExprId) -> Option<String> {
-    let path = |file| source_path(db, file);
-    if let Some(file_id) = located_concats(db, owner).get(&expr) {
-        use std::fmt::Write;
-        let call = file_id.macro_file()?.loc(db).to_node_view(db);
-        // alloc: the value of the `concat!`, made only where one of a place is evaluated
-        let mut text = String::new();
-        for part in concat_parts(call.value)? {
-            match part {
-                ConcatPart::Text(part) => text.push_str(&part),
-                ConcatPart::Location(expander, range) => {
-                    let (file, line, col) = macro_location_of(db, call.file_id, range)?;
-                    match expander {
-                        BuiltinFnLikeExpander::Line => _ = write!(text, "{line}"),
-                        BuiltinFnLikeExpander::Column => _ = write!(text, "{col}"),
-                        _ => text.push_str(path(file)?),
-                    }
+/// and a constant is evaluated from what the build names the file. `None` for any other
+/// expression; an error, never the placeholder, for one of those it can not place.
+pub fn placed(db: &Db, owner: DefWithBodyId, expr: ExprId) -> Option<Result<String, &'static str>> {
+    if let Some(&file_id) = located_concats(db, owner).get(&expr) {
+        return Some(placed_concat(db, file_id));
+    }
+    let &file_id = location_macros(db, owner).get(&expr)?;
+    Some(placed_file(db, file_id))
+}
+
+/// What the build calls `file`, or why there is no name.
+fn named(db: &Db, file: base_db::FileId) -> Result<&str, &'static str> {
+    source_path(db, file).ok_or(
+        "`file!()` evaluated with no source names: the build did not tell the evaluator \
+         what it calls the files (`name_sources`)",
+    )
+}
+
+fn placed_concat(db: &Db, file_id: HirFileId) -> Result<String, &'static str> {
+    use std::fmt::Write;
+    let call = file_id.macro_file().ok_or("a `concat!` of `file!()` not in a macro file")?;
+    let call = call.loc(db).to_node_view(db);
+    // alloc: the value of the `concat!`, made only where one of a place is evaluated
+    let mut text = String::new();
+    let parts = concat_parts(call.value).ok_or("a `concat!` of `file!()` whose arguments do not parse")?;
+    for part in parts {
+        match part {
+            ConcatPart::Text(part) => text.push_str(&part),
+            ConcatPart::Location(expander, range) => {
+                let (file, line, col) = macro_location_of(db, call.file_id, range)
+                    .ok_or("a `file!()` in a `concat!` with no place in a source file")?;
+                match expander {
+                    BuiltinFnLikeExpander::Line => _ = write!(text, "{line}"),
+                    BuiltinFnLikeExpander::Column => _ = write!(text, "{col}"),
+                    _ => text.push_str(named(db, file)?),
                 }
             }
         }
-        return Some(text);
     }
-    let &file_id = location_macros(db, owner).get(&expr)?;
-    let site = written_call(db, file_id)?;
+    Ok(text)
+}
+
+fn placed_file(db: &Db, file_id: HirFileId) -> Result<String, &'static str> {
+    let site = written_call(db, file_id).ok_or("a `file!()` whose call is not written in the source")?;
     let range = InFile::new(site.file_id, written_range(site.value));
     let FileRange { file_id, range } = range.original_node_file_range_rooted(db);
-    let (file, _, _) = macro_location_of(db, file_id.into(), range)?;
+    let (file, _, _) = macro_location_of(db, file_id.into(), range)
+        .ok_or("a `file!()` with no place in a source file")?;
     // alloc: the value of `file!()`, made only where one is evaluated
-    Some(path(file)?.to_owned())
+    Ok(named(db, file)?.to_owned())
 }
 
 /// The macro of `name` that expands to a place in the source.

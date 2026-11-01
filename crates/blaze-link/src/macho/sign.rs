@@ -9,8 +9,8 @@
 
 #![forbid(unsafe_code)]
 
+use blaze_graph::par;
 use blaze_ids::radix;
-use rayon::prelude::*;
 use smallvec::SmallVec;
 
 use super::sha256;
@@ -293,7 +293,7 @@ pub(super) fn signature(
 }
 
 fn hash(file: &View<'_>, slots: &mut [u8]) {
-    slots.par_chunks_mut(HASH * GROUP).enumerate().for_each(|(group, slots)| {
+    par::for_each(par::enumerate(par::chunks_mut(slots, HASH * GROUP)), |(group, slots)| {
         let mut buf = [0u8; PAGE];
         for (nth, slot) in slots.chunks_exact_mut(HASH).enumerate() {
             slot.copy_from_slice(&sha256::digest(file.page(group * GROUP + nth, &mut buf)));
@@ -317,11 +317,9 @@ fn hash_cached(file: &View<'_>, slots: &mut [u8], cached: Cached<'_>) {
     cache.hashes.resize(pages, [0; HASH]);
 
     let ranges = &kept[..];
-    (cache.pages.par_chunks_mut(PAGE))
-        .zip(cache.kept_hashes.par_iter_mut())
-        .enumerate()
-        .with_min_len(GROUP)
-        .for_each(|(k, (old, hash))| {
+    par::for_each(
+        par::enumerate(par::zip(par::chunks_mut(&mut cache.pages, PAGE), &mut cache.kept_hashes)),
+        |(k, (old, hash))| {
             let page = nth_page(ranges, k);
             let mut buf = [0u8; PAGE];
             let bytes = file.page(page, &mut buf);
@@ -334,10 +332,12 @@ fn hash_cached(file: &View<'_>, slots: &mut [u8], cached: Cached<'_>) {
                 old.copy_from_slice(bytes);
                 *hash = sha256::digest(bytes);
             }
-        });
+        },
+    );
 
     let kept_hashes = &cache.kept_hashes;
-    (slots.par_chunks_mut(HASH * GROUP)).zip(cache.hashes.par_chunks_mut(GROUP)).enumerate().for_each(
+    par::for_each(
+        par::enumerate(par::zip(par::chunks_mut(slots, HASH * GROUP), par::chunks_mut(&mut cache.hashes, GROUP))),
         |(group, (slots, hashes))| {
             let mut buf = [0u8; PAGE];
             for (nth, (slot, hash)) in slots.chunks_exact_mut(HASH).zip(hashes.iter_mut()).enumerate() {

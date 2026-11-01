@@ -14,7 +14,7 @@ pub use blaze_link::premap::{
     Bind, BindKind, InitEntry, Library, PlacedName, PlacedStatic, Prot, StaticAt, Tls, page,
 };
 use blaze_link::{Format, Output, OutputKind};
-use rayon::prelude::*;
+use blaze_graph::par;
 
 use crate::PremapError;
 use crate::image::{self, Meta, Pieces};
@@ -79,9 +79,9 @@ impl Placed for Prelinked {
             }
             let (_, from) = std::mem::take(&mut rest).split_at_mut(offset - consumed);
             let (into, after) = from.split_at_mut(len);
-            into.par_chunks_mut(COPY_PIECE)
-                .zip(segment.bytes.par_chunks(COPY_PIECE))
-                .for_each(|(into, from)| into.copy_from_slice(from));
+            par::for_each(par::zip(par::chunks_mut(into, COPY_PIECE), par::chunks(&segment.bytes, COPY_PIECE)), |(into, from)| {
+                into.copy_from_slice(from);
+            });
             rest = after;
             consumed = offset + len;
         }

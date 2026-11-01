@@ -15,8 +15,8 @@
 
 use std::collections::VecDeque;
 
+use blaze_graph::par;
 use blaze_ids::bits::BitSet;
-use rayon::prelude::*;
 use rustc_hash::{FxHashMap, FxHashSet};
 
 use crate::{
@@ -126,14 +126,10 @@ pub fn decide(
     let graph = Graph::of(summaries)?;
     let attrs = graph.attrs();
     let constants = graph.constants();
-    let decided: Vec<Imports> = (0..graph.len())
-        .into_par_iter()
-        .with_min_len(64)
-        .map(|node| {
-            SCRATCH.with_borrow_mut(|scratch| graph.imports(node, limits, &attrs, &constants, scratch))
-        })
-        // alloc: one exact-size column per build
-        .collect();
+    // alloc: one exact-size column per build
+    let decided: Vec<Imports> = par::map(0..graph.len(), |node| {
+        SCRATCH.with_borrow_mut(|scratch| graph.imports(node, limits, &attrs, &constants, scratch))
+    });
     // alloc: the build's answer, once per build
     Ok(graph.keys.iter().copied().zip(decided).collect())
 }

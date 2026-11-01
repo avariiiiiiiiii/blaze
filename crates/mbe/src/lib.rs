@@ -553,7 +553,7 @@ pub fn expect_fragment<'t>(
     };
     // Over the whole level, so that `flat_advance_to` keeps its end.
     let mut cursor = buffer.cursor();
-    let mut error = false;
+    let mut error = None;
     for step in tree_traversal.iter() {
         match step {
             parser::Step::Token { kind, mut n_input_tokens } => {
@@ -572,19 +572,21 @@ pub fn expect_fragment<'t>(
                 cursor.bump_or_end();
             }
             parser::Step::Enter { .. } | parser::Step::Exit => (),
-            parser::Step::Error { .. } => error = true,
+            parser::Step::Error { msg } => {
+                error = error.or_else(|| Some(fragment_error(&cursor, msg, delim_span)));
+            }
         }
     }
 
     cursor.leave_invisible();
-    let err = if error || !cursor.is_root() {
-        Some(ExpandError::binding_error(
+    let err = match error {
+        Some(err) => Some(err),
+        None if !cursor.is_root() => Some(ExpandError::binding_error(
             buffer.cursor().token_tree().map_or(delim_span.close, |tt| tt.first_span()),
             // alloc: an error.
             format!("expected {entry_point:?}"),
-        ))
-    } else {
-        None
+        )),
+        None => None,
     };
 
     while !cursor.is_root() {
@@ -595,6 +597,13 @@ pub fn expect_fragment<'t>(
     tt_iter.flat_advance_to(&cursor);
 
     ExpandResult { value: res, err }
+}
+
+/// The first error a fragment's parse made: the parser's message, at the token it was at when
+/// it made it (`cursor`), or at the group's close when it was at the end.
+pub(crate) fn fragment_error(cursor: &tt::buffer::Cursor<'_>, msg: &str, delim_span: DelimSpan) -> ExpandError {
+    let span = cursor.token_tree().map_or(delim_span.close, |tt| tt.first_span());
+    ExpandError::binding_error(span, msg)
 }
 
 /// How many tokens past its position the `parser` crate's parser may read, plus one.

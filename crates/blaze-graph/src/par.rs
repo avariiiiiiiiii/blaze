@@ -648,7 +648,7 @@ mod tests {
     use std::{
         sync::{
             Arc, Mutex,
-            atomic::{AtomicUsize, Ordering},
+            atomic::{AtomicBool, AtomicUsize, Ordering},
         },
         time::Duration,
     };
@@ -656,7 +656,7 @@ mod tests {
     use blaze_ids::rng::SplitMix64 as Rng;
     use crossbeam_channel::unbounded;
 
-    use crate::{pool::Pool, topology::Topology};
+    use crate::{Cancelled, Key, pool::Pool, pump::Flights, topology::Topology};
 
     const LONG: Duration = Duration::from_secs(60);
 
@@ -688,6 +688,48 @@ mod tests {
             let got = rx.recv_timeout(LONG).expect("each map finishes rather than waiting on a second pool");
             assert_eq!(got, want);
         }
+    }
+
+    /// A task that runs a key opens a scope, and the scope's job, taken by the other worker,
+    /// asks for that key (self9's hang: a query's parallel loop whose item asks for a key the
+    /// task below it runs). The job's wait would close a cycle through the scope (the task
+    /// waits for its job, the job for the task's run), so it gives way at once rather than
+    /// both waiting for good.
+    #[test]
+    fn a_scope_job_asking_for_a_key_its_scope_owner_runs_gives_way() {
+        let pool = Arc::new(Pool::new(&Topology::flat(2), false).unwrap());
+        let flights = Arc::new(Flights::<()>::new());
+        let (tx, rx) = unbounded::<Result<(), Cancelled>>();
+        let key = Key([7; 32]);
+        pool.submit(
+            None,
+            move || {
+                let mut asked = None;
+                let ran = flights.get_or_run(key, || {
+                    let started = AtomicBool::new(false);
+                    crate::pool::scope_here(|scope| {
+                        scope.submit(
+                            None,
+                            || {
+                                started.store(true, Ordering::Release);
+                                flights.get_or_run(key, || Ok(()))
+                            },
+                            |it| asked = Some(it.unwrap()),
+                        );
+                        // Not pumping, so the job is the other worker's.
+                        while !started.load(Ordering::Acquire) {
+                            std::hint::spin_loop();
+                        }
+                    });
+                    Ok(())
+                });
+                assert_eq!(ran, Ok(()));
+                asked.expect("the scope's job ran")
+            },
+            move |it| _ = tx.send(it.unwrap()),
+        );
+        let asked = rx.recv_timeout(LONG).expect("the job gives way rather than wait on its scope's owner");
+        assert_eq!(asked, Err(Cancelled));
     }
 
     /// Seeded loops of every shape against the same loops run in order, on pools of one to

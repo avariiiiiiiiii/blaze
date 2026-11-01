@@ -53,7 +53,7 @@ use blaze_radix as radix;
 use crossbeam_deque::{Steal, Stealer, Worker};
 
 use crate::{
-    pump::{Lock, PUMP_DEPTH, SPINS, depth, run_task},
+    pump::{self, Lock, PUMP_DEPTH, SPINS, depth, run_task},
     sync::{
         OnceLock,
         atomic::{AtomicBool, AtomicPtr, AtomicU32, AtomicU64, AtomicUsize, Ordering, fence},
@@ -873,8 +873,10 @@ impl<'env> Scope<'env> {
         // SAFETY: `Pool::scope` keeps `Pending` until every job counted in it is done.
         unsafe { &*self.pending }.count.fetch_add(1, Ordering::Relaxed);
         let left = Left(self.pending);
+        let parent = pump::current();
         let job = move || {
             let _left = left;
+            pump::waited_by(parent);
             done(catch_unwind(AssertUnwindSafe(run)));
         };
         // SAFETY: the job borrows only what lives for `'env`, which outlives the call of

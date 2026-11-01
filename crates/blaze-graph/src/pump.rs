@@ -6,14 +6,15 @@
 //!
 //! The task a thread runs now is the top of a stack the pool keeps for the thread: a job the
 //! thread pumps while it waits is pushed above the job that waits, and that one cannot go on
-//! before it returns. Who waits for whom is one graph for the process, of two kinds of edge: a
-//! task waits for the task that runs the key it asked ([`Flights::get_or_run`]), and a task
-//! that pumped waits for the job above it on its thread. A wait whose edge would close a cycle
-//! is refused.
+//! before it returns. Who waits for whom is one graph for the process, of three kinds of edge:
+//! a task waits for the task that runs the key it asked ([`Flights::get_or_run`]), a task that
+//! pumped waits for the job above it on its thread, and a task in a scope
+//! ([`crate::pool::Scope`], so every loop of [`crate::par`]) waits for each job of it that has
+//! started, wherever it runs. A wait whose edge would close a cycle is refused.
 //!
 //! The graph costs nothing until a task waits. Each thread publishes its stack in a [`Stack`]
-//! of its own (384 bytes, 128-byte aligned, written by its thread alone): starting a job is
-//! three stores to it and ending one a fourth, and the edge to the job above is read from it.
+//! of its own (512 bytes, 128-byte aligned, written by its thread alone): starting a job is
+//! four stores to it and ending one a fifth, and the edge to the job above is read from it.
 //! A wait's own edge, to the runner it waits for, sits beside the task in the same slot. Only
 //! a wait takes the one process-wide lock ([`WAITS`]), to check and add its edge as one step; a
 //! run nobody waits for takes its key's shard twice and nothing else.
@@ -90,16 +91,18 @@ const DEPTH_MASK: u64 = (1 << (THREAD_SHIFT - DEPTH_SHIFT)) - 1;
 const CLIENT: u64 = DEPTH_MASK;
 const _: () = assert!(PUMP_DEPTH < CLIENT as usize);
 
-/// A task as the cycle check sees it: its id (0 for none) and the runner of the key it waits
-/// for (0 for none; written under [`WAITS`]). 16 bytes.
+/// A task as the cycle check sees it: its id (0 for none), the runner of the key it waits
+/// for (0 for none; written under [`WAITS`]) and the task that waits for it to end, the one
+/// that submitted it as a scope's job (0 for none; see [`waited_by`]). 24 bytes.
 struct Published {
     task: AtomicU64,
     on: AtomicU64,
+    parent: AtomicU64,
 }
 
 impl Published {
     const fn new() -> Published {
-        Published { task: AtomicU64::new(0), on: AtomicU64::new(0) }
+        Published { task: AtomicU64::new(0), on: AtomicU64::new(0), parent: AtomicU64::new(0) }
     }
 }
 
@@ -119,7 +122,7 @@ struct Stack {
 }
 
 #[cfg(not(blaze_check))]
-const _: () = assert!(size_of::<Stack>() == 384);
+const _: () = assert!(size_of::<Stack>() == 512);
 
 impl Stack {
     fn new() -> Stack {
@@ -239,6 +242,7 @@ pub(crate) fn run_task<R>(f: impl FnOnce() -> R) -> R {
         let id = next_id(me.index, u64::from(len), &me.seq);
         let entry = &me.stack.tasks[at];
         entry.on.store(0, Ordering::Relaxed);
+        entry.parent.store(0, Ordering::Relaxed);
         entry.task.store(id, Ordering::Release);
         me.stack.len.store(len + 1, Ordering::Release);
         Leave { stack: me.stack, len }
@@ -251,11 +255,23 @@ pub fn depth() -> usize {
     ME.with(|me| me.stack.len.load(Ordering::Relaxed) as usize).saturating_sub(1)
 }
 
-fn current() -> u64 {
+/// The task this thread runs now: the top of its stack, or the thread itself outside any job.
+pub(crate) fn current() -> u64 {
     ME.with(|me| match me.stack.len.load(Ordering::Relaxed) as usize {
         0 => me.client,
         len => me.stack.tasks[len - 1].task.load(Ordering::Relaxed),
     })
+}
+
+/// Says the task this thread runs now (a scope's job, at its start) is waited for by `parent`,
+/// the task that submitted it and waits in its scope for it to end. The edge needs no check:
+/// a task just started waits for nobody yet, so no cycle runs through it.
+pub(crate) fn waited_by(parent: u64) {
+    ME.with(|me| {
+        if let Some(len) = (me.stack.len.load(Ordering::Relaxed) as usize).checked_sub(1) {
+            me.stack.tasks[len].parent.store(parent, Ordering::Release);
+        }
+    });
 }
 
 /// Where `task` is published, while it lives.
@@ -291,15 +307,18 @@ fn edges(task: u64) -> (u64, u64) {
 struct Walk {
     next: Vec<u64>,
     seen: FxHashSet<u64>,
+    /// Each live scope job as (the task that waits for it, the job), read at the check's start.
+    children: Vec<(u64, u64)>,
 }
 
 impl Walk {
     /// Whether `from` waits, through any chain, for `to`. The graph without the edge being
     /// checked has no cycle (each edge was checked as it was added, and an edge to a job just
-    /// pumped cannot close one), so the walk ends.
+    /// pumped or just started for a scope cannot close one), so the walk ends.
     fn reaches(&mut self, from: u64, to: u64) -> bool {
         self.next.clear();
         self.seen.clear();
+        self.read_children();
         self.next.push(from);
         while let Some(task) = self.next.pop() {
             if task == to {
@@ -311,14 +330,41 @@ impl Walk {
             let (on, above) = edges(task);
             self.next.push(on);
             self.next.push(above);
+            for &(parent, child) in &self.children {
+                if parent == task {
+                    self.next.push(child);
+                }
+            }
         }
         false
+    }
+
+    /// Fills `children` from every thread's published stack. A job that starts after this is
+    /// read waits for nobody yet; its own first wait is checked after this one, under the
+    /// same lock, and sees this check's edge.
+    fn read_children(&mut self) {
+        self.children.clear();
+        for (_, stack) in stacks().iter() {
+            let len = (stack.len.load(Ordering::Acquire) as usize).min(PUMP_DEPTH + 1);
+            for entry in &stack.tasks[..len] {
+                let task = entry.task.load(Ordering::Acquire);
+                let parent = entry.parent.load(Ordering::Acquire);
+                if task != 0 && parent != 0 && entry.task.load(Ordering::Acquire) == task {
+                    self.children.push((parent, task));
+                }
+            }
+        }
     }
 }
 
 /// Orders the waits: a check and the edge it adds are one step against every other wait's.
-static WAITS: Lock<Walk> = // alloc: none, empty: the check's scratch, kept for the process
-    Lock::new(Walk { next: Vec::new(), seen: FxHashSet::with_hasher(FxBuildHasher) });
+static WAITS: Lock<Walk> = Lock::new(Walk {
+    // alloc: none, empty: the check's scratch, kept for the process
+    next: Vec::new(),
+    seen: FxHashSet::with_hasher(FxBuildHasher),
+    // alloc: none, empty: as `next`
+    children: Vec::new(),
+});
 
 #[cfg(test)]
 thread_local! {

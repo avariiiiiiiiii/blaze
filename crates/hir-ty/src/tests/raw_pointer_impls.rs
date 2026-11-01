@@ -160,11 +160,7 @@ fn a_lookup_that_finds_no_impl_says_why() {
     let ModuleDefId::AdtId(AdtId::StructId(s)) = root_def(&db, main, "S") else { panic!("`S` is a struct") };
     let distance = p.trait_items(&db).method_by_name(&Name::new_root("distance")).expect("`P::distance`");
     let function = |krate: Crate, name: &str| -> FunctionId {
-        let root = crate_def_map(&db, krate).root_module_id();
-        let scope = root.def_map(&db).module(&db, root).scope(&db);
-        let Some(ModuleDefId::FunctionId(it)) = scope.get(&Name::new_root(name)).take_values() else {
-            panic!("`{name}`, a function at the root")
-        };
+        let ModuleDefId::FunctionId(it) = root_def(&db, krate, name) else { panic!("`{name}` is a function") };
         it
     };
     let (f, measure, bounded) = (function(main, "f"), function(dep, "measure"), function(dep, "bounded"));

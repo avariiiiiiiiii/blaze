@@ -468,7 +468,8 @@ fn profitable(size: u32, members: usize, params: u32, limits: &Limits) -> bool {
 /// The functions among `candidates` that fold, each group with its members sorted by key;
 /// the same groups in the same order whatever the order of `candidates`.
 ///
-/// Members of one group have equal settings and masked IR, and equal values of every
+/// Members of one group have equal settings, masked IR and references' count and kinds, and
+/// equal values of every
 /// constant but `varying` (a place by its target: places whose targets are equal for every
 /// member are not varying). A group's members differ in at least one constant (functions
 /// equal in all are code dedupe's and the memo's) and in at most [`Limits::max_params`]
@@ -476,7 +477,7 @@ fn profitable(size: u32, members: usize, params: u32, limits: &Limits) -> bool {
 /// too many are split, each taking the first group, in key order, it fits.
 ///
 /// Hashes no IR: a candidate's bucket is its form's content ID, computed when it was
-/// interned.
+/// interned, with its references' count and kinds ([`with_refs`]).
 pub fn groups(
     candidates: &[(InstanceKey, Settings, Masking<'_>, &Refs)],
     limits: &Limits,
@@ -504,7 +505,7 @@ pub fn groups(
         all.push(Candidate {
             key,
             settings,
-            masked_id: masked.form.content(),
+            masked_id: with_refs(masked.form.content(), refs),
             size: form.size,
             constants: masked.constants,
             refs,
@@ -551,6 +552,22 @@ pub fn groups(
     groups
 }
 
+const FOLD_REFS_DOMAIN: &str = "blaze v2 fold references 1";
+
+/// A masked form's content ID with how many references its function has and the kind of each:
+/// the merged body is made against the first member's references and kept under the group's
+/// key, and each thunk against its member's, so a group's members, and every group of one key,
+/// have references alike. A masked form leaves out the places it names, and a reference no
+/// instruction names is in no form.
+fn with_refs(form: ContentId, refs: &Refs) -> ContentId {
+    let mut hasher = Hasher::new(FOLD_REFS_DOMAIN);
+    hasher.id(&form).update(&(refs.len() as u64).to_le_bytes());
+    for target in refs {
+        hasher.update(&[crate::driver::place_kind(target)]);
+    }
+    hasher.finish()
+}
+
 #[cfg(test)]
 mod tests {
     use blaze_ids::rng::SplitMix64 as Rng;
@@ -593,6 +610,22 @@ mod tests {
         items: &'a [(InstanceKey, Masked, Vec<Target>)],
     ) -> Vec<(InstanceKey, Settings, Masking<'a>, &'a Refs)> {
         items.iter().map(|(k, m, r)| (*k, settings(1), masking(m), r.as_slice())).collect()
+    }
+
+    /// 3 has one reference more than 1 and 2, which no instruction names: the merged body is
+    /// made against the first member's references and kept under the group's key, so 3 is in
+    /// no group with them, and a group of one key always has references alike.
+    #[test]
+    fn functions_of_other_references_do_not_fold_together() {
+        let mut more = refs(9, 10);
+        more.push(Target::Extern("memcpy".to_owned()));
+        let items = [(key(1), grow(4, 4), refs(9, 10)), (key(2), grow(8, 8), refs(9, 10)), (key(3), grow(16, 8), more)];
+        let groups = groups(&of(&items), &Limits::default());
+        assert_eq!(groups.len(), 1);
+        assert_eq!(groups[0].members, vec![key(1), key(2)]);
+
+        let alike = [(key(1), grow(4, 4), refs(9, 10)), (key(2), grow(8, 8), refs(9, 10))];
+        assert_eq!(groups[0].key(), super::groups(&of(&alike), &Limits::default())[0].key());
     }
 
     #[test]
@@ -813,7 +846,8 @@ mod tests {
                     hasher.update(&kind(constant));
                 }
                 let cells = masked.constants.iter().map(|&it| cell(key, it, refs)).collect();
-                buckets.entry((settings, hasher.finish())).or_default().push(Candidate {
+                let masked_id = super::with_refs(hasher.finish(), refs);
+                buckets.entry((settings, masked_id)).or_default().push(Candidate {
                     key,
                     masked,
                     cells,

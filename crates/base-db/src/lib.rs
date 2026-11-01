@@ -48,7 +48,7 @@ pub use crate::{
         DependencyBuilder, Env, ExtraCrateData, LangCrateOrigin, ProcMacroLoadingError,
         ProcMacroPaths, ReleaseChannel, SourceRoot, SourceRootId, TargetKind, UniqueCrateData,
     },
-    maintain::{Maintained, Maintainer, Written},
+    maintain::{Maintained, Maintainer, Reads, Written},
     named::NAMED_PATHS_DOMAIN,
     reparse::Reparse,
     view::{ViewChange, ViewError, ViewFile, ViewRoot},

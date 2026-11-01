@@ -51,7 +51,22 @@ impl LifetimeParamData {
     pub fn is_early_bound(&self) -> bool {
         self.bound_type == LifetimeBoundType::EarlyBound
     }
+
+    /// The name of the `index`th lifetime an impl's header leaves out (`&T`, `'_`), a fresh
+    /// lifetime parameter of the impl as rustc's resolver `fresh_lifetime` makes it: `'_#0`,
+    /// which no source can write, so only the header's own references name it.
+    pub fn fresh_name(index: u32) -> Name {
+        Name::new_lifetime(&format!("{FRESH_PREFIX}{index}")) // alloc: one name per fresh lifetime
+    }
+
+    /// Whether this is a lifetime an impl's header leaves out ([`Self::fresh_name`]), which
+    /// rustc names `'_`.
+    pub fn is_fresh(&self) -> bool {
+        self.name.as_str().starts_with(FRESH_PREFIX)
+    }
 }
+
+const FRESH_PREFIX: &str = "'_#";
 
 /// Data about a generic const parameter (to a function, struct, impl, ...).
 #[derive(Clone, PartialEq, Eq, Debug, Hash)]

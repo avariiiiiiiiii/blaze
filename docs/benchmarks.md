@@ -549,8 +549,10 @@ of 7 to 28), the same 30 edits each ([raw JSON](benchmarks/hotpatch/macbook.json
 On macOS blaze also patches a running program without a restart: a program that links
 `blaze-live` (`harness/live`, as small as this one) takes an edit in a median of 12.5 ms (p90
 28.0, p99 48.9) when it goes through `blaze build`, and 4.0 ms (p90 11.6, p99 13.8) when an
-editor sends it over the daemon's socket (`harness/live_latency.py --program probe cargo socket`,
-30 edits each, same MacBook, [raw JSON](benchmarks/live/macbook-probe-cargo.json)). That is the
+editor sent it over the daemon's socket (`harness/live_latency.py --program probe cargo socket`,
+30 edits each, same MacBook, [raw JSON](benchmarks/live/macbook-probe-cargo.json); the socket mode
+is refused now that the editor commits through blaze-api, until it is a client of
+`blaze_api::client`). That is the
 flow to set against subsecond's; the restart flow above is what blaze does where it cannot
 patch, today Linux.
 
@@ -659,8 +661,9 @@ labelled `bench-regression` with a table of what moved (or comments on the one a
 writes the table to the run's summary and fails.
 
 Live edits are checked the same way. `.github/workflows/live-latency.yaml` runs every night on
-main on a GitHub macOS arm64 runner (`macos-15`), times socket, burst and replay edits of the
-four live programs (`harness/live_latency.py`, [live.md](live.md#latency-under-typing)), appends
+main on a GitHub macOS arm64 runner (`macos-15`), times edits of the four live programs through
+`blaze build` (`harness/live_latency.py cargo`; its socket, burst and replay modes are refused
+until they are clients of `blaze_api::client`, [live.md](live.md#latency-under-typing)), appends
 one line for all of them to `docs/benchmarks/history/macos-arm64-live.jsonl` and checks the p50
 and p90 of each program and mode (floor 1 ms). A shared runner is noisier than the benchmark
 machine; the band widens with the spread its own history shows.
@@ -695,8 +698,9 @@ every table and chart again from the stored results.
 ## Caveats
 
 - Live edits (the patch applied to a running program) work on macOS on Apple silicon only and are
-  measured there by `harness/live_latency.py`, per keystroke under typing as well as one edit at
-  a time: [live.md](live.md#latency-under-typing) has the numbers from a MacBook, and
+  measured there by `harness/live_latency.py`, one edit at a time through `blaze build` (its
+  per-keystroke modes wait on a `blaze_api::client` port): [live.md](live.md#latency-under-typing)
+  has the numbers once measured on a MacBook, and
   `history/macos-arm64-live.jsonl` the runs.
 - One machine, one OS. The numbers on a laptop will differ; the ratios are what carries over.
 - Cold is the least precise number here: five runs at most, each minutes long on the large

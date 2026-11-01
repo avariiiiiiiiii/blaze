@@ -55,7 +55,7 @@ pub use hashes::ItemHashes;
 pub use linked::{LinkInputs, span_tables_of};
 pub use lowered::{Lowering, lowered};
 pub use roots::{RootKind, RootTest, Roots, harness::MODULE as HARNESS_MODULE, proc_macros as proc_macro_list};
-pub use toolchain::{Runs, select, toolchain};
+pub use toolchain::{Runs, build, select, toolchain};
 #[cfg(feature = "llvm")]
 pub use crate::llvm::pgo::Profile;
 #[cfg(feature = "llvm")]

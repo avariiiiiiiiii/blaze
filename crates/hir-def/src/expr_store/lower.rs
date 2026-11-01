@@ -59,7 +59,8 @@ use crate::{
         Array, Binding, BindingAnnotation, BindingId, BindingProblems, CaptureBy, ClosureKind,
         CoroutineKind, CoroutineSource, Expr, ExprId, Item, Label, LabelId, Literal, LoopSource,
         MatchArm, Movability, OffsetOf, Pat, PatId, RecordFieldPat, RecordLitField, RecordSpread,
-        Statement, Statements, Unsafe, UnsafeBinderCastKind, generics::GenericParams,
+        Statement, Statements, Unsafe, UnsafeBinderCastKind,
+        generics::{GenericParams, LifetimeParamData},
     },
     item_scope::BuiltinShadowMode,
     lang_item::{LangItemTarget, LangItems},
@@ -359,6 +360,7 @@ pub(crate) fn lower_impl(
     let mut expr_collector =
         ExprCollector::with_maps(db, module, impl_syntax.file_id, LoweringMode::Analysis, maps);
     expr_collector.set_lowering(lowering);
+    expr_collector.impl_header_lifetimes = Some(0);
     let self_ty =
         expr_collector.lower_type_ref_opt_disallow_impl_trait(impl_syntax.value.self_ty());
     let trait_ = impl_syntax.value.trait_().and_then(|it| match it {
@@ -369,12 +371,14 @@ pub(crate) fn lower_impl(
         }
         _ => None,
     });
+    let fresh = expr_collector.impl_header_lifetimes.take().unwrap_or(0);
     let mut collector = generics::GenericParamsCollector::new(impl_id.into());
     collector.lower(
         &mut expr_collector,
         impl_syntax.value.generic_param_list(),
         impl_syntax.value.where_clause(),
     );
+    collector.push_fresh_lifetimes(fresh);
     let params = collector.finish();
     let (store, source_map) = expr_collector.finish_store();
     (store, source_map, self_ty, trait_, params)
@@ -619,6 +623,13 @@ pub struct ExprCollector<'db> {
     is_lowering_coroutine: bool,
 
     for_type_binder: Option<ThinVec<Name>>,
+
+    /// While an impl's header is lowered, how many lifetimes it has left out so far (`&T`,
+    /// `'_`): each is a fresh early-bound lifetime parameter of the impl, as rustc's resolver
+    /// `fresh_lifetime` makes it, referred to by its name ([`LifetimeParamData::fresh_name`])
+    /// as a declared one is. `None` elsewhere, and inside a fn pointer type or `Fn(..)` sugar,
+    /// whose binder owns the lifetimes left out in it.
+    impl_header_lifetimes: Option<u32>,
 
     /// Legacy (`macro_rules!`) macros can have multiple definitions and shadow each other,
     /// and we need to find the current definition. So we track the number of definitions we saw.
@@ -941,6 +952,7 @@ impl<'db> ExprCollector<'db> {
             name_generator_index: 0,
             named_lifetime_store: NamedLifetimeStore::default(),
             for_type_binder: None,
+            impl_header_lifetimes: None,
             stacks: Stacks::take(),
             given_blocks: None,
             block_owner: None,
@@ -1010,10 +1022,28 @@ impl<'db> ExprCollector<'db> {
         let lifetime_ref = match lifetime.text() {
             "" | "'" => LifetimeRef::Error,
             "'static" => LifetimeRef::Static,
-            "'_" => LifetimeRef::Placeholder,
+            "'_" => self.fresh_impl_header_lifetime().unwrap_or(LifetimeRef::Placeholder),
             text => LifetimeRef::Named(Name::new_lifetime(text)),
         };
         self.alloc_lifetime_ref(lifetime_ref, LifetimePtr::of(lifetime))
+    }
+
+    /// The next fresh lifetime parameter of the impl whose header is being lowered
+    /// ([`Self::impl_header_lifetimes`]), `None` outside one.
+    fn fresh_impl_header_lifetime(&mut self) -> Option<LifetimeRef> {
+        let fresh = self.impl_header_lifetimes.as_mut()?;
+        let name = LifetimeParamData::fresh_name(*fresh);
+        *fresh += 1;
+        Some(LifetimeRef::Named(name))
+    }
+
+    /// `f` with no fresh impl-header lifetimes: inside a fn pointer type or `Fn(..)` sugar, the
+    /// lifetimes left out are its binder's.
+    fn without_impl_header_lifetimes<R>(&mut self, f: impl FnOnce(&mut Self) -> R) -> R {
+        let header = self.impl_header_lifetimes.take();
+        let result = f(self);
+        self.impl_header_lifetimes = header;
+        result
     }
 
     pub(in crate::expr_store) fn lower_lifetime_ref_opt(
@@ -1068,8 +1098,13 @@ impl<'db> ExprCollector<'db> {
                 self.alloc_type_ref(TypeRef::Slice(inner_ty), ptr)
             }
             ast::Type::RefType(inner) => {
+                let lifetime = match inner.lifetime() {
+                    Some(lt) => Some(self.lower_lifetime_ref(lt)),
+                    None => self
+                        .fresh_impl_header_lifetime()
+                        .map(|it| self.alloc_lifetime_ref_desugared(it)),
+                };
                 let inner_ty = self.lower_type_ref_opt(inner.ty(), impl_trait_lower_fn);
-                let lifetime = inner.lifetime().map(|lt| self.lower_lifetime_ref(lt));
                 let mutability = Mutability::from_mutable(inner.mut_token().is_some());
                 self.alloc_type_ref(
                     TypeRef::Reference(&RefType { ty: inner_ty, lifetime, mutability }),
@@ -1081,6 +1116,8 @@ impl<'db> ExprCollector<'db> {
                 // Taken before the parameters are lowered: a function pointer among them
                 // is not what the `for` is written on.
                 let binder = self.for_type_binder.take().map(|b| b.into());
+                // The lifetimes left out in it are its own binder's.
+                let impl_header_lifetimes = self.impl_header_lifetimes.take();
                 let ret_ty = inner
                     .ret_type()
                     .and_then(|rt| rt.ty())
@@ -1121,6 +1158,7 @@ impl<'db> ExprCollector<'db> {
                     params: self.stacks.fn_params.drain(params_base..).collect(),
                     binder,
                 };
+                self.impl_header_lifetimes = impl_header_lifetimes;
                 let id = self.store.alloc_fn_type(fn_);
                 self.map_type_ref(id, ptr, false)
             }

@@ -422,8 +422,8 @@ fn main() {}
 "#;
     let fixture = format!("{FFI_STD}//- /main.rs crate:other:main edition:2021 deps:core,std\n{source}");
     let messages = checked(&fixture).messages();
-    let named = "hiding a lifetime that's named elsewhere is confusing";
-    let eliding = "eliding a lifetime that's named elsewhere is confusing";
+    let named = "mismatched_lifetime_syntaxes: hiding a lifetime that's named elsewhere is confusing";
+    let eliding = "mismatched_lifetime_syntaxes: eliding a lifetime that's named elsewhere is confusing";
     assert_eq!(messages, [eliding, named], "{messages:?}");
     let options = compiletest(Mode::Other, &Options::default());
     let kept = checked_with(&fixture, "$DIR/", &options).messages();

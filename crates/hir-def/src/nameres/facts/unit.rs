@@ -253,6 +253,24 @@ fn glob_position(db: &Db, glob: GlobId) -> (span::TextSize, span::TextSize, u32)
     (original.range.start(), range.start(), u32::from(glob.idx.into_raw()))
 }
 
+/// Whether `glob`, giving a name at `vis` the item another glob (`prev`, at `prev_vis`)
+/// already gave it, is the one the name is bound through: the wider, and of two as wide the
+/// first in the source ([`glob_position`]), so the binding is the same whichever arrives first.
+/// Both collectors ask it.
+pub(in crate::nameres) fn glob_takes_over(
+    db: &Db,
+    def_map: &DefMap,
+    glob: GlobId,
+    vis: Visibility,
+    prev: Option<GlobId>,
+    prev_vis: Visibility,
+) -> bool {
+    if vis != prev_vis {
+        return vis.max(db, prev_vis, def_map) == Some(vis);
+    }
+    prev.is_some_and(|prev| prev != glob && glob_position(db, glob) < glob_position(db, prev))
+}
+
 /// Whether the type or value binding of `def`, an import's resolution, is a glob's of a
 /// module of `krate`, which an expansion there may still shadow. A macro binding is
 /// determined whatever brought it, as in rustc.
@@ -940,7 +958,13 @@ impl<'db, 'f, A: Allocator + Clone> Unit<'db, 'f, A> {
                             self.pull_glob(m, module_id, vis, glob);
                             // record the glob import in case we add further items
                             let (db, def_map) = (self.db, &self.def_map);
-                            self.state.globs.add(m, module_id, (vis, glob), |(old_vis, _)| {
+                            // Two globs of one module share an edge. The one its names are bound
+                            // through (`glob_takes_over`) takes it over, so what the source gains
+                            // later is credited as when it was pulled.
+                            self.state.globs.add(m, module_id, (vis, glob), |(old_vis, old_glob)| {
+                                if glob_takes_over(db, def_map, glob, vis, Some(*old_glob), *old_vis) {
+                                    *old_glob = glob;
+                                }
                                 if let Some(new_vis) = old_vis.max(db, vis, def_map) {
                                     *old_vis = new_vis;
                                 }
@@ -1256,8 +1280,14 @@ impl<'db, 'f, A: Allocator + Clone> Unit<'db, 'f, A> {
             {
                 if def.def == prev_def.def
                     && self.state.from_glob_import.contains_type(module_id, *name)
-                    && def.vis != prev_def.vis
-                    && def.vis.max(self.db, prev_def.vis, &self.def_map) == Some(def.vis)
+                    && glob_takes_over(
+                        self.db,
+                        &self.def_map,
+                        glob,
+                        def.vis,
+                        prev_def.import.and_then(ImportOrExternCrate::glob),
+                        prev_def.vis,
+                    )
                 {
                     changed = true;
                     // This import is being handled here, don't pass it down to
@@ -1298,8 +1328,14 @@ impl<'db, 'f, A: Allocator + Clone> Unit<'db, 'f, A> {
             {
                 if def.def == prev_def.def
                     && self.state.from_glob_import.contains_value(module_id, *name)
-                    && def.vis != prev_def.vis
-                    && def.vis.max(self.db, prev_def.vis, &self.def_map) == Some(def.vis)
+                    && glob_takes_over(
+                        self.db,
+                        &self.def_map,
+                        glob,
+                        def.vis,
+                        prev_def.import.map(ImportOrExternCrate::from).and_then(ImportOrExternCrate::glob),
+                        prev_def.vis,
+                    )
                 {
                     changed = true;
                     defs.values = None;
@@ -1331,8 +1367,14 @@ impl<'db, 'f, A: Allocator + Clone> Unit<'db, 'f, A> {
             {
                 if def.def == prev_def.def
                     && self.state.from_glob_import.contains_macro(module_id, *name)
-                    && def.vis != prev_def.vis
-                    && def.vis.max(self.db, prev_def.vis, &self.def_map) == Some(def.vis)
+                    && glob_takes_over(
+                        self.db,
+                        &self.def_map,
+                        glob,
+                        def.vis,
+                        prev_def.import.and_then(ImportOrExternCrate::glob),
+                        prev_def.vis,
+                    )
                 {
                     changed = true;
                     defs.macros = None;

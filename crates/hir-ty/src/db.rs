@@ -263,12 +263,27 @@ pub trait HirDatabase: sealed::Sealed {
         def: EnumVariantId,
     ) -> Result<i128, ConstEvalError<'db>>;
 
+    /// The method of the impl a call of the trait method `func` runs, or `func` itself when
+    /// none is found: what an IDE reads, of code that may not type-check.
     fn lookup_impl_method<'db>(
         &'db self,
         env: ParamEnvAndCrate<'db>,
         func: FunctionId,
         fn_subst: GenericArgs<'db>,
     ) -> (Either<FunctionId, (BuiltinDeriveImplId, BuiltinDeriveImplMethod)>, GenericArgs<'db>);
+
+    /// As [`HirDatabase::lookup_impl_method`], with why no impl's method is found: what
+    /// codegen reads, to stop where a concrete call has none
+    /// ([`NoImplMethod::is_expected`](crate::method_resolution::NoImplMethod::is_expected)).
+    fn lookup_impl_method_or_why<'db>(
+        &'db self,
+        env: ParamEnvAndCrate<'db>,
+        func: FunctionId,
+        fn_subst: GenericArgs<'db>,
+    ) -> Result<
+        (Either<FunctionId, (BuiltinDeriveImplId, BuiltinDeriveImplMethod)>, GenericArgs<'db>),
+        crate::method_resolution::NoImplMethod,
+    >;
 
     /// What the interpreter (`hir_ty_mir::interpret_mir`) gives running `body`: the value it
     /// returns.
@@ -716,16 +731,29 @@ impl HirDatabase for Db {
         fn_subst: GenericArgs<'db>,
     ) -> (Either<FunctionId, (BuiltinDeriveImplId, BuiltinDeriveImplMethod)>, GenericArgs<'db>)
     {
+        self.lookup_impl_method_or_why(env, func, fn_subst)
+            .unwrap_or((Either::Left(func), fn_subst))
+    }
+
+    fn lookup_impl_method_or_why<'db>(
+        &'db self,
+        env: ParamEnvAndCrate<'db>,
+        func: FunctionId,
+        fn_subst: GenericArgs<'db>,
+    ) -> Result<
+        (Either<FunctionId, (BuiltinDeriveImplId, BuiltinDeriveImplMethod)>, GenericArgs<'db>),
+        crate::method_resolution::NoImplMethod,
+    > {
         if !matches!(func.loc(self).container, hir_def::ItemContainerId::TraitId(_)) {
-            return (Either::Left(func), fn_subst);
+            return Ok((Either::Left(func), fn_subst));
         }
-        let (found, args) = crate::method_resolution::lookup_impl_method_stored(
+        crate::method_resolution::lookup_impl_method_stored(
             self,
             env.store(),
             func,
             fn_subst.store(),
-        );
-        (found, args.as_ref())
+        )
+        .map(|(found, args)| (found, args.as_ref()))
     }
 
     #[inline]

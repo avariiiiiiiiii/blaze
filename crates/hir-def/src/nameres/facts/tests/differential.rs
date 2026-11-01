@@ -562,6 +562,80 @@ fn a_wider_glob_of_the_same_item_binds_it() {
     assert!(failures.is_empty(), "old and new def maps differ:\n{failures}");
 }
 
+/// `reexport_2` globs `reexport_1` twice, privately then `pub`, before `reexport_1` has
+/// `Placeholder` (the root's glob of `reexport_2` puts all three in one cycle, resolved in tree
+/// order). Both globs share one edge, and what reaches `reexport_2` through it later is credited
+/// to the `pub use`, as when `reexport_1` is resolved first (globs.rs `regression_18580`).
+#[test]
+fn a_name_reaching_two_globs_of_one_module_later_is_credited_to_the_wider() {
+    let fixture = "//- /lib.rs crate:main\npub mod libs {\n    pub struct Placeholder;\n}\npub mod reexport_2 {\n    use reexport_1::*;\n    pub use reexport_1::*;\n    pub mod reexport_1 {\n        pub use crate::libs::*;\n    }\n}\nuse reexport_2::*;\n";
+    let name = |it: &str| hir_expand::name::Name::new_symbol_root(intern::Symbol::intern(it));
+    let mut failures = String::new();
+    compare_fixture("a_name_reaching_two_globs_of_one_module_later", fixture, &Exempt::NONE, &mut failures);
+    for on in [true, false] {
+        with_fast_path(on, || {
+            let db = fixture_db(fixture);
+            let krate = db.fetch_test_crate();
+            let map = new_crate_local_def_map(&db, krate).def_map(&db);
+            let reexport_2 = match map.module(&db, map.root).scope(&db).type_(&name("reexport_2")) {
+                Some((ModuleDefId::ModuleId(it), _)) => it,
+                other => panic!("`reexport_2` is {other:?}"),
+            };
+            let t = map.module(&db, reexport_2).scope(&db).get(&name("Placeholder"));
+            let glob = t.types.and_then(|it| it.import).and_then(crate::item_scope::ImportOrExternCrate::glob);
+            let Some(glob) = glob else { panic!("fast path {on}: `Placeholder` is {t:?}, not through a glob") };
+            let use_ = crate::Lookup::lookup(&glob.use_, &db).id;
+            let range = hir_expand::InFile::new(use_.file_id, use_.to_range(&db)).original_node_file_range_rooted(&db);
+            let text = db.file_text(range.file_id.file_id(&db)).text(&db);
+            let text = &text[range.range];
+            assert!(text.starts_with("pub use"), "fast path {on}: `Placeholder` is credited to `{text}`");
+        });
+    }
+    assert!(failures.is_empty(), "old and new def maps differ:\n{failures}");
+}
+
+/// `m` globs `a` and `b`, both giving `b::X` as `pub`; `b` has it before `a`'s re-export
+/// resolves, so `b`'s glob arrives first whichever is written first. Of two globs as wide the
+/// first in the source binds the name, so the binding does not depend on arrival (generated
+/// 0x33a6fd1240da37, its macros through `pub(super)` and `pub(crate)` globs of the root).
+#[test]
+fn of_two_globs_as_wide_giving_one_item_the_first_in_the_source_binds_it() {
+    let crate_ = |globs: &str| {
+        format!(
+            "//- /lib.rs crate:main\npub mod m {{\n{globs}\n}}\npub mod a {{\n    pub use crate::b::X;\n}}\npub mod b {{\n    pub struct X;\n}}\n"
+        )
+    };
+    let variants = [
+        ("a_first", crate_("    pub use crate::a::*;\n    pub use crate::b::*;"), "pub use crate::a::*"),
+        ("b_first", crate_("    pub use crate::b::*;\n    pub use crate::a::*;"), "pub use crate::b::*"),
+    ];
+    let name = |it: &str| hir_expand::name::Name::new_symbol_root(intern::Symbol::intern(it));
+    let mut failures = String::new();
+    for (variant, fixture, first) in &variants {
+        compare_fixture(variant, fixture, &Exempt::NONE, &mut failures);
+        for on in [true, false] {
+            with_fast_path(on, || {
+                let db = fixture_db(fixture);
+                let krate = db.fetch_test_crate();
+                let map = new_crate_local_def_map(&db, krate).def_map(&db);
+                let m = match map.module(&db, map.root).scope(&db).type_(&name("m")) {
+                    Some((ModuleDefId::ModuleId(it), _)) => it,
+                    other => panic!("{variant}: `m` is {other:?}"),
+                };
+                let x = map.module(&db, m).scope(&db).get(&name("X"));
+                let glob = x.types.and_then(|it| it.import).and_then(crate::item_scope::ImportOrExternCrate::glob);
+                let Some(glob) = glob else { panic!("{variant}, fast path {on}: `X` is {x:?}, not through a glob") };
+                let use_ = crate::Lookup::lookup(&glob.use_, &db).id;
+                let range = hir_expand::InFile::new(use_.file_id, use_.to_range(&db)).original_node_file_range_rooted(&db);
+                let text = db.file_text(range.file_id.file_id(&db)).text(&db);
+                let text = &text[range.range];
+                assert!(text.starts_with(first), "{variant}, fast path {on}: `X` is credited to `{text}`");
+            });
+        }
+    }
+    assert!(failures.is_empty(), "old and new def maps differ:\n{failures}");
+}
+
 /// `crate::a::e::a` takes `a::e`'s private `T` through `pub use super::*` after the root has
 /// glob-imported it: it holds `T` as `pub(in crate::a::e)`, so passing its new names on to the
 /// root's glob gives the root nothing, and the root's `T` is `a::T` from its other glob, with no

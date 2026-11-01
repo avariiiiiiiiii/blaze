@@ -559,6 +559,34 @@ fn a_summary_names_the_callees_its_body_calls() {
     assert!(!main(&after).contains(&0x44), "{:x?}", main(&after));
 }
 
+/// 4 reads a static it did not, which its code hash leaves out, as a fact of the arguments a
+/// share key misses adds a call: one more reference under one instance key. Each body gets a
+/// template of its own, and both are kept: neither is given the other's.
+#[test]
+fn a_body_with_one_more_reference_has_a_template_of_its_own() {
+    let policy = policy(OptLevel::O0, Mode::Output);
+    let mut program = program();
+    program.statics.insert(7, (0xaa, None));
+    let mut store = Store::default();
+    let without = build(&program, &Machine::default(), &policy, &Memo::new(), &store).unwrap();
+    store.keep(&without.puts);
+
+    program.functions.get_mut(&4).unwrap().statics = vec![7];
+    let machine = Machine::default();
+    let with = build(&program, &machine, &policy, &Memo::new(), &store).unwrap();
+    assert_eq!(machine.emitted.load(Ordering::Relaxed), 1);
+    let read = |built: &Built| built.functions.iter().any(|it| it.code[0] == 0x44 && it.relocs.len() == 2);
+    assert!(read(&with));
+    assert!(!read(&without));
+    store.keep(&with.puts);
+
+    program.functions.get_mut(&4).unwrap().statics = Vec::new();
+    let machine = Machine::default();
+    let again = build(&program, &machine, &policy, &Memo::new(), &store).unwrap();
+    assert_eq!(machine.emitted.load(Ordering::Relaxed), 0);
+    assert_eq!(again.functions, without.functions);
+}
+
 /// 4 calls `memmove` where it called `memcpy`, which no key holds: 1 and 2, which import 4,
 /// have one reference more than their stored templates were made against, as `memmove` is
 /// none of theirs, so they are compiled again; 4's own template, and 3's and 5's, still fit.

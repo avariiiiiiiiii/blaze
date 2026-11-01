@@ -91,12 +91,15 @@ pub fn set_run_order(order: RunOrder) -> RunOrder {
     RUN_ORDER.replace(order)
 }
 
-/// The events a logged database keeps while [`Db::log`] runs. The hook reads `active` before
-/// it takes the lock, so an event outside `log` costs one relaxed load.
+/// The events a logged database keeps while [`Db::log`] runs, and the queries a maintainer's
+/// apply executes, which it must not. The hook reads `active` and `applying` before it takes a
+/// lock, so an event outside both costs two relaxed loads.
 #[derive(Default)]
 struct EventLog {
     active: AtomicBool,
     events: Mutex<Option<Vec<blaze_query::db::Event>>>,
+    applying: AtomicBool,
+    executed: Mutex<Vec<blaze_query::db::DatabaseKeyIndex>>,
 }
 
 impl EventLog {
@@ -152,6 +155,12 @@ impl Db {
             Box::new(move |_: &blaze_query::db::Storage, event: blaze_query::db::Event| {
                 if traced {
                     executions::record(&event);
+                }
+                if let Some(log) = &log
+                    && log.applying.load(Ordering::Relaxed)
+                    && let blaze_query::db::EventKind::WillExecute { database_key } = event.kind
+                {
+                    log.executed.lock().unwrap_or_else(|it| it.into_inner()).push(database_key);
                 }
                 if let Some(log) = &log
                     && log.active.load(Ordering::Relaxed)
@@ -441,10 +450,27 @@ impl Db {
     /// caller's file and line in `function`, so a profile says whose tasks a stretch ran.
     #[track_caller]
     pub fn run_all<F: Fn(&Db, usize) + Sync>(&self, tag: Tag, count: usize, task: F) {
+        self.run_tasks(std::panic::Location::caller(), count, false, |db, at| frame::task(tag, |_| task(db, at)));
+    }
+
+    /// [`Db::run_all`] for a maintainer's reads, each task in its own frame: under
+    /// [`RunOrder::LeftToReaders`] too it runs them, in order, since what they compute is
+    /// what the maintainer's apply diffs, and no reader asks for it.
+    #[track_caller]
+    pub(crate) fn run_every<F: Fn(&Db, usize) + Sync>(&self, count: usize, task: F) {
+        self.run_tasks(std::panic::Location::caller(), count, true, task);
+    }
+
+    fn run_tasks<F: Fn(&Db, usize) + Sync>(
+        &self,
+        caller: &'static std::panic::Location<'static>,
+        count: usize,
+        every: bool,
+        task: F,
+    ) {
         if count == 0 {
             return;
         }
-        let caller = std::panic::Location::caller();
         let all = tracing::info_span!(target: "blaze", "run_all", function = tracing::field::Empty, count);
         // alloc: only while a subscriber records the span, which interns it
         let site = (!all.is_disabled()).then(|| format!("{}:{}", caller.file(), caller.line()));
@@ -455,7 +481,7 @@ impl Db {
         let run = |db: &Db, at: usize| {
             let span = tracing::info_span!(target: "blaze", "run_all task", function = site.as_deref());
             let _span = span.entered();
-            frame::task(tag, |_| task(db, at))
+            task(db, at)
         };
         match self.run {
             Run::Pool => blaze_query::db::par_for_each(count, |at| run(self, at)),
@@ -468,6 +494,7 @@ impl Db {
                         .flat_map(|first| (first..count).step_by(stride))
                         .for_each(|at| run(self, at));
                 }
+                RunOrder::LeftToReaders if every => (0..count).for_each(|at| run(self, at)),
                 RunOrder::LeftToReaders => {}
             },
         }
@@ -510,6 +537,28 @@ impl Db {
         // clone: one count of the log, tests only, so `f` can borrow the database.
         let log = self.log.clone().expect("`Db::log_mut` on a database made by neither `Db::for_tests` nor `Db::logged`");
         log.record(|| f(self))
+    }
+
+    /// Starts noting the queries executed, on a logged database: a maintainer's apply is
+    /// starting.
+    pub(crate) fn begin_apply(&self) {
+        if let Some(log) = &self.log {
+            log.executed.lock().unwrap_or_else(|it| it.into_inner()).clear();
+            log.applying.store(true, Ordering::Release);
+        }
+    }
+
+    /// Stops noting the queries executed, and names those executed since [`Db::begin_apply`],
+    /// in order: none on a database that logs nothing.
+    pub(crate) fn end_apply(&self) -> Vec<String> {
+        let Some(log) = &self.log else { return Vec::new() }; // alloc: empty, allocates nothing
+        log.applying.store(false, Ordering::Release);
+        let executed = std::mem::take(&mut *log.executed.lock().unwrap_or_else(|it| it.into_inner()));
+        executed
+            .into_iter()
+            // alloc: a logged database's check, tests only
+            .map(|key| self.storage.ingredient_name(key.ingredient_index()).to_owned())
+            .collect() // alloc: a logged database's check, tests only
     }
 
     /// The names of the queries `f` executed, as the query engine names them, in order.

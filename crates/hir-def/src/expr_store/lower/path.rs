@@ -337,19 +337,23 @@ impl ExprCollector<'_> {
         impl_trait_lower_fn: &mut ImplTraitLowering<'_>,
     ) -> Option<GenericArgsIdx> {
         let params = args?;
-        let mark = self.store.list_mark();
-        for param in params.type_args() {
-            let type_ref = self.lower_type_ref_opt(param.ty(), impl_trait_lower_fn);
-            self.store.push_list_type(type_ref);
-        }
-        let tuple = self.with_lists(mark, |this, lists| {
-            this.store.alloc_type_ref(TypeRef::Tuple(lists.types_since(mark)))
+        // The lifetimes left out in `Fn(..)` sugar are its own binder's.
+        let (tuple, output) = self.without_impl_header_lifetimes(|this| {
+            let mark = this.store.list_mark();
+            for param in params.type_args() {
+                let type_ref = this.lower_type_ref_opt(param.ty(), impl_trait_lower_fn);
+                this.store.push_list_type(type_ref);
+            }
+            let tuple = this.with_lists(mark, |this, lists| {
+                this.store.alloc_type_ref(TypeRef::Tuple(lists.types_since(mark)))
+            });
+            let output = match ret_type {
+                Some(ret_type) => this.lower_type_ref_opt(ret_type.ty(), impl_trait_lower_fn),
+                // -> ()
+                None => this.alloc_type_ref_desugared(TypeRef::UNIT),
+            };
+            (tuple, output)
         });
-        let output = match ret_type {
-            Some(ret_type) => self.lower_type_ref_opt(ret_type.ty(), impl_trait_lower_fn),
-            // -> ()
-            None => self.alloc_type_ref_desugared(TypeRef::UNIT),
-        };
         let paths = self.store.paths_mut();
         let binding = paths.binding(Name::new_symbol_root(sym::Output), None, Some(output), []);
         Some(paths.push_generic_args(

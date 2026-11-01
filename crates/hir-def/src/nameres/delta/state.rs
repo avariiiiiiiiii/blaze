@@ -35,9 +35,23 @@ pub(super) type Key = (ModuleId, Option<Name>);
 
 /// Every crate's state, by crate. A crate served by the frozen image has none.
 #[derive(Default)]
-pub struct State {
+pub(in crate::nameres) struct State {
     pub(super) crates: FxHashMap<Crate, CrateState>,
-    pub(super) scratch: Scratch,
+    pub(super) pass: Pass,
+}
+
+/// One write's run across its steps, and buffers kept from one write to the next.
+#[derive(Default)]
+pub(super) struct Pass {
+    /// The crates by layer of the crate graph: a step's jobs are a layer's crates.
+    pub(super) layers: Vec<Vec<Crate>>,
+    /// The modules whose row, children or textual macros changed, of the crates applied so
+    /// far: `LastWrite` carries names only.
+    pub(super) modules_changed: Vec<ModuleId>,
+    /// A job's buffers each, taken by the job and given back by its apply.
+    pub(super) scratch: Vec<Scratch>,
+    /// The crates of the layer whose scopes the step published, for the next step's records.
+    pub(super) scoped: Vec<super::Scoped>,
 }
 
 /// Buffers kept from one write to the next: a warm over-delete allocates nothing.

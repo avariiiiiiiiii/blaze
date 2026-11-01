@@ -325,13 +325,6 @@ pub fn is_impossible_associated_item(
     let fresh = infcx.fresh_args_for_item(Span::Dummy, impl_.into());
     let args = trait_ref.instantiate(interner, fresh).skip_norm_wip().args;
     let parent = crate::generics::generics(db, item).len_parent() as u32;
-    // FIXME(01225): remove with the fix; a traced run for blaze-doc's `Finds`.
-    let trace = std::env::var_os("BLAZE_TRACE_01225").is_some();
-    if trace {
-        eprintln!("01225 impl={impl_:?} item={item:?} krate={krate:?} parent={parent}");
-        eprintln!("01225   impl args (fresh)={fresh:?}");
-        eprintln!("01225   trait ref args={args:?}");
-    }
     let mut ocx = ObligationCtxt::new(&infcx);
     for clause in crate::lower::GenericPredicates::query_own_explicit(db, item)
         .skip_binder()
@@ -340,27 +333,9 @@ pub fn is_impossible_associated_item(
         let clause = EarlyBinder::bind(interner, clause).instantiate(interner, args).skip_norm_wip();
         let obligation =
             Obligation::new(interner, ObligationCause::dummy(), ParamEnv::empty(), clause);
-        if trace {
-            eprintln!("01225   clause={clause:?}");
-            infcx.probe(|_| {
-                let mut alone = ObligationCtxt::new(&infcx);
-                let normalized =
-                    alone.deeply_normalize(&ObligationCause::dummy(), ParamEnv::empty(), clause);
-                eprintln!("01225     deeply normalized={normalized:?}");
-                alone.register_obligation(obligation);
-                let errors = alone.try_evaluate_obligations();
-                eprintln!("01225     alone: errors={errors:?}");
-                eprintln!("01225     alone: pending={:?}", alone.into_pending_obligations());
-            });
-        }
         ocx.register_obligation(obligation);
     }
-    let errors = ocx.try_evaluate_obligations();
-    if trace {
-        eprintln!("01225   together: errors={errors:?}");
-        eprintln!("01225   impossible={}", !errors.is_empty());
-    }
-    !errors.is_empty()
+    !ocx.try_evaluate_obligations().is_empty()
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

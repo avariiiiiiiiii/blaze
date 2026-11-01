@@ -2239,6 +2239,9 @@ impl<'db> HirDisplay<'db> for Region<'db> {
                     return write!(f, "'_");
                 }
                 let param_data = &generics[param.id.local_id];
+                if param_data.is_fresh() {
+                    return write!(f, "'_");
+                }
                 write!(f, "{}", param_data.name.display(f.db, f.edition()))?;
                 Ok(())
             }

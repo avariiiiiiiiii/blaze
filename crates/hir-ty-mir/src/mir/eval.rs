@@ -2871,30 +2871,45 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
         }
     }
 
-    fn coerce_unsized_look_through_fields<T>(
+    /// The pointees of the pointer a `CoerceUnsized` cast from `current` to `target` widens, as
+    /// rustc's `coerce_unsized_info` finds it: through a struct, the one field whose type the
+    /// cast changes (`Box<T, A>`'s pointer, not its allocator, which is its last field).
+    fn coerce_unsized_pointees(
         &self,
-        ty: Ty<'db>,
-        goal: impl Fn(TyKind<'db>) -> Option<T>,
-    ) -> Result<'db, T> {
-        let kind = ty.kind();
-        if let Some(it) = goal(kind) {
-            return Ok(it);
-        }
-        match kind {
-            TyKind::Adt(adt_ef, subst) if let AdtId::StructId(struct_id) = adt_ef.def_id() => {
-                let field_types = self.db.field_types(struct_id.into());
-                if let Some(ty) = field_types
-                    .iter()
-                    .last()
-                    .map(|it| it.1.ty().instantiate(self.interner(), subst))
-                {
-                    return self.coerce_unsized_look_through_fields(ty.skip_norm_wip(), goal);
+        current: Ty<'db>,
+        target: Ty<'db>,
+    ) -> Result<'db, (Ty<'db>, Ty<'db>)> {
+        match (current.kind(), target.kind()) {
+            (
+                TyKind::RawPtr(from, _) | TyKind::Ref(_, from, _),
+                TyKind::RawPtr(to, _) | TyKind::Ref(_, to, _),
+            ) => Ok((from, to)),
+            (TyKind::Pat(from, _), TyKind::Pat(to, _)) => self.coerce_unsized_pointees(from, to),
+            (TyKind::Adt(current_adt, current_subst), TyKind::Adt(target_adt, target_subst))
+                if let AdtId::StructId(id) = current_adt.def_id()
+                    && target_adt.def_id() == current_adt.def_id() =>
+            {
+                let mut changed = None;
+                for (_, field) in self.db.field_types(id.into()).iter() {
+                    let from =
+                        field.ty().instantiate(self.interner(), current_subst).skip_norm_wip();
+                    let to = field.ty().instantiate(self.interner(), target_subst).skip_norm_wip();
+                    if from != to {
+                        if changed.replace((from, to)).is_some() {
+                            not_supported!("unsizing a struct whose cast changes two fields");
+                        }
+                    } else if self.layout(from)?.size.bytes_usize() != 0 {
+                        // The cast widens the value's bytes as one pointer.
+                        not_supported!("unsizing a struct with bytes beside its pointer");
+                    }
+                }
+                match changed {
+                    Some((from, to)) => self.coerce_unsized_pointees(from, to),
+                    None => Err(MirEvalError::CoerceUnsizedError(current.store())),
                 }
             }
-            TyKind::Pat(ty, _) => return self.coerce_unsized_look_through_fields(ty, goal),
-            _ => (),
+            _ => Err(MirEvalError::CoerceUnsizedError(current.store())),
         }
-        Err(MirEvalError::CoerceUnsizedError(ty.store()))
     }
 
     fn coerce_unsized(
@@ -2903,15 +2918,7 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
         current_ty: Ty<'db>,
         target_ty: Ty<'db>,
     ) -> Result<'db, IntervalOrOwned<M::Shadow>> {
-        fn for_ptr<'db>(it: TyKind<'db>) -> Option<Ty<'db>> {
-            match it {
-                TyKind::RawPtr(ty, _) | TyKind::Ref(_, ty, _) => Some(ty),
-                _ => None,
-            }
-        }
-        let target_ty = self.coerce_unsized_look_through_fields(target_ty, for_ptr)?;
-        let current_ty = self.coerce_unsized_look_through_fields(current_ty, for_ptr)?;
-
+        let (current_ty, target_ty) = self.coerce_unsized_pointees(current_ty, target_ty)?;
         self.unsizing_ptr_from_addr(target_ty, current_ty, addr)
     }
 

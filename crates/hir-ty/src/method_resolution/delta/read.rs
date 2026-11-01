@@ -334,16 +334,25 @@ fn hash_table_trait<'db>(
     only: Option<Either<(), &SimplifiedType<'db>>>,
 ) {
     let Some(t) = table.trait_index(trait_) else { return };
+    // Impls and rows go in by their identities' order: the table orders them by interned ids,
+    // which two databases give out in different orders.
+    let identities = |impls: &[ImplId]| {
+        // alloc: the identities of one row's impls, once per row hashed
+        let mut ids: Vec<ContentId> = impls.iter().map(|&imp| impl_identity(db, imp)).collect();
+        ids.sort_unstable();
+        ids
+    };
     if !matches!(only, Some(Either::Right(_))) {
-        let blanket = table.blanket.run(t);
+        let blanket = identities(table.blanket.run(t));
         hasher.update(&(blanket.len() as u64).to_le_bytes());
-        for &imp in blanket {
-            hasher.id(&impl_identity(db, imp));
+        for id in &blanket {
+            hasher.id(id);
         }
     }
     if matches!(only, Some(Either::Left(()))) {
         return;
     }
+    let mut rows = Vec::new(); // alloc: one hash per row, once per table hashed
     for (self_ty, (impls, derives)) in table.rows_at(t) {
         if let Some(Either::Right(only)) = only
             && only != self_ty
@@ -356,16 +365,24 @@ fn hash_table_trait<'db>(
                  names"
             )
         };
-        head_identity(db, hasher, head);
-        hasher.update(&(impls.len() as u64).to_le_bytes());
-        for &imp in impls {
-            hasher.id(&impl_identity(db, imp));
+        let mut row = Hasher::new(IMPL_SET_DOMAIN);
+        head_identity(db, &mut row, head);
+        let ids = identities(impls);
+        row.update(&(ids.len() as u64).to_le_bytes());
+        for id in &ids {
+            row.id(id);
         }
         if only.is_none() {
-            hasher.update(&(derives.len() as u64).to_le_bytes());
+            row.update(&(derives.len() as u64).to_le_bytes());
             for &imp in derives {
-                derive_identity(db, hasher, imp);
+                derive_identity(db, &mut row, imp);
             }
         }
+        rows.push(row.finish());
+    }
+    rows.sort_unstable();
+    hasher.update(&(rows.len() as u64).to_le_bytes());
+    for row in &rows {
+        hasher.id(row);
     }
 }

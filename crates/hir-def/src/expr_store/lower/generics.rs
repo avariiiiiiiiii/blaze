@@ -123,6 +123,18 @@ impl GenericParamsCollector {
         }
     }
 
+    /// `count` fresh early-bound lifetime parameters after those collected: the lifetimes an
+    /// impl's header leaves out, as rustc's resolver `fresh_lifetime` makes them, named
+    /// [`LifetimeParamData::fresh_name`].
+    pub(crate) fn push_fresh_lifetimes(&mut self, count: u32) {
+        for index in 0..count {
+            self.lifetimes.alloc(LifetimeParamData {
+                name: LifetimeParamData::fresh_name(index),
+                bound_type: LifetimeBoundType::EarlyBound,
+            });
+        }
+    }
+
     pub(crate) fn collect_impl_trait<R>(
         &mut self,
         ec: &mut ExprCollector<'_>,

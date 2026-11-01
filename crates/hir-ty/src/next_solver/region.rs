@@ -255,8 +255,9 @@ impl<'db> RegionName<DbInterner<'db>> for EarlyParamRegion {
     /// The lifetime parameter's declared name, or `None` for an elided one (`'_`), as rustc's.
     fn get_name(&self, interner: DbInterner<'db>) -> Option<Symbol> {
         let params = hir_def::hir::generics::GenericParams::of(interner.db, self.id.parent);
-        let name = *params[self.id.local_id].name.symbol();
-        (name != intern::sym::tick_underscore).then_some(Symbol(name))
+        let param = &params[self.id.local_id];
+        let name = *param.name.symbol();
+        (name != intern::sym::tick_underscore && !param.is_fresh()).then_some(Symbol(name))
     }
 
     fn is_named(&self, interner: DbInterner<'db>) -> bool {

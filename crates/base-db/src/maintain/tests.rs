@@ -15,7 +15,7 @@ use crate::{AbsPathBuf, FileId, FileSet, VfsPath};
 use crate::{
     CrateGraphBuilder, CrateOrigin, CrateWorkspaceData, Db, Env, SourceRoot, SourceRootId,
     TargetKind,
-    maintain::{Maintained, Maintainer, Written, maintainers},
+    maintain::{Maintained, Maintainer, Reads, Written, maintainers},
 };
 
 /// What a maintainer saw of one pass, owned.
@@ -59,6 +59,12 @@ struct Probe {
     panic_on: Option<u32>,
     /// Whether `second` reports work for the crates of the graph.
     report: bool,
+    /// How many steps `steps` runs, reading the files 0 to 2 in each: none while `None`.
+    steps: Option<u32>,
+    /// Whether `steps`' apply runs a query its reads did not.
+    apply_reads: bool,
+    /// What `steps`' apply took of its reads, a step each: the step and the files' lengths.
+    applied: Vec<(u32, Vec<(FileId, u32)>)>,
 }
 
 thread_local! {
@@ -73,7 +79,10 @@ struct Runs(u32);
 #[derive(Default)]
 struct Second(u32);
 
-fn first(db: &mut Db, written: &Written<'_>) {
+/// The reads of a maintainer that reads nothing.
+fn none(_: &Db, _: &Written<'_>, _: &mut Reads) {}
+
+fn first(db: &mut Db, written: &Written<'_>, _: &Reads) {
     let Some((own_write, panic_on)) = PROBE.with(|probe| {
         let mut probe = probe.borrow_mut();
         probe.on.then(|| {
@@ -96,7 +105,7 @@ fn first(db: &mut Db, written: &Written<'_>) {
     }
 }
 
-fn second(db: &mut Db, _: &Written<'_>) {
+fn second(db: &mut Db, _: &Written<'_>, _: &Reads) {
     let Some(report) = PROBE.with(|probe| {
         let mut probe = probe.borrow_mut();
         probe.on.then(|| {
@@ -114,8 +123,40 @@ fn second(db: &mut Db, _: &Written<'_>) {
     }
 }
 
-inventory::submit! { Maintainer { order: 20, name: "test-second", run: second } }
-inventory::submit! { Maintainer { order: 10, name: "test-first", run: first } }
+/// A step's read of one file: its text's length, by a query.
+fn length(db: &Db, _: &Written<'_>, key: &mut (FileId, u32)) {
+    key.1 = crate::line_index(db, db.file_text(key.0)).len().into();
+}
+
+fn steps_reads(_: &Db, _: &Written<'_>, reads: &mut Reads) {
+    let Some(steps) = PROBE.with(|probe| probe.borrow().on.then_some(probe.borrow().steps)).flatten() else {
+        return;
+    };
+    reads.each(blaze_mem::Tag::Other, (0..3).map(|n| (file(n), 0)), length);
+    if reads.step() + 1 < steps {
+        reads.again();
+    }
+}
+
+fn steps_apply(db: &mut Db, _: &Written<'_>, reads: &Reads) {
+    let Some(apply_reads) = PROBE.with(|probe| {
+        let probe = probe.borrow();
+        (probe.on && probe.steps.is_some()).then_some(probe.apply_reads)
+    }) else {
+        return;
+    };
+    let read: Vec<(FileId, u32)> = reads.take().collect();
+    let step = reads.step();
+    PROBE.with(|probe| probe.borrow_mut().applied.push((step, read)));
+    if apply_reads {
+        _ = crate::line_index(db, db.file_text(file(5)));
+    }
+    db.set_file_text(file(4), &format!("// step {step}\n"));
+}
+
+inventory::submit! { Maintainer { order: 20, name: "test-second", reads: none, apply: second } }
+inventory::submit! { Maintainer { order: 10, name: "test-first", reads: none, apply: first } }
+inventory::submit! { Maintainer { order: 30, name: "test-steps", reads: steps_reads, apply: steps_apply } }
 
 /// Runs `f` with this thread's probe on, and returns what `first` saw and the order the
 /// maintainers ran in.
@@ -360,4 +401,59 @@ fn work_is_kept_per_pass_while_asked_for() {
     reporting(&mut || db.set_file_text(file(1), "fn k() {}\n"));
     db.take_maintained(&mut out);
     assert_eq!(out, vec![Maintained { write: 0, maintainer: "test-second", krate, work }]);
+}
+
+/// Runs `f` with `steps` on for `count` steps, and returns what its apply took.
+fn stepped(count: u32, apply_reads: bool, f: impl FnOnce()) -> Vec<(u32, Vec<(FileId, u32)>)> {
+    PROBE.with(|probe| {
+        *probe.borrow_mut() = Probe { on: true, steps: Some(count), apply_reads, ..Probe::default() };
+    });
+    let ran = panic::catch_unwind(panic::AssertUnwindSafe(f));
+    let probe = PROBE.with(|probe| std::mem::take(&mut *probe.borrow_mut()));
+    if let Err(panic) = ran {
+        panic::resume_unwind(panic);
+    }
+    probe.applied
+}
+
+#[test]
+fn each_step_applies_what_its_reads_read() {
+    let mut db = Db::for_tests();
+    for n in 0..3 {
+        db.set_file_text(file(n), &"x".repeat(n as usize + 1));
+    }
+    let applied = stepped(2, false, || db.set_file_text(file(1), "yyyy"));
+    let read = vec![(file(0), 1), (file(1), 4), (file(2), 3)];
+    assert_eq!(applied, vec![(0, read.clone()), (1, read)]);
+    assert!(db.file_text(file(4)).text(&db).contains("// step 1"), "each step's apply wrote");
+}
+
+#[test]
+fn reads_run_when_batches_are_left_to_readers() {
+    let mut db = Db::for_tests();
+    db.set_file_text(file(0), "ab");
+    for n in 1..3 {
+        db.set_file_text(file(n), "");
+    }
+    let order = crate::set_run_order(crate::RunOrder::LeftToReaders);
+    let applied = stepped(1, false, || db.set_file_text(file(0), "abc"));
+    crate::set_run_order(order);
+    assert_eq!(applied, vec![(0, vec![(file(0), 3), (file(1), 0), (file(2), 0)])]);
+}
+
+#[test]
+#[should_panic(expected = "its apply executed")]
+fn an_apply_that_executes_a_query_stops_the_write() {
+    let mut db = Db::for_tests();
+    for n in [0, 1, 2, 5] {
+        db.set_file_text(file(n), "fn f() {}\n");
+    }
+    stepped(1, true, || db.set_file_text(file(0), "fn a() {}\n"));
+}
+
+#[test]
+#[should_panic(expected = "outside a maintainer's reads")]
+fn state_is_lent_to_reads_alone() {
+    let db = Db::for_tests();
+    db.lend_state(|_: &mut Runs| ());
 }

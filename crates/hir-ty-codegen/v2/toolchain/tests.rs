@@ -33,11 +33,18 @@ fn no_flags_is_the_targets_baseline() {
     assert_eq!(it.id, of(LINUX, &[]).unwrap().id, "one identity for one blaze");
 }
 
+/// The code under a code hash is what this blaze makes of it: a store kept across blaze builds
+/// (one `BLAZE_HOME` the self-build reuses) held another build's template under the key of
+/// one this build made, and the put of this build's was refused as other bytes.
 #[test]
-fn the_identity_is_the_pinned_nightly_and_the_producer() {
+fn another_blaze_build_is_another_toolchain() {
     assert!(NIGHTLY.starts_with("nightly-") && !NIGHTLY.contains(char::is_whitespace), "{NIGHTLY:?}");
-    let named = format!("{NIGHTLY}\n{PRODUCER}");
-    assert_eq!(of(LINUX, &[]).unwrap().id, ContentId::of(ID_DOMAIN, named.as_bytes()));
+    let this = build_of(&std::env::current_exe().unwrap()).unwrap();
+    assert_eq!(build().unwrap(), this);
+    assert_eq!(of(LINUX, &[]).unwrap().id, id_of(&this));
+    let mut other = this;
+    other.0[0] ^= 1;
+    assert_ne!(id_of(&other), id_of(&this));
 }
 
 #[test]

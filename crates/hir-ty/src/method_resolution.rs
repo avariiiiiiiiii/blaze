@@ -465,15 +465,10 @@ pub fn lookup_impl_const<'db>(
         None => return (const_id, subs),
     };
 
-    lookup_impl_assoc_item_for_trait_ref(infcx, trait_ref, env, name)
-        .and_then(|assoc| {
-            if let (Either::Left(AssocItemId::ConstId(id)), s) = assoc {
-                Some((id, s))
-            } else {
-                None
-            }
-        })
-        .unwrap_or((const_id, subs))
+    match lookup_impl_assoc_item_for_trait_ref(infcx, trait_ref, env, name) {
+        Ok((Either::Left(AssocItemId::ConstId(id)), s)) => (id, s),
+        _ => (const_id, subs),
+    }
 }
 
 /// Checks if the self parameter of `Trait` method is the `dyn Trait` and we should
@@ -511,8 +506,10 @@ pub fn is_dyn_method<'db>(
 }
 
 /// What [`lookup_impl_method_query`] returns, in a form a query can keep.
-pub(crate) type StoredImplMethod =
-    (Either<FunctionId, (BuiltinDeriveImplId, BuiltinDeriveImplMethod)>, StoredGenericArgs);
+pub(crate) type StoredImplMethod = Result<
+    (Either<FunctionId, (BuiltinDeriveImplId, BuiltinDeriveImplMethod)>, StoredGenericArgs),
+    NoImplMethod,
+>;
 
 /// [`lookup_impl_method_query`], memoized: codegen asks the same trait method with the same
 /// arguments many times per build and again on every edit, and each ask re-runs trait
@@ -524,34 +521,37 @@ pub(crate) fn lookup_impl_method_stored(
     func: FunctionId,
     fn_subst: StoredGenericArgs,
 ) -> StoredImplMethod {
-    let (found, args) = lookup_impl_method_query(db, env.as_ref(db), func, fn_subst.as_ref());
-    (found, args.store())
+    lookup_impl_method_query(db, env.as_ref(db), func, fn_subst.as_ref())
+        .map(|(found, args)| (found, args.store()))
 }
 
 fn lookup_impl_method_cycle_result(
     _: &Db,
     _: blaze_query::db::Id,
     _env: crate::traits::StoredParamEnvAndCrate,
-    func: FunctionId,
-    fn_subst: StoredGenericArgs,
+    _func: FunctionId,
+    _fn_subst: StoredGenericArgs,
 ) -> StoredImplMethod {
-    (Either::Left(func), fn_subst)
+    Err(NoImplMethod::Cycle)
 }
 
 /// Looks up the impl method that actually runs for the trait method `func`.
 ///
-/// Returns `func` if it's not a method defined in a trait or the lookup failed.
+/// Returns `func` if it's not a method defined in a trait, and why not where the lookup fails.
 pub(crate) fn lookup_impl_method_query<'db>(
     db: &'db Db,
     env: ParamEnvAndCrate<'db>,
     func: FunctionId,
     fn_subst: GenericArgs<'db>,
-) -> (Either<FunctionId, (BuiltinDeriveImplId, BuiltinDeriveImplMethod)>, GenericArgs<'db>) {
+) -> Result<
+    (Either<FunctionId, (BuiltinDeriveImplId, BuiltinDeriveImplMethod)>, GenericArgs<'db>),
+    NoImplMethod,
+> {
     let interner = DbInterner::new_with(db, env.krate);
     let infcx = interner.infer_ctxt().build(TypingMode::PostAnalysis);
 
     let ItemContainerId::TraitId(trait_id) = func.loc(db).container else {
-        return (Either::Left(func), fn_subst);
+        return Ok((Either::Left(func), fn_subst));
     };
     let trait_params = GenericParams::of(db, trait_id.into()).len();
     let trait_ref = TraitRef::new_from_args(
@@ -561,25 +561,18 @@ pub(crate) fn lookup_impl_method_query<'db>(
     );
 
     let name = &FunctionSignature::of(db, func).name;
-    let Some((impl_fn, impl_subst)) =
-        lookup_impl_assoc_item_for_trait_ref(&infcx, trait_ref, env.param_env, name).and_then(
-            |(assoc, impl_args)| {
-                let assoc = match assoc {
-                    Either::Left(AssocItemId::FunctionId(id)) => Either::Left(id),
-                    Either::Right(it) => Either::Right(it),
-                    _ => return None,
-                };
-                Some((assoc, impl_args))
-            },
-        )
-    else {
-        return (Either::Left(func), fn_subst);
+    let (assoc, impl_subst) =
+        lookup_impl_assoc_item_for_trait_ref(&infcx, trait_ref, env.param_env, name)?;
+    let impl_fn = match assoc {
+        Either::Left(AssocItemId::FunctionId(id)) => Either::Left(id),
+        Either::Right(it) => Either::Right(it),
+        Either::Left(_) => return Err(NoImplMethod::NoItem),
     };
 
-    (
+    Ok((
         impl_fn,
         GenericArgs::new_from_iter(impl_subst.iter().chain(fn_subst.iter().skip(trait_params))),
-    )
+    ))
 }
 
 fn lookup_impl_assoc_item_for_trait_ref<'db>(
@@ -587,8 +580,10 @@ fn lookup_impl_assoc_item_for_trait_ref<'db>(
     trait_ref: TraitRef<'db>,
     env: ParamEnv<'db>,
     name: &Name,
-) -> Option<(Either<AssocItemId, (BuiltinDeriveImplId, BuiltinDeriveImplMethod)>, GenericArgs<'db>)>
-{
+) -> Result<
+    (Either<AssocItemId, (BuiltinDeriveImplId, BuiltinDeriveImplMethod)>, GenericArgs<'db>),
+    NoImplMethod,
+> {
     let (impl_id, impl_subst) = find_matching_impl(infcx, env, trait_ref)?;
     let impl_id = match impl_id {
         AnyImplId::ImplId(it) => it,
@@ -597,7 +592,8 @@ fn lookup_impl_assoc_item_for_trait_ref<'db>(
                 .loc(infcx.interner.db)
                 .trait_
                 .get_method(name.symbol())
-                .map(|method| (Either::Right((impl_, method)), impl_subst));
+                .map(|method| (Either::Right((impl_, method)), impl_subst))
+                .ok_or(NoImplMethod::NoItem);
         }
     };
     let db = infcx.interner.db;
@@ -609,23 +605,28 @@ fn lookup_impl_assoc_item_for_trait_ref<'db>(
         })
     };
     if let Some(item) = item_of(impl_id) {
-        return Some((Either::Left(item), impl_subst));
+        return Ok((Either::Left(item), impl_subst));
     }
     // A specializing impl takes the items it leaves out from the impl it specializes: the
     // closest one that has the item.
     let parent =
-        crate::specialization::specialized_ancestor(db, impl_id, |it| item_of(it).is_some())?;
+        crate::specialization::specialized_ancestor(db, impl_id, |it| item_of(it).is_some())
+            .ok_or(NoImplMethod::NoItem)?;
     let parent_args = infcx.fresh_args_for_item(Span::Dummy, parent.into());
-    let parent_trait_ref =
-        db.impl_trait(parent)?.instantiate(infcx.interner, parent_args).skip_norm_wip();
+    let parent_trait_ref = db
+        .impl_trait(parent)
+        .ok_or(NoImplMethod::NoItem)?
+        .instantiate(infcx.interner, parent_args)
+        .skip_norm_wip();
     let mut ocx = ObligationCtxt::new(infcx);
-    ocx.eq(&ObligationCause::dummy(), env, trait_ref, parent_trait_ref).ok()?;
+    ocx.eq(&ObligationCause::dummy(), env, trait_ref, parent_trait_ref)
+        .map_err(|_| NoImplMethod::Unimplemented)?;
     let parent_args = infcx.deeply_resolve_ignoring_regions(parent_args);
     if parent_args.has_non_region_infer() {
-        return None;
+        return Err(NoImplMethod::Ambiguous);
     }
     let parent_args = parent_args.fold_with(&mut ReplaceInferWithError::new(infcx.interner));
-    Some((Either::Left(item_of(parent)?), parent_args))
+    Ok((Either::Left(item_of(parent).ok_or(NoImplMethod::NoItem)?), parent_args))
 }
 
 /// The function or constant of `impl_` named `name`, the first if there are more: all that a
@@ -745,16 +746,71 @@ fn value_item_named(items: &[(Name, AssocItemId)], name: &Name) -> Option<Candid
     })
 }
 
+/// Why a trait method's call names no impl's method ([`HirDatabase::lookup_impl_method_or_why`]):
+/// it then calls the trait's own, which is right where the impl is chosen later or is the
+/// compiler's, and an error where the call is concrete and no impl holds.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, blaze_query::Value)]
+pub enum NoImplMethod {
+    /// The trait's arguments hold a type or const parameter: the impl is chosen once they are
+    /// known.
+    Generic,
+    /// A where clause of the environment proves the trait ref.
+    Param,
+    /// The compiler's own impl proves it: a closure's `Fn*`, `dyn Trait`'s vtable, `Sized`,
+    /// `Copy` of a tuple and the like.
+    Builtin,
+    /// Trait selection proves that no impl holds, or the nested obligations of the one it
+    /// picks fail.
+    Unimplemented,
+    /// More than one impl may hold, or the one picked leaves its arguments open.
+    Ambiguous,
+    /// The trait ref's projections do not normalize.
+    Unnormalized,
+    /// The impl found has no method of the name, nor does an impl it specializes.
+    NoItem,
+    /// The lookup asks itself again.
+    Cycle,
+}
+
+impl NoImplMethod {
+    /// Whether the call names the trait's own method rightly: its impl is chosen later or is
+    /// the compiler's.
+    pub fn is_expected(self) -> bool {
+        matches!(self, NoImplMethod::Generic | NoImplMethod::Param | NoImplMethod::Builtin)
+    }
+
+    pub fn describe(self) -> &'static str {
+        match self {
+            NoImplMethod::Generic => "its arguments are still generic",
+            NoImplMethod::Param => "a where clause proves it",
+            NoImplMethod::Builtin => "the compiler's built-in impl proves it",
+            NoImplMethod::Unimplemented => "no impl holds",
+            NoImplMethod::Ambiguous => "more than one impl may hold",
+            NoImplMethod::Unnormalized => "its projections do not normalize",
+            NoImplMethod::NoItem => "the impl found has no method of that name",
+            NoImplMethod::Cycle => "the lookup depends on itself",
+        }
+    }
+}
+
 pub(crate) fn find_matching_impl<'db>(
     infcx: &InferCtxt<'db>,
     env: ParamEnv<'db>,
     trait_ref: TraitRef<'db>,
-) -> Option<(AnyImplId, GenericArgs<'db>)> {
-    let trait_ref = infcx.at(&ObligationCause::dummy(), env).deeply_normalize(trait_ref).ok()?;
+) -> Result<(AnyImplId, GenericArgs<'db>), NoImplMethod> {
+    let generic = trait_ref.has_non_region_param();
+    let open = |why| if generic { NoImplMethod::Generic } else { why };
+    let trait_ref = infcx
+        .at(&ObligationCause::dummy(), env)
+        .deeply_normalize(trait_ref)
+        .map_err(|_| open(NoImplMethod::Unnormalized))?;
 
     let obligation = Obligation::new(infcx.interner, ObligationCause::dummy(), env, trait_ref);
 
-    let selection = infcx.select(&obligation).ok()??;
+    let selection = infcx
+        .select(&obligation)
+        .map_err(|_| open(NoImplMethod::Unimplemented))?
+        .ok_or_else(|| open(NoImplMethod::Ambiguous))?;
 
     // Currently, we use a fulfillment context to completely resolve
     // all nested obligations. This is because they can inform the
@@ -764,12 +820,12 @@ pub(crate) fn find_matching_impl<'db>(
 
     let errors = ocx.evaluate_obligations_error_on_ambiguity();
     if !errors.is_empty() {
-        return None;
+        return Err(open(NoImplMethod::Unimplemented));
     }
 
     let impl_source = infcx.deeply_resolve_ignoring_regions(impl_source);
     if impl_source.has_non_region_infer() {
-        return None;
+        return Err(open(NoImplMethod::Ambiguous));
     }
 
     // Selection may leave region inference variables unresolved; replace them before they escape
@@ -777,11 +833,12 @@ pub(crate) fn find_matching_impl<'db>(
     //
     // FIXME: decide whether inferred regions should be replaced with error or erased.
     match impl_source {
-        ImplSource::UserDefined(impl_source) => Some((
+        ImplSource::UserDefined(impl_source) => Ok((
             impl_source.impl_def_id,
             impl_source.args.fold_with(&mut ReplaceInferWithError::new(infcx.interner)),
         )),
-        ImplSource::Param(_) | ImplSource::Builtin(..) => None,
+        ImplSource::Param(_) => Err(NoImplMethod::Param),
+        ImplSource::Builtin(..) => Err(NoImplMethod::Builtin),
     }
 }
 
@@ -813,20 +870,31 @@ pub fn loaded_crates(db: &Db, krate: Crate) -> Box<[Crate]> {
             .modules(db)
             .filter_map(|(_, module)| module.origin.file_id())
             .chain(included.iter().map(|&(_, file)| file));
+        // Few dependencies are left unnamed: each identifier is compared with them, and the walk
+        // ends when none is left.
+        fn named_by<'a>(
+            unnamed: &mut Vec<&base_db::BuiltDependency, &Frame>,
+            mut identifiers: impl Iterator<Item = &'a str>,
+        ) {
+            while !unnamed.is_empty()
+                && let Some(text) = identifiers.next()
+            {
+                unnamed.retain(|dep| dep.name.symbol().as_str() != text);
+            }
+        }
         let named_in = |unnamed: &mut Vec<&base_db::BuiltDependency, &Frame>,
                         root: syntax::view::Node<'_>| {
             let (tree, at) = root.flat();
-            // Few dependencies are left unnamed: each identifier is compared with them, and the
-            // walk ends when none is left.
-            let mut identifiers = (at..tree.end(at))
-                .filter(|&it| tree.is_token(it) && tree.kind(it).0 == SyntaxKind::IDENT as u16);
-            while !unnamed.is_empty()
-                && let Some(it) = identifiers.next()
-            {
-                let text = tree.token_text(it);
-                unnamed.retain(|dep| dep.name.symbol().as_str() != text);
-            }
+            named_by(
+                unnamed,
+                (at..tree.end(at))
+                    .filter(|&it| tree.is_token(it) && tree.kind(it).0 == SyntaxKind::IDENT as u16)
+                    .map(|it| tree.token_text(it)),
+            );
         };
+        // A file is lexed, not walked: the tree of a library file is an outline, whose `fn`
+        // bodies are not in it until walked into, and a dependency named in a body alone is
+        // loaded all the same (a library's `memchr::memchr(..)` in a function).
         while !unnamed.is_empty()
             && let Some(file) = files.next()
         {
@@ -834,7 +902,13 @@ pub fn loaded_crates(db: &Db, krate: Crate) -> Box<[Crate]> {
             if !unnamed.iter().any(|dep| text.contains(dep.name.symbol().as_str())) {
                 continue;
             }
-            named_in(&mut unnamed, file.parse(db).root());
+            let lexed = syntax::LexedStr::new(file.edition(db), text);
+            named_by(
+                &mut unnamed,
+                (0..lexed.len())
+                    .filter(|&i| lexed.kind(i) == SyntaxKind::IDENT)
+                    .map(|i| lexed.text(i)),
+            );
         }
         // rustc loads the crate a path in a macro's output names too, as in the `impl
         // dep::Trait for ..` a derive of a proc macro writes. A `macro_rules!` of `krate`

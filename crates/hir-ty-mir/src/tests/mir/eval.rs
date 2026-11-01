@@ -2966,3 +2966,97 @@ fn main() {
 "#,
     );
 }
+
+/// The proc-macro bridge's `Decode` impls, each leaving its header's lifetimes out, and
+/// `run_client`'s closure calling `<(ExpnGlobals<Span>, A)>::decode`, whose callee the 00:49
+/// self-run's serde derives found no definition of (queue 01481). `S` counts the decodes, so
+/// each call is seen in order.
+#[test]
+fn the_bridges_decode_impls_evaluate_for_run_client() {
+    check_pass(
+        r#"
+//- minicore: sized, fn, copy, slice, panic, fmt
+pub trait Decode<'a, 's, S>: Sized {
+    fn decode(r: &mut &'a [u8], s: &'s mut S) -> Self;
+}
+impl<S> Decode<'_, '_, S> for () {
+    fn decode(_: &mut &[u8], _: &mut S) -> Self {}
+}
+impl<'a, S, A: for<'s> Decode<'a, 's, S>, B: for<'s> Decode<'a, 's, S>> Decode<'a, '_, S> for (A, B) {
+    fn decode(r: &mut &'a [u8], s: &mut S) -> Self {
+        (Decode::decode(r, s), Decode::decode(r, s))
+    }
+}
+macro_rules! rpc_struct {
+    (struct $name:ident <$T:ident> { $($field:ident),* }) => {
+        pub struct $name<$T> { $(pub $field: $T),* }
+        impl<'a, S, $T: for<'s> Decode<'a, 's, S>> Decode<'a, '_, S> for $name<$T> {
+            fn decode(r: &mut &'a [u8], s: &mut S) -> Self {
+                $name { $($field: Decode::decode(r, s)),* }
+            }
+        }
+    };
+}
+pub struct Span(u32);
+impl Decode<'_, '_, u32> for Span {
+    fn decode(_: &mut &[u8], s: &mut u32) -> Self {
+        *s += 1;
+        Span(*s)
+    }
+}
+rpc_struct!(struct ExpnGlobals<Span> { def_site, call_site });
+pub fn run_client<A: for<'a, 's> Decode<'a, 's, u32>>(buf: &[u8]) -> A {
+    let f = || {
+        let mut bytes = buf;
+        let reader = &mut bytes;
+        let mut count = 0u32;
+        let (globals, input) = <(ExpnGlobals<Span>, A)>::decode(reader, &mut count);
+        if globals.def_site.0 != 1 || globals.call_site.0 != 2 {
+            panic!("globals decoded wrong");
+        }
+        input
+    };
+    f()
+}
+fn main() {
+    let input: Span = run_client(&[1, 2, 3]);
+    if input.0 != 3 {
+        panic!("input decoded wrong");
+    }
+    let () = run_client::<()>(&[]);
+}
+"#,
+    );
+}
+
+#[test]
+fn a_box_with_an_allocator_unsizes_a_closure_to_dyn_fn() {
+    check_pass(
+        r#"
+//- minicore: fn, unsize, coerce_unsized
+use core::marker::Unsize;
+use core::ops::CoerceUnsized;
+
+pub struct Global;
+
+pub struct Box<T: ?Sized, A = Global>(*const T, A);
+
+impl<T: ?Sized + Unsize<U>, U: ?Sized, A> CoerceUnsized<Box<U, A>> for Box<T, A> {}
+
+fn should_not_reach() {
+    _ // FIXME: replace this function with panic when that works
+}
+
+fn main() {
+    let x = 5;
+    let closure = move || x + 2;
+    let boxed: Box<_, Global> = Box(&closure as *const _, Global);
+    let unsized_: Box<dyn Fn() -> i32, Global> = boxed;
+    let f: &dyn Fn() -> i32 = unsafe { &*unsized_.0 };
+    if f() != 7 {
+        should_not_reach();
+    }
+}
+"#,
+    );
+}

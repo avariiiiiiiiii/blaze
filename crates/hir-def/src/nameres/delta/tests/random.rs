@@ -405,8 +405,15 @@ fn the_fixture_scripts_that_once_failed_keep_the_maps_equal() {
     );
     // 2026-11-01: `reexport_2::Placeholder` reached by `use reexport_1::*` and `pub use
     // reexport_1::*`: the fresh map credited the `pub use`, the maintained one the `use`, both
-    // `pub`.
+    // `pub`. The two globs' shared edge kept the first glob when the second widened it.
     fixture_script(fixture_named("tests/globs.rs::regression_18580#0"), &[TextEdit::Remove { at: 1024 }], false);
+    // 2026-11-01: the maintained `crate::a` kept `struct Ok` from `foo!()`, which the fresh map did
+    // not have after the edit.
+    fixture_script(
+        fixture_named("tests/macros.rs::macro_use_prelude_is_eagerly_expanded#0"),
+        &[TextEdit::Remove { at: 257 }],
+        false,
+    );
     // 2026-11-01: removing `#![crate_type="proc-macro"]` left the maintained root censored, its
     // `S` and fn `pub(crate)`.
     fixture_batches(
@@ -710,6 +717,9 @@ const PINNED_GENERATED: &[(u64, bool, &[ModelEdit])] = &[
     // 2026-11-01: one item through two globs, `pub(crate)` and private in the root (the same
     // visibility): the fresh map kept `pub(crate)`, the maintained one the private spelling.
     (0x4082715, false, &[ModelEdit::AddItem { module: 0, at: 1, seed: 181 }]),
+    // 2026-11-01: `m0` and `m1` reached `crate::a` through two globs, both `pub(crate)`: each map
+    // credited the glob that arrived first.
+    (0x33a6fd1240da37, false, &[ModelEdit::AddItem { module: 1, at: 0, seed: 1 }]),
 ];
 
 #[test]

@@ -173,11 +173,44 @@ rests on these numbers.
 | owner | dict | what holds the bytes: a memo table per query kind, an arena |
 | bytes | u64 | live bytes |
 
+### `switches`: one row a switch of a job on a fiber, on the thread it happened on
+
+| column | type | |
+|---|---|---|
+| build_id | u64? | the build the thread worked for then |
+| process | u32 | the process id |
+| thread | u32 | the thread it happened on |
+| thread_name | dict | the thread's name |
+| t_ns | i64 | when |
+| event | dict | `started`, `parked`, `resumed` or `ended` |
+| job | u64 | the job: its slot's generation << 32 \| its slot |
+| fiber | u32 | the fiber it runs on |
+| core | u32 | the driver's core of the thread |
+| wait_kind | dict? | for `parked`: `job`, `key`, `counter`, `until`, or `moved` (the scheduler moving it to another core) |
+| wait_value | u64? | the job's slot, the key's hash, the counter or the deadline; null for `moved` |
+
+The fiber driver (`blaze_graph::sched::fiber::observe`) tells the recorder of each switch, under
+its lock, one ring row each. A job's open spans and build move with it:
+`blaze_profile::install` registers the recorder's enter stack and build with
+`fiber::carry`. A span begun before a wait therefore closes after it, on whatever thread
+resumed the job, with the parent and depth it began with. The thread the job left starts its
+next job inside no span. Three views read it:
+- `job_waits`: one row a wait, its `parked` and next `resumed` switch, with `thread_before`,
+  `thread_after`, `waited_ns` and `moved`.
+- `job_spans`: `spans` plus the `job` running on the span's thread when it began.
+- `job_tiles`, below, is built from `job_spans`.
+
 ### `tiles`: a result, not stored
 
 The explorer's zoomed-out view: the spans of a time range per (process, thread, depth,
 bucket). Its columns are `process u32, thread u32, depth u16, t0_ns i64, t1_ns i64, count u32,
 busy_ns i64, name dict` (the name of the longest span in the bucket).
+
+### `job_tiles`: a result, not stored
+
+The per-job lane beside the per-thread one: `tiles` with `job u64` in place of `thread`, from
+`job_spans` (the `tiles` op with `"lane": "job"`). A job that moved between threads is one
+lane. Its waits are gaps, drawn from `job_waits`.
 
 ### `open`: a result, not stored
 

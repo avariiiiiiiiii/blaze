@@ -11,6 +11,12 @@
 //! on the caller once every job of the loop has ended; what the loop had made is then leaked,
 //! never dropped twice.
 //!
+//! An item on another worker whose wait gave way ([`crate::Cancelled`]: it would close a cycle
+//! through a task that waits for the loop) is not a panic of the loop: it runs again on the
+//! calling thread once the others are done, where the cycle is its caller's own, so a give-way
+//! never escapes a loop unseen. An owned item (a `Vec<T>`'s, which the unwind dropped) cannot
+//! run again, and its give-way is the loop's panic.
+//!
 //! The items are a [`Source`]: a slice (`&[T]`, `&Vec<T>`), a mutable one (`&mut [T]`,
 //! `&mut Vec<T>`), an owned `Vec<T>`, a range of indices, or [`chunks`], [`chunks_mut`],
 //! [`windows`], [`zip`] and [`enumerate`] of them. Every loop takes each item once, so an
@@ -28,7 +34,10 @@ use std::{
 };
 
 pub use crate::pool::Scope;
-use crate::{pool, pump::Lock};
+use crate::{
+    pool,
+    pump::{self, Lock},
+};
 
 /// Ranges per worker a loop splits its items into: enough that a worker that drew slow items
 /// leaves the rest to the others, few enough that claiming one stays far below its work.
@@ -260,6 +269,8 @@ pub struct Chunks<'a, T> {
 unsafe impl<'a, T: Sync> Source for Chunks<'a, T> {
     type Item = &'a [T];
 
+    const AGAIN: bool = true;
+
     fn len(&self) -> usize {
         self.items.len().div_ceil(self.size)
     }
@@ -278,9 +289,12 @@ pub struct ChunksMut<'a, T> {
     size: usize,
 }
 
-// SAFETY: the pieces are disjoint and each handed out once, so each `&mut [T]` is the only one.
+// SAFETY: the pieces are disjoint and each handed out once, or again once the first is gone
+// with its unwind, so each `&mut [T]` is the only one.
 unsafe impl<'a, T: Send> Source for ChunksMut<'a, T> {
     type Item = &'a mut [T];
+
+    const AGAIN: bool = true;
 
     fn len(&self) -> usize {
         self.items.len.div_ceil(self.size)
@@ -304,6 +318,8 @@ pub struct Windows<'a, T> {
 // SAFETY: each item is a shared piece of the slice, which is `Sync` when `T` is.
 unsafe impl<'a, T: Sync> Source for Windows<'a, T> {
     type Item = &'a [T];
+
+    const AGAIN: bool = true;
 
     fn len(&self) -> usize {
         (self.items.len() + 1).saturating_sub(self.size)
@@ -502,7 +518,12 @@ pub fn for_each_giving_way(
 
 /// Runs `run` over ranges that cover `0..len` once, each with the state its thread's
 /// `init` made (once per thread that claims a range), on the pool a loop called here runs on.
-fn split<St>(len: usize, init: impl Fn() -> St + Sync, run: impl Fn(&mut St, Range<usize>) + Sync) {
+///
+/// With `again` (the items' [`Source::AGAIN`]), an item that gave way on another worker (its
+/// wait would close a cycle through a task that waits for this loop) is run once more on this
+/// thread after the loop, where it meets that cycle on its own stack, rather than failing the
+/// loop. An item that gives way on this thread gives way for the caller, as any panic does.
+fn split<St>(len: usize, again: bool, init: impl Fn() -> St + Sync, run: impl Fn(&mut St, Range<usize>) + Sync) {
     if len == 0 {
         return;
     }
@@ -517,14 +538,31 @@ fn split<St>(len: usize, init: impl Fn() -> St + Sync, run: impl Fn(&mut St, Ran
     let failed = AtomicBool::new(false);
     // dyn: a panic's payload, as `catch_unwind` gives it
     let panic: Lock<Option<Box<dyn Any + Send>>> = Lock::new(None);
-    let claim = || {
+    // alloc: empty unless an item gives way
+    let gave: Lock<Vec<usize>> = Lock::new(Vec::new());
+    let claim = |here: bool| {
         let mut state = None;
         while !failed.load(Ordering::Relaxed) {
             let at = next.fetch_add(grain, Ordering::Relaxed);
             if at >= len {
                 break;
             }
-            run(state.get_or_insert_with(&init), at..(at + grain).min(len));
+            let range = at..(at + grain).min(len);
+            if here || !again {
+                run(state.get_or_insert_with(&init), range);
+                continue;
+            }
+            for at in range {
+                let before = pump::gave_way();
+                let one = catch_unwind(AssertUnwindSafe(|| run(state.get_or_insert_with(&init), at..at + 1)));
+                let Err(it) = one else { continue };
+                if pump::gave_way() == before {
+                    resume_unwind(it);
+                }
+                // The unwound item may have left the state half used.
+                state = None;
+                gave.lock().push(at);
+            }
         }
     };
     let caught = |ran: thread::Result<()>| {
@@ -535,12 +573,20 @@ fn split<St>(len: usize, init: impl Fn() -> St + Sync, run: impl Fn(&mut St, Ran
     };
     pool::scope_here(|scope| {
         for _ in 1..jobs {
-            scope.submit(None, &claim, &caught);
+            scope.submit(None, || claim(false), &caught);
         }
-        caught(catch_unwind(AssertUnwindSafe(&claim)));
+        caught(catch_unwind(AssertUnwindSafe(|| claim(true))));
     });
     if let Some(it) = panic.into_inner() {
         resume_unwind(it);
+    }
+    let mut gave = gave.into_inner();
+    if !gave.is_empty() {
+        gave.sort_unstable();
+        let mut state = init();
+        for at in gave {
+            run(&mut state, at..at + 1);
+        }
     }
 }
 
@@ -579,11 +625,12 @@ pub fn extend_init<I, St, R>(
     let base = out.len();
     // The buffer does not move until `set_len`: nothing else touches `out` meanwhile.
     let to = Out(out.as_mut_ptr().wrapping_add(base));
-    split(len, init, |state, range| {
+    split(len, <I::Source as Source>::AGAIN, init, |state, range| {
         for at in range {
-            // SAFETY: `split` gives each index below `len` once.
+            // SAFETY: as in `for_each`.
             let made = f(state, unsafe { items.item(at) });
-            // SAFETY: `base + at` is within the capacity reserved above, and written once.
+            // SAFETY: `base + at` is within the capacity reserved above, and written once: a
+            // call that unwound wrote nothing.
             unsafe { to.write(at, made) };
         }
     });
@@ -642,9 +689,10 @@ where
 pub fn for_each<I: IntoSource>(items: I, f: impl Fn(I::Item) + Sync) {
     let items = items.into_source();
     let len = items.len();
-    split(len, || (), |(), range| {
+    split(len, <I::Source as Source>::AGAIN, || (), |(), range| {
         for at in range {
-            // SAFETY: `split` gives each index below `len` once.
+            // SAFETY: `split` gives each index below `len` once, or again after its call
+            // unwound when `AGAIN` allows.
             f(unsafe { items.item(at) });
         }
     });
@@ -663,9 +711,9 @@ where
     let len = items.len();
     let first = AtomicUsize::new(usize::MAX);
     let found: Lock<Option<(usize, R)>> = Lock::new(None);
-    split(len, || (), |(), range| {
+    split(len, <I::Source as Source>::AGAIN, || (), |(), range| {
         for at in range {
-            // SAFETY: `split` gives each index below `len` once.
+            // SAFETY: as in `for_each`.
             let item = unsafe { items.item(at) };
             if at > first.load(Ordering::Relaxed) {
                 continue;
@@ -790,6 +838,83 @@ mod tests {
         );
         let asked = rx.recv_timeout(LONG).expect("the job gives way rather than wait on its scope's owner");
         assert_eq!(asked, Err(Cancelled));
+    }
+
+    /// round 20's blaze-doc failures: a loop's caller runs a key it began inside the loop (in
+    /// an item of its own), and another worker's item asks for that key. The caller ends that
+    /// run before it waits for the loop, so this is no cycle: the item waits for the run and
+    /// gets its value, where it was refused as one through the loop's owner.
+    #[test]
+    fn a_job_asking_for_a_key_its_scope_owner_began_inside_the_scope_waits_for_it() {
+        let pool = Arc::new(Pool::new(&Topology::flat(2), false).unwrap());
+        let flights = Arc::new(Flights::<u32>::new());
+        let (tx, rx) = unbounded::<Result<u32, Cancelled>>();
+        let key = Key([5; 32]);
+        pool.submit(
+            None,
+            move || {
+                let asking = AtomicBool::new(false);
+                let mut asked = None;
+                crate::pool::scope_here(|scope| {
+                    let ran = flights.get_or_run(key, || {
+                        scope.submit(
+                            None,
+                            || {
+                                asking.store(true, Ordering::Release);
+                                flights.get_or_run(key, || Ok(1))
+                            },
+                            |it| asked = Some(it.unwrap()),
+                        );
+                        while !asking.load(Ordering::Acquire) {
+                            std::hint::spin_loop();
+                        }
+                        std::thread::sleep(Duration::from_millis(50));
+                        Ok(5)
+                    });
+                    assert_eq!(ran, Ok(5));
+                });
+                asked.expect("the scope's job ran")
+            },
+            move |it| _ = tx.send(it.unwrap()),
+        );
+        let asked = rx.recv_timeout(LONG).expect("the job's wait ends with the owner's run");
+        assert!(asked.is_ok(), "the job was refused a key its owner ends before waiting: {asked:?}");
+    }
+
+    /// A loop inside a key's run whose items, on another worker, ask for that key: each gives
+    /// way there (a cycle through the loop's caller) and runs again on the caller, where the
+    /// cycle is its own (here: it does not ask), so the loop makes every item and nothing of a
+    /// give-way escapes it.
+    #[test]
+    fn an_item_that_gives_way_on_a_worker_runs_again_on_the_caller() {
+        let pool = Arc::new(Pool::new(&Topology::flat(2), false).unwrap());
+        let flights = Arc::new(Flights::<()>::new());
+        let (tx, rx) = unbounded::<(Vec<usize>, Vec<usize>)>();
+        let key = Key([6; 32]);
+        pool.submit(
+            None,
+            move || {
+                let caller = std::thread::current().id();
+                let runs: Vec<AtomicUsize> = (0..64).map(|_| AtomicUsize::new(0)).collect();
+                let mut made = Vec::new();
+                let ran = flights.get_or_run(key, || {
+                    made = super::map(0..64, |at| {
+                        runs[at].fetch_add(1, Ordering::Relaxed);
+                        if std::thread::current().id() != caller && flights.get_or_run(key, || Ok(())).is_err() {
+                            std::panic::resume_unwind(Box::new("gave way"));
+                        }
+                        at * 2
+                    });
+                    Ok(())
+                });
+                assert_eq!(ran, Ok(()));
+                (made, runs.iter().map(|it| it.load(Ordering::Relaxed)).collect())
+            },
+            move |it| _ = tx.send(it.unwrap()),
+        );
+        let (made, runs) = rx.recv_timeout(LONG).expect("the loop ends");
+        assert_eq!(made, (0..64).map(|it| it * 2).collect::<Vec<_>>());
+        assert!(runs.iter().all(|&it| it == 1 || it == 2), "{runs:?}");
     }
 
     /// self10's livelock: a task that runs a key gives a batch whose every task asks for that

@@ -1,16 +1,18 @@
-//! The fibers driver of [`Sched`] (docs/v2/plan/lanes/sched.md, phase 2): one worker thread per
-//! core of the shape, each running jobs on stackful fibers (corosensei). A job that waits
-//! switches back to its worker, which tells the scheduler and runs whatever it decides next;
-//! the waiting job holds no thread, and resumes, on whichever core the scheduler says, when
-//! what it waits for is done.
+//! The fibers driver of the scheduler (docs/v2/plan/lanes/sched.md, phase 2): one worker thread per
+//! core of the shape, each running jobs on stackful fibers (corosensei). A job that waits switches
+//! back to its worker, which tells the scheduler and runs whatever it decides next; the waiting job
+//! holds no thread, and resumes, on whichever core the scheduler says, when what it waits for is
+//! done.
 //!
 //! Every call into the scheduler is made on a worker's own stack, after the fiber has switched
 //! out: a job is never made runnable (and so never resumed by another core) while it is still
 //! on its old core's stack.
 //!
-//! The scheduler is one state machine behind one lock; each transition is a few dozen
-//! instructions and allocates nothing warm, so the lock is held for less than a cache miss's
-//! worth of work per spawn, wait or end.
+//! Every driver of the process is a member of one [`World`] behind one lock: one wait graph
+//! for all their jobs, so a cycle of waits through two drivers' jobs is refused as one of a
+//! single driver is, and each driver's own placement. A job's [`JobId`] here (its [`Cx::job`],
+//! [`Handle`], a [`Cycle`]'s) is its world id, unique among the live jobs of every driver. Each
+//! transition is a few dozen instructions and allocates nothing warm.
 //!
 //! Code that has no [`Cx`] to hand (the query engine) reaches the running job through
 //! [`wait`], [`miss`] and [`current_job`], which read this thread's fiber.
@@ -28,10 +30,11 @@ use std::{
     any::Any,
     cell::Cell,
     fmt, io, mem,
+    ops::{Deref, DerefMut},
     panic::{self, AssertUnwindSafe},
     ptr,
     sync::{
-        Arc, Mutex, MutexGuard, Once, OnceLock,
+        Arc, LazyLock, Mutex, MutexGuard, Once, OnceLock,
         atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering},
     },
     thread::{self, JoinHandle, Thread},
@@ -43,7 +46,7 @@ use corosensei::{
     stack::{DefaultStack, Stack},
 };
 
-use super::{CoreId, CounterId, Cores, Cycle, JobId, Sched, Spawn, Stats, Suspend, Wait, Yielded};
+use super::{CoreId, CounterId, Cores, Cycle, JobId, Spawn, Stats, Suspend, Wait, World, Yielded};
 use crate::Key;
 
 /// What the driver runs: each job's payload, and how to run one.
@@ -159,18 +162,15 @@ enum Slot<J> {
     Parked(Fiber<J>, Box<Taken>),
 }
 
+/// A driver's own: its jobs' slots, by local id, and its fibers.
 struct State<W: Work> {
-    sched: Sched,
     slots: Vec<Slot<W::Job>>,
-    generation: Vec<u32>,
     free: Vec<u32>,
     /// Spawned and not done.
     live: u32,
     idle: Vec<Fiber<W::Job>>,
     /// Boxes for parked jobs' carried thread-locals, kept for the next job to park.
     spare_taken: Vec<Box<Taken>>,
-    /// A `Run` for a core made by a call from another core's worker; read by its worker.
-    pending: Vec<u32>,
     closing: bool,
     joiner: Option<Thread>,
     panic: Option<Panic>,
@@ -197,10 +197,69 @@ impl CoreSlot {
     }
 }
 
+/// Every driver's scheduling, under one lock for the process: the [`World`] (one wait graph,
+/// each driver's placement as a member) and each member's wakers. A job of one driver woken by
+/// another's is woken through them. The per-core change (docs/v2/plan/lanes/sched.md) takes
+/// spawns and ends off this lock.
+struct Global {
+    world: World,
+    /// By member, as the world numbers them; `None` once the driver stopped.
+    io: Vec<Option<Io>>,
+    dirty: Vec<u32>,
+}
+
+struct Io {
+    cores: Arc<[CoreSlot]>,
+    /// A `Run` for a core (a local job id) made by another core's worker; read by its worker.
+    pending: Vec<u32>,
+}
+
+static GLOBAL: LazyLock<Mutex<Global>> = LazyLock::new(|| {
+    // alloc: the process's scheduler, once
+    Mutex::new(Global { world: World::new(1024), io: Vec::with_capacity(8), dirty: Vec::with_capacity(8) })
+});
+
+/// The process's [`Global`] and a driver's [`State`], locked in that order, always, so no two
+/// locks are ever taken the other way round.
+struct Locked<'a, W: Work> {
+    global: MutexGuard<'static, Global>,
+    state: MutexGuard<'a, State<W>>,
+    member: u32,
+}
+
+impl<W: Work> Locked<'_, W> {
+    fn world(&mut self) -> &mut World {
+        &mut self.global.world
+    }
+
+    /// This member's pending `Run` of `core`, taken.
+    fn take_pending(&mut self, core: u32) -> Option<u32> {
+        let io = self.global.io[self.member as usize].as_mut().expect("a running driver's wakers");
+        let job = mem::replace(&mut io.pending[core as usize], NONE);
+        (job != NONE).then_some(job)
+    }
+}
+
+impl<W: Work> Deref for Locked<'_, W> {
+    type Target = State<W>;
+
+    fn deref(&self) -> &State<W> {
+        &self.state
+    }
+}
+
+impl<W: Work> DerefMut for Locked<'_, W> {
+    fn deref_mut(&mut self) -> &mut State<W> {
+        &mut self.state
+    }
+}
+
 struct Shared<W: Work> {
     work: W,
+    /// This driver's number in the [`World`].
+    member: u32,
     state: Mutex<State<W>>,
-    cores: Box<[CoreSlot]>,
+    cores: Arc<[CoreSlot]>,
     config: Config,
     start: Instant,
     go: AtomicBool,
@@ -208,31 +267,38 @@ struct Shared<W: Work> {
 }
 
 impl<W: Work> Shared<W> {
-    fn lock(&self) -> MutexGuard<'_, State<W>> {
-        self.state.lock().expect("the scheduler's lock: a call into the scheduler panicked")
+    fn lock(&self) -> Locked<'_, W> {
+        let global = GLOBAL.lock().expect("the scheduler's lock: a call into the scheduler panicked");
+        let state = self.state.lock().expect("a driver's lock: a call into the scheduler panicked");
+        Locked { global, state, member: self.member }
     }
 
     fn now(&self) -> u64 {
         u64::try_from(self.start.elapsed().as_nanos()).unwrap_or(u64::MAX)
     }
 
-    /// Does what the scheduler decided; the `Run` for `me`, if any, is returned.
-    fn dispatch(&self, st: &mut State<W>, me: Option<u32>) -> Option<JobId> {
+    /// Does what the scheduler decided, for every driver whose placement it changed; the
+    /// `Run` of this driver's core `me`, if any, is returned (a local job id).
+    fn dispatch(&self, st: &mut Locked<'_, W>, me: Option<u32>) -> Option<u32> {
         let mut mine = None;
-        let State { sched, pending, .. } = st;
-        for decision in sched.take_decisions() {
-            match decision {
-                super::Decision::Run { core, job } => {
-                    if Some(core.0) == me {
-                        mine = Some(job);
-                    } else {
-                        pending[core.0 as usize] = job.0;
-                        self.cores[core.0 as usize].wake();
+        let Global { world, io, dirty } = &mut *st.global;
+        world.take_dirty(dirty);
+        for &member in dirty.iter() {
+            let Some(Some(io)) = io.get_mut(member as usize) else { continue };
+            for decision in world.take_decisions(member) {
+                match decision {
+                    super::Decision::Run { core, job } => {
+                        if member == self.member && Some(core.0) == me {
+                            mine = Some(job.0);
+                        } else {
+                            io.pending[core.0 as usize] = job.0;
+                            io.cores[core.0 as usize].wake();
+                        }
                     }
-                }
-                super::Decision::Wake { core, .. } => self.cores[core.0 as usize].wake(),
-                super::Decision::Yield { core, .. } => {
-                    self.cores[core.0 as usize].moving.store(true, Ordering::Relaxed);
+                    super::Decision::Wake { core, .. } => io.cores[core.0 as usize].wake(),
+                    super::Decision::Yield { core, .. } => {
+                        io.cores[core.0 as usize].moving.store(true, Ordering::Relaxed);
+                    }
                 }
             }
         }
@@ -251,21 +317,22 @@ impl<W: Work> Shared<W> {
         }
     }
 
-    fn spawn_locked(&self, st: &mut State<W>, job: W::Job, how: Spawn) -> Handle {
-        let id = match st.free.pop() {
-            Some(id) => id,
+    fn spawn_locked(&self, st: &mut Locked<'_, W>, job: W::Job, how: Spawn) -> Handle {
+        let local = match st.free.pop() {
+            Some(local) => local,
             None => {
                 st.slots.push(Slot::Free);
-                st.generation.push(0);
                 (st.slots.len() - 1) as u32
             }
         };
-        st.slots[id as usize] = Slot::Fresh(job);
+        st.slots[local as usize] = Slot::Fresh(job);
         st.live += 1;
-        st.sched.spawn(JobId(id), how);
-        let generation = st.generation[id as usize];
+        let world = st.world();
+        let global = world.alloc();
+        world.spawn(self.member, local, global, how);
+        let generation = world.generation(global);
         let _ = self.dispatch(st, None);
-        Handle { job: JobId(id), generation }
+        Handle { job: global, generation }
     }
 }
 
@@ -334,11 +401,11 @@ impl<W: Work> Cx<'_, W> {
 
     /// A counter for a parallel map's jobs ([`Spawn::counted`]).
     pub fn counter(&self) -> CounterId {
-        self.shared.lock().sched.counter()
+        self.shared.lock().world().counter()
     }
 
     pub fn drop_counter(&self, counter: CounterId) {
-        self.shared.lock().sched.drop_counter(counter);
+        self.shared.lock().world().drop_counter(counter);
     }
 
     /// Runs every job of `jobs` as a child counted towards one counter, and waits for them all
@@ -359,20 +426,20 @@ impl<W: Work> Cx<'_, W> {
 
     /// This job makes `key`: `false` when another flight has it already (wait for it).
     pub fn claim(&self, key: Key) -> bool {
-        self.shared.lock().sched.claim(key, Some(self.job))
+        self.shared.lock().world().claim(key, Some(self.job))
     }
 
     /// This job's flight of `key` ended: its waiters wake on this core.
     pub fn key_done(&self, key: Key) {
         let mut st = self.shared.lock();
-        st.sched.key_done(key);
+        st.world().key_done(key);
         let _ = self.shared.dispatch(&mut st, None);
     }
 
     /// Whether this job is on the critical path, by the profiler.
     pub fn set_critical(&self, critical: bool) {
         let mut st = self.shared.lock();
-        st.sched.set_critical(self.job, critical);
+        st.world().set_critical(self.job, critical);
         let _ = self.shared.dispatch(&mut st, None);
     }
 
@@ -648,7 +715,7 @@ fn put_carried(taken: &Taken) {
 pub struct Switch {
     pub event: SwitchEvent,
     pub job: JobId,
-    /// The job's slot's generation: with `job`, one job of the driver's life ([`Handle`]).
+    /// The job's generation: with `job`, one job of the process's life ([`Handle`]).
     pub generation: u32,
     pub fiber: u32,
     pub core: CoreId,
@@ -676,9 +743,9 @@ pub fn observe(observer: fn(Switch)) -> Result<(), fn(Switch)> {
 }
 
 #[inline]
-fn switched<W: Work>(st: &State<W>, event: SwitchEvent, job: JobId, fiber: u32, me: u32) {
+fn switched(world: &World, event: SwitchEvent, job: JobId, fiber: u32, me: u32) {
     if let Some(observer) = OBSERVER.get() {
-        let generation = st.generation[job.0 as usize];
+        let generation = world.generation(job);
         observer(Switch { event, job, generation, fiber, core: CoreId(me) });
     }
 }
@@ -730,21 +797,25 @@ impl<W: Work> Driver<W> {
     ) -> Result<Driver<W>, DriverError> {
         carry_stack_limit();
         let n = cores.len();
-        let slots = (0..n)
+        let slots: Arc<[CoreSlot]> = (0..n)
             .map(|_| CoreSlot { moving: AtomicBool::new(false), woken: AtomicBool::new(false), thread: OnceLock::new() })
             .collect(); // alloc: setup, once per driver
         let mut pending = Vec::with_capacity(n);
         pending.resize(n, NONE);
         let jobs = config.fibers.max(64);
+        let member = {
+            let mut global = GLOBAL.lock().expect("the scheduler's lock: a call into the scheduler panicked");
+            let member = global.world.join(cores, jobs);
+            assert_eq!(member as usize, global.io.len(), "the world's members and their wakers");
+            global.io.push(Some(Io { cores: Arc::clone(&slots), pending }));
+            member
+        };
         let state = State {
-            sched: Sched::new(cores, jobs),
             slots: Vec::with_capacity(jobs),
-            generation: Vec::with_capacity(jobs),
             free: Vec::with_capacity(jobs),
             live: 0,
             idle: Vec::with_capacity(config.fibers),
             spare_taken: Vec::with_capacity(config.fibers),
-            pending,
             closing: false,
             joiner: None,
             panic: None,
@@ -753,6 +824,7 @@ impl<W: Work> Driver<W> {
         // alloc: the driver's shared state, once per driver
         let shared = Arc::new(Shared {
             work,
+            member,
             state: Mutex::new(state),
             cores: slots,
             config,
@@ -762,7 +834,15 @@ impl<W: Work> Driver<W> {
         });
         let mut fibers = Vec::with_capacity(config.fibers);
         for _ in 0..config.fibers {
-            fibers.push(new_fiber(&shared)?);
+            match new_fiber(&shared) {
+                Ok(fiber) => fibers.push(fiber),
+                Err(error) => {
+                    let mut st = shared.lock();
+                    st.world().leave(member);
+                    st.global.io[member as usize] = None;
+                    return Err(error);
+                }
+            }
         }
         shared.lock().idle = fibers;
         let setup = Arc::new(setup); // alloc: once per driver
@@ -843,13 +923,13 @@ impl<W: Work> Driver<W> {
 
     /// A flight of the driver's (IO, a child process): `false` when the key has one already.
     pub fn claim(&self, key: Key) -> bool {
-        self.shared.lock().sched.claim(key, None)
+        self.shared.lock().world().claim(key, None)
     }
 
     /// The driver's flight of `key` ended: its waiters wake, each on the core it last ran on.
     pub fn key_done(&self, key: Key) {
         let mut st = self.shared.lock();
-        st.sched.key_done(key);
+        st.world().key_done(key);
         let _ = self.shared.dispatch(&mut st, None);
     }
 
@@ -909,7 +989,10 @@ impl<W: Work> Driver<W> {
                 mem::forget(fiber);
             }
         }
-        (st.sched.stats(), st.failed.take(), st.panic.take())
+        let member = self.shared.member;
+        let stats = st.world().leave(member).map(|place| place.stats()).unwrap_or_default();
+        st.global.io[member as usize] = None;
+        (stats, st.failed.take(), st.panic.take())
     }
 }
 
@@ -923,8 +1006,9 @@ fn worker<W: Work>(shared: &Arc<Shared<W>>, me: u32) {
     }
     let slot = &shared.cores[me as usize];
     FLAG.set(ptr::from_ref(&slot.moving));
+    let member = shared.member;
     let mut st = shared.lock();
-    st.sched.core_idle(CoreId(me));
+    st.world().core_idle(member, CoreId(me));
     let mut next = shared.dispatch(&mut st, Some(me));
     loop {
         if shared.stop.load(Ordering::Acquire) {
@@ -932,10 +1016,7 @@ fn worker<W: Work>(shared: &Arc<Shared<W>>, me: u32) {
         }
         let job = match next.take() {
             Some(job) => Some(job),
-            None => {
-                let pending = mem::replace(&mut st.pending[me as usize], NONE);
-                (pending != NONE).then_some(JobId(pending))
-            }
+            None => st.take_pending(me),
         };
         if let Some(job) = job {
             let (back, then) = run(shared, st, me, job);
@@ -943,15 +1024,15 @@ fn worker<W: Work>(shared: &Arc<Shared<W>>, me: u32) {
             next = then;
             continue;
         }
-        let deadline = st.sched.next_deadline();
+        let deadline = st.world().next_deadline(member);
         drop(st);
         idle(shared, slot, deadline);
         st = shared.lock();
         if deadline.is_some() {
-            st.sched.advance_clock(shared.now());
+            st.world().advance_clock(member, shared.now());
         }
-        if st.sched.running(CoreId(me)).is_none() {
-            st.sched.core_idle(CoreId(me));
+        if st.world().place(member).running(CoreId(me)).is_none() {
+            st.world().core_idle(member, CoreId(me));
         }
         next = shared.dispatch(&mut st, Some(me));
     }
@@ -992,15 +1073,17 @@ fn park_carried<W: Work>(st: &mut State<W>) -> Box<Taken> {
     taken
 }
 
-/// Runs (or resumes) `job` on core `me` until it waits, moves or ends; returns the lock and the
-/// core's next `Run`.
+/// Runs (or resumes) the job of local id `local` on core `me` until it waits, moves or ends;
+/// returns the lock and the core's next `Run`.
 fn run<'a, W: Work>(
     shared: &'a Arc<Shared<W>>,
-    mut st: MutexGuard<'a, State<W>>,
+    mut st: Locked<'a, W>,
     me: u32,
-    job: JobId,
-) -> (MutexGuard<'a, State<W>>, Option<JobId>) {
-    let j = job.0 as usize;
+    local: u32,
+) -> (Locked<'a, W>, Option<u32>) {
+    let member = shared.member;
+    let j = local as usize;
+    let job = st.world().place(member).global(local);
     let (mut fiber, mut input) = match mem::replace(&mut st.slots[j], Slot::Running) {
         Slot::Fresh(payload) => {
             let fiber = match st.idle.pop() {
@@ -1014,13 +1097,13 @@ fn run<'a, W: Work>(
                     }
                 },
             };
-            switched(&st, SwitchEvent::Started, job, fiber.1, me);
+            switched(&st.global.world, SwitchEvent::Started, job, fiber.1, me);
             (fiber, In::Start(job, payload))
         }
         Slot::Parked(fiber, taken) => {
             put_carried(&taken);
             st.spare_taken.push(taken);
-            switched(&st, SwitchEvent::Resumed, job, fiber.1, me);
+            switched(&st.global.world, SwitchEvent::Resumed, job, fiber.1, me);
             (fiber, In::Go(Answer::Ready))
         }
         Slot::Running => panic!("job {} run on core {me} while it runs", job.0),
@@ -1040,17 +1123,17 @@ fn run<'a, W: Work>(
                 let on = match want {
                     Want::On(on) => Some(on),
                     Want::Job(handle) => {
-                        (st.generation[handle.job.0 as usize] == handle.generation).then_some(Wait::Job(handle.job))
+                        (st.world().generation(handle.job) == handle.generation).then_some(Wait::Job(handle.job))
                     }
                 };
                 if let Some(Wait::Until(_)) = on {
-                    st.sched.advance_clock(shared.now());
+                    st.world().advance_clock(member, shared.now());
                 }
-                match on.map(|on| st.sched.suspended(job, on)) {
+                match on.map(|on| st.world().suspended(member, job, on)) {
                     None | Some(Ok(Suspend::Ready)) => In::Go(Answer::Ready),
                     Some(Err(cycle)) => In::Go(Answer::Cycle(cycle)),
                     Some(Ok(Suspend::Waiting)) => {
-                        switched(&st, SwitchEvent::Parked(on), job, fiber.1, me);
+                        switched(&st.global.world, SwitchEvent::Parked(on), job, fiber.1, me);
                         let taken = park_carried(&mut st);
                         st.slots[j] = Slot::Parked(fiber, taken);
                         let next = shared.dispatch(&mut st, Some(me));
@@ -1058,10 +1141,10 @@ fn run<'a, W: Work>(
                     }
                 }
             }
-            Out::Move => match st.sched.yielded(job) {
+            Out::Move => match st.world().yielded(member, job) {
                 Yielded::Stay => In::Go(Answer::Ready),
                 Yielded::Moved => {
-                    switched(&st, SwitchEvent::Parked(None), job, fiber.1, me);
+                    switched(&st.global.world, SwitchEvent::Parked(None), job, fiber.1, me);
                     let taken = park_carried(&mut st);
                     st.slots[j] = Slot::Parked(fiber, taken);
                     let next = shared.dispatch(&mut st, Some(me));
@@ -1069,11 +1152,10 @@ fn run<'a, W: Work>(
                 }
             },
             Out::Done(panicked) => {
-                switched(&st, SwitchEvent::Ended, job, fiber.1, me);
-                st.sched.done(job);
+                switched(&st.global.world, SwitchEvent::Ended, job, fiber.1, me);
+                st.world().done(member, job);
                 st.slots[j] = Slot::Free;
-                st.generation[j] = st.generation[j].wrapping_add(1);
-                st.free.push(job.0);
+                st.free.push(local);
                 st.live -= 1;
                 st.idle.push(fiber);
                 if let Some(panicked) = panicked {

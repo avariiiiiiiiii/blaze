@@ -1644,6 +1644,137 @@ mod tests {
         assert_eq!(copied(moved_id), None, "two threads' counts don't subtract");
     }
 
+    /// What [`Carry`]'s jobs saw: their span ids and the threads they ran on.
+    #[derive(Default)]
+    struct CarrySeen {
+        outer: u64,
+        inner: u64,
+        after: u64,
+        other: u64,
+        left: u32,
+        reached: u32,
+        other_on: u32,
+    }
+
+    /// A job inside two spans, on the slow core, that moves to the fast core at a query miss
+    /// once the fast core frees, opens a span there, then waits for a job on the core it left.
+    struct Carry {
+        started: AtomicBool,
+        seen: Mutex<CarrySeen>,
+    }
+
+    enum CarryJob {
+        Block,
+        Moving,
+        Other,
+    }
+
+    /// Read in a function of its own: a thread-local read must not span a wait in one function.
+    #[inline(never)]
+    fn tid() -> u32 {
+        crate::sampler::os_tid() as u32
+    }
+
+    fn id(span: &tracing::Span) -> u64 {
+        span.id().unwrap().into_u64()
+    }
+
+    impl blaze_graph::sched::fiber::Work for &'static Carry {
+        type Job = CarryJob;
+
+        fn run(&self, cx: &blaze_graph::sched::fiber::Cx<'_, Self>, job: CarryJob) {
+            use blaze_graph::sched::{Affinity, CoreId, Spawn};
+            match job {
+                CarryJob::Block => {
+                    let deadline = std::time::Instant::now() + Duration::from_secs(60);
+                    while !self.started.load(Ordering::Acquire) {
+                        assert!(std::time::Instant::now() < deadline, "the moving job did not start");
+                        std::hint::spin_loop();
+                    }
+                }
+                CarryJob::Moving => {
+                    let _build = building(41);
+                    let outer = tracing::info_span!(target: "blaze", "carry outer").entered();
+                    let inner = tracing::info_span!(target: "blaze", "carry inner").entered();
+                    let left = tid();
+                    self.started.store(true, Ordering::Release);
+                    let deadline = std::time::Instant::now() + Duration::from_secs(60);
+                    while tid() == left {
+                        assert!(std::time::Instant::now() < deadline, "the job never moved to the fast core");
+                        cx.miss();
+                    }
+                    let reached = tid();
+                    let after = tracing::info_span!(target: "blaze", "carry after");
+                    let after_id = id(&after);
+                    drop(after);
+                    let other = cx.spawn(CarryJob::Other, Spawn::root().hint(Affinity::Core(CoreId(1))));
+                    cx.wait_job(other).expect("waiting for a child is no cycle");
+                    let mut seen = lock(&self.seen);
+                    (seen.outer, seen.inner, seen.after) = (id(&outer), id(&inner), after_id);
+                    (seen.left, seen.reached) = (left, reached);
+                    drop(seen);
+                    drop(inner);
+                    drop(outer);
+                }
+                CarryJob::Other => {
+                    let other = tracing::info_span!(target: "blaze", "carry other");
+                    let mut seen = lock(&self.seen);
+                    (seen.other, seen.other_on) = (id(&other), tid());
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_span_opened_before_a_wait_closes_after_its_job_resumes_on_another_worker() {
+        use blaze_graph::sched::{Affinity, CoreId, Cores, Spawn, fiber};
+        crate::install();
+        static CARRY: OnceLock<Carry> = OnceLock::new();
+        let work = CARRY.get_or_init(|| Carry { started: AtomicBool::new(false), seen: Mutex::new(CarrySeen::default()) });
+        let cores = Cores::classes(&[(1024, 1), (512, 1)]).unwrap();
+        let config = fiber::Config { fibers: 4, stack: 256 << 10, spin: 64 };
+        let driver = fiber::Driver::start(cores, work, config, |_| Ok(())).expect("the driver starts");
+        driver.spawn(CarryJob::Block, Spawn::root().hint(Affinity::Core(CoreId(0))));
+        driver.spawn(CarryJob::Moving, Spawn::root().critical(true));
+        driver.join().unwrap();
+        let seen = lock(&work.seen);
+        assert_ne!(seen.left, seen.reached, "the job resumed on another worker");
+
+        let mut read = Read::default();
+        window(Duration::from_secs(60), &mut read);
+        let span = |id: u64| *read.spans.iter().find(|it| it.span_id == id).expect("the span is a row");
+        let (outer, inner, after, other) = (span(seen.outer), span(seen.inner), span(seen.after), span(seen.other));
+        assert_eq!((inner.parent, inner.depth), (seen.outer, 1));
+        assert_eq!((after.parent, after.depth), (seen.inner, 2), "a span made after the move nests under the job's");
+        assert_eq!(after.thread, seen.reached);
+        assert_eq!((outer.thread, inner.thread), (seen.left, seen.left), "a span's thread is the one it began on");
+        assert!(inner.start_ns + inner.dur_ns >= after.start_ns + after.dur_ns, "the inner span closed after the move");
+        assert_eq!((outer.build, inner.build, after.build), (41, 41, 41), "the job's build moved with it");
+        assert_eq!(other.thread, seen.left, "the other job ran on the thread the moving one left");
+        assert_eq!((other.parent, other.depth), (0, 0), "the other thread's next span is not inside the moved job's");
+        assert_eq!(other.build, 0, "nor of its build");
+
+        let job = read
+            .switches
+            .iter()
+            .find(|it| it.build == 41 && it.waited == Some((WaitedOn::Moved, 0)))
+            .expect("the move is a parked switch of the job's build")
+            .job;
+        let mut moving: Vec<&SwitchRow> = read.switches.iter().filter(|it| it.job == job).collect();
+        moving.sort_by_key(|it| it.t_ns);
+        assert_eq!(moving.first().map(|it| it.event), Some(Switched::Started));
+        assert_eq!(moving.last().map(|it| it.event), Some(Switched::Ended));
+        let moved = moving.iter().position(|it| it.waited == Some((WaitedOn::Moved, 0))).unwrap();
+        let (parked, resumed) = (moving[moved], moving[moved + 1]);
+        assert_eq!((parked.thread, resumed.thread), (seen.left, seen.reached), "{parked:?} then {resumed:?}");
+        assert_eq!(resumed.event, Switched::Resumed);
+        assert_eq!((parked.job, parked.fiber), (resumed.job, resumed.fiber), "one job, one fiber");
+        assert!(
+            moving.iter().any(|it| it.event == Switched::Parked && matches!(it.waited, Some((WaitedOn::Job, _)))),
+            "the wait for the child is a parked switch too"
+        );
+    }
+
     #[test]
     fn a_fiber_stack_row_reads_as_four_counters_of_its_fiber_and_job() {
         crate::install();

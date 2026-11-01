@@ -20,7 +20,7 @@ use blaze_core::{
     Address, Completion, Conn, Effect, FileName, Tag,
     sim::{Faults, Rng, Sim},
 };
-use blaze_ids::ContentId;
+use blaze_ids::{ContentId, Hasher};
 use blaze_query::{Cancelled, Cx, Database, DbError, Query, QueryKey, QueryKind};
 use blaze_units::{
     query::{
@@ -42,6 +42,8 @@ use super::{
 
 const SOCKET: &str = "run/blaze/v2.sock";
 const STATE: &str = "cache/blaze/v2";
+/// [`Options::std`]: the machine's, outside every state directory.
+const STD: &str = "cache/blaze/std/0b";
 const FINISHED: &str = "`dev` profile [unoptimized + debuginfo]";
 const LIBRARY: &str = "/rustc/0123abcd/library";
 const DEP: &str = "/home/u/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/dep-1.0.0";
@@ -81,6 +83,15 @@ thread_local! {
     static OUTPUT: Cell<bool> = const { Cell::new(false) };
     /// Whether the program's compile warns twice, as its unit.
     static WARNS: Cell<bool> = const { Cell::new(false) };
+    /// Whether the first unit's compile shares [`SHARED`] in the standard library's shared
+    /// store, as a std unit made here does.
+    static SHARES: Cell<bool> = const { Cell::new(false) };
+}
+
+const SHARED: &[u8] = b"a std unit's record\n";
+
+fn shared_key() -> blaze_cas::Key {
+    blaze_cas::Key(ContentId::of("blaze serve tests shared", SHARED))
 }
 
 const APP: &[u8] = b"\x7fELF the program\n";
@@ -579,7 +590,11 @@ impl Front<Fake> for FakeFront {
             true => vec![warning_of_app("unused variable: `x`"), warning_of_app("unused import: `y`")],
             false => Vec::new(),
         };
-        Ok(Some(Compiled { diagnostics, ok: true, puts, outputs, artifact: None, macros: None, links: Vec::new() }))
+        let share = match unit == 0 && SHARES.get() {
+            true => vec![Put { key: shared_key(), kind: blaze_cas::Kind::Query, bytes: SHARED.to_vec() }],
+            false => Vec::new(),
+        };
+        Ok(Some(Compiled { diagnostics, ok: true, puts, share, outputs, artifact: None, macros: None, links: Vec::new() }))
     }
 
     fn script(&self, unit: usize, _: u64) -> Result<FakeRuns, ApiError> {
@@ -670,6 +685,8 @@ impl Front<Fake> for FakeFront {
 fn options() -> Options {
     Options {
         state: name(STATE),
+        std: name(STD),
+        writer: Hasher::new("blaze v2 test writer").part(STATE.as_bytes()).finish(),
         socket: name(SOCKET),
         http: None,
         budget: None,
@@ -838,6 +855,40 @@ fn a_build_of_a_checkout_goes_from_the_server_to_built() {
     assert!(built.is_some() && built < worked, "`Built`, then `Work`: {got:#?}");
     assert_eq!(daemon.driver().contents(&name("w/Cargo.lock")), b"# a lock\n");
     assert!(daemon.mounts().has(DEP) && daemon.mounts().has(INDEX) && daemon.mounts().has(LIBRARY));
+}
+
+/// What a daemon of one `BLAZE_HOME` shares of the standard library, a daemon of another finds
+/// once it starts: one shared store under [`Options::std`], each a writer of its own.
+#[test]
+fn what_one_homes_daemon_shares_of_std_another_homes_finds() {
+    SHARES.set(true);
+    let mut sim = Sim::new(23, Faults::default());
+    checkout(&mut sim, "[package]\nname = \"app\"\n");
+    let steps = Arc::new(Fake::default());
+    let mut first = start(sim, &steps, 23);
+    let mut client = dial(&mut first);
+    let id = client.send(&mut first, Request::Build { view: ViewRef::Head("/w".into()), targets: agent() });
+    let got = client.wait(&mut first, id);
+    SHARES.set(false);
+    assert_eq!(got.last(), Some(&Response::Done { ok: true }), "{got:#?}");
+    assert_eq!(first.std_store().get(&shared_key()).unwrap().map(|it| it.bytes.to_vec()), Some(SHARED.to_vec()));
+    first.stop();
+    let mut turns = 0;
+    while first.turn() {
+        turns += 1;
+        assert!(turns < TURNS, "the daemon never stopped");
+    }
+
+    let other = Options {
+        state: name("cache/blaze/v2-other"),
+        socket: name("run/blaze/other.sock"),
+        writer: Hasher::new("blaze v2 test writer").part(b"cache/blaze/v2-other").finish(),
+        ..options()
+    };
+    let second = Daemon::start(first.into_driver(), other, steps.clone(), Runner::Inline(Inline::new(24)))
+        .unwrap_or_else(|why| panic!("{why}"));
+    assert_eq!(second.std_store().get(&shared_key()).unwrap().map(|it| it.bytes.to_vec()), Some(SHARED.to_vec()));
+    assert!(second.store().get(&shared_key()).unwrap().is_none(), "the home's own store has none of it");
 }
 
 /// Each unit's compile is a node a phase: its names first, its check and its codegen once those

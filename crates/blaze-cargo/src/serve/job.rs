@@ -138,6 +138,8 @@ pub struct World<'a, S: Steps> {
     pub vfs: &'a mut Vfs,
     pub db: &'a Arc<Database>,
     pub store: &'a mut Store,
+    /// The standard library's store, shared by this build's daemons ([`super::Options::std`]).
+    pub std: &'a mut Store,
     pub plane: &'a mut Tasks<S>,
     pub mounts: &'a mut Mounts,
     pub heads: &'a Heads,
@@ -833,6 +835,13 @@ struct Job<S: Steps> {
     /// Build scripts' runs the plane started whose programs are not yet all placed: each
     /// starts once its compile's outputs have nothing in flight ([`Jobs::run_script`]).
     held: Vec<NodeId>,
+    /// The look of the shared std store ([`blaze_cas::Store::look_again`]) its units wait
+    /// for: what another daemon put before the job began is found, never compiled again.
+    look: u64,
+    /// The build waiting for that look: the units a build ahead picked, or none for all.
+    awaiting: Option<Option<Vec<u32>>>,
+    /// It put into the shared std store: flushed once it ends, for the other daemons.
+    shared: bool,
     /// Its runs of user code that have not ended.
     runs: u32,
     over: Option<(bool, Option<ApiError>)>,
@@ -1157,6 +1166,9 @@ impl<S: Steps> Jobs<S> {
             placing: 0,
             busy: FxHashMap::default(),
             held: Vec::new(), // alloc: none until a run waits for its program
+            look: 0,
+            awaiting: None,
+            shared: false,
             runs: 0,
             over: None,
             stats: RequestStats::default(),
@@ -1745,6 +1757,7 @@ impl<S: Steps> Jobs<S> {
             config: prep.config,
             units,
             store: w.store.reader(),
+            std: w.std.reader(),
             color: cargo.map_or(self.setup.color, |it| it.color),
             short,
             width: cargo.and_then(|it| it.width),
@@ -1753,6 +1766,8 @@ impl<S: Steps> Jobs<S> {
             goal: goal_of(&job.work),
             cancelled: job.cancelled.clone(), // clone: a refcount, once per view
         };
+        // Asked as the view is lowered, so it is in by the time the units are built.
+        job.look = w.std.look_again(w.effects);
         if matches!(job.work, Work::Trace(_) | Work::Verify(_)) {
             job.ready.push(Ready { input, root: prep.root, front: None, writer: None });
             self.next(w, id);
@@ -1765,6 +1780,20 @@ impl<S: Steps> Jobs<S> {
         let fresh = lone(w.plane, NodeKind::Names, &name, Pool::Work, None, kinds::LOWER);
         job.stage = Stage::Lower(fresh.first(), input, prep.root);
         self.add(w, id, fresh, Some(work), false);
+    }
+
+    /// The shared std store has looked again: each build that waited for the look begins.
+    pub fn looked(&mut self, w: &mut World<'_, S>) {
+        let looked = w.std.looked();
+        let jobs = &self.jobs;
+        let waited = |id: &&JobId| jobs.get(key_of(**id)).is_some_and(|it| it.awaiting.is_some() && it.look <= looked);
+        // alloc: the jobs a look lets build, a few, once per look
+        let ready: Vec<JobId> = self.order.iter().filter(waited).copied().collect();
+        for id in ready {
+            let Some(picked) = self.jobs.get_mut(key_of(id)).and_then(|it| it.awaiting.take()) else { continue };
+            self.build(w, id, picked.as_deref());
+        }
+        self.wind_up(w);
     }
 
     /// The next view to make ready, or the work once all are.
@@ -1803,6 +1832,10 @@ impl<S: Steps> Jobs<S> {
     /// and every unit they depend on.
     fn build(&mut self, w: &mut World<'_, S>, id: JobId, picked: Option<&[u32]>) {
         let Some(job) = self.jobs.get_mut(key_of(id)) else { return };
+        if w.std.looked() < job.look {
+            job.awaiting = Some(picked.map(<[u32]>::to_vec)); // alloc: a build ahead's picks, once
+            return;
+        }
         let ready = job.ready.pop();
         let Some(Ready { input, root, front: Some(front), writer: Some(writer) }) = ready else {
             self.end(w, id, false, Some(ApiError::new("a build's view is not lowered", None)));
@@ -2173,6 +2206,15 @@ impl<S: Steps> Jobs<S> {
                     let error = ApiError::new(format!("the store holds other bytes under {key:?}: {mismatch:?}"), None);
                     job.over.get_or_insert((false, Some(error)));
                 }
+            }
+        }
+        job.shared |= !compiled.share.is_empty();
+        for put in compiled.share {
+            let key = put.key;
+            if let Err(mismatch) = w.std.put(put.key, put.kind, put.bytes) {
+                // alloc: an error, once
+                let what = format!("the standard library's shared store holds other bytes under {key:?}: {mismatch:?}");
+                job.over.get_or_insert((false, Some(ApiError::new(what, None))));
             }
         }
         let outputs = match (compiled.artifact, &mut job.stage) {
@@ -2753,6 +2795,10 @@ impl<S: Steps> Jobs<S> {
         }
         for (id, ok, error) in over.drain(..) {
             let Some(job) = self.jobs.remove(key_of(id)) else { continue };
+            // What it shared is committed for the other daemons, which find it at their next look.
+            if job.shared {
+                w.std.flush(w.effects);
+            }
             for queries in job.queries {
                 if job.built != Some(queries) {
                     w.db.close(queries);
@@ -2801,6 +2847,7 @@ impl<S: Steps> Jobs<S> {
         let front = self.front_db();
         w.images.ask(Parts { db: w.db, front, vfs: &mut *w.vfs, predict: w.plane.predict(), effects: &mut *w.effects });
         w.store.flush(w.effects);
+        w.std.flush(w.effects);
         // alloc: once per snapshot
         let heads: Vec<(String, ContentId)> = w.vfs.heads().into_iter().map(|(head, root)| (head.to_owned(), root)).collect();
         let ticket = heads.first().and_then(|(head, root)| w.vfs.set_head(head, *root).ok());

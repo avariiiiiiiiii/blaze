@@ -363,7 +363,9 @@ pub fn tiles_by(spans: &[RecordBatch], range: Range, lane: Lane) -> Result<Recor
     let name = DictionaryArray::<UInt32Type>::try_new(UInt32Array::from(out.name), Arc::new(values))
         .map_err(TilesError::Arrow)?;
     let lanes: ArrayRef = match lane {
+        // alloc: a column of the answer, once a request
         Lane::Thread => Arc::new(UInt32Array::from_iter_values(out.lane.iter().map(|it| *it as u32))),
+        // alloc: a column of the answer, once a request
         Lane::Job => Arc::new(UInt64Array::from(out.lane)),
     };
     let columns: Vec<ArrayRef> = vec![

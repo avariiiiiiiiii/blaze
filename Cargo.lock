@@ -1194,6 +1194,7 @@ dependencies = [
  "arrow-array",
  "arrow-ipc",
  "arrow-schema",
+ "blaze-graph",
  "libc",
  "object 0.40.0",
  "parquet",

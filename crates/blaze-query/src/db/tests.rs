@@ -658,7 +658,7 @@ fn until_it_holds<F: Function<Db = TestDb, Key = Cell, Value = u64>>(
     loop {
         match Cancelled::catch(AssertUnwindSafe(|| *get::<F>(db, cell))) {
             Ok(value) => return value,
-            Err(Cancelled::WouldWaitOnItself) => {}
+            Err(Cancelled::WouldWaitOnItself { .. }) => {}
             Err(other) => panic!("cancelled: {other}"),
         }
     }

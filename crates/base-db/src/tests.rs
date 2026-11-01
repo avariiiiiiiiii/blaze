@@ -912,7 +912,9 @@ fn a_task_that_waited_on_itself_runs_again() {
     pool.install(|| {
         db.run_all(blaze_mem::Tag::Parse, runs.len(), |_: &Db, at: usize| {
             if runs[at].fetch_add(1, Ordering::Relaxed) == 0 && at % 3 == 0 {
-                std::panic::resume_unwind(Box::new(blaze_query::db::Cancelled::WouldWaitOnItself));
+                std::panic::resume_unwind(Box::new(
+                    blaze_query::db::Cancelled::WouldWaitOnItself { asked: None },
+                ));
             }
         });
     });

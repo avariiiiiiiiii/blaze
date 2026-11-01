@@ -300,16 +300,29 @@ fn machine_file(disk: &mut blaze_usercode::inputs::Disk) -> impl FnMut(&std::pat
 /// and every native input it linked is as it was. Read in place: no decode, no allocation.
 pub(crate) fn fresh(job: &Job, unit: usize) -> bool {
     let Ok(Some(key)) = record_key(job, unit) else { return false };
-    let (store, guard) = (&job.input.store, blaze_cas::enter());
-    let Ok(Some(entry)) = store.get(&guard, &key) else { return false };
+    let guard = blaze_cas::enter();
+    found(&job.input.store, &guard, &key).is_some() || (shared(job, unit) && found(&job.input.std, &guard, &key).is_some())
+}
+
+/// Whether `unit` is the standard library's, whose records are also in the shared std store
+/// ([`crate::serve::work::JobInput::std`]).
+fn shared(job: &Job, unit: usize) -> bool {
+    job.unit(unit).is_ok_and(|it| it.is_std)
+}
+
+/// The record of `key` in `store`, every output it names in `store` and every native input
+/// as it was, and where its CBOR body starts.
+fn found<'g>(store: &'g blaze_cas::Reader, guard: &'g blaze_cas::Guard, key: &Key) -> Option<(blaze_cas::Entry<'g>, usize)> {
+    let entry = store.get(guard, key).ok()??;
     let mut disk = blaze_usercode::inputs::Disk::new(Vec::new());
-    header::check(entry.bytes, |key| store.has(&guard, key), &mut machine_file(&mut disk)).is_some()
+    let body = header::check(entry.bytes, |key| store.has(guard, key), &mut machine_file(&mut disk))?;
+    Some((entry, body))
 }
 
 /// What `unit`'s last build made, as its record keeps it: none when the view's units were never
 /// built, or were built from other code.
 pub(crate) fn last_made(job: &Job, unit: usize) -> Option<Made> {
-    kept(job, unit).map(|it| it.made)
+    kept(job, unit).map(|it| it.0.made)
 }
 
 /// Every instance the view's last build compiled or found, with the code hash it was made
@@ -335,14 +348,57 @@ pub(crate) fn codegen_inputs(job: &Job) -> Result<Vec<(ContentId, ContentId)>, F
     Ok(inputs)
 }
 
-/// The record of `unit` the store has, every output and native input of it as it was.
-fn kept(job: &Job, unit: usize) -> Option<Record> {
+/// The record of `unit` the store has, every output and native input of it as it was. A
+/// standard library unit's the store has not is the shared std store's, another daemon's,
+/// with the puts that copy it and every output it names into the store.
+fn kept(job: &Job, unit: usize) -> Option<(Record, Vec<Put>)> {
     let key = record_key(job, unit).ok()??;
-    let (store, guard) = (&job.input.store, blaze_cas::enter());
-    let entry = store.get(&guard, &key).ok()??;
-    let mut disk = blaze_usercode::inputs::Disk::new(Vec::new());
-    let body = header::check(entry.bytes, |key| store.has(&guard, key), &mut machine_file(&mut disk))?;
-    blaze_protocol::cbor::from_slice(&entry.bytes[body..]).ok()
+    let guard = blaze_cas::enter();
+    if let Some((entry, body)) = found(&job.input.store, &guard, &key) {
+        return Some((blaze_protocol::cbor::from_slice(&entry.bytes[body..]).ok()?, Vec::new()));
+    }
+    if !shared(job, unit) {
+        return None;
+    }
+    let std = &job.input.std;
+    let (entry, body) = found(std, &guard, &key)?;
+    let record: Record = blaze_protocol::cbor::from_slice(&entry.bytes[body..]).ok()?;
+    let mut puts = Vec::with_capacity(record.outputs.len() + 1); // alloc: once per std unit found shared
+    for (_, output, _) in &record.outputs {
+        let it = std.get(&guard, output).ok()??;
+        // alloc: a copy of what another daemon made, once per output, for the store to own
+        puts.push(Put { key: *output, kind: it.kind, bytes: it.bytes.to_vec() });
+    }
+    // alloc: the record's copy, once per std unit found shared
+    puts.push(Put { key, kind: entry.kind, bytes: entry.bytes.to_vec() });
+    Some((record, puts))
+}
+
+/// What std unit `unit` made, for the shared std store: its record `record` and every output
+/// it names, from `compiled`'s puts or the store.
+fn share(job: &Job, unit: usize, compiled: &Compiled, record: &Put) -> Result<Vec<Put>, ApiError> {
+    let guard = blaze_cas::enter();
+    let mut share = Vec::with_capacity(compiled.outputs.len() + 1); // alloc: once per std unit made
+    for output in &compiled.outputs {
+        let put = match compiled.puts.iter().find(|it| it.key == output.key) {
+            // alloc: a copy for the shared store, once per output of a std unit made
+            Some(put) => Put { key: put.key, kind: put.kind, bytes: put.bytes.clone() },
+            None => match job.input.store.get(&guard, &output.key) {
+                // alloc: a copy for the shared store, once per output of a std unit made
+                Ok(Some(it)) => Put { key: output.key, kind: it.kind, bytes: it.bytes.to_vec() },
+                Ok(None) => {
+                    // alloc: an error, once
+                    let what = format!("unit {unit}'s output {} is neither made now nor in the store", output.path);
+                    return Err(ApiError::new(what, None));
+                }
+                Err(corrupt) => return Err(ApiError::new(format!("unit {unit}'s output {}: {corrupt}", output.path), None)),
+            },
+        };
+        share.push(put);
+    }
+    // alloc: the record's copy, once per std unit made
+    share.push(Put { key: record.key, kind: record.kind, bytes: record.bytes.clone() });
+    Ok(share)
 }
 
 /// What a unit's phases made so far, for the phases after them ([`Phase`]), under the unit's
@@ -439,11 +495,12 @@ fn lock(slot: &Mutex<Phases>) -> MutexGuard<'_, Phases> {
 /// lint flags, its crate's def map, what it does, and its check: served from the store, none
 /// (what a program reaches of the crate is type-checked by its walk), or of every body.
 fn names(job: &Job, reader: &UnitReader, unit: usize, slot: &Mutex<Phases>) -> Result<(), Failed> {
-    if let Some(record) = kept(job, unit) {
+    if let Some((record, puts)) = kept(job, unit) {
         let compiled = Compiled {
             diagnostics: record.diagnostics,
             ok: record.ok,
-            puts: Vec::new(),
+            puts,
+            share: Vec::new(),
             outputs: record
                 .outputs
                 .into_iter()
@@ -632,7 +689,7 @@ fn store(job: &Job, reader: &UnitReader, unit: usize, phases: &mut Phases) -> Re
             *context = with_natives(*context, &natives);
         }
     }
-    let mut compiled = Compiled { diagnostics, ok, puts, outputs, artifact, macros, links };
+    let mut compiled = Compiled { diagnostics, ok, puts, share: Vec::new(), outputs, artifact, macros, links };
     if let Some(key) = key && !script::pure::built_nothing(job, unit) {
         let record = RecordRef {
             ok: compiled.ok,
@@ -646,7 +703,11 @@ fn store(job: &Job, reader: &UnitReader, unit: usize, phases: &mut Phases) -> Re
         header::write(&mut bytes, &keys, &natives);
         blaze_protocol::cbor::append(&mut bytes, &record)
             .map_err(|why| ApiError::new(format!("encoding the record of unit {unit}: {why}"), None))?;
-        compiled.puts.push(Put { key, kind: Kind::Query, bytes });
+        let record = Put { key, kind: Kind::Query, bytes };
+        if shared(job, unit) {
+            compiled.share = share(job, unit, &compiled, &record)?;
+        }
+        compiled.puts.push(record);
     }
     if let Some(slot) = job.made.get(unit) {
         let _ = slot.set(made);

@@ -68,6 +68,9 @@ const JOBS_END: u64 = 7 << 32;
 /// The watches of directories outside views ([`blaze_vfs::Outside`]).
 const OUTSIDE: u64 = 7 << 32;
 const OUTSIDE_END: u64 = OUTSIDE + blaze_vfs::outside::TAGS;
+/// The shared standard library's store ([`Options::std`]).
+const STD_STORE: u64 = 8 << 32;
+const STD_STORE_END: u64 = 9 << 32;
 const WATCHERS: u64 = 1 << 40;
 const RUNS: u64 = 1 << 50;
 const RUNS_END: u64 = 1 << 62;
@@ -114,6 +117,7 @@ macro_rules! world {
             vfs: &mut $daemon.vfs,
             db: &$daemon.db,
             store: &mut $daemon.store,
+            std: &mut $daemon.std,
             plane: &mut $daemon.plane,
             mounts: &mut $daemon.mounts,
             heads: &$daemon.heads,
@@ -129,6 +133,13 @@ macro_rules! world {
 pub struct Options {
     /// Its state directory ([`super::state`]), under the driver's root.
     pub state: FileName,
+    /// The directory this blaze build's daemons share the standard library in, whatever
+    /// their `BLAZE_HOME` (`<machine>/std/<build id>`, [`super::machine`] and
+    /// [`super::build_id`]), under the driver's root: each std key's outputs in a directory of
+    /// its own, their records and outputs in the shared store `store` beside them.
+    pub std: FileName,
+    /// The daemon as a writer of that store: one per state directory.
+    pub writer: ContentId,
     pub socket: FileName,
     /// Where HTTP is listened on, and the bearer token its clients send.
     pub http: Option<(SocketAddr, String)>,
@@ -179,6 +190,9 @@ pub struct Daemon<D: Driver, S: Steps> {
     db: Arc<Database>,
     /// Only the loop writes it; workers read it through [`Store::reader`], with no lock.
     store: Store,
+    /// The standard library's records and outputs, shared with every daemon of this build
+    /// ([`Options::std`]); written and read as `store` is.
+    std: Store,
     plane: Plane<Step<S>, History>,
     mounts: Mounts,
     heads: Heads,
@@ -409,12 +423,14 @@ pub enum Failed {
     /// A build stopped moving ([`blaze_profile::Stall`]'s words): its workers may be
     /// deadlocked, so the next request starts a fresh daemon.
     Stalled(String),
+    /// A store stopped (a file of it could not be read or written), named.
+    Store(String),
 }
 
 impl fmt::Display for Failed {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Failed::Server(why) | Failed::Stalled(why) => f.write_str(why),
+            Failed::Server(why) | Failed::Stalled(why) | Failed::Store(why) => f.write_str(why),
             Failed::Corrupt(corrupt) => write!(f, "the daemon image: {corrupt}"),
             Failed::Settle(error) => write!(f, "the database could not settle onto its image: {error}"),
             Failed::Image(failed) => write!(f, "{failed}"),
@@ -527,12 +543,15 @@ impl<D: Driver, S: Steps> Daemon<D, S> {
         let mut store = Store::open(store_config, &mut effects);
         store.encode_columns(blaze_format::Spans::columns());
         store.encode_columns(hir_def::item_tree::ItemTree::columns());
+        let shared = blaze_cas::SharedConfig { root: under(&options.std, "store"), writer: options.writer, tags: STD_STORE };
+        let mut std = Store::open_shared(shared, &mut effects);
         let mut read = Read { socket_free: activated, ..Read::default() };
         let mut done = Vec::new();
         let socket = format!("/{}", options.socket);
         loop {
             let read_all = read.journal.is_some() && read.image.is_some() && read.socket_free;
-            if read_all && (store.ready() || store.broken().is_some()) {
+            let opened = |it: &Store| it.ready() || it.broken().is_some();
+            if read_all && opened(&store) && opened(&std) {
                 break;
             }
             driver.submit(&mut effects);
@@ -540,6 +559,10 @@ impl<D: Driver, S: Steps> Daemon<D, S> {
             for completion in done.drain(..) {
                 if store.owns(completion.tag) {
                     store.complete(completion, &mut effects);
+                    continue;
+                }
+                if std.owns(completion.tag) {
+                    std.complete(completion, &mut effects);
                     continue;
                 }
                 let Completion { tag, done } = completion;
@@ -570,6 +593,9 @@ impl<D: Driver, S: Steps> Daemon<D, S> {
         }
         if let Some(broken) = store.broken() {
             return Err(broken.to_string().into());
+        }
+        if let Some(broken) = std.broken() {
+            return Err(format!("the standard library's shared store: {broken}").into());
         }
         let mapping = read.image.flatten();
         let mut started = Started::default();
@@ -654,7 +680,7 @@ impl<D: Driver, S: Steps> Daemon<D, S> {
         let server = Server::new(server_config, &mut effects);
         let jobs = Jobs::new(Setup {
             views: format!("/{state}/views"),
-            std: format!("/{state}/std"),
+            std: format!("/{}", options.std),
             host: options.host,
             env: options.env,
             color: options.color,
@@ -673,6 +699,7 @@ impl<D: Driver, S: Steps> Daemon<D, S> {
             vfs,
             db: Arc::new(db),
             store,
+            std,
             plane,
             mounts,
             heads: Heads::new(COOKIES, WATCHERS, RUNS, Outside::new(options.outside, "/", OUTSIDE)),
@@ -752,6 +779,11 @@ impl<D: Driver, S: Steps> Daemon<D, S> {
         &self.store
     }
 
+    /// The standard library's store, shared with this build's other daemons.
+    pub fn std_store(&self) -> &Store {
+        &self.std
+    }
+
     /// Makes its store the process's ([`blaze_cas::Handle::install`]): the daemon of `blaze
     /// serve` alone, as a process has one store, and a test's daemons are many to a process. Its
     /// root is the driver's, `/`.
@@ -775,6 +807,7 @@ impl<D: Driver, S: Steps> Daemon<D, S> {
         self.heads.stop(&mut self.effects);
         self.ask_image();
         self.store.flush(&mut self.effects);
+        self.std.flush(&mut self.effects);
         self.vfs.flush(&mut self.effects);
     }
 
@@ -916,6 +949,20 @@ impl<D: Driver, S: Steps> Daemon<D, S> {
                 let placed = self.store.placed();
                 let mut said = self.spare.said.pop().unwrap_or_default();
                 self.jobs.placed(&mut world!(self, said), placed);
+                self.said(said);
+            }
+            STD_STORE..STD_STORE_END => {
+                debug_assert!(self.std.owns(completion.tag), "the shared store's tags are its");
+                self.std.complete(completion, &mut self.effects);
+                if let Some(broken) = self.std.broken()
+                    && self.failed.is_none()
+                {
+                    let why = Failed::Store(format!("the standard library's shared store: {broken}"));
+                    self.fail(why);
+                    return;
+                }
+                let mut said = self.spare.said.pop().unwrap_or_default();
+                self.jobs.looked(&mut world!(self, said));
                 self.said(said);
             }
             COOKIES..JOBS | OUTSIDE..OUTSIDE_END | WATCHERS..RUNS => {

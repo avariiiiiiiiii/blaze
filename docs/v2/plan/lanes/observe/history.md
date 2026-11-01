@@ -17,7 +17,7 @@ downloaded at query time).
 next flush's number and the buffers it reuses. `flush(build)` takes what is new in the rings
 since the last flush, and the CPU sampler's new samples (named once a flush, through
 `symbols.rs`), and writes one file a table that has rows (`spans`, `counters`, `builds`,
-`samples`):
+`samples`, `switches`):
 
     <dir>/<build>-<seq>.<table>.parquet
 
@@ -71,14 +71,17 @@ about 3,000 rows a second loses some.
 `crates/blaze-profile/sql/views.sql` is the prelude every query runs after. It defines one view
 for each table (`spans`, `counters`, `builds`, `samples`, `provenance`, `inputs`,
 `alloc_samples`, `heap_by_owner`), each over
-`read_parquet([<globs>], union_by_name = true)`. It also defines two views over `spans` and one
-over `counters`:
+`read_parquet([<globs>], union_by_name = true)`. It also defines these views over them:
 - `queries`: the spans of queries, with `memo` (verified, reran, reran-same-output) and `cause`
   from `provenance`, matched on the build, the query's kind and its key;
 - `passes`: the code generator's steps on one function (spans that name a `function` and are
   not queries), with the span's name as `pass`;
 - `fiber_stacks`: one row per job that ran on a fiber, with its four `fiber stack` counters
-  as columns and `high_water` (`deepest + grown`).
+  as columns and `high_water` (`deepest + grown`);
+- `job_waits`: one row per wait of a job, its `parked` switch and the next `resumed` one, with
+  the threads before and after, `waited_ns` and `moved`;
+- `job_spans`: `spans` with the `job` running on the span's thread when it began (an ASOF join
+  on `switches`), which the explorer's per-job lane draws from.
 
 `views::prelude(&[dir, ...])` fills in each `@<table>` with the list of globs, one per
 directory. That is the history's directory, plus the live window's directory with `--live`.

@@ -54,7 +54,7 @@ mod symbols;
 pub mod views;
 pub mod watchdog;
 
-pub use flight::{Plot, moved, plot};
+pub use flight::{FiberStack, Plot, fiber_stack, moved, plot};
 pub use watchdog::{Stall, Watchdog};
 
 /// The variable that turns profiling on, naming the directory the profile is written to.

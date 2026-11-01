@@ -530,6 +530,32 @@ fn a_carried_thread_local_follows_its_job_across_waits() {
     assert_eq!(work.checked.load(Ordering::Relaxed), 6);
 }
 
+/// A job's `Cx` is `Sync`, but a wait through it from another thread panics there, without
+/// touching the job's fiber; the job itself goes on and waits as usual.
+struct Lent {
+    refused: AtomicBool,
+}
+
+impl Work for &'static Lent {
+    type Job = ();
+
+    fn run(&self, cx: &Cx<'_, Self>, (): ()) {
+        let other = thread::scope(|scope| scope.spawn(|| cx.wait(Wait::Until(cx.now() + 1_000))).join());
+        self.refused.store(other.is_err(), Ordering::Relaxed);
+        cx.wait(Wait::Until(cx.now() + 1_000)).expect("a timed wait closes no cycle");
+    }
+}
+
+#[test]
+fn a_wait_through_a_jobs_cx_from_another_thread_panics() {
+    static WORK: OnceLock<Lent> = OnceLock::new();
+    let work = WORK.get_or_init(|| Lent { refused: AtomicBool::new(false) });
+    let driver = start(Cores::flat(1).unwrap(), work);
+    driver.spawn((), Spawn::root());
+    driver.join().unwrap();
+    assert!(work.refused.load(Ordering::Relaxed), "a wait off the job's fiber went through");
+}
+
 /// Jobs recurse through `stdx::ensure_sufficient_stack` far past their fiber's 256 KiB and
 /// wait at the bottom, inside a grown segment, on two cores: the stack grows instead of
 /// overflowing, and each job finds its own limit after each wait, wherever it resumes.

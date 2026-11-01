@@ -440,6 +440,47 @@ pub fn join<A: Send, B>(a: impl FnOnce() -> A + Send, b: impl FnOnce() -> B) -> 
     }
 }
 
+/// `task(at)` for each `at` in `0..count`, each once, as a job of its own on the pool a loop
+/// called here runs on: the tasks whose run unwound with a payload `gave_way` accepts (a wait
+/// that would close a cycle gave way), in order, for the caller to run again on its own thread,
+/// where it meets the cycle on its own stack. Never again here: another round on the pool
+/// would meet the same cycle, held by this caller (or a task below it) until it returns. The
+/// first other panic is raised once every task has run.
+///
+/// Each task is a job, never a call on this thread in the caller's task, so a task that asks
+/// for a key the caller runs gives way rather than being taken for the caller's own ask.
+pub fn for_each_giving_way(
+    count: usize,
+    task: impl Fn(usize) + Sync,
+    // dyn: a panic's payload, as `catch_unwind` gives it
+    gave_way: impl Fn(&(dyn Any + Send)) -> bool + Sync,
+) -> Vec<usize> {
+    // alloc: the tasks that gave way, few, once per batch
+    let again = Lock::new(Vec::new());
+    // dyn: as above
+    let other: Lock<Option<Box<dyn Any + Send>>> = Lock::new(None);
+    let near = pool::group();
+    let (task, gave_way, again, other) = (&task, &gave_way, &again, &other);
+    pool::scope_here(|scope| {
+        for at in 0..count {
+            scope.submit(near, move || task(at), move |ran| {
+                let Err(panic) = ran else { return };
+                if gave_way(&*panic) {
+                    again.lock().push(at);
+                } else {
+                    other.lock().get_or_insert(panic);
+                }
+            });
+        }
+    });
+    if let Some(panic) = other.lock().take() {
+        resume_unwind(panic);
+    }
+    let mut again = std::mem::take(&mut *again.lock());
+    again.sort_unstable();
+    again
+}
+
 /// Runs `run` over ranges that cover `0..len` once, each with the state its thread's
 /// `init` made (once per thread that claims a range), on the pool a loop called here runs on.
 fn split<St>(len: usize, init: impl Fn() -> St + Sync, run: impl Fn(&mut St, Range<usize>) + Sync) {
@@ -730,6 +771,69 @@ mod tests {
         );
         let asked = rx.recv_timeout(LONG).expect("the job gives way rather than wait on its scope's owner");
         assert_eq!(asked, Err(Cancelled));
+    }
+
+    /// self10's livelock: a task that runs a key gives a batch whose every task asks for that
+    /// key. Each one gives way (a cycle through the batch's caller), and a batch that ran the
+    /// ones that gave way again on the pool would meet the same cycle forever, as the caller
+    /// holds the key until the batch returns. Each runs once and comes back to the caller, in
+    /// order; other tasks run once and are not handed back.
+    #[test]
+    fn a_task_that_gives_way_runs_once_and_comes_back_to_the_caller() {
+        struct GaveWay;
+        let pool = Arc::new(Pool::new(&Topology::flat(2), false).unwrap());
+        let flights = Arc::new(Flights::<()>::new());
+        let (tx, rx) = unbounded::<(Vec<usize>, Vec<usize>)>();
+        let key = Key([9; 32]);
+        pool.submit(
+            None,
+            move || {
+                let runs: Vec<AtomicUsize> = (0..12).map(|_| AtomicUsize::new(0)).collect();
+                let mut again = Vec::new();
+                let ran = flights.get_or_run(key, || {
+                    again = super::for_each_giving_way(
+                        runs.len(),
+                        |at| {
+                            runs[at].fetch_add(1, Ordering::Relaxed);
+                            if at % 3 == 0 && flights.get_or_run(key, || Ok(())).is_err() {
+                                std::panic::resume_unwind(Box::new(GaveWay));
+                            }
+                        },
+                        |panic| panic.is::<GaveWay>(),
+                    );
+                    Ok(())
+                });
+                assert_eq!(ran, Ok(()));
+                (again, runs.iter().map(|it| it.load(Ordering::Relaxed)).collect())
+            },
+            move |it| _ = tx.send(it.unwrap()),
+        );
+        let (again, runs) = rx.recv_timeout(LONG).expect("the batch ends rather than run its give-ways again");
+        assert_eq!(again, [0, 3, 6, 9]);
+        assert_eq!(runs, [1; 12]);
+    }
+
+    /// Any other panic of a task reaches the caller once every task has run.
+    #[test]
+    fn any_other_panic_of_a_batch_reaches_the_caller_after_every_task() {
+        let pool = Pool::new(&Topology::flat(2), false).unwrap();
+        let ran = AtomicUsize::new(0);
+        let caught = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            pool.install(|| {
+                super::for_each_giving_way(
+                    4,
+                    |at| {
+                        ran.fetch_add(1, Ordering::Relaxed);
+                        if at == 2 {
+                            std::panic::resume_unwind(Box::new("task 2 failed"));
+                        }
+                    },
+                    |_| false,
+                )
+            })
+        }));
+        assert_eq!(caught.unwrap_err().downcast_ref::<&str>(), Some(&"task 2 failed"));
+        assert_eq!(ran.load(Ordering::Relaxed), 4);
     }
 
     /// Seeded loops of every shape against the same loops run in order, on pools of one to

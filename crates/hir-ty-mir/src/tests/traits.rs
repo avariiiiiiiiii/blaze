@@ -15,7 +15,7 @@ impl core::future::Future for IntFuture {
     type Output = u64;
 }
 
-fn test() {
+async fn test() {
     let r = IntFuture;
     let v = r.await;
     v;
@@ -31,7 +31,7 @@ fn infer_async() {
 //- minicore: future
 async fn foo() -> u64 { 128 }
 
-fn test() {
+async fn test() {
     let r = foo();
     let v = r.await;
     v;
@@ -213,7 +213,7 @@ impl core::future::Future for IntFuture {
     type Output = u64;
 }
 
-fn test() {
+async fn test() {
     let r = Futurable;
     let v = r.await;
     v;

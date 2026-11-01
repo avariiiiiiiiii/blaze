@@ -606,3 +606,288 @@ fn exempt() {
 "#,
     );
 }
+
+/// `fiber_boundary` over a `blaze_graph` whose `sched` has the fibers, a `corosensei`, and a
+/// crate `main` depending on both. A line of the crate linted says what it expects:
+/// `//~ fiber` that the line names `blaze_graph::sched::fiber` outside `sched`, `//~ corosensei`
+/// that it names `corosensei`, `//~ driver` that it names the fiber driver.
+mod fiber_boundary {
+    use base_db::FileId;
+    use blaze_diagnostics::emit::{Sources, Style};
+    use hir_expand::fixture;
+    use rustc_hash::FxHashMap;
+
+    use crate::{
+        check::{Setup, check},
+        conf::Conf,
+        level::CommandLine,
+    };
+
+    const FLAGS: &str = "-A clippy::all --deny=blaze::fiber_boundary";
+
+    const SCHED: &str = r#"
+pub mod sched {
+    pub mod fiber {
+        pub struct Driver;
+        pub struct Carried;
+        pub fn wait() {}
+    }
+    pub use fiber::Driver;
+    pub fn carry() {}
+}
+"#;
+
+    fn fixture(graph: &str, main: &str) -> String {
+        format!(
+            "//- minicore: sized\n\
+             //- /corosensei/lib.rs crate:corosensei\n\
+             pub struct Coroutine;\n\
+             //- /blaze_graph/lib.rs crate:blaze_graph deps:corosensei\n\
+             {}\n\
+             //- /src/lib.rs crate:main deps:blaze_graph,corosensei\n\
+             {}\n",
+            graph.trim_matches('\n'),
+            main.trim_matches('\n'),
+        )
+    }
+
+    /// The diagnostics of the lints in the crate `linted` of `fixture`, each as rustc writes it.
+    fn lint_crate(fixture: &str, linted: &str) -> String {
+        let db = fixture::db(fixture).into_db();
+        hir::attach_db(&db, || {
+            let krate = hir::Crate::all(&db)
+                .into_iter()
+                .find(|it| it.display_name(&db).is_some_and(|it| it.to_string() == linted))
+                .expect("the fixture has the crate linted");
+            let mut names: FxHashMap<FileId, String> = FxHashMap::default();
+            let mut texts = Vec::new();
+            for krate in hir::Crate::all(&db) {
+                for module in krate.modules(&db) {
+                    let Some(file) = module.definition_source_file_id(&db).file_id() else { continue };
+                    let file = file.file_id(&db);
+                    let root = db.file_source_root(file).source_root_id(&db);
+                    let root = db.source_root(root).source_root(&db);
+                    let Some(path) = root.path_for_file(&file) else { continue };
+                    let name = path.to_string().trim_start_matches('/').to_owned();
+                    if names.insert(file, name.clone()).is_none() {
+                        texts.push((name, db.file_text(file).text(&db).to_string()));
+                    }
+                }
+            }
+            let flags: Vec<String> = FLAGS.split_whitespace().map(str::to_owned).collect();
+            let setup = Setup {
+                command_line: CommandLine::parse(&flags).expect("the flags read"),
+                conf: Conf::default(),
+            };
+            let name_of = |file: FileId| names.get(&file).cloned();
+            let found = check(&db, krate, &setup, &name_of).expect("every file of the crates is named");
+            let mut sources = Sources::of(texts);
+            crate::serve::written(found.iter(), &mut sources, |_| None, Style::default())
+                .into_iter()
+                .map(|it| it.rendered)
+                .collect()
+        })
+    }
+
+    /// What a message of `fiber_boundary` says is named.
+    fn named_in(message: &str) -> Option<&'static str> {
+        let named = message.strip_suffix(" is named outside `blaze_graph::sched`")?;
+        match named {
+            "`blaze_graph::sched::fiber`" => Some("fiber"),
+            "`corosensei`" => Some("corosensei"),
+            _ if named.starts_with("the fiber driver `") => Some("driver"),
+            _ => None,
+        }
+    }
+
+    /// The findings of `out`, as (file, line, what is named).
+    fn found(out: &str) -> Vec<(String, u32, &'static str)> {
+        let mut found = Vec::new();
+        let mut named = None;
+        for line in out.lines() {
+            if let Some(message) = line.strip_prefix("error: ").or_else(|| line.strip_prefix("warning: ")) {
+                named = named_in(message);
+                continue;
+            }
+            let Some(at) = line.trim_start().strip_prefix("--> ") else { continue };
+            let Some(named) = named.take() else { continue };
+            let mut parts = at.rsplitn(3, ':');
+            let (_column, number, file) = (parts.next(), parts.next(), parts.next());
+            let number = number.and_then(|it| it.parse().ok()).expect("a line number after the path");
+            found.push((file.expect("a path before the line").to_owned(), number, named));
+        }
+        found.sort_unstable();
+        found
+    }
+
+    /// What the markers of `fixture` expect, as (file, line, what is named).
+    fn expected(fixture: &str) -> Vec<(String, u32, &'static str)> {
+        let mut expected = Vec::new();
+        let mut file = None;
+        let mut number = 0;
+        for line in fixture.lines() {
+            if let Some(header) = line.strip_prefix("//- ") {
+                file = header.strip_prefix('/').and_then(|it| it.split_whitespace().next());
+                number = 0;
+                continue;
+            }
+            number += 1;
+            let Some((_, marks)) = line.split_once("//~") else { continue };
+            let file = file.expect("a marker is in a file of the fixture");
+            for mark in marks.split_whitespace() {
+                let named = ["fiber", "corosensei", "driver"]
+                    .into_iter()
+                    .find(|&it| it == mark)
+                    .unwrap_or_else(|| panic!("`{mark}` is not what `fiber_boundary` names"));
+                expected.push((file.to_owned(), number, named));
+            }
+        }
+        expected.sort_unstable();
+        expected
+    }
+
+    /// Lints the crate `linted` of the fixture of `graph` and `main`; it must find what the
+    /// markers say, each finding with the way through the scheduler's API as its help.
+    fn check_fibers(graph: &str, main: &str, linted: &str) {
+        let fixture = fixture(graph, main);
+        let out = lint_crate(&fixture, linted);
+        let want = expected(&fixture);
+        assert_eq!(found(&out), want, "the findings in `{linted}` of:\n{fixture}\nwere:\n{out}");
+        if !want.is_empty() {
+            assert!(out.contains("fibers are the scheduler's alone"), "{out}");
+        }
+    }
+
+    #[test]
+    fn an_import_of_sched_fiber_outside_sched_is_rejected() {
+        check_fibers(
+            SCHED,
+            r#"
+use blaze_graph::sched::fiber::Carried; //~ fiber
+use blaze_graph::sched::{carry, fiber}; //~ fiber
+pub fn take(_: Carried) {}
+"#,
+            "main",
+        );
+    }
+
+    #[test]
+    fn a_path_through_sched_fiber_in_an_expression_is_rejected() {
+        check_fibers(
+            SCHED,
+            r#"
+pub fn run() {
+    blaze_graph::sched::fiber::wait(); //~ fiber
+    let _ = blaze_graph::sched::fiber::Carried; //~ fiber
+}
+pub fn pattern(it: blaze_graph::sched::fiber::Carried) { //~ fiber
+    let blaze_graph::sched::fiber::Carried = it; //~ fiber
+}
+"#,
+            "main",
+        );
+    }
+
+    #[test]
+    fn corosensei_named_outside_sched_is_rejected() {
+        check_fibers(
+            SCHED,
+            r#"
+use corosensei::Coroutine; //~ corosensei
+extern crate corosensei; //~ corosensei
+pub fn make() -> corosensei::Coroutine { //~ corosensei
+    Coroutine //~ corosensei
+}
+"#,
+            "main",
+        );
+        check_fibers(
+            r#"
+pub mod sched {
+    pub mod fiber {
+        pub struct Driver;
+        pub struct Carried;
+        pub fn wait() {}
+    }
+    pub use fiber::Driver;
+    pub fn carry() {}
+}
+pub mod util {
+    use corosensei::Coroutine; //~ corosensei
+    pub mod sched {
+        use corosensei::Coroutine; //~ corosensei
+    }
+}
+"#,
+            "",
+            "blaze_graph",
+        );
+    }
+
+    #[test]
+    fn the_driver_reexported_from_sched_is_still_rejected() {
+        check_fibers(
+            SCHED,
+            r#"
+use blaze_graph::sched::Driver; //~ driver
+pub fn drive(it: blaze_graph::sched::Driver) -> Driver { //~ driver driver
+    it
+}
+"#,
+            "main",
+        );
+    }
+
+    #[test]
+    fn sched_and_its_children_may_name_fibers() {
+        check_fibers(
+            r#"
+pub mod sched {
+    use corosensei::Coroutine;
+    pub mod fiber {
+        use corosensei::Coroutine;
+        pub struct Driver;
+        pub struct Carried;
+        pub fn wait() {}
+        pub fn drive(_: Driver, _: Coroutine) {
+            self::wait();
+            crate::sched::fiber::wait();
+        }
+    }
+    pub use fiber::Driver;
+    pub fn carry() {
+        fiber::wait();
+        let _ = crate::sched::fiber::Carried;
+    }
+    pub fn driver(it: Driver) -> Driver {
+        it
+    }
+    pub mod nested {
+        pub fn deeper(_: corosensei::Coroutine) {
+            super::fiber::wait();
+        }
+    }
+}
+"#,
+            "",
+            "blaze_graph",
+        );
+    }
+
+    #[test]
+    fn the_schedulers_own_api_is_accepted() {
+        check_fibers(
+            SCHED,
+            r#"
+use blaze_graph::sched;
+use blaze_graph::sched::carry;
+pub fn run() {
+    blaze_graph::sched::carry();
+    sched::carry();
+    carry();
+}
+"#,
+            "main",
+        );
+    }
+}

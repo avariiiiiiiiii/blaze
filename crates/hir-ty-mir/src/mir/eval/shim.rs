@@ -362,25 +362,21 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
                 ))?;
                 while let TyKind::Ref(_, ty, _) = arg.ty.kind() {
                     if ty.is_str() {
-                        let (pointee, metadata) = arg.interval.get(self)?.split_at(self.ptr_size());
+                        let pointee = self.read_pointer(arg.interval.addr)?;
+                        let metadata = &arg.interval.get(self)?[self.ptr_size()..];
                         let len = from_bytes!(usize, metadata);
 
                         return {
                             Err(MirEvalError::Panic(
-                                std::str::from_utf8(
-                                    self.read_memory(Address::from_bytes(pointee)?, len)?,
-                                )
-                                .unwrap()
-                                .to_owned(), // alloc: the panic's message, error path
+                                std::str::from_utf8(self.read_memory(pointee, len)?)
+                                    .unwrap()
+                                    .to_owned(), // alloc: the panic's message, error path
                             ))
                         };
                     }
                     let size = self.size_of_sized(ty, locals, "begin panic arg")?;
-                    let pointee = arg.interval.get(self)?;
-                    arg = IntervalAndTy {
-                        interval: Interval::new(Address::from_bytes(pointee)?, size),
-                        ty,
-                    };
+                    let pointee = self.read_pointer(arg.interval.addr)?;
+                    arg = IntervalAndTy { interval: Interval::new(pointee, size), ty };
                 }
                 // alloc: error path
                 Err(MirEvalError::Panic(format!("unknown-panic-payload: {:?}", arg.ty.kind())))
@@ -540,7 +536,7 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
                 };
                 let fd = u128::from_le_bytes(pad16(fd.get(self)?, IsSigned::No));
                 let interval = Interval {
-                    addr: Address::from_bytes(ptr.get(self)?)?,
+                    addr: self.read_pointer(ptr.interval.addr)?,
                     size: from_bytes!(usize, len.get(self)?),
                 };
                 match fd {

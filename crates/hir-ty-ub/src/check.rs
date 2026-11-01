@@ -577,6 +577,15 @@ impl<'db> Machine<'db> for Checker<'db> {
         }
     }
 
+    // Miri: a static is a global allocation, its value in it before any thread runs
+    // (`VClockAlloc::new_allocation` at time zero); the evaluator lays it out on first use.
+    fn initialized(&mut self, addr: u64) {
+        if let Some(alloc) = self.mem.live_at(addr) {
+            let size = self.mem.info(alloc).size;
+            self.races.initialized(alloc, size);
+        }
+    }
+
     // Miri: machine.rs, `after_stack_push` and `before_stack_pop` (`on_stack_pop`).
     fn call(&mut self) -> MResult<()> {
         self.borrows.push_frame();

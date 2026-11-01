@@ -244,6 +244,11 @@ pub trait Machine<'db> {
     /// to unless it is `static mut`. Promoted temporaries stay writable: blaze's body writes
     /// them itself.
     fn freeze(&mut self, addr: u64);
+    /// The [`MemKind::Global`] allocation that starts at `addr` has the initial bytes the
+    /// evaluator laid out when the program first used it (a static's value, the pointer to a
+    /// static): they are its value from before every thread, as a static's is in Miri, not a
+    /// write of the thread that happened to use it first.
+    fn initialized(&mut self, addr: u64);
 
     /// A frame starts: called before the arguments are copied into the callee's locals.
     fn call(&mut self) -> MResult<()>;
@@ -378,6 +383,8 @@ impl<'db> Machine<'db> for Plain {
     }
     #[inline(always)]
     fn freeze(&mut self, _: u64) {}
+    #[inline(always)]
+    fn initialized(&mut self, _: u64) {}
     #[inline(always)]
     fn call(&mut self) -> MResult<()> {
         Ok(())

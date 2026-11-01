@@ -2103,11 +2103,14 @@ impl<'db> ExprCollector<'db> {
                     ArrayExprKind::Repeat { initializer, repeat } => {
                         let initializer = self.collect_expr_opt(initializer);
                         let repeat = self.with_label_rib(RibKind::Constant, |this| {
-                            if let Some(repeat) = repeat {
-                                this.with_binding_owner(|this| this.collect_expr(repeat))
-                            } else {
-                                this.missing_expr()
-                            }
+                            // An anonymous const: a body of its own, never `async`.
+                            this.with_awaitable_block(Awaitable::No("constant"), |this| {
+                                if let Some(repeat) = repeat {
+                                    this.with_binding_owner(|this| this.collect_expr(repeat))
+                                } else {
+                                    this.missing_expr()
+                                }
+                            })
                         });
                         self.alloc_expr(
                             Expr::Array(Array::Repeat { initializer, repeat }),
@@ -4055,8 +4058,12 @@ impl<'db> ExprCollector<'db> {
         self.def_map.features()
     }
 
+    /// An anonymous const's root (a const argument, an array type's length): a body of its own,
+    /// never `async`.
     fn with_fresh_binding_expr_root(&mut self, f: impl FnOnce(&mut Self) -> ExprId) -> ExprId {
-        self.with_expr_root(|this| this.with_binding_owner(f))
+        self.with_expr_root(|this| {
+            this.with_awaitable_block(Awaitable::No("constant"), |this| this.with_binding_owner(f))
+        })
     }
 
     fn with_expr_root(&mut self, f: impl FnOnce(&mut Self) -> ExprId) -> ExprId {

@@ -168,6 +168,9 @@ pub(crate) struct ModuleDecls {
     pub(crate) legacy: Inherited,
     /// Its tables after collection: where its first macro step starts.
     pub(crate) side: Arc<SideTables>,
+    /// The files of the `mod`s it left out for their `#![cfg]`, which no module defines: a
+    /// write of one changes this log.
+    pub(crate) configured_out: Box<[span::FileId]>,
 }
 
 /// The ops a module gains at a round `r >= 1`: from its own macro step of `r - 1`, the step that

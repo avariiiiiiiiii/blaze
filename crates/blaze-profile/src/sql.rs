@@ -362,6 +362,16 @@ mod tests {
             let _outer = tracing::info_span!(target: "blaze", "sql outer").entered();
             let _inner = tracing::info_span!(target: "blaze", "sql inner", function = "app::main").entered();
             flight::plot(flight::Plot::Queued, 3);
+            for (job, deepest) in [(1, 40 << 10), (2, 900 << 10)] {
+                flight::fiber_stack(flight::FiberStack {
+                    fiber: 3,
+                    job,
+                    reserved: 16 << 20,
+                    deepest,
+                    touched: 900 << 10,
+                    grown: 0,
+                });
+            }
         })
         .join()
         .unwrap();
@@ -391,6 +401,12 @@ mod tests {
         assert_eq!(count("SELECT count(*) AS n FROM builds WHERE build_id = 77 AND commit = 'feedbeef'"), 1);
         assert!(count("SELECT count(*) AS n FROM passes WHERE build_id = 77 AND function = 'app::main'") >= 1);
         assert_eq!(count("SELECT count(*) AS n FROM provenance"), 0, "an empty table reads from its schema file");
+        assert_eq!(count("SELECT count(*) AS n FROM fiber_stacks WHERE build_id = 77 AND fiber = 3"), 2);
+        let mut build = Map::new();
+        build.insert("build".into(), Value::from(77));
+        let ranked = views::render(views::find("jobs_by_stack_high_water").unwrap(), &build).unwrap();
+        let deepest = format!("SELECT CAST(job AS BIGINT) AS job FROM ({ranked}) WHERE rank = 1");
+        assert_eq!(count(&deepest), 2, "the job that went deepest ranks first");
 
         let live = run_live(
             &Query { duckdb: &duckdb, history: &dir, sql: "SELECT count(*) AS n FROM counters WHERE name = 'pool queued'" },

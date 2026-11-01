@@ -124,6 +124,8 @@ pub const COUNTERS: Table = Table {
         col("name", Type::Dict, "what is counted"),
         col("t_ns", Type::I64, "when"),
         col("value", Type::F64, "the value then"),
+        opt("fiber", Type::U32, "the fiber a fiber stack counter is of; null for any other counter"),
+        opt("job", Type::U64, "the job that ran on that fiber; null for any other counter"),
     ],
 };
 

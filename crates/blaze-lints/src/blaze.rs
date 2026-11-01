@@ -13,6 +13,7 @@ mod alloc;
 mod clone;
 mod dispatch;
 mod exempt;
+mod fiber;
 mod hashmap;
 mod parallel;
 #[cfg(test)]
@@ -49,6 +50,7 @@ pub enum Lint {
     StdHashmap,
     Parallelizable,
     SerialDependence,
+    FiberBoundary,
 }
 
 /// The group `blaze::hot`: every lint of hot code, SipHash maps included as `hot_lint.py`
@@ -64,6 +66,7 @@ impl Lint {
         Lint::StdHashmap,
         Lint::Parallelizable,
         Lint::SerialDependence,
+        Lint::FiberBoundary,
     ];
 
     /// The name after `blaze::`.
@@ -75,6 +78,7 @@ impl Lint {
             Lint::StdHashmap => "std_hashmap",
             Lint::Parallelizable => "parallelizable",
             Lint::SerialDependence => "serial_dependence",
+            Lint::FiberBoundary => "fiber_boundary",
         }
     }
 
@@ -92,6 +96,9 @@ impl Lint {
             Lint::StdHashmap => concat!(docs!(), "#std_hashmap"),
             Lint::Parallelizable => concat!(parallel_docs!(), "#parallelizable"),
             Lint::SerialDependence => concat!(parallel_docs!(), "#serial_dependence"),
+            Lint::FiberBoundary => {
+                "https://github.com/indexable-inc/blaze/blob/main/docs/v2/plan/lanes/may-suspend/fiber-boundary.md"
+            }
         }
     }
 
@@ -107,6 +114,9 @@ impl Lint {
             Lint::Parallelizable => "run the iterations with rayon's parallel iterators or blaze's pool",
             Lint::SerialDependence => {
                 "make the dependence a reduction to run the iterations in parallel, or keep it serial"
+            }
+            Lint::FiberBoundary => {
+                "go through `blaze_graph::sched`'s own API (`sched::wait`, `sched::carry`, ...): fibers are the scheduler's alone"
             }
         }
     }
@@ -137,6 +147,15 @@ pub(crate) fn check_node<'t>(cx: &mut Cx<'_, 't>, node: ast::Node<'t>) {
         cx.blaze(Lint::StdHashmap, node, span, message)
             .help(Lint::StdHashmap.help())
             .help(format!("for further information visit {}", Lint::StdHashmap.docs_url()));
+    }
+    if cx.on_blaze(Lint::FiberBoundary)
+        && let Some(message) = fiber::check(cx, node)
+        && let Some(range) = cx.range(node)
+    {
+        let span = cx.span(range);
+        cx.blaze(Lint::FiberBoundary, node, span, message)
+            .help(Lint::FiberBoundary.help())
+            .help(format!("for further information visit {}", Lint::FiberBoundary.docs_url()));
     }
     if node == cx.root() && cx.in_file() {
         check_body(cx);

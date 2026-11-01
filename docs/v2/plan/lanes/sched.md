@@ -173,8 +173,14 @@ files). Fibers change no query call site.
 - **Runtime structures**: a Chase-Lev deque per core for its queue and a `runnext` slot (the
   LIFO slot), owner-pushed and owner-popped, thieves taking half by CAS; the inbox a
   multi-producer queue; "parked" and "stealable" the same bitmasks, as atomics. As written,
-  the driver keeps `Sched`'s queues and masks behind its one lock; moving them to per-core
-  deques and atomic masks is the next change to the driver, with the same tests.
+  the driver keeps `Sched`'s queues and masks behind its one lock. Next (20:40), the `Sched`
+  splits: a sans-IO wait graph (wait states, keys, counters, timers, the cycle check) stays
+  behind the lock, taken only by a wait, a claim, a key's end or a wake; the run queues move
+  to the driver as per-core Chase-Lev deques, a runnext slot, an inbox, and parked and
+  stealable masks as atomics; placement (nearest parked, least loaded, steal order by tier)
+  stays sans-IO, as pure functions over a snapshot of them. A spawn, and an end that wakes no
+  one, take no lock. The concurrent parts go through `crate::sync`, model-checked under
+  `blaze_check`.
 - **Fibers**: a recycled pool (corosensei 0.3.4's mmap'd stacks: reserved, guard page below,
   committed as touched), grown while more jobs are started at once, which admission bounds.
   `crates/blaze-check/src/coro.rs`'s own switch (the model checker's) is to be folded into it

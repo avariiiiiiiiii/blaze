@@ -29,7 +29,7 @@ use crate::{
     consteval::ConstEvalError,
     db::HirDatabase,
     intrinsic::{Intrinsic, intrinsic_of},
-    mir::{IsSigned, MirEvalError, pad16},
+    mir::{IsSigned, MirEvalError, MirLowerError, pad16},
     next_solver::{Allocation, AllocationData, GenericArgs, Ty, TyKind, ensure_sufficient_stack},
 };
 
@@ -44,6 +44,11 @@ pub(crate) fn value<'db>(
     subst: GenericArgs<'db>,
     trait_env: Option<ParamEnvAndCrate<'db>>,
 ) -> Result<Allocation<'db>, ConstEvalError<'db>> {
+    // As rustc's `eval_to_allocation` of a body whose type check is tainted by errors: no value,
+    // so a type using the constant is an error, not a mismatch with whatever it would run to.
+    if InferenceResult::of(db, owner).has_errors {
+        return Err(ConstEvalError::MirLowerError(MirLowerError::HasErrors));
+    }
     match by_hir(db, owner, trait_env) {
         Some(value) => value,
         None => by_mir(db, owner, subst, trait_env),

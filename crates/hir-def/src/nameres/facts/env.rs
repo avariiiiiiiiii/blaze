@@ -14,7 +14,7 @@ use blaze_mem::Frame;
 use cfg::CfgOptions;
 use hashbrown::HashMap;
 use hir_expand::{
-    InFile, MacroCallId, attrs::AttrId, mod_path::ModPath, name::Name,
+    EditionedFileId, InFile, MacroCallId, attrs::AttrId, mod_path::ModPath, name::Name,
     proc_macro::CustomProcMacroExpander,
 };
 use rustc_hash::FxBuildHasher;
@@ -282,6 +282,13 @@ pub(crate) trait Sink<'db> {
     /// syntax, which a sink that runs again on a write keeps the file of.
     fn collecting_expansion(&mut self, call: MacroCallId) {
         let _ = call;
+    }
+
+    /// The file of a `mod` the collection left out for its `#![cfg]`: no module, so no group
+    /// has the file, and only a write of it brings the module in. A sink that runs again on a
+    /// write keeps the file.
+    fn configured_out_file(&mut self, file: EditionedFileId) {
+        let _ = file;
     }
 }
 

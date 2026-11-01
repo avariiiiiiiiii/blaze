@@ -419,6 +419,40 @@ fn removing_a_crate_feature_removes_it_from_the_maintained_map() {
     assert!(failures.is_empty(), "{failures}");
 }
 
+/// A `mod` whose file is configured out by its `#![cfg]` has no module, so no group holds the
+/// file: a write of the file alone that drops the `#![cfg]` still brings the module in.
+#[test]
+fn removing_a_mod_files_cfg_brings_the_module_in() {
+    let mut loaded = Loaded::new("//- /main.rs\nmod module;\n//- /module.rs\n#![cfg(NEVER)]\nstruct S;\n");
+    let file = loaded.file("/module.rs");
+    loaded.db.set_file_text(file, "struct S;\n");
+    let krate = loaded.krate();
+    assert_eq!(module_path(&loaded.db, module_at(&loaded.db, krate, &["module"])), "crate::module");
+    let mut failures = String::new();
+    check_db(&loaded.db, "a mod file's cfg removed", &Exempt::NONE, false, &mut failures);
+    loaded.db.set_file_text(file, "#![cfg(NEVER)]\nstruct S;\n");
+    check_db(&loaded.db, "a mod file's cfg back", &Exempt::NONE, false, &mut failures);
+    assert!(failures.is_empty(), "{failures}");
+}
+
+/// Two `mod`s of one name in one parent (E0428) are one module id: the first keeps the name,
+/// on load and after an edit adds the second.
+#[test]
+fn a_second_mod_of_a_name_declares_nothing() {
+    let mut loaded = Loaded::new("//- /lib.rs\npub mod a { pub struct S; }\n//- /a.rs\npub struct T;\n");
+    let root = loaded.file("/lib.rs");
+    loaded.db.set_file_text(root, "pub mod a { pub struct S; }\npub mod a;\n");
+    let krate = loaded.krate();
+    let a = module_at(&loaded.db, krate, &["a"]);
+    let map = crate_local_def_map(&loaded.db, krate).def_map(&loaded.db);
+    let scope = map.module(&loaded.db, a).scope(&loaded.db);
+    assert!(scope.get(&name("S")).take_types().is_some(), "the first `mod a` keeps the name");
+    assert!(scope.get(&name("T")).take_types().is_none(), "the second declares nothing");
+    let mut failures = String::new();
+    check_db(&loaded.db, "a second mod of a name", &Exempt::NONE, false, &mut failures);
+    assert!(failures.is_empty(), "{failures}");
+}
+
 /// A glob of a module with an unresolved import takes no name of it, whether the glob shares a
 /// run with the import (the maintainer's region) or reads it from upstream (`facts`' components).
 #[test]

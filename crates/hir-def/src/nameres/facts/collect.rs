@@ -440,6 +440,8 @@ struct DeclSink<'a, 'db, 'f> {
     log: FrameVec<'f, DeclOp>,
     children: FrameVec<'f, DeclKey>,
     child_keys: FrameVec<'f, (ModuleId, DeclKey)>,
+    /// [`ModuleDecls::configured_out`].
+    configured_out: FrameVec<'f, span::FileId>,
     from_glob_import: PerNsGlobImports<&'f Frame>,
     /// The module's plain imports by the name each binds: indices into `log`, in order.
     named: FrameMap<'f, Name, FrameVec<'f, u32>>,
@@ -478,6 +480,7 @@ impl<'a, 'db, 'f> DeclSink<'a, 'db, 'f> {
             log: Vec::new_in(cx.frame),
             children: Vec::new_in(cx.frame),
             child_keys: Vec::new_in(cx.frame),
+            configured_out: Vec::new_in(cx.frame),
             from_glob_import: PerNsGlobImports::new_in(cx.frame),
             named: map_in(cx.frame),
         }
@@ -691,8 +694,10 @@ impl<'a, 'db, 'f> DeclSink<'a, 'db, 'f> {
             // clone: test capture of the held scope
             HELD.with(|it| it.borrow_mut().insert(self.key, (**held).clone()));
         }
+        // alloc: the files of its configured-out `mod`s, at exact size; empty for most modules
+        let configured_out = Box::from(&self.configured_out[..]);
         // alloc: one per module, the tables its first macro step starts from
-        ModuleDecls { ops, children, legacy, side: Arc::new(side) }
+        ModuleDecls { ops, children, legacy, side: Arc::new(side), configured_out }
     }
 }
 
@@ -736,6 +741,10 @@ impl<'a, 'db, 'f> Sink<'db> for DeclSink<'a, 'db, 'f> {
             DeclOp::Import(it) => f(&it.path),
             other => unreachable!("the import index names {other:?}"),
         })
+    }
+
+    fn configured_out_file(&mut self, file: EditionedFileId) {
+        self.configured_out.push(file.file_id(self.cx.db));
     }
 
     fn child(&mut self, request: ChildRequest<'_>) -> ChildMode {
@@ -1569,7 +1578,7 @@ impl<'db, 'f, S: Sink<'db>, A: Allocator + Clone> ModCollector<'_, 'db, 'f, S, A
                     Some(dir) => (DeclItems::Inline(item_id), dir),
                     None => (DeclItems::Nothing, self.mod_dir),
                 };
-                let (module_id, mode) = self.push_child_module(
+                let Some((module_id, mode)) = self.push_child_module(
                     name,
                     module_ast_id,
                     None,
@@ -1577,7 +1586,9 @@ impl<'db, 'f, S: Sink<'db>, A: Allocator + Clone> ModCollector<'_, 'db, 'f, S, A
                     self.tree_id,
                     child_items,
                     child_dir,
-                );
+                ) else {
+                    return;
+                };
                 let Some(mod_dir) = mod_dir else { return };
                 if let ChildMode::Inline = mode {
                     self.child(module_id, self.tree_id, item_tree, mod_dir).collect_in_top_module(items);
@@ -1602,6 +1613,7 @@ impl<'db, 'f, S: Sink<'db>, A: Allocator + Clone> ModCollector<'_, 'db, 'f, S, A
                         let head = mod_file_head(db, file_id, krate);
                         match &head.cfg_disabled {
                             Some(cfg) => {
+                                self.sink.configured_out_file(file_id);
                                 self.emit_unconfigured_diagnostic(
                                     InFile::new(self.file_id(), module_ast_id.erase()),
                                     cfg,
@@ -1609,7 +1621,7 @@ impl<'db, 'f, S: Sink<'db>, A: Allocator + Clone> ModCollector<'_, 'db, 'f, S, A
                             }
                             None => {
                                 let tree = TreeId::new(file_id.into(), None);
-                                let (module_id, mode) = self.push_child_module(
+                                let Some((module_id, mode)) = self.push_child_module(
                                     name,
                                     ast_id.value,
                                     Some((file_id, is_mod_rs)),
@@ -1617,7 +1629,9 @@ impl<'db, 'f, S: Sink<'db>, A: Allocator + Clone> ModCollector<'_, 'db, 'f, S, A
                                     tree,
                                     DeclItems::Top,
                                     mod_dir,
-                                );
+                                ) else {
+                                    return;
+                                };
                                 if let ChildMode::Inline = mode {
                                     let child_tree = file_item_tree(db, file_id.into(), krate);
                                     self.child(module_id, tree, child_tree, mod_dir)
@@ -1684,8 +1698,13 @@ impl<'db, 'f, S: Sink<'db>, A: Allocator + Clone> ModCollector<'_, 'db, 'f, S, A
         tree: TreeId,
         items: DeclItems,
         mod_dir: ModDir,
-    ) -> (ModuleId, ChildMode) {
+    ) -> Option<(ModuleId, ChildMode)> {
         let db = self.cx.db;
+        // A module's id is its parent and name, so a second `mod` of a name (E0428) declares
+        // nothing: the first keeps the name, as in rustc's resolver.
+        if self.sink.def_map().module(db, self.module_id).children(db).contains_key(&name) {
+            return None;
+        }
         let vis = self.resolve_vis(visibility);
         let origin = match definition {
             None => {
@@ -1743,7 +1762,7 @@ impl<'db, 'f, S: Sink<'db>, A: Allocator + Clone> ModCollector<'_, 'db, 'f, S, A
                 inherited,
             });
         }
-        (module, mode)
+        Some((module, mode))
     }
 
     /// Resolves attributes on an item.

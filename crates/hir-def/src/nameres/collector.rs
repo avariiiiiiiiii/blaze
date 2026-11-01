@@ -3439,12 +3439,14 @@ impl<'db> ModCollector<'_, 'db> {
         match item_tree.mod_kind(module) {
             // inline module, just recurse
             ModKind::Inline { items } => {
-                let module_id = self.push_child_module(
+                let Some(module_id) = self.push_child_module(
                     *name,
                     module_ast_id,
                     None,
                     &self.item_tree[module.visibility],
-                );
+                ) else {
+                    return;
+                };
 
                 let Some(mod_dir) = self.mod_dir.descend_into_definition(
                     name,
@@ -3492,12 +3494,14 @@ impl<'db> ModCollector<'_, 'db> {
                                 );
                             }
                             Some(AttrsOrCfgRef::Enabled { .. }) | None => {
-                                let module_id = self.push_child_module(
+                                let Some(module_id) = self.push_child_module(
                                     *name,
                                     ast_id.value,
                                     Some((file_id, is_mod_rs)),
                                     &self.item_tree[module.visibility],
-                                );
+                                ) else {
+                                    return;
+                                };
                                 ModCollector {
                                     def_collector: self.def_collector,
                                     macro_depth: self.macro_depth,
@@ -3537,7 +3541,13 @@ impl<'db> ModCollector<'_, 'db> {
         declaration: FileAstId<ast::Module>,
         definition: Option<(EditionedFileId, bool)>,
         visibility: &crate::visibility::RawVisibility,
-    ) -> ModuleId {
+    ) -> Option<ModuleId> {
+        // A module's id is its parent and name, so a second `mod` of a name (E0428) declares
+        // nothing: the first keeps the name, as in rustc's resolver (`facts::collect` too).
+        let db = self.def_collector.db;
+        if self.def_collector.def_map.module(db, self.module_id).children(db).contains_key(&name) {
+            return None;
+        }
         let vis = self
             .def_collector
             .def_map
@@ -3592,7 +3602,7 @@ impl<'db> ModCollector<'_, 'db> {
             vis,
             None,
         );
-        module
+        Some(module)
     }
 
     /// Resolves attributes on an item.

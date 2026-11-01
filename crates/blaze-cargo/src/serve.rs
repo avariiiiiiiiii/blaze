@@ -182,6 +182,10 @@ fn serve(args: impl IntoIterator<Item = OsString>) -> anyhow::Result<()> {
     };
     let state = state()?;
     std::fs::create_dir_all(&state).with_context(|| format!("making the daemon's state directory {}", state.display()))?;
+    // Where a stall's trace is written (`daemon::Failed::Stalled`): by the loop, which makes no
+    // directories.
+    let stalls = state.join("stalls");
+    std::fs::create_dir_all(&stalls).with_context(|| format!("making {}", stalls.display()))?;
     if let Some(parent) = socket.parent() {
         std::fs::create_dir_all(parent).with_context(|| format!("making the socket's directory {}", parent.display()))?;
     }

@@ -408,6 +408,13 @@ impl<W: Work> Cx<'_, W> {
     #[inline(never)]
     fn switch(&self, out: Out) -> Result<(), Cycle> {
         check_no_wait(self.job);
+        let here = HERE.get();
+        assert!(
+            here.is_some_and(|here| ptr::eq(here.cx, ptr::from_ref(self).cast())),
+            "job {}'s `Cx` waited off its own fiber (on job {:?}'s)",
+            self.job.0,
+            here.map(|here| here.job.0)
+        );
         let back = self.yielder.suspend(out);
         enter(self);
         match back {
@@ -417,6 +424,14 @@ impl<W: Work> Cx<'_, W> {
         }
     }
 }
+
+// SAFETY: the one part of a `Cx` that is not `Sync` is its `Yielder`, used only by `switch`,
+// which first asserts that this thread runs the fiber of this very `Cx` (`HERE` holds its
+// address, set by `enter` on that fiber and cleared as it switches out): another thread
+// holding a `&Cx` panics there instead of touching the yielder. The rest goes through
+// `Shared`, which is `Sync`.
+#[allow(unsafe_code)]
+unsafe impl<W: Work> Sync for Cx<'_, W> {}
 
 /// This thread's running job, as the code without a [`Cx`] reaches it.
 #[derive(Clone, Copy)]

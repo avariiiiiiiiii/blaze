@@ -180,6 +180,8 @@ pub fn counters(counters: &[CounterRow], process: Process<'_>) -> Result<RecordB
         names.finish(name_keys)?,
         column(Int64Array::from_iter_values(counters.iter().map(|it| it.t_ns))),
         column(Float64Array::from_iter_values(counters.iter().map(|it| it.value as f64))),
+        column(UInt32Array::from_iter(counters.iter().map(|it| it.fiber.map(|(fiber, _)| fiber)))),
+        column(UInt64Array::from_iter(counters.iter().map(|it| it.fiber.map(|(_, job)| job)))),
     ];
     RecordBatch::try_new(schema_of(&schema::COUNTERS), columns)
 }

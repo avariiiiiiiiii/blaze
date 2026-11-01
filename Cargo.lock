@@ -2867,6 +2867,24 @@ dependencies = [
 ]
 
 [[package]]
+name = "hir-ty-suspend"
+version = "0.0.0"
+dependencies = [
+ "base-db",
+ "blaze-mem",
+ "blaze-query",
+ "either",
+ "hir-def",
+ "hir-expand",
+ "hir-ty",
+ "hir-ty-mir",
+ "intern",
+ "rustc-hash",
+ "rustc_type_ir",
+ "smallvec",
+]
+
+[[package]]
 name = "hir-ty-ub"
 version = "0.0.0"
 dependencies = [

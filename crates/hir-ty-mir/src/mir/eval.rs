@@ -4104,6 +4104,15 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
         }
     }
 
+    /// The block of [`Self::heap_allocate`] that `block` is has its initial bytes written
+    /// ([`Machine::initialized`]).
+    #[inline(always)]
+    fn initialized(&self, block: Interval) {
+        if M::CHECKS && block.size != 0 {
+            self.machine.initialized(block.addr.to_usize() as u64);
+        }
+    }
+
     /// A zeroed block of the heap: a freed one of its size class and alignment when there is
     /// one, else one at the end.
     /// The machine is told of it, as `zeroed` (initialized) or not.
@@ -5376,6 +5385,7 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
             let location = self.locate_static(st, result.addr)?;
             let nested = self.static_nested_mutability(st);
             self.write_allocation(locals, allocation, result.addr, size, nested)?;
+            self.initialized(result);
             self.freeze_static(st, allocation.ty, result);
             self.record_static(result.addr, size, st)?;
             return Ok(location);
@@ -5420,6 +5430,7 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
     fn locate_static(&mut self, st: StaticId, memory: Address) -> Result<'db, Address> {
         let addr = self.heap_allocate(self.ptr_size(), self.ptr_size())?;
         self.write_pointer(addr, memory)?;
+        self.initialized(Interval::new(addr, self.ptr_size()));
         self.static_locations.insert(st, addr);
         Ok(addr)
     }

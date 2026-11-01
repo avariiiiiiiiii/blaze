@@ -24,9 +24,9 @@ use std::{fmt, time::Duration};
 use blaze_api::{
     ApiError, Applicability, Artifact, ArtifactKind, Basis, BuildScriptRan, Cached, Cargo,
     CrateType, Diagnostic, Envelope, FactRead, FetchVerb, Level, LinkHow, LinkKind, Linked,
-    Mismatch, Ranked, Reach, ReachedItem, Request, Response, SCHEMA, ServedCrate, ServedPart,
-    Span, Status, Table, TargetKind, Targets, TestOutcome, TestResult, Traced, Ub, UnitOf,
-    UnitProfile, UnitStarted, UnitTarget, Verb, ViewRef, Worked,
+    LiveFrame, Mismatch, Ranked, Reach, ReachedItem, Request, Response, SCHEMA, ServedCrate,
+    ServedPart, Span, Status, Table, TargetKind, Targets, TestOutcome, TestResult, Traced, Ub,
+    UnitOf, UnitProfile, UnitStarted, UnitTarget, Verb, ViewRef, Worked,
     frames::{self, Refused},
 };
 use blaze_fuzzer::Target;
@@ -264,6 +264,10 @@ fn seeds() -> Vec<Vec<u8>> {
         Request::Trace { view: head(), targets: targets(false) },
         Request::Tables { view: head() },
         Request::Pack { view: head(), targets: targets(false), program: "app".to_owned() },
+        Request::Explore { dev: true },
+        Request::Profile { seconds: 60 },
+        Request::Live,
+        Request::Sql { sql: "select 1".to_owned(), last_s: 30 },
     ];
     let span = Span {
         file: "src/lib.rs".to_owned(),
@@ -402,7 +406,33 @@ fn seeds() -> Vec<Vec<u8>> {
         }),
         Response::Why(Why { query: key(1, 2), chain: Vec::new(), input: Some(Input::Config) }),
         Response::Why(Why { query: key(1, 3), chain: Vec::new(), input: Some(Input::Dir("src".to_owned())) }),
-        Response::Status(Status { pid: 4242, views: 1, requests: vec![1, 2], budget_bytes: 1 << 30, memory_bytes: 0 }),
+        Response::Status(Status {
+            pid: 4242,
+            views: 1,
+            requests: vec![1, 2],
+            budget_bytes: 1 << 30,
+            memory_bytes: 0,
+            history: None,
+        }),
+        Response::Status(Status {
+            pid: 1,
+            views: 0,
+            requests: Vec::new(),
+            budget_bytes: 0,
+            memory_bytes: 0,
+            history: Some("the disk is full".to_owned()),
+        }),
+        Response::Explored { link: "https://ix.dev/explore#x".to_owned() },
+        Response::Profiled { trace: b"{}".to_vec() },
+        Response::Live(LiveFrame {
+            lost: 1,
+            open: Vec::new(),
+            at_ns: -1,
+            spans: vec![0xff],
+            skipped: u64::MAX,
+            counters: Vec::new(),
+        }),
+        Response::Queried { ipc: vec![1, 2, 3], rows: 3 },
         Response::Done { ok: false },
         Response::Error(ApiError::new("no such head as `x`", Some("x".to_owned()))),
         Response::Opened { root: id(8) },

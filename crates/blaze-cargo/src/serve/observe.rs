@@ -42,15 +42,15 @@ pub fn duckdb(value: Option<std::ffi::OsString>) -> Result<Option<PathBuf>, Stri
     let Some(value) = value else { return Ok(None) };
     let path = PathBuf::from(value);
     if !path.is_absolute() {
-        return Err(format!(
+        return Err(format!(  // alloc: error path
             "{DUCKDB}={} is not an absolute path: it names the DuckDB `nix run .#duckdb` pins",
             path.display()
         ));
     }
     match fs::metadata(&path) {
         Ok(meta) if meta.is_file() => Ok(Some(path)),
-        Ok(_) => Err(format!("{DUCKDB}={} is not a file", path.display())),
-        Err(error) => Err(format!("{DUCKDB}={}: {error}", path.display())),
+        Ok(_) => Err(format!("{DUCKDB}={} is not a file", path.display())),  // alloc: error path
+        Err(error) => Err(format!("{DUCKDB}={}: {error}", path.display())),  // alloc: error path
     }
 }
 
@@ -74,7 +74,7 @@ pub struct Keeper(JoinHandle<()>);
 
 impl Keeper {
     pub fn join(self) -> Result<(), String> {
-        self.0.join().map_err(|_| "the profile history's thread (`blaze-history`) panicked".to_owned())
+        self.0.join().map_err(|_| "the profile history's thread (`blaze-history`) panicked".to_owned())  // alloc: error path
     }
 }
 
@@ -88,19 +88,19 @@ pub fn keep_history(state: &Path, duckdb: Option<PathBuf>) -> Result<(Profiling,
     // clone: a path, once a daemon
     let at = dir.clone();
     let thread = std::thread::Builder::new()
-        .name("blaze-history".to_owned())
+        .name("blaze-history".to_owned())  // alloc: once a daemon
         .spawn(move || match History::open(&at, history::CAP_BYTES) {
             Ok(history) => {
                 _ = opened_to.send(Ok(history.next_build()));
                 keep(history, &rows, &failed_to);
             }
-            Err(error) => _ = opened_to.send(Err(error.to_string())),
+            Err(error) => _ = opened_to.send(Err(error.to_string())),  // alloc: error path, once a daemon
         })
-        .map_err(|error| format!("starting the profile history's thread (`blaze-history`): {error}"))?;
+        .map_err(|error| format!("starting the profile history's thread (`blaze-history`): {error}"))?;  // alloc: error path
     let first_build = match opened.recv() {
         Ok(Ok(first)) => first,
         Ok(Err(why)) => return Err(why),
-        Err(_) => return Err("the profile history's thread (`blaze-history`) ended before it opened the history".to_owned()),
+        Err(_) => return Err("the profile history's thread (`blaze-history`) ended before it opened the history".to_owned()),  // alloc: error path
     };
     Ok((Profiling { dir, duckdb, first_build, ended, failed }, Keeper(thread)))
 }
@@ -124,7 +124,7 @@ fn keep(mut history: History, rows: &Receiver<BuildRow>, failed: &Sender<String>
         };
         if let Err(error) = flushed {
             tracing::error!("{error}");
-            _ = failed.send(error.to_string());
+            _ = failed.send(error.to_string());  // alloc: error path, a flush that failed
         }
         if last {
             return;
@@ -146,7 +146,7 @@ fn commit_of(workspace: &Path) -> Option<String> {
     };
     let head = fs::read_to_string(dir.join("HEAD")).ok()?;
     let head = head.trim();
-    let Some(name) = head.strip_prefix("ref:").map(str::trim) else { return Some(head.to_owned()) };
+    let Some(name) = head.strip_prefix("ref:").map(str::trim) else { return Some(head.to_owned()) };  // alloc: once a build, on the history's thread
     let common = match fs::read_to_string(dir.join("commondir")) {
         Ok(common) => dir.join(common.trim()),
         // clone: a path, once a build
@@ -154,7 +154,7 @@ fn commit_of(workspace: &Path) -> Option<String> {
     };
     for at in [&dir, &common] {
         if let Ok(hash) = fs::read_to_string(at.join(name)) {
-            return Some(hash.trim().to_owned());
+            return Some(hash.trim().to_owned());  // alloc: once a build, on the history's thread
         }
     }
     let packed = fs::read_to_string(common.join("packed-refs")).ok()?;
@@ -225,7 +225,7 @@ impl Observe {
     pub fn ended(&mut self, row: BuildRow) {
         let Some(profiling) = &self.profiling else { return };
         if profiling.ended.send(row).is_err() {
-            self.history_error = Some("the profile history's thread (`blaze-history`) is gone: no build is written".to_owned());
+            self.history_error = Some("the profile history's thread (`blaze-history`) is gone: no build is written".to_owned());  // alloc: error path
         }
     }
 
@@ -235,7 +235,7 @@ impl Observe {
     /// so the next one tries again.
     pub fn explore(&mut self, to: RequestRef, dev: bool, out: &mut Vec<Reply>) {
         let Some(profiling) = &self.profiling else {
-            return fail(out, to, ApiError::new(NO_PROFILING, Some("blaze explore".to_owned())));
+            return fail(out, to, ApiError::new(NO_PROFILING, Some("blaze explore".to_owned())));  // alloc: error path
         };
         if self.explorer.as_ref().is_some_and(|(was, _)| *was != dev) {
             self.explorer = None;
@@ -245,7 +245,7 @@ impl Observe {
                 history: blaze_explore::History {
                     // clone: two paths, once an explorer
                     duckdb: profiling.duckdb.clone(),
-                    dir: profiling.dir.clone(),
+                    dir: profiling.dir.clone(),  // clone: once an explorer
                 },
                 world: None,
                 dev_origin: dev,
@@ -253,7 +253,7 @@ impl Observe {
             };
             match blaze_explore::start(config) {
                 Ok(explorer) => self.explorer = Some((dev, explorer)),
-                Err(error) => return fail(out, to, ApiError::new(error.to_string(), Some("blaze explore".to_owned()))),
+                Err(error) => return fail(out, to, ApiError::new(error.to_string(), Some("blaze explore".to_owned()))),  // alloc: error path
             }
         }
         let Some((_, explorer)) = &self.explorer else { return };
@@ -272,17 +272,17 @@ impl Observe {
     /// flight recorder, run on a thread of its own (DuckDB's run is never the loop's).
     pub fn query(&mut self, to: RequestRef, sql: String, last_s: u32, out: &mut Vec<Reply>) {
         let Some(profiling) = &self.profiling else {
-            return fail(out, to, ApiError::new(NO_PROFILING, Some("blaze debug sql --live".to_owned())));
+            return fail(out, to, ApiError::new(NO_PROFILING, Some("blaze debug sql --live".to_owned())));  // alloc: error path
         };
         let Some(duckdb) = &profiling.duckdb else {
-            let what = format!("the daemon was started with no {DUCKDB}: `nix run .#duckdb` names the DuckDB it runs");
-            return fail(out, to, ApiError::new(what, Some("blaze debug sql --live".to_owned())));
+            let what = format!("the daemon was started with no {DUCKDB}: `nix run .#duckdb` names the DuckDB it runs");  // alloc: error path
+            return fail(out, to, ApiError::new(what, Some("blaze debug sql --live".to_owned())));  // alloc: error path
         };
-        let stop = Arc::new(AtomicBool::new(false));
+        let stop = Arc::new(AtomicBool::new(false));  // alloc: once a query
         // clone: once a query, for its thread
         let (duckdb, dir, stopped, answered) = (duckdb.clone(), profiling.dir.clone(), Arc::clone(&stop), self.answered_to.clone());
         let window = Duration::from_secs(u64::from(last_s));
-        let spawned = std::thread::Builder::new().name("blaze-sql".to_owned()).spawn(move || {
+        let spawned = std::thread::Builder::new().name("blaze-sql".to_owned()).spawn(move || {  // alloc: once a query
             let query = sql::Query { duckdb: &duckdb, history: &dir, sql: &sql };
             let answer = sql::run_live_with(&query, window, &stopped).map_err(sql_error).and_then(|batches| ipc(&batches));
             _ = answered.send(Answered { to, answer });
@@ -290,8 +290,8 @@ impl Observe {
         match spawned {
             Ok(_) => self.querying.push(Querying { to, stop }),
             Err(error) => {
-                let what = format!("starting the thread of a live query (`blaze-sql`): {error}");
-                fail(out, to, ApiError::new(what, Some("blaze debug sql --live".to_owned())));
+                let what = format!("starting the thread of a live query (`blaze-sql`): {error}");  // alloc: error path
+                fail(out, to, ApiError::new(what, Some("blaze debug sql --live".to_owned())));  // alloc: error path
             }
         }
     }
@@ -336,7 +336,7 @@ impl Observe {
                 return true;
             }
             if let Err(error) = it.feed.next(&mut it.frame) {
-                fail(out, it.to, ApiError::new(format!("the live feed: {error}"), Some("live".to_owned())));
+                fail(out, it.to, ApiError::new(format!("the live feed: {error}"), Some("live".to_owned())));  // alloc: error path
                 return false;
             }
             let frame = &mut it.frame;
@@ -381,7 +381,7 @@ fn fail(out: &mut Vec<Reply>, to: RequestRef, error: ApiError) {
 
 /// A query's error as the API says it, its kind ([`sql::SqlError::kind`]) where it failed.
 fn sql_error(error: sql::SqlError) -> ApiError {
-    ApiError::new(error.to_string(), Some(error.kind().to_owned()))
+    ApiError::new(error.to_string(), Some(error.kind().to_owned()))  // alloc: error path
 }
 
 /// A query's batches as one Arrow IPC stream, and their rows; no bytes for no batches.
@@ -391,7 +391,7 @@ fn ipc(batches: &[arrow_array::RecordBatch]) -> Result<(Vec<u8>, u64), ApiError>
     let mut out = Vec::new();
     if let Some(first) = batches.first() {
         blaze_explore::frame::ipc(&mut out, &first.schema(), batches)
-            .map_err(|error| ApiError::new(format!("encoding a query's answer as Arrow IPC: {error}"), Some("sql".to_owned())))?;
+            .map_err(|error| ApiError::new(format!("encoding a query's answer as Arrow IPC: {error}"), Some("sql".to_owned())))?;  // alloc: error path
     }
     Ok((out, rows))
 }

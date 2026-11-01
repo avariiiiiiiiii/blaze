@@ -1022,7 +1022,9 @@ impl<'db, 'f> InferenceContext<'db, 'f> {
                 Ty::new_ref(self.interner(), self.types.regions.statik, arr, Mutability::Not)
             }
         };
-        let ty = self.insert_type_vars_shallow(ty);
+        // rustc's `ExprKind::Err` is of the error type, which unifies with what it meets: a
+        // fresh variable in its place would leave its uses ambiguous (E0284).
+        let ty = if matches!(expr, Expr::Missing) { ty } else { self.insert_type_vars_shallow(ty) };
         // Non-block expressions whose children diverged.
         match expr {
             Expr::Block { .. }

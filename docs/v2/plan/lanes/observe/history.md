@@ -71,21 +71,24 @@ about 3,000 rows a second loses some.
 `crates/blaze-profile/sql/views.sql` is the prelude every query runs after. It defines one view
 for each table (`spans`, `counters`, `builds`, `samples`, `provenance`, `inputs`,
 `alloc_samples`, `heap_by_owner`), each over
-`read_parquet([<globs>], union_by_name = true)`. It also defines two views over `spans`:
+`read_parquet([<globs>], union_by_name = true)`. It also defines two views over `spans` and one
+over `counters`:
 - `queries`: the spans of queries, with `memo` (verified, reran, reran-same-output) and `cause`
   from `provenance`, matched on the build, the query's kind and its key;
 - `passes`: the code generator's steps on one function (spans that name a `function` and are
-  not queries), with the span's name as `pass`.
+  not queries), with the span's name as `pass`;
+- `fiber_stacks`: one row per job that ran on a fiber, with its four `fiber stack` counters
+  as columns and `high_water` (`deepest + grown`).
 
 `views::prelude(&[dir, ...])` fills in each `@<table>` with the list of globs, one per
 directory. That is the history's directory, plus the live window's directory with `--live`.
 
 `sql/examples.sql` holds the named queries, each a `-- name:` line, a `-- says:` line, then its
 SQL. `views::VIEWS` cuts them out at compile time, so a missing section is a compile error.
-Their arguments are declared in Rust, each with a type and a default. The ten:
+Their arguments are declared in Rust, each with a type and a default. The eleven:
 `slowest_queries`, `slower_between_commits`, `memo_hit_rate_per_crate`, `critical_path`,
 `allocations_per_query_kind`, `what_reran`, `busiest_threads`, `longest_gaps`,
-`top_cpu_stacks` and `time_by_span_name`. `views::render` binds the arguments as SQL literals:
+`top_cpu_stacks`, `time_by_span_name` and `jobs_by_stack_high_water`. `views::render` binds the arguments as SQL literals:
 - an integer as it is written;
 - a float with an exponent, so DuckDB types it `DOUBLE`;
 - text single-quoted, with each quote doubled.

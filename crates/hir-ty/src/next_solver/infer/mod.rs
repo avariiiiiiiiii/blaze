@@ -1433,7 +1433,7 @@ impl<'db> InferCtxt<'db> {
         }
 
         let bound_vars = value.bound_vars();
-        let mut args = Vec::with_capacity(bound_vars.len());
+        let mut args = smallvec::SmallVec::<[GenericArg<'db>; 8]>::with_capacity(bound_vars.len());
 
         for bound_var_kind in bound_vars {
             let arg: GenericArg<'db> = match bound_var_kind {
@@ -1445,7 +1445,7 @@ impl<'db> InferCtxt<'db> {
         }
 
         struct ToFreshVars<'db> {
-            args: Vec<GenericArg<'db>>,
+            args: smallvec::SmallVec<[GenericArg<'db>; 8]>,
         }
 
         impl<'db> BoundVarReplacerDelegate<DbInterner<'db>> for ToFreshVars<'db> {

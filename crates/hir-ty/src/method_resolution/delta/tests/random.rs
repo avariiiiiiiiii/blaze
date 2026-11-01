@@ -373,7 +373,9 @@ fn declarations(db: &Db, krate: Crate) -> Vec<String> {
 /// head, its derives, the body modules it lists, and the hash of their impls.
 fn slice_rows(db: &Db, krate: Crate) -> Vec<String> {
     use crate::method_resolution::delta::{
-        impl_identity, publish::trait_slice, read::body_impl_set_hash,
+        impl_identity,
+        publish::trait_slice,
+        read::{body_impl_set_hash, trait_bodies},
     };
 
     let mut out = Vec::new();
@@ -393,6 +395,23 @@ fn slice_rows(db: &Db, krate: Crate) -> Vec<String> {
             rows.bodies,
             body_impl_set_hash(db, krate, trait_),
         ));
+        for &module in rows.bodies.iter() {
+            let table = trait_bodies(db, module);
+            let Some(t) = table.trait_index(trait_) else {
+                out.push(format!("{name}: body {module:?} has no impl of it"));
+                continue;
+            };
+            for &imp in table.blanket.run(t) {
+                out.push(format!("{name}: body {module:?} blanket {:?}", impl_identity(db, imp)));
+            }
+            for (self_ty, (impls, derives)) in table.rows_at(t) {
+                let ids: Vec<_> = impls.iter().map(|&imp| impl_identity(db, imp)).collect();
+                out.push(format!(
+                    "{name}: body {module:?} {self_ty:?} {ids:?}, {} derives",
+                    derives.len()
+                ));
+            }
+        }
     }
     out
 }

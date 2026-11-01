@@ -249,6 +249,8 @@ impl<'db> Machine<'db> for Provenance {
     #[inline(always)]
     fn freeze(&mut self, _: u64) {}
     #[inline(always)]
+    fn initialized(&mut self, _: u64) {}
+    #[inline(always)]
     fn call(&mut self) -> MResult<()> {
         Ok(())
     }

@@ -739,10 +739,15 @@ impl MacroCallId {
                     .map_or_else(|| node.syntax().text_range(), |path| path.syntax().text_range());
                 let span = map.span_for_range(path_range);
 
-                let refused = |kind, why: &str| {
+                // A refused call's tree is also its expansion: no tokens, not even delimiters.
+                let refused = |why: &str| {
                     (
                         tt::TopSubtree::from_token_trees(
-                            tt::Delimiter { open: span, close: span, kind },
+                            tt::Delimiter {
+                                open: span,
+                                close: span,
+                                kind: tt::DelimiterKind::Invisible,
+                            },
                             tt::TokenTreesView::empty(),
                         ),
                         SyntaxFixupUndoInfo::default(),
@@ -753,7 +758,6 @@ impl MacroCallId {
 
                 let Some(tt) = node.token_tree() else {
                     return refused(
-                        tt::DelimiterKind::Invisible,
                         "this macro call has no `(..)`, `[..]` or `{..}` argument, so it is not expanded",
                     );
                 };
@@ -769,13 +773,6 @@ impl MacroCallId {
                     // pathological, deeply nested code. The expansion is refused, with why.
                     cov_mark::hit!(issue9358_bad_macro_stack_overflow);
 
-                    let kind = match first {
-                        _ if loc.def.is_proc_macro() => tt::DelimiterKind::Invisible,
-                        T!['('] => tt::DelimiterKind::Parenthesis,
-                        T!['['] => tt::DelimiterKind::Bracket,
-                        T!['{'] => tt::DelimiterKind::Brace,
-                        _ => tt::DelimiterKind::Invisible,
-                    };
                     // alloc: an error's message, on the error path
                     let why = match tt.right_delimiter_token() {
                         None => format!(
@@ -788,7 +785,7 @@ impl MacroCallId {
                             last.text()
                         ),
                     };
-                    return refused(kind, &why);
+                    return refused(&why);
                 }
 
                 let mode = if loc.def.is_proc_macro() {

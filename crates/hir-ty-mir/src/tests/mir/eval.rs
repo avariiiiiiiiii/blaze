@@ -162,6 +162,15 @@ fn check_error_with(
     })
 }
 
+/// The error `e` is, under the functions it was raised in.
+fn innermost<'a, 'db>(e: &'a MirEvalError<'db>) -> &'a MirEvalError<'db> {
+    let mut err = e;
+    while let MirEvalError::InFunction(inner, _) = err {
+        err = inner;
+    }
+    err
+}
+
 #[test]
 fn function_with_extern_c_abi() {
     check_pass(
@@ -1159,7 +1168,7 @@ fn syscalls() {
 fn syscall_numbers_are_the_targets() {
     check_error_with(
         &getrandom_syscall("aarch64", 318),
-        |e| matches!(e, MirEvalError::NotSupported(s) if s.contains("syscall id 318")),
+        |e| matches!(innermost(&e), MirEvalError::NotSupported(s) if s.contains("syscall id 318")),
     );
     check_error_with(
         r#"
@@ -1173,7 +1182,7 @@ fn main() {
     syscall(318, &mut x, 4usize, 0);
 }
 "#,
-        |e| matches!(e, MirEvalError::NotSupported(s) if s.contains("target_arch")),
+        |e| matches!(innermost(&e), MirEvalError::NotSupported(s) if s.contains("target_arch")),
     );
 }
 
@@ -1554,7 +1563,7 @@ fn main() {
     );
     // Where the outer call is an expression, so is one last in its expansion: rustc rejects
     // `outer!()` as the value of a block when it expands to a call of several statements, whose
-    // expansion does not parse as the expression it is expanded as.
+    // expansion does not parse as the expression it is expanded as: the value is missing.
     check_error_with(
         r#"
 macro_rules! two { ($($t:tt)*) => { $($t)* $($t)* } }
@@ -1565,7 +1574,7 @@ fn main() {
     let _ = { outer!() };
 }
 "#,
-        |e| matches!(e, MirEvalError::MirLowerError(_, MirLowerError::HasErrors)),
+        |e| matches!(e, MirEvalError::MirLowerError(_, MirLowerError::IncompleteExpr)),
     );
 }
 
@@ -1738,6 +1747,7 @@ fn main() {
 
 #[test]
 fn caller_location_intrinsic() {
+    // `Location::caller` tracks its caller, so it is where `main` calls it, counted from 1.
     check_pass(
         r#"
 //- minicore: panic_location
@@ -1747,7 +1757,7 @@ fn should_not_reach() {
 
 fn main() {
     let loc = core::panic::Location::caller();
-    if loc.line() != 1 || loc.column() != 1 {
+    if loc.line() != 6 || loc.column() != 15 {
         should_not_reach();
     }
 }

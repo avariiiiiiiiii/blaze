@@ -341,6 +341,8 @@ impl<'db> Machine<'db> for Recorder {
         self.events.push(Event::Freeze { addr });
     }
 
+    fn initialized(&mut self, _: u64) {}
+
     fn call(&mut self) -> MResult<()> {
         self.events.push(Event::Call);
         Ok(())

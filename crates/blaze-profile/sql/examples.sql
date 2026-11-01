@@ -161,3 +161,22 @@ FROM spans
 WHERE build_id = $build
 GROUP BY name
 ORDER BY total_ms DESC
+
+-- name: jobs_by_stack_high_water
+-- says: a build's jobs ranked by how deep they went on their fiber's stack and past it, in KiB, beside what the fiber reserved
+SELECT
+    rank() OVER (ORDER BY high_water DESC) AS rank,
+    process,
+    fiber,
+    job,
+    ended_ns,
+    high_water / 1024 AS high_water_kib,
+    deepest / 1024 AS deepest_kib,
+    grown / 1024 AS grown_kib,
+    touched / 1024 AS touched_kib,
+    reserved / 1024 AS reserved_kib,
+    round(100 * deepest / reserved, 1) AS reserved_used_pct
+FROM fiber_stacks
+WHERE build_id = $build
+ORDER BY high_water DESC
+LIMIT $limit

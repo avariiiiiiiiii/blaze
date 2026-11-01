@@ -13,7 +13,7 @@ const fn tag(lint: Lint) -> Option<&'static str> {
         Lint::HotClone => Some("clone"),
         Lint::HotAlloc | Lint::StdHashmap => Some("alloc"),
         Lint::HotDyn => Some("dyn"),
-        Lint::Parallelizable | Lint::SerialDependence => None,
+        Lint::Parallelizable | Lint::SerialDependence | Lint::FiberBoundary => None,
     }
 }
 

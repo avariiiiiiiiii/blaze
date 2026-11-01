@@ -20,10 +20,7 @@
 //!   global trait goals' answers (`hir_ty::next_solver::goal_store`). Each is served with the
 //!   images and stored where they are.
 
-use std::{
-    panic,
-    sync::{Arc, Mutex, OnceLock},
-};
+use std::sync::{Arc, Mutex, OnceLock};
 
 use base_db::{Crate, Db, Env};
 use blaze_api::{ApiError, Diagnostic, Level, ServedCrate, ServedPart};
@@ -554,40 +551,19 @@ impl ImageStore for Images {
     }
 }
 
-/// `task(at)` for each `at` in `0..count` on the shared pool, each in a frame of its own, as
-/// [`base_db::run_on_pool`] runs a batch: a task that would wait on a query its own thread
-/// runs below it runs again in a round of its own, and the first other panic goes on from here
-/// once its round is over.
+/// `task(at)` for each `at` in `0..count` on the pool, each in a frame of its own, as
+/// [`base_db::Db::run_all`] runs a batch: a task that would wait on a query held by this
+/// caller or a task below it runs again here, on this thread, after the batch
+/// ([`blaze_graph::par::for_each_giving_way`]); the first other panic goes on from here once
+/// every task has run.
 // dyn: as `ImageStore::for_each`
 fn on_pool(count: usize, task: &(dyn Fn(usize) + Sync)) {
     let task = |at: usize| blaze_mem::frame::task(blaze_mem::Tag::Query, |_| task(at));
-    let pool = blaze_graph::exec::shared();
-    let near = blaze_graph::pool::group();
-    let panicked = Mutex::new(None);
-    let again = Mutex::new(Vec::new());
-    let mut round: Vec<usize> = (0..count).collect(); // alloc: setup, once per batch of crates
-    while !round.is_empty() {
-        pool.scope(|scope| {
-            for &at in &round {
-                let (panicked, again) = (&panicked, &again);
-                scope.submit(near, move || task(at), move |ran| {
-                    let Err(panic) = ran else { return };
-                    if matches!(panic.downcast_ref::<blaze_query::db::Cancelled>(), Some(blaze_query::db::Cancelled::WouldWaitOnItself)) {
-                        again.lock().unwrap_or_else(|it| it.into_inner()).push(at);
-                    } else {
-                        panicked.lock().unwrap_or_else(|it| it.into_inner()).get_or_insert(panic);
-                    }
-                });
-            }
-        });
-        round.clear();
-        std::mem::swap(&mut round, &mut *again.lock().unwrap_or_else(|it| it.into_inner()));
-        if panicked.lock().unwrap_or_else(|it| it.into_inner()).is_some() {
-            break;
-        }
-    }
-    if let Some(panic) = panicked.into_inner().unwrap_or_else(|it| it.into_inner()) {
-        panic::resume_unwind(panic);
+    let again = blaze_graph::par::for_each_giving_way(count, task, |panic| {
+        matches!(panic.downcast_ref::<blaze_query::db::Cancelled>(), Some(blaze_query::db::Cancelled::WouldWaitOnItself))
+    });
+    for at in again {
+        task(at);
     }
 }
 

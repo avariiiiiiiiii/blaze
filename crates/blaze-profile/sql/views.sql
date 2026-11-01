@@ -45,6 +45,24 @@ LEFT JOIN (
     AND memo.query_key = spans.function
 WHERE spans.query_kind IS NOT NULL;
 
+-- One row a job that ran on a fiber, from the four counters `fiber_stack` writes at its end
+-- (crates/blaze-profile/src/flight.rs), in bytes: what its fiber reserved, how deep the job went
+-- on it, how much of it is committed, and the segments the job grew past it. `high_water` is
+-- how deep the job went in all. A job's number is reused, so a job is its fiber, number and
+-- end together.
+CREATE OR REPLACE VIEW fiber_stacks AS
+SELECT
+    build_id, process, fiber, job, t_ns AS ended_ns,
+    max(value) FILTER (WHERE name = 'fiber stack reserved') AS reserved,
+    max(value) FILTER (WHERE name = 'fiber stack deepest') AS deepest,
+    max(value) FILTER (WHERE name = 'fiber stack touched') AS touched,
+    max(value) FILTER (WHERE name = 'fiber stack grown') AS grown,
+    max(value) FILTER (WHERE name = 'fiber stack deepest')
+        + max(value) FILTER (WHERE name = 'fiber stack grown') AS high_water
+FROM counters
+WHERE fiber IS NOT NULL
+GROUP BY build_id, process, fiber, job, t_ns;
+
 -- One row a step of the code generator on one function: a span that names its function and is
 -- not a query.
 CREATE OR REPLACE VIEW passes AS

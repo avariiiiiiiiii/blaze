@@ -71,9 +71,23 @@ outermost first. `?` marks a nullable column.
 |---|---|---|
 | build_id | u64? | the build, or null |
 | process | u32 | the process id |
-| name | dict | what is counted: `memo hits`, `memo misses`, `joined`, `pool queued`, `pool running`, `frame bytes`, `live bytes` |
+| name | dict | what is counted: `memo hits`, `memo misses`, `joined`, `pool queued`, `pool running`, `frame bytes`, `live bytes`, and per job on a fiber `fiber stack reserved`, `fiber stack deepest`, `fiber stack touched`, `fiber stack grown` (bytes) |
 | t_ns | i64 | when |
 | value | f64 | the value then |
+| fiber | u32? | the fiber a `fiber stack` counter is of, or null |
+| job | u64? | the job that ran on that fiber, or null |
+
+The fiber driver notes the four `fiber stack` counters when a job ends, as one row in the
+recorder (`blaze_profile::fiber_stack`):
+- `reserved` is the fiber's stack, guard page left out.
+- `deepest` is how far below the stack's base the job went.
+- `touched` is how much of the fiber's stack is committed, which only grows over the fiber's
+  life.
+- `grown` is the segments the job grew past the fiber's stack.
+
+The `fiber_stacks` view has one row per job, and `jobs_by_stack_high_water` ranks a build's
+jobs by `deepest + grown`. A later choice between fibers and a narrow stackless primitive
+rests on these numbers.
 
 ### `builds`: one row a build request the daemon ran
 

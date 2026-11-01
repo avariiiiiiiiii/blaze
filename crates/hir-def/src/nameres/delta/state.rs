@@ -65,6 +65,8 @@ pub(super) struct CrateState {
     pub(super) module_readers: ReadIndex<ModuleId, ModuleId>,
     /// The groups each file defines a round-0 module of.
     pub(super) files: FxHashMap<FileId, Vec<ModuleId>>,
+    /// The groups that left out a `mod` of each file for its `#![cfg]` (`Group::configured_out`).
+    pub(super) configured_out: FxHashMap<FileId, Vec<ModuleId>>,
     /// The crate env after the root's last run, which a run without the root starts from.
     pub(super) env: CrateEnv,
     /// The std prelude every path reads: the env's, or a `#[prelude_import]`'s, with the group
@@ -110,6 +112,7 @@ impl CrateState {
             reads: ReadIndex::new(),
             module_readers: ReadIndex::new(),
             files: FxHashMap::default(),
+            configured_out: FxHashMap::default(),
             env: CrateEnv::default(),
             prelude: None,
             prelude_holder: None,
@@ -156,6 +159,8 @@ pub(super) struct Group {
     pub(super) parent: Option<ModuleId>,
     /// `module_decls(key).children`: the keys of the round-0 modules it declares.
     pub(super) children: Box<[DeclKey]>,
+    /// `module_decls(key).configured_out`: the files of the `mod`s it left out.
+    pub(super) configured_out: Box<[FileId]>,
     /// The group's modules in the order the last run made them, the round-0 one first.
     pub(super) modules: Vec<ModuleId>,
     pub(super) out: GroupOut,

@@ -16,8 +16,9 @@
 //! - A stop writes the image, waits for it to be mapped, then stops listening and hangs up.
 //! - The explorer, the live feed and live SQL are answered by the loop itself ([`Observe`]);
 //!   each build that ends goes to the profile history's thread. A build whose tasks stop
-//!   moving for [`Watchdog::BOUND`] fails with the stall, whose trace is written beside the
-//!   state, and the daemon stops: its workers may be deadlocked and cannot be got back.
+//!   moving for [`Watchdog::BOUND`] fails with the stall, whose trace is written to the
+//!   state's `stalls/`, and the daemon stops: its workers may be deadlocked and cannot be got
+//!   back.
 
 #![forbid(unsafe_code)]
 
@@ -193,7 +194,7 @@ pub struct Daemon<D: Driver, S: Steps> {
     failed: Option<Failed>,
     pid: u32,
     started: Started,
-    /// Its state directory, where a stall's trace is written.
+    /// Its state directory, in whose `stalls/` a stall's trace is written.
     state: FileName,
     observe: Observe,
     watchdog: Watchdog,
@@ -847,7 +848,7 @@ impl<D: Driver, S: Steps> Daemon<D, S> {
         let stall = blaze_profile::watchdog::stall(quiet, running);
         let said = stall.to_string();
         tracing::error!("{said}");
-        let file = under(&self.state, &format!("stall-{now}.json"));
+        let file = under(&self.state, &format!("stalls/{now}.json"));
         self.effects.push(Effect::Write { file, bytes: stall.trace, tag: STALL });
         // clone: the error, once a stall
         let error = ApiError::new(said.clone(), Some("stall".to_owned()));

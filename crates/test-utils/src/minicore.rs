@@ -2247,12 +2247,9 @@ pub mod panic {
     // endregion:panic_location
 
     pub macro panic_2021 {
-        () => ({
-            const fn panic_cold_explicit() -> ! {
-                $crate::panicking::panic_explicit()
-            }
-            panic_cold_explicit();
-        }),
+        () => (
+            $crate::panicking::panic_default_msg()
+        ),
         // Special-case the single-argument case for const_panic.
         ("{}", $arg:expr $(,)?) => ({
             #[rustc_const_panic_str] // enforce a &&str argument in const-check and hook this by const-eval
@@ -2295,6 +2292,12 @@ pub mod panicking {
     #[lang = "panic"]
     pub const fn panic(expr: &'static str) -> ! {
         panic_fmt(crate::fmt::Arguments::from_str(expr))
+    }
+
+    // panic!() without args expands to this
+    #[track_caller]
+    pub const fn panic_default_msg() -> ! {
+        panic("explicit panic")
     }
 }
 // endregion:panic

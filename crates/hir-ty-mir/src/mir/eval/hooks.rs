@@ -192,6 +192,12 @@ impl<'db, M: Machine<'db>> Hooks<M> {
         }
     }
     #[inline(always)]
+    pub(super) fn initialized(&self, addr: u64) {
+        if M::CHECKS {
+            self.with(|m| m.initialized(addr))
+        }
+    }
+    #[inline(always)]
     pub(super) fn call(&self) -> Result<'db, ()> {
         self.unit(|m| m.call())
     }

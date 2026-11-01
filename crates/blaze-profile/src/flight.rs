@@ -215,10 +215,18 @@ pub enum Plot {
     FrameBytes,
     /// Bytes every tag of `blaze_mem` holds.
     LiveBytes,
+    /// Bytes a fiber's stack has reserved, at a job's end ([`fiber_stack`]).
+    FiberStackReserved,
+    /// Bytes below its base the job ran on its fiber's stack ([`FiberStack::deepest`]).
+    FiberStackDeepest,
+    /// Bytes of the fiber's stack committed so far ([`FiberStack::touched`]).
+    FiberStackTouched,
+    /// Bytes of segments the job grew past its fiber's stack ([`FiberStack::grown`]).
+    FiberStackGrown,
 }
 
 impl Plot {
-    pub const ALL: [Plot; 7] = [
+    pub const ALL: [Plot; 11] = [
         Plot::MemoHits,
         Plot::MemoMisses,
         Plot::Joined,
@@ -226,6 +234,10 @@ impl Plot {
         Plot::Running,
         Plot::FrameBytes,
         Plot::LiveBytes,
+        Plot::FiberStackReserved,
+        Plot::FiberStackDeepest,
+        Plot::FiberStackTouched,
+        Plot::FiberStackGrown,
     ];
 
     pub const fn name(self) -> &'static str {
@@ -237,6 +249,10 @@ impl Plot {
             Plot::Running => "pool running",
             Plot::FrameBytes => "frame bytes",
             Plot::LiveBytes => "live bytes",
+            Plot::FiberStackReserved => "fiber stack reserved",
+            Plot::FiberStackDeepest => "fiber stack deepest",
+            Plot::FiberStackTouched => "fiber stack touched",
+            Plot::FiberStackGrown => "fiber stack grown",
         }
     }
 
@@ -251,6 +267,39 @@ pub fn plot(which: Plot, value: u64) {
     if let Some(ring) = ring() {
         let build = u64::from(BUILD.with(Cell::get));
         ring.put([clock::ticks(), value, 0, 0, KIND_PLOT << 62 | which as u64, 0, build, 0]);
+    }
+}
+
+/// What a job left on its fiber's stack, read by the fiber driver when the job ends. Every
+/// size is in bytes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct FiberStack {
+    /// The fiber, numbered by the driver: the same number for the fiber's whole life.
+    pub fiber: u32,
+    /// The job that ran on it.
+    pub job: u64,
+    /// What the fiber's stack reserved, guard page left out.
+    pub reserved: u64,
+    /// How far below its base the job's stack pointer went, as far as the driver saw it.
+    pub deepest: u64,
+    /// How much of the fiber's stack is committed: the deepest any job on it went, to the page.
+    pub touched: u64,
+    /// Segments the job grew past the fiber's stack.
+    pub grown: u64,
+}
+
+/// The plot byte of a [`fiber_stack`] row: one row a job, read as four counters.
+const FIBER_STACK_ROW: u64 = 0xff;
+
+/// Notes `stack` now, in this thread's ring: one row, read as the counters
+/// [`Plot::FiberStackReserved`], [`Plot::FiberStackDeepest`], [`Plot::FiberStackTouched`] and
+/// [`Plot::FiberStackGrown`] of its fiber and job.
+#[inline]
+pub fn fiber_stack(stack: FiberStack) {
+    if let Some(ring) = ring() {
+        let build = u64::from(BUILD.with(Cell::get));
+        let what = KIND_PLOT << 62 | u64::from(stack.fiber) << 8 | FIBER_STACK_ROW;
+        ring.put([clock::ticks(), stack.reserved, stack.deepest, stack.touched, what, stack.grown, build, stack.job]);
     }
 }
 
@@ -842,6 +891,8 @@ pub struct CounterRow {
     pub plot: Plot,
     pub t_ns: i64,
     pub value: u64,
+    /// The fiber and job a [`fiber_stack`] counter is of; `None` for every other plot.
+    pub fiber: Option<(u32, u64)>,
 }
 
 /// A build's end, as [`crate::built`] noted it.
@@ -955,6 +1006,19 @@ fn take(into: &mut Read, mut rows: impl FnMut(&Ring, &mut Vec<(u64, [u64; WORDS]
                         unit: row[6] as u32,
                     });
                 }
+                KIND_PLOT if row[4] & 0xff == FIBER_STACK_ROW => {
+                    let fiber = Some(((row[4] >> 8) as u32, row[7]));
+                    let (build, t_ns) = (row[6] as u32, scale.mono(row[0]));
+                    into.counters.extend(
+                        [
+                            (Plot::FiberStackReserved, row[1]),
+                            (Plot::FiberStackDeepest, row[2]),
+                            (Plot::FiberStackTouched, row[3]),
+                            (Plot::FiberStackGrown, row[5]),
+                        ]
+                        .map(|(plot, value)| CounterRow { build, plot, t_ns, value, fiber }),
+                    );
+                }
                 KIND_PLOT => {
                     let Some(plot) = Plot::of(row[4] & 0xff) else { continue };
                     into.counters.push(CounterRow {
@@ -962,6 +1026,7 @@ fn take(into: &mut Read, mut rows: impl FnMut(&Ring, &mut Vec<(u64, [u64; WORDS]
                         plot,
                         t_ns: scale.mono(row[0]),
                         value: row[1],
+                        fiber: None,
                     });
                 }
                 KIND_MARK => into.ends.push(BuildEnd { build: row[1], t_ns: scale.mono(row[0]), thread: by.tid }),
@@ -1261,5 +1326,47 @@ mod tests {
         assert!(row.dur_ns >= 0);
         // Its thread ended, so the ring that made it names that thread or the next to take it.
         assert!(row.thread == tid || row.thread != 0);
+    }
+
+    #[test]
+    fn a_fiber_stack_row_reads_as_four_counters_of_its_fiber_and_job() {
+        crate::install();
+        let job = u64::MAX - 5;
+        std::thread::spawn(move || {
+            let _build = building(9);
+            fiber_stack(FiberStack {
+                fiber: u32::MAX - 1,
+                job,
+                reserved: 16 << 20,
+                deepest: 300 << 10,
+                touched: 320 << 10,
+                grown: 1 << 20,
+            });
+            plot(Plot::Queued, 1);
+        })
+        .join()
+        .unwrap();
+        let mut read = Read::default();
+        window(Duration::from_secs(60), &mut read);
+        let ours: Vec<(Plot, u64)> = read
+            .counters
+            .iter()
+            .filter(|it| it.fiber == Some((u32::MAX - 1, job)))
+            .inspect(|it| assert_eq!(it.build, 9))
+            .map(|it| (it.plot, it.value))
+            .collect();
+        assert_eq!(
+            ours,
+            [
+                (Plot::FiberStackReserved, 16 << 20),
+                (Plot::FiberStackDeepest, 300 << 10),
+                (Plot::FiberStackTouched, 320 << 10),
+                (Plot::FiberStackGrown, 1 << 20),
+            ]
+        );
+        assert!(
+            read.counters.iter().filter(|it| it.plot == Plot::Queued && it.build == 9).all(|it| it.fiber.is_none()),
+            "a plot is of no fiber"
+        );
     }
 }

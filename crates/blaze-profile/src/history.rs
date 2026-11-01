@@ -597,7 +597,13 @@ mod tests {
         let process = Process { pid: 9, name: "blaze test", commit: Some("abc") };
         let spans = batches::spans(&spans, process).unwrap();
         let counters: Vec<CounterRow> = (0..10)
-            .map(|i| CounterRow { build: 1, plot: Plot::ALL[i % Plot::ALL.len()], t_ns: i as i64, value: i as u64 * 3 })
+            .map(|i| CounterRow {
+                build: 1,
+                plot: Plot::ALL[i % Plot::ALL.len()],
+                t_ns: i as i64,
+                value: i as u64 * 3,
+                fiber: None,
+            })
             .collect();
         let counters = batches::counters(&counters, process).unwrap();
         let builds = builds(&[row(1, Outcome::Ok), row(2, Outcome::Stalled)]).unwrap();

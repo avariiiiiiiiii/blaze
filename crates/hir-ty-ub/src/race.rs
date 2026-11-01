@@ -730,6 +730,13 @@ impl Races {
         };
     }
 
+    /// `alloc`, `size` bytes of memory from before every thread, has its initial bytes, which
+    /// the evaluator wrote when the program first used it: they are no thread's write, so its
+    /// clocks start again at time zero.
+    pub fn initialized(&mut self, alloc: AllocId, size: u64) {
+        self.new_alloc(alloc, size, None);
+    }
+
     /// `alloc`, `size` bytes, is freed: a write of every byte. Its clocks go with it; memory
     /// reports any later access as use after free.
     pub fn free(&mut self, alloc: AllocId, size: u64, site: SiteId) -> Result<(), RaceError> {

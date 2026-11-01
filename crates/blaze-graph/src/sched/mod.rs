@@ -45,6 +45,7 @@ use blaze_core::wheel::Wheel;
 use rustc_hash::FxHashMap;
 
 pub use cores::{CoreInfo, Cores, Distances, LEVELS, Level, MAX_CORES, ShapeError};
+pub use fiber::{Carried, NoWait, carry, claim, current_job, key_done, miss, wait};
 
 use crate::Key;
 use cores::{any_in, first_from, get, set};
@@ -1329,9 +1330,8 @@ impl Sched {
                 assert_eq!(self.jobs[job].state, JobState::Running, "core {c} runs job {job}");
                 assert_eq!(self.jobs[job].core, core, "job {job}'s core");
             }
-            for &job in &self.urgent[c] {
-                assert!(self.jobs[job as usize].critical, "job {job} on core {c}'s critical queue");
-            }
+            // A job's queue is its class when queued: `set_critical` on a queued job leaves it
+            // there, so either queue may hold either class.
             let queued = self.inbox[c].iter().chain(&self.queue[c]).chain(&self.urgent[c]).copied();
             let queued = queued.chain([self.slot[c], self.reserved[c]].into_iter().filter(|&it| it != NONE));
             for job in queued {

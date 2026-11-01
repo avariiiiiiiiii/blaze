@@ -19,7 +19,9 @@
 //! An ADT's verdict is a query of the ADT with its identity arguments, per (trait, asking
 //! crate), so the impls seen are the solver's. A verdict that holds needs no fact about the
 //! parameters, so it holds of every instance; the fast path asks it for any ADT instance and
-//! walks only the built-in types around it.
+//! walks only the built-in types around it. One that fails over a generic ADT's identity
+//! arguments may have needed only a fact about them, so the fast path then walks the
+//! instance's own impls or fields, as the query would have with those arguments.
 //!
 //! Every answer here is one the solver reaches through the search graph, so it costs the
 //! search-graph depth the solver's evaluation would: one level per goal of the walk, a cycle
@@ -279,14 +281,19 @@ impl<'db> Walk<'db> {
     fn node(&mut self, trait_: TraitIdWrapper, ty: Ty<'db>) -> bool {
         let interner = self.interner;
         if self.inline == Inline::No
-            && let TyKind::Adt(def, _) = ty.kind()
+            && let TyKind::Adt(def, args) = ty.kind()
             && !def.is_phantom_data()
         {
             let depth =
                 auto_trait_depth(interner.db, def.def_id(), trait_.0, interner.expect_crate());
-            let deepest = self.len - 1 + usize::from(depth);
-            self.deepest = self.deepest.max(deepest);
-            return depth != 0 && deepest <= self.limit;
+            // A verdict that fails over the identity arguments may need only a fact about the
+            // parameters (`Option<T>: Send` needs `T: Send`): an instance's own arguments are
+            // walked below instead.
+            if depth != 0 || args.is_empty() {
+                let deepest = self.len - 1 + usize::from(depth);
+                self.deepest = self.deepest.max(deepest);
+                return depth != 0 && deepest <= self.limit;
+            }
         }
         match impls(interner, trait_, ty) {
             Impls::None => {}

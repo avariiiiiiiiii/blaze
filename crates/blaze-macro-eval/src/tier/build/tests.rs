@@ -73,7 +73,7 @@ fn the_tiers_spec_is_static_copy_and_patch_that_counts_nothing() {
     for (checks, assertions) in [(true, true), (false, false), (false, true)] {
         let (policy, stencils) = policy(checks, assertions).unwrap();
         assert!(!stencils.pic);
-        let tier = tier_spec(policy.choose(&origin, None).unwrap().first);
+        let tier = tier_spec(policy.choose(&origin, None).unwrap().first, "f").unwrap();
         assert_eq!(tier.backend, Backend::Stencil);
         assert!(!tier.counted && !tier.fold);
         assert_eq!(tier.toolchain.relocation, Relocation::Static);
@@ -95,4 +95,16 @@ fn each_name_is_found_by_its_user_name() {
     assert_eq!(at[&(0, 7)], a.as_u32());
     assert_eq!(at[&(1, 3)], b.as_u32());
     assert_eq!(at.len(), 2);
+}
+
+#[test]
+fn a_unit_planned_for_llvm_is_refused_by_name_never_compiled_as_stencils() {
+    if !machine::SUPPORTED {
+        return;
+    }
+    let (policy, _) = policy(true, true).unwrap();
+    let mut spec = policy.choose(&Origin::BuildTime(Package::new("proc-macro")), None).unwrap().first;
+    spec.backend = Backend::Llvm { opt: 3 };
+    let error = tier_spec(spec, "core::fmt::write").unwrap_err();
+    assert!(error.0.contains("`core::fmt::write`") && error.0.contains("opt-level 3"), "{error:?}");
 }

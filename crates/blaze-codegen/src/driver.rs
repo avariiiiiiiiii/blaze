@@ -35,7 +35,7 @@ use crate::{
     CodegenError, CompiledFunction, Instance, InstanceKey, Static, Target, Unit,
     backend::{
         Address, Described, DescribedStatic, Emitted, FrontRef, Frontend, Import, Prepare, Shape,
-        release_refs,
+        laid_out, release_refs,
     },
     blob,
     dedupe::{Deduped, dedupe},
@@ -952,12 +952,16 @@ impl<'a, B: Prepare> Build<'a, B> {
                 owner: node.described.owner,
                 code: node.unit.instance.code,
                 refs: &node.refs,
+                name: &node.described.name,
+                origin: node.described.origin,
             }),
             statics.keys.iter().zip(&statics.values).map(|(id, node)| owners::StaticOf {
                 id: *id,
                 unit: InstanceKey(node.described.value),
                 owner: Owner::of(&node.described.origin),
                 refs: &node.refs,
+                symbol: node.described.symbol.as_deref(),
+                origin: node.described.origin,
             }),
             &mut out.errors,
         );
@@ -1136,42 +1140,31 @@ impl<'a, B: Prepare> Build<'a, B> {
             .collect();
         let mut prepared: HashMap<InstanceKey, (Shape, B::Prepared)> = HashMap::new();
 
-        // Folding: every candidate's masked shape, kept from an earlier build, from the store
-        // or from its IR, each form interned once in `self.masks` (hashed only when new).
-        // Each dev key at most once; sorted by key below.
+        // Folding: every candidate's masked IR from its own IR, prepared in this build. No key
+        // known before preparing holds what a masked data object is told by (its positions'
+        // anchors, its file names), so a mask kept from another build or unit could name
+        // other data than the IR a group merges. Each form interned once in `self.masks`
+        // (hashed only when new).
         // alloc: per build, sized by its units
-        let mut masked: Vec<(InstanceKey, Option<Masking<'a>>)> = Vec::new();
+        let candidates_of: Vec<InstanceKey> = dev.iter().filter(|key| nodes[*key].spec.fold).copied().collect();
         // alloc: per build, sized by its units
-        let mut unmasked = Vec::new();
-        for key in dev.iter().filter(|key| nodes[*key].spec.fold) {
-            let (unit, stored) = (&nodes[key].unit, nodes[key].stored());
-            if let Some(kept) = self.masks.get(&stored) {
-                masked.push((*key, kept));
-                continue;
-            }
-            // alloc: an error
-            let read = out.read(store, &keys::masked(&stored), unit, |it| blob::decode_masked(it).map_err(|e| e.to_string()));
-            match read {
-                Read::Hit(it) => {
-                    masked.push((*key, self.masks.put(&stored, it)));
-                }
-                Read::Miss => unmasked.push(*key),
-                Read::Failed => {}
-            }
-        }
-        for (key, made) in self.prepare_all(nodes, &unmasked, &mut out.errors) {
+        let mut masks: Vec<(InstanceKey, Option<Masked>)> = Vec::with_capacity(candidates_of.len());
+        for (key, made) in self.prepare_all(nodes, &candidates_of, &mut out.errors) {
             match made {
                 Ok((shape, made)) => {
-                    let (node, stored) = (&nodes[&key], nodes[&key].stored());
-                    let it: Option<Masked> = self.backend.masked(&node.unit, &made, &node.refs);
-                    out.put(keys::masked(&stored), Kind::Query, blob::encode_masked(it.as_ref()));
-                    masked.push((key, self.masks.put(&stored, it)));
+                    let node = &nodes[&key];
+                    masks.push((key, self.backend.masked(&node.unit, &made, &node.refs)));
                     prepared.insert(key, (shape, made));
                 }
                 Err(why) => out.errors.push(why),
             }
         }
-        masked.sort_unstable_by_key(|it| it.0);
+        masks.sort_unstable_by_key(|it| it.0);
+        let forms = self.masks.table();
+        let masked: Vec<(InstanceKey, Option<Masking<'_>>)> = (masks.iter())
+            .map(|(key, it)| (*key, it.as_ref().map(|it| Masking::of(forms, it))))
+            // alloc: per build, sized by its units
+            .collect();
         // alloc: per build, sized by its units
         let mut candidates = Vec::new();
         for (key, it) in &masked {
@@ -1780,9 +1773,9 @@ impl<'a, B: Prepare> Build<'a, B> {
             let imported: Vec<&[Target]> =
                 // alloc: per release unit, sized by its imports
                 imports.imported.iter().map(|it| by_name[it].node.refs.as_slice()).collect();
-            let refs = release_refs(&job.node.refs, &imported);
+            let (refs, places) = release_refs(&job.node.refs, &imported);
             let key = job.unit.instance.key();
-            let blob_key = keys::release(&imports.blob_key(job.stored()));
+            let blob_key = keys::release(&imports.blob_key(laid_out(job.stored(), &places)));
             match out.read(store, &blob_key, &job.unit, |it| stored_function(it, key, &refs)) {
                 Read::Hit(made) => {
                     out.stats.stored += 1;

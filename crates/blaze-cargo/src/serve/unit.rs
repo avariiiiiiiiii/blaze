@@ -37,6 +37,7 @@ mod files;
 mod graph;
 mod harness;
 mod intent;
+mod memo;
 mod pack;
 mod reach;
 mod run;
@@ -70,8 +71,8 @@ use crate::serve::{
     Paths,
     fetch::Fetcher,
     work::{
-        Compiled, Failed, Front, FrontEnd, Goal, Image, JobInput, Kept, KeptDb, Library, Phase, Put, Runs,
-        Selection, Source, SourceFile, Steps, Writer,
+        Broke, Compiled, Failed, Front, FrontEnd, Goal, Image, JobInput, Kept, KeptDb, Library, Phase, Put, Runs,
+        Selection, Source, SourceFile, Steps, Writer, applying,
     },
 };
 
@@ -90,7 +91,8 @@ pub(crate) struct Shared {
     /// The directory of blaze's stand-ins for the tools cargo names to a build script:
     /// `rustc` and `rustdoc`, each blaze's own executable under that name.
     pub(crate) tools: PathBuf,
-    pub(crate) memo: Arc<blaze_codegen::memo::Memo>,
+    /// The code generator's memo, which each job takes at its start ([`Job::memo`]).
+    pub(crate) memos: Arc<memo::Memos>,
     /// What `-C target-cpu=native` is on this machine; none without LLVM.
     pub(crate) host_cpu: Option<blaze_units::stdlib::target::HostCpu>,
     /// Test selection's one selector per suite, for the daemon's life
@@ -107,7 +109,7 @@ impl Real {
             state: paths.state.clone(),
             launcher: paths.launcher.clone(),
             tools,
-            memo: blaze_codegen::driver::shared_memo(),
+            memos: memo::Memos::new(),
             host_cpu: hir_ty_codegen::host_cpu().map(|(name, features)| blaze_units::stdlib::target::HostCpu {
                 arch: std::env::consts::ARCH.to_owned(),
                 name,
@@ -176,6 +178,9 @@ impl Steps for Real {
         }
         let writer = cancellable(move || -> Result<(UnitWriter, Vec<Put>), Failed> {
             let mut kept = kept;
+            // Held until this job's front end is kept with its own: what the head's last build
+            // used stays in the memo for this one.
+            let held = kept.as_mut().and_then(|it| it.memo.take());
             let mut puts = Vec::new();
             let mut flushed = None;
             if let Some(it) = &mut kept {
@@ -221,7 +226,7 @@ impl Steps for Real {
                 Some(session) => session,
                 None => deps::session(&lowered, &input.store, &input.config.invocation.env)?,
             };
-            let mut job = Job::new(input.clone(), lowered.crates().clone(), self.shared.clone())?;
+            let mut job = Job::new(input.clone(), lowered.crates().clone(), self.shared.clone(), held)?;
             job._seeded = seeded;
             let job = Arc::new(job);
             let waits = graph::Waits::new(&job.graph);
@@ -250,6 +255,8 @@ impl Steps for Real {
                 macros: Vec::new(),
                 deps,
                 flushed,
+                broke: Vec::new(),
+                broken: false,
             };
             Ok((writer, puts))
         })??;
@@ -308,6 +315,9 @@ pub struct KeptLowered {
     /// The trees its job's last edit reparsed in place, for the next build to seed its parses
     /// with when it moves to the edit's commit.
     seeds: Vec<blaze_intent::Seed>,
+    /// What its job's builds used of the code generator's memo, kept there while it is kept;
+    /// taken by the next job of the head.
+    memo: Option<memo::Held>,
 }
 
 /// What a task reads the front end through ([`Steps::Reader`]): a shared reference to the job's
@@ -356,6 +366,18 @@ pub struct UnitWriter {
     /// What storing the kept front end this one lowered into did with its goals and bodies'
     /// steps ([`deps::store`]); None when nothing was kept.
     flushed: Option<deps::Flushes>,
+    /// The writes that panicked as they were applied, not yet taken ([`Writer::broke`]).
+    broke: Vec<Broke>,
+    /// Whether a write ever panicked: the front end may be half written, and is not kept.
+    broken: bool,
+}
+
+/// `broke`, a panic of a step of an apply for each of the units `ready`, kept once for each.
+fn broke_each(into: &mut Vec<Broke>, broke: Broke, ready: &[u32]) {
+    for &unit in ready {
+        // clone: a panic, once per unit it fails
+        into.push(Broke { unit: unit as usize, what: broke.what, panic: broke.panic.clone() });
+    }
 }
 
 impl Writer<Real> for UnitWriter {
@@ -386,25 +408,57 @@ impl Writer<Real> for UnitWriter {
         let Some(lowered) = Arc::get_mut(&mut self.front) else { return Ok(false) };
         self.ready.clear();
         for (unit, macros) in self.macros.drain(..) {
-            lowered.macros(unit, macros).map_err(lower_error)?;
-            self.ready.push(unit as u32);
+            match applying(unit, "a proc macro's load", || lowered.macros(unit, macros)) {
+                Ok(done) => {
+                    done.map_err(lower_error)?;
+                    self.ready.push(unit as u32);
+                }
+                Err(broke) => self.broke.push(broke),
+            }
         }
-        harness::macros_applied(lowered, &self.job, &self.waits, &self.ready)?;
+        let (job, waits, ready) = (&self.job, &self.waits, &self.ready);
+        if let Some(first) = ready.first() {
+            match applying(*first as usize, "a proc macro's load", || harness::macros_applied(lowered, job, waits, ready)) {
+                Ok(done) => done?,
+                Err(broke) => broke_each(&mut self.broke, broke, &self.ready),
+            }
+        }
         self.ready.clear();
         for (run, ran) in self.runs.drain(..) {
-            lowered.ran(run, &ran).map_err(lower_error)?;
             let from = self.ready.len();
-            self.waits.applied(run as u32, &mut self.ready);
-            harness::write(lowered, &self.job, self.ready[from..].iter().copied())?;
-            for &unit in &self.ready[from..] {
-                identify(lowered, &self.job, unit);
+            let (job, waits, ready) = (&self.job, &mut self.waits, &mut self.ready);
+            let applied = applying(run, "a build script's run", || -> Result<(), ApiError> {
+                lowered.ran(run, &ran).map_err(lower_error)?;
+                waits.applied(run as u32, ready);
+                harness::write(lowered, job, ready[from..].iter().copied())?;
+                for &unit in &ready[from..] {
+                    identify(lowered, job, unit);
+                }
+                Ok(())
+            });
+            match applied {
+                Ok(done) => done?,
+                Err(broke) => {
+                    self.ready.truncate(from);
+                    self.broke.push(broke);
+                }
             }
         }
         // A front end freshly lowered was served; the units these runs made ready are served too.
         if self.deps.is_some() && !self.ready.is_empty() {
-            deps::serve(lowered, &self.job, &self.ready, &mut self.session, &mut self.deps)?;
+            let (job, ready, session, kept) = (&self.job, &self.ready, &mut self.session, &mut self.deps);
+            match applying(ready[0] as usize, "serving its dependencies", || deps::serve(lowered, job, ready, session, kept)) {
+                Ok(done) => done?,
+                Err(broke) => broke_each(&mut self.broke, broke, &self.ready),
+            }
         }
         Ok(true)
+    }
+
+    fn broke(&mut self) -> Option<Broke> {
+        let broke = self.broke.pop();
+        self.broken |= broke.is_some();
+        broke
     }
 
     fn tables(&mut self) -> Result<Vec<(&'static str, u64, u64)>, Failed> {
@@ -433,6 +487,10 @@ impl Writer<Real> for UnitWriter {
             let what = "the front end is kept for the head's next build with no task reading it, and one still does";
             return Err(ApiError::new(what, None));
         }
+        if self.broken || !self.broke.is_empty() {
+            let what = "the front end is not kept for the head's next build: a write to it panicked, and it may be half written";
+            return Err(ApiError::new(what, None));
+        }
         let UnitWriter { session, front, job, deps, .. } = self;
         let Some(lowered) = Arc::into_inner(front) else {
             let what = "the front end is kept for the head's next build, and another holder of it is still alive";
@@ -440,6 +498,8 @@ impl Writer<Real> for UnitWriter {
         };
         let later = std::mem::take(&mut *job.later.lock().unwrap_or_else(|it| it.into_inner()));
         let seeds = std::mem::take(&mut *job.seeds.lock().unwrap_or_else(|it| it.into_inner()));
+        let used = std::mem::take(&mut *job.memo_used.lock().unwrap_or_else(|it| it.into_inner()));
+        let memo = Some(job.shared.memos.hold(used));
         Ok(KeptLowered {
             session,
             lowered,
@@ -449,6 +509,7 @@ impl Writer<Real> for UnitWriter {
             later,
             root: job.mounted.root().to_owned(), // alloc: once per front end kept
             seeds,
+            memo,
         })
     }
 }
@@ -596,10 +657,19 @@ pub(crate) struct Job {
     /// The seeds its front end took: the database holds a seed weakly, so it lives as long as
     /// the job.
     _seeded: Vec<blaze_intent::Seed>,
+    /// The code generator's memo, taken once at the job's start: every build of the job reads
+    /// and puts in it, and no collection runs while the job holds it.
+    pub(crate) memo: Arc<blaze_codegen::memo::Memo>,
+    /// Every memo entry the job's builds took or put ([`blaze_codegen::driver::Built::memo_used`]),
+    /// held with its front end once it is kept.
+    pub(crate) memo_used: Mutex<Vec<ContentId>>,
+    /// What the head's last build used of the memo, kept there until this job's front end is.
+    _held: Option<memo::Held>,
 }
 
 impl Job {
-    fn new(input: JobInput, crates: Arc<Crates>, shared: Arc<Shared>) -> Result<Job, ApiError> {
+    fn new(input: JobInput, crates: Arc<Crates>, shared: Arc<Shared>, held: Option<memo::Held>) -> Result<Job, ApiError> {
+        let memo = shared.memos.for_job();
         let graph = graph::Graph::new(&input.units)?;
         let config = &input.config;
         let mounted = Arc::new(files::Mounted::new(input.files.clone(), input.root, &config.mounts, &config.invocation.root));
@@ -626,6 +696,9 @@ impl Job {
             later: Mutex::new(Vec::new()), // alloc: setup, once per job; grows once per dependency crate checked
             seeds: Mutex::new(Vec::new()),
             _seeded: Vec::new(),
+            memo,
+            memo_used: Mutex::new(Vec::new()),
+            _held: held,
         })
     }
 

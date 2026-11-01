@@ -186,6 +186,55 @@ fn lints_order() {
     assert_eq!(check_cfg, ["cfg(has_foo)"]);
 }
 
+#[test]
+fn the_workspace_sets_blaze_lints_in_its_metadata() {
+    let manifest = Path::new("/w/Cargo.toml");
+    let of = |text: &str| flags::workspace_lints(Some(&toml::Value::Table(toml::from_str(text).unwrap())), manifest);
+    assert_eq!(
+        of("[blaze.lints]\nhot_clone = \"deny\"\nhot_alloc = \"warn\"\n").unwrap(),
+        ["--warn=blaze::hot_alloc", "--deny=blaze::hot_clone"]
+    );
+    assert_eq!(of("[blaze]\nexperimental = []\n").unwrap(), Vec::<String>::new());
+    assert_eq!(flags::workspace_lints(None, manifest).unwrap(), Vec::<String>::new());
+    let level = of("[blaze.lints]\nhot_alloc = \"loud\"\n").unwrap_err();
+    assert_eq!(
+        level.what,
+        "[workspace.metadata.blaze.lints] in /w/Cargo.toml: the level of `hot_alloc` is `allow`, `warn`, `deny` or `forbid`"
+    );
+    let path = of("[blaze.lints]\n\"blaze::hot_alloc\" = \"warn\"\n").unwrap_err();
+    assert!(path.what.ends_with("is named without its tool: these are blaze's own lints"), "{}", path.what);
+}
+
+/// cargo hands every `[lints]` table to rustc as flags, and rustc stops at a tool it does not
+/// know (E0602, `unknown lint tool: blaze`), so a cargo build of this workspace breaks; blaze's
+/// own lints are set in `[workspace.metadata.blaze.lints]` instead.
+#[test]
+fn no_manifest_of_this_workspace_names_a_lint_tool_rustc_does_not_know() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let mut manifests = vec![root.join("Cargo.toml")];
+    for entry in std::fs::read_dir(root.join("crates")).unwrap() {
+        let at = entry.unwrap().path().join("Cargo.toml");
+        if at.is_file() {
+            manifests.push(at);
+        }
+    }
+    for at in manifests {
+        let text = std::fs::read_to_string(&at).unwrap();
+        let manifest: toml::Table = toml::from_str(&text).unwrap_or_else(|e| panic!("{}: {e}", at.display()));
+        let workspace = manifest.get("workspace").and_then(|it| it.get("lints"));
+        for lints in [manifest.get("lints"), workspace].into_iter().flatten() {
+            let Some(tools) = lints.as_table() else { continue };
+            for tool in tools.keys() {
+                assert!(
+                    ["rust", "clippy", "rustdoc", "cargo", "workspace"].contains(&tool.as_str()),
+                    "{} names the lint tool `{tool}`, which a cargo build hands rustc",
+                    at.display()
+                );
+            }
+        }
+    }
+}
+
 /// A configuration seen from `cwd` with `env` and `--config` arguments `cli`.
 fn config(cwd: &Path, env: &[(&str, &str)], cli: &[&str]) -> Config<Disk> {
     let mut vars = vec![("CARGO_HOME".to_owned(), cwd.join("cargo-home").display().to_string())];
@@ -628,6 +677,7 @@ fn plan_app(target: Option<&str>) -> (PathBuf, Vec<UnitPlan>, String) {
     };
     let target_dir = ws.join("target");
     let unsandboxed: FxHashSet<&str> = ["app"].into_iter().collect();
+    let ws_metadata = Some(toml::Value::Table(toml::from_str("[blaze.lints]\nhot_alloc = \"warn\"\n").unwrap()));
     let input = PlanInput {
         units: &units,
         std_plans: &std_plans,
@@ -639,6 +689,7 @@ fn plan_app(target: Option<&str>) -> (PathBuf, Vec<UnitPlan>, String) {
         build_std: false,
         ws_root: &ws,
         ws_manifest: &app_path,
+        ws_metadata: ws_metadata.as_ref(),
         sysroot: None,
         target_dir: &target_dir,
         build_dir: &target_dir,
@@ -686,6 +737,7 @@ fn plans_of_a_workspace() {
     assert_eq!(get(&serde.env, "FROM_CONFIG"), Some("1"));
 
     let pm = &plans[1];
+    assert!(pm.lints.is_empty(), "the workspace's blaze lints are its members'");
     let hex = extra(pm);
     assert_eq!(
         pm.outputs,
@@ -729,7 +781,7 @@ fn plans_of_a_workspace() {
     assert_eq!(get(&lib.env, "CARGO_PRIMARY_PACKAGE"), Some("1"));
     assert_eq!(get(&lib.env, "CARGO_CRATE_NAME"), Some("app"));
     assert_eq!(get(&lib.env, "CARGO_BIN_NAME"), None);
-    assert_eq!(lib.lints, ["--forbid=unsafe_code", "--warn=unexpected_cfgs"]);
+    assert_eq!(lib.lints, ["--warn=blaze::hot_alloc", "--forbid=unsafe_code", "--warn=unexpected_cfgs"]);
     assert_eq!(lib.check_cfg[2], "cfg(has_foo)");
     assert_eq!(lib.cfgs, ["feature=\"default\"", "feature=\"foo-bar\""]);
     assert_ne!(lib.metadata, plans[5].metadata);

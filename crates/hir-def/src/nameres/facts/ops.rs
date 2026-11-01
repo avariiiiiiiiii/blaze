@@ -98,6 +98,9 @@ pub(crate) enum MacroOpKind {
         mod_item: ModItemId,
         /// The tree `mod_item` is in; its item tree is `tree.item_tree(db, krate)`.
         tree: TreeId,
+        /// What the item's collection, after the attribute, reads of it
+        /// (`item_tree::deferred_item_shape`): none of it is in the log otherwise.
+        shape: u128,
     },
 }
 

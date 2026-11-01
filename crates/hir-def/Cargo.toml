@@ -59,6 +59,7 @@ unicode-ident.workspace = true
 
 [dev-dependencies]
 blaze-alloc-count.workspace = true
+blaze-graph.workspace = true
 expect-test.workspace = true
 fst.workspace = true
 hegeltest.workspace = true

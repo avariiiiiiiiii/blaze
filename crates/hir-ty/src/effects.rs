@@ -80,10 +80,15 @@ fn closure_expr_is_const(
 ) -> bool {
     let (_, source_map) = ExpressionStore::with_source_map(db, owner);
     let Ok(source) = source_map.expr_syntax(expr) else { return false };
-    match source.value.to_view(source.file_id.root(db)) {
-        Either::Left(ast::Expr::ClosureExpr(closure)) => closure.const_token().is_some(),
-        _ => false,
+    // The span of an expression in parentheses is the parentheses' (as rustc's).
+    let Either::Left(mut syntax) = source.value.to_view(source.file_id.root(db)) else {
+        return false;
+    };
+    while let ast::Expr::ParenExpr(paren) = &syntax {
+        let Some(inner) = paren.expr() else { return false };
+        syntax = inner;
     }
+    matches!(syntax, ast::Expr::ClosureExpr(closure) if closure.const_token().is_some())
 }
 
 /// rustc's `is_conditionally_const`: whether `def` can be used in a const context, given that its

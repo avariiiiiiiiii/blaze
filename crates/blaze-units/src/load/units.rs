@@ -278,6 +278,7 @@ pub(crate) fn units(
         build_std: spec.build_std.is_some(),
         ws_root: ws.root(),
         ws_manifest: ws.root_manifest(),
+        ws_metadata: ws.custom_metadata(),
         sysroot,
         target_dir: &out_dir,
         build_dir: &out_build,

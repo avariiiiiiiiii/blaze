@@ -427,14 +427,24 @@ fn policy(overflow_checks: bool, debug_assertions: bool) -> Result<(Policy, blaz
 
 /// `spec` as the tier compiles it: copy-and-patch's IR of static code that counts nothing
 /// and folds nothing, everything else (overflow checks, debug assertions) as the build chose.
-fn tier_spec(mut spec: Spec) -> Spec {
+/// A unit planned above opt-level 0 is refused naming `what`: the tier compiles only
+/// copy-and-patch code, never another backend's plan. Std is planned at its shipped
+/// opt-level 3 until a policy can plan it at the profile's (codegen, queue 01466).
+fn tier_spec(mut spec: Spec, what: &str) -> Result<Spec, Stop> {
+    if let Backend::Llvm { opt } = spec.backend {
+        // alloc: error path
+        return Err(Stop(format!(
+            "can't compile `{what}`: it is planned at opt-level {opt}, and the compiled tier compiles only \
+             copy-and-patch code at opt-level 0 (planning std at opt-level 0 waits on codegen queue 01466)"
+        )));
+    }
     spec.backend = Backend::Stencil;
     spec.counted = false;
     spec.fold = false;
     spec.debuginfo = DebugInfo::None;
     spec.pgo = Pgo::None;
     spec.toolchain.relocation = Relocation::Static;
-    spec
+    Ok(spec)
 }
 
 /// The width of each parameter of the confined `sig` but `vmctx`, and of its result.
@@ -532,7 +542,7 @@ fn compile(db: &Db, krate: Crate, bridge: &Bridge, macros: &[(FunctionId, bool)]
     }
 
     // The statics, before the code that names them.
-    let static_spec = tier_spec(policy.choose(&origin, None).map_err(|why| Stop(format!("can't be compiled: {why}")))?.first); // alloc: error path
+    let static_spec = tier_spec(policy.choose(&origin, None).map_err(|why| Stop(format!("can't be compiled: {why}")))?.first, "its statics")?; // alloc: error path
     // alloc: once per crate compiled
     let mut statics = Vec::with_capacity(reached.statics.len());
     let mut static_values = Vec::with_capacity(reached.statics.len()); // alloc: once per crate compiled
@@ -581,7 +591,8 @@ fn compile(db: &Db, krate: Crate, bridge: &Bridge, macros: &[(FunctionId, bool)]
                 .choose(&described.origin, described.overflow_checks)
                 .map_err(|why| Stop(format!("can't compile `{}`: {why}", described.name)))? // alloc: error path
                 .first,
-        );
+            &described.name,
+        )?;
         let unit = Unit {
             instance: blaze_codegen::Instance { settings: spec.settings(), ..unit.instance },
             backend: Backend::Stencil,

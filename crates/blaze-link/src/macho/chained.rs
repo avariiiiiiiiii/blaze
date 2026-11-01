@@ -240,7 +240,7 @@ fn slots_of(placed: &Placed<'_>) -> usize {
 }
 
 /// Appends `LC_DYLD_CHAINED_FIXUPS`'s table: the header, the starts of each segment's pages
-/// (`segments` the image's `LC_SEGMENT_64`s before `__LINKEDIT`, (start, size), and
+/// (`segments` the image's `LC_SEGMENT_64`s before `__LINKEDIT`, (start, size in the file), and
 /// `__LINKEDIT` after them), the imports and their names. `slots` are [`encode`]'s,
 /// `ordinal` an import's library ordinal and `name` its Mach-O name. Padded to 8; its length.
 pub(super) fn fixups<'n>(
@@ -272,9 +272,13 @@ pub(super) fn fixups<'n>(
     let offsets = out.len();
     out.resize(offsets + 4 * count, 0);
     let mut next = 0;
-    for (nth, &(vmaddr, vmsize)) in segments.iter().enumerate() {
+    for (nth, &(vmaddr, size)) in segments.iter().enumerate() {
         let first = next + slots[next..].partition_point(|it| it.0 < vmaddr);
-        let end = first + slots[first..].partition_point(|it| it.0 < vmaddr + vmsize);
+        if first != next {
+            // alloc: error path
+            return Err(error(format!("a chained slot at {:#x} is in no segment's bytes in the file", slots[next].0)));
+        }
+        let end = first + slots[first..].partition_point(|it| it.0 < vmaddr + size);
         next = end;
         if first == end {
             continue;
@@ -283,7 +287,7 @@ pub(super) fn fixups<'n>(
         out.resize(out.len() + pad, 0);
         let at = (out.len() - starts) as u32;
         out.patch_u32(offsets + 4 * nth, at);
-        let pages = vmsize.div_ceil(PAGE) as usize;
+        let pages = size.div_ceil(PAGE) as usize;
         if pages > usize::from(u16::MAX) {
             // alloc: error path
             return Err(error(format!("a segment at {vmaddr:#x} of {pages} chained pages, more than 65,535")));

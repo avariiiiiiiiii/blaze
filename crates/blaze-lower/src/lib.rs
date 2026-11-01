@@ -132,8 +132,8 @@ pub struct Lowered {
     paths: std::sync::Arc<HashMap<FileId, String>>,
     /// Each crate's identity worked out since the last write ([`Lowered::identity`]).
     identities: FxHashMap<Crate, ContentId>,
-    /// Each root file [`Lowered::append_roots`] made since the last [`Lowered::refresh`], with
-    /// the unit it was first made for and its content ID as made.
+    /// Each root (an alias) [`Lowered::append_roots`] made since the last [`Lowered::refresh`],
+    /// with the unit it was first made for and the content ID of the module it was given.
     appended: FxHashMap<FileId, (usize, ContentId)>,
     /// Each directory read into the front end, as [`Lowered::refresh`] reads it again.
     loads: Vec<Load>,
@@ -512,11 +512,16 @@ pub fn lower_into<T: blaze_query::Tree>(db: Db, lower: Lower<'_, T>) -> Result<L
             .filter(|dep| units.graph.units[dep.index].mode == Mode::RunCustomBuild)
             .map(|dep| dep.index)
             .collect();
+        // A crate whose root blaze appends a module to ([`Lowered::append_roots`]: a test's
+        // harness) has a root of its own, an alias of the file on disk, so no other crate of
+        // that file reads the module.
+        let aliased = crates::is_test(unit, plan) && plan.harness;
         // Units cargo keeps apart for what the front end does not read (a profile's opt-level
         // or debuginfo) are one crate: two crates of one key would name each other's items.
         let made_of_root = made.entry(root_file).or_default();
         let same = made_of_root.iter().find(|it| {
             it.data == data
+                && it.aliased == aliased
                 && it.extra == extra
                 && Arc::ptr_eq(&it.workspace, &workspace)
                 && it.cfg == cfg
@@ -528,8 +533,15 @@ pub fn lower_into<T: blaze_query::Tree>(db: Db, lower: Lower<'_, T>) -> Result<L
             Some(it) => it.krate,
             None => {
                 // clone: once per crate made, kept to compare the units after with
-                let krate = Crate::create(&mut db, data.clone(), extra.clone(), workspace.clone(), cfg.clone(), env.clone(), durability);
-                made_of_root.push(Made { data, extra, workspace, cfg: cfg.clone(), env, durability, runs, krate });
+                let mut made_of = data.clone();
+                if aliased {
+                    made_of.root_file_id = db.alias(root_file).map_err(|error| {
+                        LowerError::at(format!("the root file `{src}` of {what} has no root of its own: {error}"), src.clone())
+                    })?;
+                }
+                // clone: as `made_of`
+                let krate = Crate::create(&mut db, made_of, extra.clone(), workspace.clone(), cfg.clone(), env.clone(), durability);
+                made_of_root.push(Made { data, aliased, extra, workspace, cfg: cfg.clone(), env, durability, runs, krate });
                 all.push(krate);
                 krate
             }
@@ -572,7 +584,10 @@ pub fn lower_into<T: blaze_query::Tree>(db: Db, lower: Lower<'_, T>) -> Result<L
 /// What a crate of [`lower_into`] was made of, and the build scripts' runs its unit is given:
 /// a later unit of all the same is lowered to it.
 struct Made {
+    /// With the root file on disk, which an aliased crate's root is an alias of.
     data: base_db::BuiltCrateData,
+    /// Whether its root is an alias of the file on disk, its own.
+    aliased: bool,
     extra: base_db::ExtraCrateData,
     workspace: Arc<CrateWorkspaceData>,
     cfg: CfgOptions,
@@ -613,7 +628,8 @@ impl Lowered {
     }
 
     /// Unit `unit`'s identity in the front end: of its crate (its root file's path, data,
-    /// cfgs, env, edition, target), the files of its source root by path and content (an
+    /// cfgs, env, edition, target), its root's text and appended module (an alias's, which is
+    /// not among its source root's files), the files of its source root by path and content (an
     /// applied run's `OUT_DIR` among them), the process's environment, and each crate it
     /// depends on by its identity, so the identity of a crate covers everything it is made
     /// from. None for a unit with no crate. Worked out once per crate between writes.
@@ -845,7 +861,7 @@ fn checked<'a>(crates: &'a Crates, run: usize, ran: &Ran) -> Result<(&'a Lowerin
     Ok((lowering, cfgs))
 }
 
-const IDENTITY: &str = "blaze v2 cargo unit identity 2";
+const IDENTITY: &str = "blaze v2 cargo unit identity 3";
 
 /// [`Lowered::identity`] of `krate`, each crate of its closure worked out once into `known`,
 /// dependencies first, with a stack of its own rather than the thread's.
@@ -867,7 +883,7 @@ fn identity_of(db: &Db, krate: Crate, known: &mut FxHashMap<Crate, ContentId>) -
         }
         let root = db.file_source_root(data.root_file_id).source_root_id(db);
         let mut hasher = Hasher::new(IDENTITY);
-        hasher.id(&at.content(db)).id(&db.source_root(root).content(db));
+        hasher.id(&at.content(db)).id(&db.file_text(data.root_file_id).content(db)).id(&db.source_root(root).content(db));
         // The standard library's crates read no variable of the process (`env!` of one is
         // their crate's alone, as a std built elsewhere has it), so a workspace's
         // environment names no std crate apart.
@@ -911,12 +927,13 @@ fn note(paths: &mut std::sync::Arc<HashMap<FileId, String>>, db: &Db, set: usize
     }
 }
 
-/// Every file of the source roots `0..=sets` by its absolute path.
+/// Every file of the source roots `0..=sets` by its absolute path, and each alias of one by
+/// the path of the file it is an alias of.
 fn paths_of(db: &Db, sets: usize) -> HashMap<FileId, String> {
     let mut paths = HashMap::new();
     for set in 0..=sets {
         let root = db.source_root(SourceRootId(set as u32)).source_root(db);
-        for file in root.iter() {
+        for file in root.iter().chain(root.aliases().map(|(alias, _)| alias)) {
             if let Some(path) = root.path_for_file(&file).and_then(VfsPath::as_path) {
                 paths.insert(file, path.as_str().to_owned());
             }

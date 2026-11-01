@@ -75,6 +75,11 @@ anonymous const in a body. `hir_def::body_span!` writes them, and only while a s
 the span. The recorder interns each string, so a row holds a number, and also takes values
 recorded after the span began.
 
+A file's query spans carry its path in `function`: `parse_query` (one parse per file),
+`file_item_tree_query` (one per file and crate, the crate in `crate`; a macro file reads
+`{macro <id>}`). The same path under several crates is one file lowered again for each;
+`crate_def_map_query` carries its crate.
+
 A wait for a query another task is running is a span `wait`, its `function` naming the query
 it waits for, such as `infer_body_query(Id(1234))`, or a `QueryKey` for the build's own queries.
 Its parent is the asking span, whose self time therefore leaves the wait out, so a convoy behind
@@ -234,6 +239,70 @@ lane. Its waits are gaps, drawn from `job_waits`.
 The spans each live thread is inside now, which are not `spans` rows until they close: what the
 live feed sends beside the rows that closed. Its columns are `process u32, thread u32,
 thread_name dict, depth u16 (0 outermost), name dict, target dict, start_ns i64`.
+
+## Utilization: where a build's wall time goes
+
+The standard utilization query is the view `utilization_per_second`. For each second of a build
+it gives the busy threads: the thread-seconds of outermost spans in that second, so 19 is all of
+19 threads busy. It also lists the span names they were busy in, each over 10 ms. The build's
+window is its `builds` row, and spans count by time, not by `build_id`, so the daemon loop's
+spans count too:
+
+```sh
+blaze debug sql "SELECT * FROM utilization_per_second"
+```
+
+```sql
+-- the view's body, from crates/blaze-profile/sql/examples.sql
+WITH bounds AS (
+    SELECT started_ns AS t0, started_ns + dur_ns AS t1 FROM builds WHERE build_id = $build
+), outer_spans AS (
+    SELECT name, greatest(start_ns, t0) AS start_ns, least(start_ns + dur_ns, t1) AS end_ns, t0
+    FROM spans, bounds
+    WHERE depth = 0 AND start_ns < t1 AND start_ns + dur_ns > t0
+), seconds AS (
+    SELECT unnest(range(0, cast((t1 - t0) / 1e9 AS BIGINT) + 1)) AS second FROM bounds
+), by_name AS (
+    SELECT second, name,
+        sum(least(end_ns, t0 + (second + 1) * 1000000000) - greatest(start_ns, t0 + second * 1000000000)) AS ns
+    FROM seconds
+    JOIN outer_spans ON start_ns < t0 + (second + 1) * 1000000000 AND end_ns > t0 + second * 1000000000
+    GROUP BY second, name
+)
+SELECT seconds.second,
+    round(coalesce(sum(ns), 0) / 1e9, 2) AS busy_threads,
+    string_agg(name || ' ' || round(ns / 1e9, 2), ', ' ORDER BY ns DESC) FILTER (WHERE ns >= 10000000) AS busy_in
+FROM seconds LEFT JOIN by_name USING (second)
+GROUP BY seconds.second ORDER BY seconds.second
+```
+
+`uncovered_time` checks the profile itself. It is the share of the build's wall time in which no
+thread was inside any span, so the time the profile can't account for; it should stay under 1%.
+On 2026-10-31, rel2's release build of blaze-engine (74 s) had 66.9% uncovered; build 8 of
+`b2-home-rel`, with the phase spans below, had 0.1% (0.18 s of 134 s).
+
+Each view whose arguments all have defaults is also a DuckDB view of the same name in every
+`blaze debug sql` query, over the last build to end: `SELECT * FROM uncovered_time`. For another
+build, `blaze explain uncovered_time build=7`.
+
+The build's top-level phases each have a span:
+- the plane's tasks: `std library`, `plan`, `fetch`, `lower workspace` (loading the workspace),
+  `select tests`, and the other kinds;
+- each unit's compile phases: `unit names` (store reads and the unit's key hash), `unit bodies`,
+  `unit codegen`, `unit link` and `unit store` (its store writes), each with the unit's crate in
+  `crate`;
+- the database's `maintain` and one `maintainer` span per pass, named in `function`;
+  `apply_bodies` is the method-resolution delta's body pass; the impls maintainer has `impls
+  modules` (its serial walk of every crate's modules), then per crate `impls crate` (with
+  `crate`) and its phases `impls apply_impls`, `impls rekey`, `impls relang`, `impls publish`
+  and the rest;
+- `Db::run_all`: `run_all` over the batch and `run_all task` per task, both naming the caller's
+  file and line in `function`;
+- release codegen: `release summarize`, `release emit` and `llvm compile`, beside the existing
+  per-function `mir`, `translate` and `monomorphize`;
+- the daemon loop's `loop turn`, opened only for a turn with completions or ready work.
+
+Running a build script has no span yet.
 
 ## The flight recorder
 

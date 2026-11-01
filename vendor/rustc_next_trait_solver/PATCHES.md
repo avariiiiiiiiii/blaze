@@ -133,6 +133,17 @@ allocated a nested-goals list (`docs/v2/plan/lanes/mem/db-solver.md`, item 8). R
 buffer a warm run takes holds what any goal of the run needed. A pool now holds its depth times
 its largest buffer.
 
+### 0009-bailed-probes-give-back-their-goals
+
+What: `ProbeCtxt::enter_inner` gives its nested-goals list back to the scratch pool (patch
+`0004-solver-temporaries-recycled`) when it bails because its context must rerun outside erased
+mode, instead of dropping it.
+
+Why: each bail cost the pool one warm list, so a later probe of the same run found the pool
+empty and allocated one; a warm re-solve of an unchanged body allocated once per run
+(`docs/v2/plan/lanes/mem/db-solver.md`, item 8). Answers are unchanged: nothing reads the list
+after a bail.
+
 ## Dropped since the previous base (ra-ap-rustc_next_trait_solver 0.166.0, rustc `ce89c898`)
 
 - The backport of rust-lang/rust#161380 (a constant sends a goal back to the caller's typing

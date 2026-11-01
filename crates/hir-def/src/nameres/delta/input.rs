@@ -10,6 +10,7 @@
 //! the group it heads.
 
 use base_db::{Crate, Db, Written};
+use blaze_mem::Tag;
 use hir_expand::HirFileId;
 use span::FileId;
 
@@ -72,8 +73,26 @@ pub(super) fn read(
     delta
 }
 
-/// The groups of the written files (and the root when `deps_changed`), their logs compared;
-/// `false` when a group's round-0 children changed, which only a walk follows.
+/// Whether each parent from the root down to `group` still declares the key below it: a key may
+/// name what the write took away (a `macro_rules!` its textual scope inherits), and its log,
+/// read, would expand a call of it. The root's key is compared in [`read`].
+fn key_is_current(db: &Db, state: &CrateState, group: ModuleId) -> bool {
+    let mut chain = Vec::new(); // alloc: the group's ancestors, a few, once per checked group
+    let mut at = group;
+    while let Some(parent) = state.groups[&at].parent {
+        let parent = state.group_of.get(&parent).copied().unwrap_or(parent);
+        chain.push((parent, at));
+        at = parent;
+    }
+    chain.iter().rev().all(|&(parent, child)| {
+        queries::module_decls(db, state.groups[&parent].key).children.contains(&state.groups[&child].key)
+    })
+}
+
+/// The groups of the written files (and the root when `deps_changed`, and those that expanded an
+/// `include!` when a file no module is defined in was written), the parents of those whose logs
+/// changed and the children defined in their expansions, their logs compared; `false` when a
+/// group's round-0 children changed, which only a walk follows.
 fn incremental(
     db: &Db,
     state: &mut CrateState,
@@ -84,6 +103,11 @@ fn incremental(
     let mut checked: Vec<ModuleId> = Vec::new(); // alloc: the groups of the written files, once per write
     if deps_changed {
         checked.push(state.root);
+    }
+    // A written file no module is defined in may be one an `include!` read (`include_readers`).
+    let unknown = |file: &FileId| !state.files.contains_key(file);
+    if written.set.iter().any(unknown) || !written.included.is_empty() {
+        checked.extend(state.groups.iter().filter(|(_, g)| g.out.uses_include).map(|(&group, _)| group));
     }
     for file in written.set {
         if let Some(groups) = state.other_files.get(file) {
@@ -98,17 +122,40 @@ fn incremental(
             }
         }
     }
-    checked.sort_by_key(|it| state.groups.get_index_of(it));
-    checked.dedup();
     // Every log is checked before any is compared: `compare` keeps the new log, so one kept
-    // before a walk would hide its change from the walk.
-    for group in &checked {
-        let g = &state.groups[group];
+    // before a walk would hide its change from the walk. A parent's log reads its
+    // `#[macro_use]` children's textual macros (`legacy_exports`), so a group whose log changed
+    // has its parent checked too, up to the first parent whose log is as it was. A child defined
+    // in a macro file has its log from its parent's expansion, which changes with no file of its
+    // own written and its key as it was, so it is checked with its parent.
+    let mut at = 0;
+    while at < checked.len() {
+        if !key_is_current(db, state, checked[at]) {
+            return false;
+        }
+        let g = &state.groups[&checked[at]];
+        at += 1;
         let decls = queries::module_decls(db, g.key);
         if decls.children != g.children || decls.other_files != g.other_files {
             return false;
         }
+        for child in &decls.children {
+            let decl = child.decl(db);
+            if matches!(decl.tree.file_id(), HirFileId::MacroFile(_)) && !checked.contains(&decl.module) {
+                checked.push(decl.module);
+            }
+        }
+        if let Some(parent) = g.parent
+            && decls.ops.ops != g.log
+        {
+            let parent = state.group_of.get(&parent).copied().unwrap_or(parent);
+            if !checked.contains(&parent) {
+                checked.push(parent);
+            }
+        }
     }
+    checked.sort_by_key(|it| state.groups.get_index_of(it));
+    checked.dedup();
     for group in checked {
         let g = &mut state.groups[&group];
         let decls = queries::module_decls(db, g.key);
@@ -120,6 +167,7 @@ fn incremental(
 /// The whole round-0 tree from `root_key`, in DFS preorder: the new group order.
 fn walk(db: &Db, state: &mut CrateState, root_key: DeclKey, written: &Written<'_>, cold: bool, delta: &mut Delta) {
     delta.tree = true;
+    decls_ahead(db, root_key);
     let mut old = std::mem::take(&mut state.groups);
     let mut groups = FxIndexMap::default();
     groups.reserve(old.len());
@@ -181,6 +229,20 @@ fn walk(db: &Db, state: &mut CrateState, root_key: DeclKey, written: &Written<'_
     delta.deleted.extend(old.drain(..));
     delta.root_ops |= delta.deleted.iter().any(|(_, it)| writes_root(state.root, &it.log));
     state.groups = groups;
+}
+
+/// Every round-0 log of the tree from `root_key`, a depth at a time, each a job of the pool:
+/// a log parses its file's item tree, and the logs of one depth read nothing of each other, so
+/// [`walk`] then reads each as a memo instead of parsing the crate's files one at a time.
+/// Here and not in `module_decls`, which would read its children's logs and change with them.
+fn decls_ahead(db: &Db, root_key: DeclKey) {
+    let mut depth = vec![root_key]; // alloc: a depth of the round-0 tree, once per walk
+    while !depth.is_empty() {
+        let keys = &depth[..];
+        db.run_all(Tag::Nameres, keys.len(), |db, at| _ = queries::module_decls(db, keys[at]));
+        // alloc: the next depth, once per depth of a walk
+        depth = keys.iter().flat_map(|&key| queries::module_decls(db, key).children.iter().copied()).collect();
+    }
 }
 
 /// Compares the stored log of `group` with `new`, keeping a copy of `new` when they differ.

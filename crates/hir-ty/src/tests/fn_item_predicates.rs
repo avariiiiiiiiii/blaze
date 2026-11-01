@@ -4,7 +4,8 @@
 //! cranelift-assembler-x64-meta writes it (its MIR failed to lower,
 //! `UnresolvedMethod("count")`, which stopped the build script). Its `Iterator` is core's
 //! shape: `Copied` bounds `I: Iterator<Item = &'a T>`, `Filter` bounds
-//! `P: FnMut(&I::Item) -> bool`.
+//! `P: FnMut(&I::Item) -> bool`, which `Location::uses_memory` meets only when the solver's
+//! signature of it binds the lifetime `&self` leaves out (`lower::solver_fn_sig`).
 //! On a failure the message has each method call with no resolution, and the types around it.
 
 use hir_def::{
@@ -16,7 +17,8 @@ use hir_expand::fixture;
 use crate::{InferBodyId, InferenceResult};
 
 const FIXTURE: &str = r#"
-//- minicore: sized, fn, option
+//- minicore: sized, fn, option, clone, copy
+//- /main.rs edition:2024
 pub trait Iterator {
     type Item;
     fn next(&mut self) -> Option<Self::Item>;

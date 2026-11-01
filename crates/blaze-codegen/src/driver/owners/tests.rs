@@ -16,7 +16,11 @@ fn code(n: u8) -> CodeHash {
 }
 
 fn function(n: u8, owner: Owner, refs: &[Target]) -> Function<'_> {
-    Function { key: key(n), item: item(n), owner, code: code(n), refs }
+    Function { key: key(n), item: item(n), owner, code: code(n), refs, name: "f", origin: Origin::Std }
+}
+
+fn static_of<'a>(id: (ItemKey, ContentId), unit: InstanceKey, owner: Owner, refs: &'a [Target]) -> StaticOf<'a> {
+    StaticOf { id, unit, owner, refs, symbol: None, origin: Origin::Std }
 }
 
 #[test]
@@ -34,7 +38,7 @@ fn owners_are_by_key_with_the_generic_s_code() {
     let none: [Target; 0] = [];
     let functions = [function(1, Owner::Workspace, &none), function(2, Owner::Dependency, &none)];
     let static_id = (item(9), ContentId::default());
-    let statics = [StaticOf { id: static_id, unit: key(9), owner: Owner::Dependency, refs: &none }];
+    let statics = [static_of(static_id, key(9), Owner::Dependency, &none)];
     let mut errors = Vec::new();
     let owned = owners(functions.into_iter(), statics.into_iter(), &mut errors);
     assert!(errors.is_empty(), "{errors:?}");
@@ -67,8 +71,8 @@ fn a_dependency_s_static_and_a_reference_to_a_workspace_static_are_checked() {
     let none: [Target; 0] = [];
     let functions = [function(1, Owner::Workspace, &none), function(2, Owner::Dependency, &names_static)];
     let statics = [
-        StaticOf { id: workspace_static, unit: key(8), owner: Owner::Workspace, refs: &none },
-        StaticOf { id: (item(9), ContentId::default()), unit: key(9), owner: Owner::Dependency, refs: &names_function },
+        static_of(workspace_static, key(8), Owner::Workspace, &none),
+        static_of((item(9), ContentId::default()), key(9), Owner::Dependency, &names_function),
     ];
     let mut errors = Vec::new();
     owners(functions.into_iter(), statics.into_iter(), &mut errors);
@@ -94,6 +98,8 @@ fn refusals_across_cores_come_in_key_order() {
             owner: Owner::Dependency,
             code: CodeHash(numbered(n, 2)),
             refs: if n % 3 == 1 { &calls_workspace } else { &none },
+            name: "f",
+            origin: Origin::Std,
         })
         .chain(std::iter::once(Function {
             key: workspace,
@@ -101,6 +107,8 @@ fn refusals_across_cores_come_in_key_order() {
             owner: Owner::Workspace,
             code: CodeHash(numbered(u32::MAX, 2)),
             refs: &none,
+            name: "g",
+            origin: Origin::Std,
         }))
         .collect();
     let mut errors = Vec::new();
@@ -108,4 +116,31 @@ fn refusals_across_cores_come_in_key_order() {
     let named: Vec<_> = errors.iter().map(|it| it.unit).collect();
     let expected: Vec<_> = (0..3000u32).filter(|n| n % 3 == 1).map(|n| InstanceKey(numbered(n, 0))).collect();
     assert_eq!(named, expected);
+}
+
+/// A refusal names the dependency's code and the workspace's it refers to, each by its name
+/// and package, so the run that hits it says which they are.
+#[test]
+fn a_refusal_names_both_sides_and_their_packages() {
+    use crate::plan::Package;
+    let calls_workspace = [Target::Direct(key(1))];
+    let names_static = [Target::Static { item: item(8), instance: ContentId::default() }];
+    let none: [Target; 0] = [];
+    let functions = [
+        Function { name: "app::helper", origin: Origin::BuildTime(Package::new("app")), ..function(1, Owner::Workspace, &none) },
+        Function { name: "std::rt::run::{closure#0}", ..function(2, Owner::Dependency, &calls_workspace) },
+    ];
+    let statics = [
+        StaticOf { symbol: Some("APP_TABLE"), origin: Origin::Member(Package::new("app")), ..static_of((item(8), ContentId::default()), key(8), Owner::Workspace, &none) },
+        StaticOf { origin: Origin::Dependency(Package::new("regex")), ..static_of((item(9), ContentId::default()), key(9), Owner::Dependency, &names_static) },
+    ];
+    let mut errors = Vec::new();
+    owners(functions.into_iter(), statics.into_iter(), &mut errors);
+    assert_eq!(errors.len(), 2, "{errors:?}");
+    let function = &errors[0].what;
+    assert!(function.starts_with("`std::rt::run::{closure#0}` (of the standard library) is a dependency's"), "{function}");
+    assert!(function.contains("refers to `app::helper` (of build-time `app`), Direct("), "{function}");
+    let static_ = &errors[1].what;
+    assert!(static_.starts_with("a static (of dependency `regex`) is a dependency's"), "{static_}");
+    assert!(static_.contains("refers to the static `APP_TABLE` (of member `app`), Static {"), "{static_}");
 }

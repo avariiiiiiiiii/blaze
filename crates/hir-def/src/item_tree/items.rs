@@ -512,7 +512,7 @@ fn item_keys(
                 count_hashed();
                 bytes.clear();
                 let mut feed = Feed(&mut *bytes);
-                hash_item(item.syntax(), &mut feed);
+                hash_item(item.syntax(), &mut feed, hash_inner_attrs);
                 feed.fingerprint()
             }
         };
@@ -1117,13 +1117,35 @@ fn item_anchors(map: &RealSpanMap, item: TextRange, ids: &[[u32; 3]], out: &mut 
     out[from..].reverse();
 }
 
+/// What collecting `item` reads of it, for an item name resolution defers behind an attribute:
+/// its round-0 log carries this, so an edit of the item that keeps its ast id (a later
+/// attribute, its visibility) still changes the log. [`hash_item`] with only the inner
+/// attributes of its bodies and item lists ([`hash_inner_attr_nodes`]), so an edit within a
+/// body that adds or removes no inner attribute leaves it equal. A query of its own so that it
+/// alone reads the parse.
+pub(crate) fn deferred_item_shape(db: &Db, item: crate::AstId<tag::Item>) -> u128 {
+    #[blaze_query::tracked(returns(copy), mem_tag = Nameres)]
+    fn deferred_item_shape(db: &Db, item: crate::AstId<tag::Item>, _: ()) -> u128 {
+        let node = item.to_view(db);
+        let mut bytes = Vec::new(); // alloc: one item's syntax, once per execution
+        let mut feed = Feed(&mut bytes);
+        hash_item(node.syntax(), &mut feed, hash_inner_attr_nodes);
+        feed.fingerprint()
+    }
+    deferred_item_shape(db, item, ())
+}
+
 /// Hashes what lowering reads of `item`'s syntax ([`Ctx`](lower::Ctx)): all of it, but of the
-/// bodies of its `fn`s only the inner attributes at their start, of the items of its `impl`s
-/// and `trait`s the same, and of the bodies of its `const`s and `static`s nothing. Nothing
+/// bodies of its `fn`s and the items of its `impl`s and `trait`s what `hash_inner` hashes, and
+/// of the bodies of its `const`s and `static`s nothing. With [`hash_inner_attrs`], nothing
 /// lowering reads comes after what is left out within the node holding it, so leaving it out
 /// moves nothing that is hashed; what it moves in the item ([`item_ids`], [`item_anchors`]) is
 /// hashed with the key.
-fn hash_item(item: ast::Node<'_>, state: &mut Feed<'_>) {
+fn hash_item(
+    item: ast::Node<'_>,
+    state: &mut Feed<'_>,
+    hash_inner: fn(ast::Node<'_>, &mut Feed<'_>),
+) {
     let Some(ast) = ast::Item::cast(item) else { return hash_full(item, state) };
     let (inner, skipped, items) = match ast {
         ast::Item::Fn(it) => (element(it.body()), None, None),
@@ -1141,14 +1163,14 @@ fn hash_item(item: ast::Node<'_>, state: &mut Feed<'_>) {
     for child in item.children_with_tokens() {
         match child {
             NodeOrToken::Token(token) => hash_token(token, state),
-            NodeOrToken::Node(node) if Some(node) == inner => hash_inner_attrs(node, state),
+            NodeOrToken::Node(node) if Some(node) == inner => hash_inner(node, state),
             NodeOrToken::Node(node) if Some(node) == skipped => SKIPPED.hash(state),
             NodeOrToken::Node(node) if Some(node) == items => {
                 (NODE, node.kind() as u16).hash(state);
                 for child in node.children_with_tokens() {
                     match child {
                         NodeOrToken::Token(token) => hash_token(token, state),
-                        NodeOrToken::Node(node) => hash_item(node, state),
+                        NodeOrToken::Node(node) => hash_item(node, state, hash_inner),
                     }
                     END.hash(state);
                 }
@@ -1187,6 +1209,33 @@ fn hash_inner_attrs(node: ast::Node<'_>, state: &mut Feed<'_>) {
             }
             NodeOrToken::Node(_) => leading = false,
             NodeOrToken::Token(token) if leading => hash_token(token, state),
+            NodeOrToken::Token(_) => {}
+        }
+    }
+    END.hash(state);
+}
+
+/// Hashes the inner attributes of a `fn`'s body or an `impl`'s or `trait`'s list of items, in
+/// order and without their offsets or the tokens around them: what collecting the item reads of
+/// it. A lazy body that surely starts with none hashes as one with none, and one that may is
+/// hashed whole.
+fn hash_inner_attr_nodes(node: ast::Node<'_>, state: &mut Feed<'_>) {
+    if node.is_lazy() {
+        if ast::block_may_start_with_inner_attr(node.text(), false) {
+            hash_full(node, state);
+        }
+        return END.hash(state);
+    }
+    for child in node.children_with_tokens() {
+        match child {
+            NodeOrToken::Node(node) if node.kind() == SyntaxKind::STMT_LIST => {
+                hash_inner_attr_nodes(node, state)
+            }
+            NodeOrToken::Node(node) => {
+                if ast::AnyAttr::cast(node).is_some_and(|attr| attr.kind().is_inner()) {
+                    hash_full(node, state);
+                }
+            }
             NodeOrToken::Token(_) => {}
         }
     }

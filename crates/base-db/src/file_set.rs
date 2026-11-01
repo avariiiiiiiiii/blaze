@@ -13,6 +13,9 @@ use crate::{AnchoredPath, FileId, VfsPath};
 pub struct FileSet {
     files: FxHashMap<VfsPath, FileId>,
     paths: IndexMap<FileId, VfsPath, FxBuildHasher>,
+    /// Files that have another file's path, each with that file ([`FileSet::alias`]): found by
+    /// file alone, never by path, and not among the set's files.
+    aliases: FxHashMap<FileId, FileId>,
 }
 
 impl FileSet {
@@ -27,34 +30,63 @@ impl FileSet {
     /// The file `path` names from its anchor's directory; `None` if the anchor or that file is
     /// not in the set.
     pub fn resolve_path(&self, path: AnchoredPath<'_>) -> Option<FileId> {
-        let mut base = self.paths.get(&path.anchor)?.clone(); // clone: popped and joined into the key looked up
+        let mut base = self.path_for_file(&path.anchor)?.clone(); // clone: popped and joined into the key looked up
         base.pop();
         let path = base.join(path.path)?;
         self.files.get(&path).copied()
     }
 
+    /// The file at `path`: never an alias, whose path is another file's.
     pub fn file_for_path(&self, path: &VfsPath) -> Option<&FileId> {
         self.files.get(path)
     }
 
+    /// The path of `file`, or of the file `file` is an alias of.
     pub fn path_for_file(&self, file: &FileId) -> Option<&VfsPath> {
-        self.paths.get(file)
+        match self.paths.get(file) {
+            Some(path) => Some(path),
+            None => self.paths.get(self.aliases.get(file)?),
+        }
+    }
+
+    /// Makes `alias` a file with `of`'s path, found by file and never by path: `path_for_file`
+    /// and `resolve_path` from it answer as for `of`, `file_for_path`, `iter` and `len` know only
+    /// `of`. Whether `of` is in the set.
+    pub(crate) fn alias(&mut self, alias: FileId, of: FileId) -> bool {
+        if !self.paths.contains_key(&of) || self.paths.contains_key(&alias) {
+            return false;
+        }
+        self.aliases.insert(alias, of);
+        true
+    }
+
+    /// Each alias with the file it is an alias of, in no order.
+    pub fn aliases(&self) -> impl Iterator<Item = (FileId, FileId)> + '_ {
+        self.aliases.iter().map(|(&alias, &of)| (alias, of))
     }
 
     /// Puts `file_id` at `path`. A path names the last file put at it; a file has the last path
     /// it was put at.
     pub fn insert(&mut self, file_id: FileId, path: VfsPath) {
+        self.aliases.remove(&file_id);
         self.files.insert(path.clone(), file_id); // clone: the set keys both ways
         self.paths.insert(file_id, path);
     }
 
     /// Takes `file_id` out of the set and returns its path, the other files left in their
     /// order: `O(n)` moves of the entries after it, and no allocation. A path that names
-    /// another file keeps naming it.
+    /// another file keeps naming it. The aliases of `file_id` go with it; an alias taken out
+    /// leaves its file, and has no path of its own to return.
     pub fn remove(&mut self, file_id: FileId) -> Option<VfsPath> {
+        if self.aliases.remove(&file_id).is_some() {
+            return None;
+        }
         let path = self.paths.shift_remove(&file_id)?;
         if self.files.get(&path) == Some(&file_id) {
             self.files.remove(&path);
+        }
+        if !self.aliases.is_empty() {
+            self.aliases.retain(|_, of| *of != file_id);
         }
         Some(path)
     }

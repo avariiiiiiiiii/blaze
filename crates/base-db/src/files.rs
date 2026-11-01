@@ -42,6 +42,35 @@ mod tests;
 /// The source roots a setter changed: one, or a few for a file several roots have.
 pub(crate) type Roots = SmallVec<[SourceRootId; 4]>;
 
+/// Why [`Files::alias`] refused a file.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AliasError {
+    /// The file is in no source root: an alias has the path of a file of one.
+    NotInASourceRoot(FileId),
+    /// The file is an alias: an alias is of the file itself.
+    OfAnAlias(FileId),
+    /// The file is a crate attribute's, which has no path.
+    CrateAttr(FileId),
+    /// The file is not an alias: only an alias's appended module is set this way.
+    NotAnAlias(FileId),
+    /// Every file ID is taken.
+    NoFileId,
+}
+
+impl fmt::Display for AliasError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            AliasError::NotInASourceRoot(file) => write!(f, "{file:?} is in no source root, so it has no path to alias"),
+            AliasError::OfAnAlias(file) => write!(f, "{file:?} is an alias; alias the file it is of"),
+            AliasError::CrateAttr(file) => write!(f, "{file:?} is a crate attribute's file, which has no path"),
+            AliasError::NotAnAlias(file) => write!(f, "{file:?} is not an alias"),
+            AliasError::NoFileId => f.write_str("no file ID is left for an alias"),
+        }
+    }
+}
+
+impl std::error::Error for AliasError {}
+
 /// The inputs of a database's files and source roots. Shared by every handle of the database
 /// (`Arc<Files>`), so a reader on one handle may run while a setter runs on another.
 pub struct Files {
@@ -116,6 +145,13 @@ pub(crate) struct Writer {
     pub(crate) named: Named,
     /// An empty source root, which a root's input holds while its own is edited out of it.
     spare_root: Option<Arc<SourceRoot>>,
+    /// The aliases of each file ([`Files::alias`]), in the order they were made.
+    pub(crate) aliases: ByFile<SmallVec<[FileId; 2]>>,
+    /// The file each alias has the path and text of.
+    pub(crate) alias_of: ByFile<FileId>,
+    /// The module each alias appends to its file's text, with the text it appends
+    /// ([`Files::set_alias_appended`]).
+    pub(crate) suffixes: ByFile<(&'static str, Box<str>)>,
 }
 
 impl Writer {
@@ -128,6 +164,12 @@ impl Writer {
     /// The source roots that have `file`.
     pub(crate) fn roots_of(&self, file: FileId) -> &[SourceRootId] {
         self.in_roots.get(file).map_or(&[], |it| it.as_slice())
+    }
+
+    /// The aliases of `file`, copied out so the writer can be written while they are gone over.
+    pub(crate) fn aliases_of(&self, file: FileId) -> SmallVec<[FileId; 2]> {
+        // clone: a file's few aliases, inline
+        self.aliases.get(file).cloned().unwrap_or_default()
     }
 
     /// Notes that a source root names `file` at `path`.
@@ -195,6 +237,11 @@ impl<T> ByFile<T> {
 
     pub(crate) fn remove(&mut self, file: FileId) -> Option<T> {
         self.0.get_mut(file.index() as usize)?.take()
+    }
+
+    /// Each file with a value, by file ID.
+    pub(crate) fn iter(&self) -> impl Iterator<Item = (FileId, &T)> + '_ {
+        self.0.iter().enumerate().filter_map(|(at, it)| Some((FileId::from_raw(at as u32), it.as_ref()?)))
     }
 }
 
@@ -273,6 +320,9 @@ impl Files {
     ) {
         frame::task(Tag::Parse, |frame| {
             let mut writer = self.lock();
+            if let Some(of) = writer.alias_of.get(file_id) {
+                panic!("{file_id:?} is an alias of {of:?}: its module is set with `Db::set_alias_appended`");
+            }
             let input = self.file_text(file_id);
             if input.appended_root_module(&*db) == module {
                 return;
@@ -297,17 +347,196 @@ impl Files {
         frame::task(Tag::Parse, |frame| {
             let mut writer = self.lock();
             self.refuse_crate_attr(&writer, file_id);
+            if let Some(of) = writer.alias_of.get(file_id) {
+                panic!("{file_id:?} is an alias of {of:?}: its text is {of:?}'s, set that");
+            }
             writer.view_ids.remove(file_id);
             let appended =
                 self.input_of(&writer, file_id).and_then(|it| it.appended_root_module(&*db));
             let file = ContentId::of(blaze_vfs::FILE_DOMAIN, text.as_bytes());
             let content = FileText::content_of_file(file, appended);
             let text = syntax::Text::from(text);
+            self.write_aliases(&mut writer, db, file_id, Some((&text, file)), durability, |_| {});
             self.write_text(&mut writer, db, file_id, Some((text, file, content)), durability);
             let mut changed = Roots::new();
             index_file(&mut writer, file_id, content, &mut changed);
             self.write_root_contents(&mut writer, db, &changed, frame);
         })
+    }
+
+    /// Gives each alias of `of` the text `of` is given (`None`: no text) with its own suffix
+    /// ([`Files::write_alias`]), and hands `written` each alias.
+    pub(crate) fn write_aliases(
+        &self,
+        writer: &mut Writer,
+        db: &mut Db,
+        of: FileId,
+        text: Option<(&syntax::Text, ContentId)>,
+        durability: Option<Durability>,
+        mut written: impl FnMut(FileId),
+    ) {
+        if !writer.aliases.contains_key(of) {
+            return;
+        }
+        for alias in writer.aliases_of(of) {
+            self.write_alias(writer, db, alias, text, durability);
+            written(alias);
+        }
+    }
+
+    /// Sets `alias`'s text to its file's (`of_text`, with the blaze-vfs ID of its bytes) and its
+    /// suffix after it, and its appended root module to the suffix's: with no suffix, the
+    /// alias's text is its file's bytes, shared.
+    fn write_alias(
+        &self,
+        writer: &mut Writer,
+        db: &mut Db,
+        alias: FileId,
+        of_text: Option<(&syntax::Text, ContentId)>,
+        durability: Option<Durability>,
+    ) {
+        let suffix = writer.suffixes.get(alias);
+        let module = suffix.map(|(module, _)| *module);
+        let text = of_text.map(|(text, file)| match suffix {
+            // clone: a count of the bytes
+            None => (text.clone(), file, FileText::content_of_file(file, None)),
+            Some((module, suffix)) => {
+                // alloc: an appended alias's text, once per write of its file or its suffix
+                let mut whole = String::with_capacity(text.len() + suffix.len());
+                whole.push_str(text);
+                whole.push_str(suffix);
+                let file = ContentId::of(blaze_vfs::FILE_DOMAIN, whole.as_bytes());
+                (syntax::Text::from(whole), file, FileText::content_of_file(file, Some(module)))
+            }
+        });
+        self.write_text(writer, db, alias, text, durability);
+        if let Some(input) = self.input_of(writer, alias)
+            && input.appended_root_module(&*db) != module
+        {
+            set(input.set_appended_root_module_field(db), durability, module);
+        }
+    }
+
+    /// Has `alias` append `appended` (its module's name, and the text after its file's) to its
+    /// file's text from now on, or nothing (`None`), and writes its text so: a write of its
+    /// file keeps the suffix, writing the file's new text with it after.
+    pub(crate) fn set_alias_appended(
+        &self,
+        db: &mut Db,
+        alias: FileId,
+        appended: Option<(&'static str, &str)>,
+    ) -> Result<(), AliasError> {
+        let mut writer = self.lock();
+        let Some(&of) = writer.alias_of.get(alias) else { return Err(AliasError::NotAnAlias(alias)) };
+        let now = writer.suffixes.get(alias).map(|(module, text)| (*module, &**text));
+        if now == appended {
+            return Ok(());
+        }
+        match appended {
+            // alloc: an alias's suffix, once per change of it
+            Some((module, text)) => writer.suffixes.insert(alias, (module, text.into())),
+            None => _ = writer.suffixes.remove(alias),
+        }
+        let durability = alias_durability(&writer, of);
+        let text = self.text_input(of).map(|input| {
+            // clone: a count of the bytes
+            (input.text_field(&*db).clone(), input.reparse_field(&*db).id())
+        });
+        let of_text = text.as_ref().map(|(text, file)| (text, *file));
+        self.write_alias(&mut writer, db, alias, of_text, Some(durability));
+        Ok(())
+    }
+
+    /// A new file with `of`'s path and text (see [`FileSet::alias`]): in each source root that
+    /// has `of`, found by file and never by path, so `mod` declarations in it resolve as in
+    /// `of` while every path still names `of`. It keeps `of`'s text (every write of `of` writes
+    /// its aliases in the same change) and goes when `of` leaves its last source root, but its
+    /// appended root module is its own. Returns it and the source roots it was put in.
+    pub(crate) fn alias(&self, db: &mut Db, of: FileId) -> Result<(FileId, Roots), AliasError> {
+        let mut writer = self.lock();
+        if writer.crate_attrs.contains_key(of) {
+            return Err(AliasError::CrateAttr(of));
+        }
+        if writer.alias_of.contains_key(of) {
+            return Err(AliasError::OfAnAlias(of));
+        }
+        // alloc: inline, a file's few source roots
+        let roots: Roots = writer.roots_of(of).iter().copied().collect();
+        let Some(file_root) = self.file_source_roots.get(of.index()) else {
+            return Err(AliasError::NotInASourceRoot(of));
+        };
+        if roots.is_empty() {
+            return Err(AliasError::NotInASourceRoot(of));
+        }
+        let mut next = writer.next_file;
+        let alias = self.unused_file_id(&writer, &mut next).ok_or(AliasError::NoFileId)?;
+        writer.next_file = next;
+        for &root in &roots {
+            self.edit_root_files(&mut writer, db, root, |files| _ = files.alias_file(alias, of));
+        }
+        let file_root = file_root.source_root_id(&*db);
+        self.set_file_source_root_in(&mut writer, db, alias, file_root, Durability::MEDIUM);
+        let durability = alias_durability(&writer, of);
+        let text = self.text_input(of).map(|input| {
+            // clone: a count of the bytes, which the alias shares
+            (input.text_field(&*db).clone(), input.reparse_field(&*db).id())
+        });
+        let of_text = text.as_ref().map(|(text, file)| (text, *file));
+        self.write_alias(&mut writer, db, alias, of_text, Some(durability));
+        writer.alias_of.insert(alias, of);
+        writer.aliases.slot(of).get_or_insert_default().push(alias);
+        Ok((alias, roots))
+    }
+
+    /// The aliases of `of` ([`Files::alias`]), in the order they were made.
+    pub fn aliases_of(&self, of: FileId) -> SmallVec<[FileId; 2]> {
+        self.lock().aliases_of(of)
+    }
+
+    /// The file `alias` is an alias of, if it is one.
+    pub fn alias_of(&self, alias: FileId) -> Option<FileId> {
+        self.lock().alias_of.get(alias).copied()
+    }
+
+    /// Takes out the aliases of each of `files` that is in no source root now: each loses its
+    /// text, and is handed to `removed`.
+    pub(crate) fn drop_orphan_aliases(
+        &self,
+        writer: &mut Writer,
+        db: &mut Db,
+        files: impl IntoIterator<Item = FileId>,
+        mut removed: impl FnMut(FileId),
+    ) {
+        for of in files {
+            if !writer.roots_of(of).is_empty() {
+                continue;
+            }
+            let Some(aliases) = writer.aliases.remove(of) else { continue };
+            for alias in aliases {
+                writer.alias_of.remove(alias);
+                writer.suffixes.remove(alias);
+                self.write_text(writer, db, alias, None, None);
+                removed(alias);
+            }
+        }
+    }
+
+    /// Edits the file set of the source root `root` in place with `edit`: taken out of its
+    /// input so no reader holds it, so `make_mut` copies nothing.
+    pub(crate) fn edit_root_files(
+        &self,
+        writer: &mut Writer,
+        db: &mut Db,
+        root: SourceRootId,
+        edit: impl FnOnce(&mut SourceRoot),
+    ) {
+        let input = self.source_root(root);
+        let spare = writer.spare_root();
+        let mut source_root =
+            input.set_source_root_field(db).with_durability(Durability::MEDIUM).to(spare);
+        // clone: only for a set a reader still holds (copy on write)
+        edit(Arc::make_mut(&mut source_root));
+        input.set_source_root_field(db).with_durability(Durability::MEDIUM).to(source_root);
     }
 
     /// The text input of `file` while it has text.
@@ -660,7 +889,7 @@ impl Files {
         &self,
         db: &mut Db,
         source_root_id: SourceRootId,
-        source_root: Arc<SourceRoot>,
+        mut source_root: Arc<SourceRoot>,
         durability: Durability,
     ) {
         frame::task(Tag::Parse, |frame| {
@@ -668,6 +897,7 @@ impl Files {
             for file in source_root.iter() {
                 self.refuse_crate_attr(&writer, file);
             }
+            keep_aliases(&writer, &mut source_root);
             let index = self.index_root(&mut writer, &*db, source_root_id, &source_root, frame);
             let is_library = index.is_library;
             writer.root_contents.insert(source_root_id, index);
@@ -689,6 +919,9 @@ impl Files {
                     self.source_roots.set(source_root_id.0, Some(input));
                 }
             }
+            let mut orphans: SmallVec<[FileId; 4]> = SmallVec::new();
+            orphans.extend(writer.aliases.iter().map(|(of, _)| of).filter(|&of| writer.roots_of(of).is_empty()));
+            self.drop_orphan_aliases(&mut writer, db, orphans, |_| {});
             writer.named.publish(db, frame);
         })
     }
@@ -752,6 +985,7 @@ impl Files {
             || writer.in_roots.contains_key(id)
             || writer.view_ids.contains_key(id)
             || writer.crate_attrs.contains_key(id)
+            || writer.alias_of.contains_key(id)
     }
 
     /// The first file ID from `next` on that nothing has: the one place base-db hands out file
@@ -777,6 +1011,29 @@ impl Files {
         let id = self.unused_file_id(&writer, &mut next);
         writer.next_file = next;
         id
+    }
+}
+
+/// What an alias of `of` is written with: as durable as a file of `of`'s source root.
+fn alias_durability(writer: &Writer, of: FileId) -> Durability {
+    let root = writer.roots_of(of).first();
+    let is_library = root.and_then(|root| writer.root_contents.get(root)).is_some_and(|it| it.is_library);
+    if is_library { Durability::HIGH } else { Durability::LOW }
+}
+
+/// Puts in `root` the aliases of its files it lacks: a set given whole keeps the aliases a file
+/// of it was given.
+fn keep_aliases(writer: &Writer, root: &mut Arc<SourceRoot>) {
+    for (of, aliases) in writer.aliases.iter() {
+        if root.path_for_file(&of).is_none() {
+            continue;
+        }
+        for &alias in aliases {
+            if root.path_for_file(&alias).is_none() {
+                // clone: only for a set a reader still holds (copy on write)
+                Arc::make_mut(root).alias_file(alias, of);
+            }
+        }
     }
 }
 

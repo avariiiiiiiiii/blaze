@@ -128,7 +128,7 @@ fn maintain_all(db: &mut Db, written: &Written<'_>, state: &mut State, last: &mu
         }
         let mut work = Work::default();
         carry_maintaining();
-        let _maintaining = Maintaining { before: MAINTAINING.replace(Some(krate)) };
+        let _maintaining = Maintaining { before: replace_maintaining(Some(krate)) };
         if let Some(delta) = maintain_crate(db, krate, state, written, last, &mut modules_changed, &mut work) {
             last.push(delta);
         }
@@ -159,11 +159,21 @@ struct Maintaining {
 
 impl Drop for Maintaining {
     fn drop(&mut self) {
-        MAINTAINING.set(self.before);
+        replace_maintaining(self.before);
     }
 }
 
+// Each access to `MAINTAINING` is a call of its own, never inlined: a maintainer run that waits
+// between two may resume on another thread, and an inlined access may reuse the address of the
+// first thread's slot (docs/v2/plan/lanes/may-suspend.md).
+
+#[inline(never)]
+fn replace_maintaining(krate: Option<Crate>) -> Option<Crate> {
+    MAINTAINING.replace(krate)
+}
+
 /// The crate the maintainer is resolving on this thread, if any.
+#[inline(never)]
 pub(in crate::nameres) fn maintaining() -> Option<Crate> {
     MAINTAINING.get()
 }
@@ -187,12 +197,17 @@ fn maintain_crate(
     let mut delta = input::read(db, krate, &mut cs, written, cold, deps_changed);
     work.ops += delta.ops;
     // The root of a crate exporting procedural macros is published censored, and its state row
-    // keeps the scope before the censor: a run makes both.
-    if queries::crate_data(db, krate).proc_macro
-        && let Some(at) = delta.direct.iter().position(|(it, _)| *it == cs.root)
+    // keeps the scope before the censor: a run makes both. A crate that starts or stops exporting
+    // them (`#![crate_type]`) has its root censored or no longer, which only a run publishes.
+    let proc_macro = queries::crate_data(db, krate).proc_macro;
+    let flipped = cs.data_of.as_ref().is_some_and(|it| it.proc_macro != proc_macro);
+    if let Some(at) = delta.direct.iter().position(|(it, _)| *it == cs.root)
+        && (proc_macro || flipped)
     {
         let (group, _) = delta.direct.swap_remove(at);
         delta.seeds.push(group);
+    } else if flipped && !delta.seeds.contains(&cs.root) {
+        delta.seeds.push(cs.root);
     }
     let moved = match delta.tree {
         true => diff::update_positions(&mut cs),
@@ -263,13 +278,20 @@ fn dependency_wakes(
 
 /// The groups that glob-imported an enum the write may have changed: one declared by a group
 /// of this crate it read again, or one an earlier crate's write touched. A variant is no
-/// binding of the enum's module, so nothing else wakes them; the glob reads the module whole.
+/// binding of the enum's module, so nothing else wakes them; the glob is noted reading
+/// [`reads::enum_glob`] there, which no glob of the module reads. The same for the imports of a
+/// trait's items ([`reads::trait_import`]).
 fn enum_glob_wakes(db: &Db, cs: &CrateState, delta: &Delta, earlier: &[CrateDelta]) -> Vec<ModuleId> {
     let mut out = Vec::new(); // alloc: the groups woken, once per write that touches an enum
-    let mut wake = |def: ModuleDefId| {
-        if let ModuleDefId::AdtId(crate::AdtId::EnumId(it)) = def {
-            out.extend(cs.reads.readers((crate::Lookup::lookup(&it, db).container, None)));
+    let key = reads::enum_glob();
+    let mut wake = |def: ModuleDefId| match def {
+        ModuleDefId::AdtId(crate::AdtId::EnumId(it)) => {
+            out.extend(cs.reads.readers((crate::Lookup::lookup(&it, db).container, Some(key))));
         }
+        ModuleDefId::TraitId(it) => {
+            out.extend(cs.reads.readers((crate::Lookup::lookup(&it, db).container, Some(reads::trait_import()))));
+        }
+        _ => {}
     };
     let direct = delta.direct.iter().map(|(it, _)| it);
     for group in delta.touched.iter().chain(&delta.seeds).chain(direct) {

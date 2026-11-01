@@ -937,6 +937,17 @@ impl Hasher for KeyHasher {
     }
 }
 
+/// A node of an open request that has not settled ([`Plane::unsettled`]).
+#[derive(Clone, Copy, Debug)]
+pub struct Unsettled<'a> {
+    pub request: RequestId,
+    pub id: NodeId,
+    pub name: &'a str,
+    pub state: &'a NodeState,
+    /// A dep it waits for that has not settled, if any.
+    pub on: Option<NodeId>,
+}
+
 pub struct Plane<M = NoMemo> {
     config: PlaneConfig,
     /// The node columns, by slot, and which slots are live.
@@ -1093,6 +1104,11 @@ impl<M: Memo> Plane<M> {
         Some(&self.states[node.index() as usize])
     }
 
+    /// Whether `request` is known and not finished: one [`Plane::cancel_into`] takes.
+    pub fn is_open(&self, request: RequestId) -> bool {
+        self.request_index.get(&request).is_some_and(|r| !self.requests[r.index() as usize].finished)
+    }
+
     /// What `request` did so far, if it is known: open, or finished and not released.
     pub fn stats(&self, request: RequestId) -> Option<RequestStats> {
         let r = *self.request_index.get(&request)?;
@@ -1132,6 +1148,31 @@ impl<M: Memo> Plane<M> {
             return None;
         }
         Some(self.rows[task.first as usize].id)
+    }
+
+    /// Each node of a request not finished that has not settled, to `each`, in no order: what
+    /// a stall names.
+    pub fn unsettled<'a>(&'a self, mut each: impl FnMut(Unsettled<'a>)) {
+        for handle in self.request_index.values() {
+            let request = &self.requests[handle.index() as usize];
+            if request.finished {
+                continue;
+            }
+            for &me in &request.nodes {
+                let m = me as usize;
+                let state = &self.states[m];
+                if state.settled() {
+                    continue;
+                }
+                let cold = &self.cold[m];
+                let on = request
+                    .deps(cold)
+                    .iter()
+                    .find(|edge| !self.states[edge.dep as usize].settled())
+                    .map(|edge| self.rows[edge.dep as usize].id);
+                each(Unsettled { request: request.id, id: self.rows[m].id, name: request.name(cold), state, on });
+            }
+        }
     }
 
     /// Whether a node of `task` is of a request not idle.

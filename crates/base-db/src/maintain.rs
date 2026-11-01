@@ -19,7 +19,9 @@ use std::{
 };
 
 use blaze_dbsp::Work;
+use blaze_ids::ContentId;
 use rustc_hash::FxHashMap;
+use smallvec::SmallVec;
 use span::FileId;
 
 use crate::{Crate, Db, IncludedFile, SourceRoot, SourceRootId};
@@ -362,13 +364,22 @@ impl Db {
         })
     }
 
-    /// Runs `f` as a write of `file`'s text input, noted when its content ID changed.
+    /// Runs `f` as a write of `file`'s text input, noted when its content ID changed, and of
+    /// its aliases' ([`crate::Files::alias`]), which every write of it writes too.
     pub(crate) fn write_file<R>(&mut self, file: FileId, f: impl FnOnce(&mut Db) -> R) -> R {
         self.batch(|db| {
             let before = db.files().entry_content(&*db, file);
+            let aliases = db.files().aliases_of(file);
+            let mut was: SmallVec<[ContentId; 2]> = SmallVec::new();
+            was.extend(aliases.iter().map(|&alias| db.files().entry_content(&*db, alias)));
             let result = f(db);
             if db.files().entry_content(&*db, file) != before {
                 db.note(Note::Set(file));
+            }
+            for (&alias, was) in aliases.iter().zip(was) {
+                if db.files().entry_content(&*db, alias) != was {
+                    db.note(Note::Set(alias));
+                }
             }
             result
         })
@@ -388,9 +399,11 @@ impl Db {
         self.maintenance.passes = self.maintenance.passes.saturating_add(1);
         let pending = std::mem::replace(&mut self.maintenance.pending, Pending::empty());
         self.maintenance.maintaining = true;
+        let _span = tracing::info_span!(target: "blaze", "maintain").entered();
         let ran = panic::catch_unwind(AssertUnwindSafe(|| {
             let written = pending.written();
             for maintainer in all {
+                let _span = tracing::info_span!(target: "blaze", "maintainer", function = maintainer.name).entered();
                 (maintainer.run)(self, &written);
             }
         }));

@@ -22,6 +22,9 @@ resolver = "2"
 [workspace.metadata.blaze]
 experimental = ["sandboxed-tests"]
 
+[workspace.metadata.blaze.lints]
+hot_alloc = "warn"
+
 # llvm-sys's build script (vendor/llvm-sys/pin.rs) checks the pinned LLVM `nix develop` names.
 [workspace.metadata.blaze.sandbox]
 build-script-env = ["LLVM_SYS_231_PREFIX"]

@@ -542,8 +542,12 @@ pub trait Writer<S: Steps>: Send + 'static {
     fn waiting(&self) -> bool;
     /// Every write asked for, applied as one, in the order asked, if no reader is alive:
     /// `Ok(true)` once applied (or none waited), `Ok(false)` while a reader is, asking again
-    /// costing one load. An error ends the job.
+    /// costing one load. An error ends the job. A write that panics (a maintainer's panic
+    /// included) is caught by [`applying`] and kept for [`Writer::broke`]; the others are
+    /// applied, and the front end is never kept ([`Writer::keep`] fails).
     fn apply(&mut self) -> Result<bool, ApiError>;
+    /// A write [`Writer::apply`] applied that panicked, taken, one a call.
+    fn broke(&mut self) -> Option<Broke>;
     /// On a worker, the writer handed to the tables' task as the front end's last use: its
     /// tables (name, elements, bytes), measured with it exclusive; an
     /// error while a reader of it is alive.
@@ -568,6 +572,24 @@ pub trait Writer<S: Steps>: Send + 'static {
     /// is alive or a write fails to apply: the build ends with it, never a silent full lower
     /// next time.
     fn keep(self) -> Result<S::KeptFront, ApiError>;
+}
+
+/// A write to a job's front end that panicked: the unit it was for (a proc macro's load, or a
+/// build script's run) and the panic. The job fails with it, and every unit that depends on
+/// that one is refused, while keep-going builds the rest (`Jobs::apply_writes`).
+#[derive(Debug)]
+pub struct Broke {
+    pub unit: usize,
+    /// What the write was: "a proc macro's load", "a build script's run".
+    pub what: &'static str,
+    pub panic: super::plane::Panic,
+}
+
+/// `write`, the write `what` for unit `unit`, applied on the loop: its panic as a [`Broke`]
+/// instead of unwinding the loop, which would end every request the daemon serves.
+pub fn applying<T>(unit: usize, what: &'static str, write: impl FnOnce() -> T) -> Result<T, Broke> {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(write))
+        .map_err(|payload| Broke { unit, what, panic: super::plane::panicked(&*payload) })
 }
 
 /// One job's front end, its units lowered: shared by the job's tasks, read only.

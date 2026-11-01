@@ -51,14 +51,17 @@ use std::{collections::VecDeque, fmt};
 use blaze_core::wheel::Wheel;
 
 pub use cores::{CoreInfo, Cores, Distances, LEVELS, Level, MAX_CORES, ShapeError};
-pub use fiber::{Carried, NoWait, Switch, SwitchEvent, carry, current_job, miss, observe, on_fiber};
-pub(crate) use host::{Host, join_pool, leave_pool};
+pub use fiber::{
+    Carried, Idle, IdleReason, NoWait, Switch, SwitchEvent, carry, current_job, miss, observe, observe_idle, on_fiber,
+};
+pub(crate) use host::{Host, check_stall, join_pool, leave_pool};
 pub use host::{
     claim, claim_for, close_scope, count_towards, innermost_scope, job_here, key_done, open_scope, release, wait,
 };
 
 use crate::Key;
 use cores::{any_in, first_from, get, set};
+pub use graph::StallWait;
 use graph::{Graph, Home, Life, On, Waited};
 
 /// How many slot jobs a core runs in a row before it looks at its inbox and queues (Tokio's
@@ -205,6 +208,46 @@ pub enum Yielded {
 #[derive(Clone, PartialEq, Eq, Debug)] // clone: an error, off every hot path
 pub struct Cycle {
     pub jobs: Vec<JobId>,
+}
+
+/// No wait could ever end: every pool's workers idle with nothing queued, no driver running,
+/// and every job in the wait graph waiting on another of them (a job, a key a job claimed, or
+/// a counter of such jobs). Each of those waits ends with this, for its job (`job`) to fail
+/// with it: the request it served fails naming every wait, instead of hanging.
+#[derive(Clone, PartialEq, Eq, Debug)] // clone: an error, off every hot path
+pub struct Stalled {
+    pub job: JobId,
+    pub waits: Vec<(JobId, StallWait)>,
+}
+
+/// The most waits a [`Stalled`]'s message names.
+const STALL_NAMED: usize = 64;
+
+impl fmt::Display for Stalled {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "stalled: nothing can run and no wait can end ({} jobs wait), so job {} fails: ", self.waits.len(), self.job.0)?;
+        for (at, (job, wait)) in self.waits.iter().take(STALL_NAMED).enumerate() {
+            if at > 0 {
+                f.write_str("; ")?;
+            }
+            write!(f, "job {} waits for ", job.0)?;
+            match wait {
+                StallWait::Job(other) => write!(f, "job {}", other.0)?,
+                StallWait::Key { key, claimer } => {
+                    f.write_str("key ")?;
+                    for byte in key.0 {
+                        write!(f, "{byte:02x}")?;
+                    }
+                    write!(f, ", claimed by job {}", claimer.0)?;
+                }
+                StallWait::Counter(counter) => write!(f, "counter {} (a scope's jobs)", counter.0)?,
+            }
+        }
+        if self.waits.len() > STALL_NAMED {
+            write!(f, "; and {} more", self.waits.len() - STALL_NAMED)?;
+        }
+        Ok(())
+    }
 }
 
 impl fmt::Display for Cycle {
@@ -969,6 +1012,9 @@ pub(crate) struct World {
     dirty: Vec<u32>,
     woken: Vec<u32>,
     here: Vec<u32>,
+    /// The waits of the last stall ([`World::stall`]), and the jobs it woke not yet told.
+    stall: Vec<(JobId, StallWait)>,
+    stalled: Vec<JobId>,
 }
 
 impl World {
@@ -983,7 +1029,43 @@ impl World {
             dirty: Vec::with_capacity(4),
             woken: Vec::with_capacity(64),
             here: Vec::with_capacity(64),
+            stall: Vec::new(),
+            stalled: Vec::new(),
         }
+    }
+
+    /// Every pool is idle, as its caller found under the scheduler's lock: if no driver runs
+    /// and no wait in the graph can end by what is in it ([`Graph::stuck`]), every waiting job
+    /// wakes, to fail with the stall ([`World::take_stall`]). How many woke.
+    pub(crate) fn stall(&mut self) -> usize {
+        if self.members.iter().any(Option::is_some) {
+            return 0;
+        }
+        let mut waits = std::mem::take(&mut self.stall);
+        let stuck = self.graph.stuck(&mut waits);
+        self.stall = waits;
+        if !stuck {
+            return 0;
+        }
+        let mut woken = std::mem::take(&mut self.woken);
+        woken.clear();
+        self.graph.wake_all(&mut woken);
+        // alloc: a stall, once
+        self.stalled.extend(woken.iter().map(|&job| JobId(job)));
+        let count = woken.len();
+        self.woken = woken;
+        self.split(None);
+        count
+    }
+
+    /// The stall `job` woke for, if it did: told once. The job leaves the scopes it has open
+    /// that no job counts towards, as it unwinds out of them; with them, its innermost scope.
+    pub(crate) fn take_stall(&mut self, job: JobId) -> Option<(Stalled, Option<CounterId>)> {
+        let at = self.stalled.iter().position(|&it| it == job)?;
+        self.stalled.swap_remove(at);
+        let scope = self.graph.leave_empty_scopes(job);
+        // alloc: a stall's report, once per job it fails
+        Some((Stalled { job, waits: self.stall.clone() }, scope))
     }
 
     /// A new member, every core parked.

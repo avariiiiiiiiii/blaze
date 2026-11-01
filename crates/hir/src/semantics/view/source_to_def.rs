@@ -109,12 +109,17 @@ impl<'db> ToDef<'db> for ast::IdentPat<'db> {
 pub(super) struct ViewCtx<'db, 'a> {
     sema: &'a Semantics<'db>,
     s2d: SourceToDefCtx<'db, 'a>,
+    /// The crate of the macro call whose expansion the query's node is in, `None` for a node
+    /// of a file: the crate whose module a file of two crates is, on the way out of the
+    /// expansion (see [`ViewCtx::file_module`]).
+    call_crate: Option<base_db::Crate>,
 }
 
 impl<'db> Semantics<'db> {
     pub(super) fn with_ctx<T>(&self, f: impl FnOnce(&mut ViewCtx<'db, '_>) -> T) -> T {
         let mut cache = self.imp.s2d_cache.borrow_mut();
-        let mut ctx = ViewCtx { sema: self, s2d: SourceToDefCtx { db: self.db, cache: &mut cache } };
+        let mut ctx =
+            ViewCtx { sema: self, s2d: SourceToDefCtx { db: self.db, cache: &mut cache }, call_crate: None };
         f(&mut ctx)
     }
 
@@ -530,8 +535,16 @@ impl<'db> ViewCtx<'db, '_> {
     }
 
     fn file_module(&mut self, file_id: HirFileId) -> Option<ModuleId> {
-        let file = file_id.original_file(self.db()).file_id(self.db());
-        self.s2d.file_to_def(file).first().copied()
+        let db = self.db();
+        let file = file_id.original_file(db).file_id(db);
+        // A file of two crates has a module in each, but a macro file's items are only in its
+        // call's crate: the other's module maps none of them to a def. So is a module of the
+        // file the walk out of the expansion comes to (an inline `mod` around the call).
+        let krate = file_id.macro_file().map(|it| it.loc(db).krate).or(self.call_crate);
+        match krate {
+            Some(krate) => self.s2d.file_to_def_in(krate, file),
+            None => self.s2d.file_to_def(file).first().copied(),
+        }
     }
 
     pub(super) fn module_to_def(&mut self, src: InFile<ast::Module<'db>>) -> Option<ModuleId> {
@@ -855,6 +868,11 @@ impl<'db> ViewCtx<'db, '_> {
 
     pub(super) fn find_container(&mut self, src: InFile<Node<'db>>) -> Option<ChildContainer> {
         let _p = tracing::info_span!("find_container").entered();
+        if self.call_crate.is_none()
+            && let Some(macro_file) = src.file_id.macro_file()
+        {
+            self.call_crate = Some(macro_file.loc(self.db()).krate);
+        }
         let def = self.parent_ancestors_with_macros(src, |this, container, child| {
             this.container_to_def(container, child)
         });

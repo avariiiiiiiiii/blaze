@@ -80,8 +80,8 @@ use super::{
     mounts::Mounts,
     plane::{self, Did, Fresh, Happened, Plane, Posting, Task, kinds, loops},
     work::{
-        Compiled, Failed, Front, FrontEnd, Goal, Image, JobInput, Kept, KeptDb, Library, Linking, Phase, Readers,
-        Runs, Selection, Source, Steps, Writer,
+        Broke, Compiled, Failed, Front, FrontEnd, Goal, Image, JobInput, Kept, KeptDb, Library, Linking, Phase,
+        Readers, Runs, Selection, Source, Steps, Writer,
     },
 };
 use crate::cli::print::Format;
@@ -252,6 +252,26 @@ impl<S: Steps> plane::Work for Step<S> {
 
     fn run(&self, arg: u32, readers: Readers<S>) -> Option<Did<Value<S>>> {
         let at = arg as usize;
+        let _span = match &self.does {
+            Does::Library { .. } => tracing::info_span!("std library"),
+            Does::Plan { .. } => tracing::info_span!("plan"),
+            Does::Fetch { .. } => tracing::info_span!("fetch"),
+            Does::Lower { .. } => tracing::info_span!("lower workspace"),
+            // Its phases have spans of their own (`unit::compile::compile`).
+            Does::Compile { .. } => tracing::Span::none(),
+            Does::Select { .. } => tracing::info_span!("select tests"),
+            Does::Evaluate { .. } => tracing::info_span!("evaluate"),
+            Does::Reach { .. } => tracing::info_span!("reach"),
+            Does::CodegenInputs { .. } => tracing::info_span!("codegen inputs"),
+            Does::Tables { .. } => tracing::info_span!("tables"),
+            Does::Trace { .. } => tracing::info_span!("trace"),
+            Does::Verify { .. } => tracing::info_span!("verify"),
+            Does::Edit { .. } => tracing::info_span!("edit"),
+            Does::Ahead { .. } => tracing::info_span!("ahead"),
+            Does::Pack { .. } => tracing::info_span!("pack"),
+            Does::Doc { .. } => tracing::info_span!("doc"),
+        }
+        .entered();
         match &self.does {
             Does::Library { steps, kept } => self.settle(steps.library(kept).map_err(Failed::Error), Value::Library),
             Does::Plan { steps, db, queries } => self.settle(steps.plan(db, *queries), Value::Planned),
@@ -785,6 +805,16 @@ struct Build<S: Steps> {
     artifacts: Vec<Artifact>,
     /// `blaze test --ub`'s tests, run in the evaluator once every unit is checked.
     evaluation: Option<Evaluation>,
+    /// The units a write that panicked leaves unbuilt; none until one does.
+    refused: Option<Refused>,
+}
+
+/// The units of a build that depend on a write to its front end that panicked
+/// ([`Writer::broke`]): each task of one is refused, naming the panic, while keep-going
+/// builds the rest.
+struct Refused {
+    units: BitSet<u32>,
+    why: String,
 }
 
 struct Evaluation {
@@ -798,6 +828,35 @@ struct Evaluation {
 impl<S: Steps> Build<S> {
     fn unit(&self, node: NodeId) -> Option<usize> {
         self.units.get(node.0.wrapping_sub(self.first.0) as usize).map(|it| *it as usize)
+    }
+
+    /// The job's error for `broke`, a write that panicked, with every unit that depends on its
+    /// unit refused from now on. The unit itself was built: its write is what failed.
+    fn refuse_after(&mut self, broke: &Broke) -> ApiError {
+        let graph = &self.input.units.graph.units;
+        let unit = &graph[broke.unit];
+        let error = ApiError::new(
+            // alloc: an error, once
+            format!("the daemon {}, applying {} of {} of {}", broke.panic, broke.what, unit.target.name, unit.pkg_id),
+            Some(unit.pkg_id.clone()), // clone: an error, once
+        );
+        let refused = self.refused.get_or_insert_with(|| Refused {
+            units: BitSet::new(graph.len()), // alloc: once a write panics
+            why: format!("a write it depends on panicked: {}", error.what), // alloc: an error, once
+        });
+        let after = broke.unit as u32;
+        let mut grew = true;
+        while grew {
+            grew = false;
+            for (at, it) in (0u32..).zip(graph) {
+                let reached = |dep: &blaze_units::schema::UnitDep| dep.index as u32 == after || refused.units.contains(dep.index as u32);
+                if at != after && !refused.units.contains(at) && it.dependencies.iter().any(reached) {
+                    refused.units.insert(at);
+                    grew = true;
+                }
+            }
+        }
+        error
     }
 
     /// Whether `node` is its unit's first: the one whose start is the unit's.
@@ -1327,6 +1386,13 @@ impl<S: Steps> Jobs<S> {
         let job = self.batches.job_of(task.id).and_then(|id| self.jobs.get_mut(key_of(id)));
         let readers = match job {
             Some(Job { stage: Stage::Units(build), .. }) => {
+                if let Some(refused) = &build.refused
+                    && build.unit(task.id).is_some_and(|unit| refused.units.contains(unit as u32))
+                {
+                    // clone: a refused task's why, once
+                    w.plane.refuse(w.now, task, refused.why.clone());
+                    return;
+                }
                 let Some(this) = build.writer.reader() else {
                     build.held.push((task, again));
                     return;
@@ -1375,7 +1441,14 @@ impl<S: Steps> Jobs<S> {
             if !build.writer.waiting() && build.held.is_empty() {
                 continue;
             }
-            match build.writer.apply() {
+            let applied = build.writer.apply();
+            while let Some(broke) = build.writer.broke() {
+                let error = build.refuse_after(&broke);
+                if !job.cancelled.load(Ordering::Acquire) {
+                    job.over.get_or_insert((false, Some(error)));
+                }
+            }
+            match applied {
                 Ok(true) => posts.append(&mut build.held),
                 Ok(false) => {}
                 Err(error) => {
@@ -2001,6 +2074,7 @@ impl<S: Steps> Jobs<S> {
             root,
             artifacts: Vec::new(), // alloc: once per build
             evaluation,
+            refused: None,
         }));
         if count > 0 {
             self.add(w, id, nodes, Some(work), true);
@@ -2668,6 +2742,30 @@ impl<S: Steps> Jobs<S> {
     /// The daemon's tasks stalled ([`blaze_profile::Stall`]): every job with a plane request
     /// under way ends now, failed with `error`, its request cancelled and its build written
     /// to the history as stalled. Nothing of it is waited for: the daemon stops after this.
+    /// Whether a job's write waits for readers of its front end: held by tasks, or by whoever
+    /// took one that outlives its task, each of which ends on its own.
+    pub fn writes_waiting(&self) -> bool {
+        self.order.iter().any(|id| {
+            self.jobs
+                .get(key_of(*id))
+                .is_some_and(|job| matches!(&job.stage, Stage::Units(build) if build.writer.waiting()))
+        })
+    }
+
+    /// What the loop holds node `node` back for, if it does: what a stall names of it.
+    pub fn holding(&self, node: NodeId) -> Option<&'static str> {
+        let job = self.batches.job_of(node).and_then(|id| self.jobs.get(key_of(id)))?;
+        if job.held.contains(&node) {
+            return Some("a build script's run held until its program is placed (Jobs::release_held)");
+        }
+        match &job.stage {
+            Stage::Units(build) if build.held.iter().any(|(task, _)| task.id == node) => {
+                Some("a task held until its job's write is applied (Jobs::apply_writes)")
+            }
+            _ => None,
+        }
+    }
+
     pub fn stalled(&mut self, w: &mut World<'_, S>, error: &ApiError) {
         let jobs = &self.jobs;
         let stalled: Vec<JobId> = self
@@ -2683,7 +2781,9 @@ impl<S: Steps> Jobs<S> {
                 let stats = w.plane.stats(request);
                 self.rows.push(job.row(request, stats, profile_history::Outcome::Stalled));
                 job.cancelled.store(true, Ordering::Release);
-                w.plane.cancel(w.now, request);
+                if w.plane.is_open(request) {
+                    w.plane.cancel(w.now, request);
+                }
             }
             for queries in &job.queries {
                 if job.built != Some(*queries) {

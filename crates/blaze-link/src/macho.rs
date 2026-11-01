@@ -1196,9 +1196,11 @@ impl MachO {
         };
         let (indirect, indirect_count) = indirect(placed, &mut sections, &symbols.index_of)?;
         let name_at = |(at, len): (u32, u32)| &symbols.strings[at as usize..(at + len) as usize];
-        // Each segment before `__LINKEDIT`, (start, size): the chained fixups' page starts.
+        // Each segment before `__LINKEDIT`, (start, the size of its bytes in the file): the
+        // chained fixups' page starts. dyld's page-in linking maps every page they count from the
+        // file, so a zero-fill page counted is mapped over with the bytes after the segment.
         // alloc: none: at most eight segments, inline
-        let laid: SmallVec<[(u64, u64); 8]> = segments.iter().map(|it| (it.vmaddr, it.vmsize)).collect();
+        let laid: SmallVec<[(u64, u64); 8]> = segments.iter().map(|it| (it.vmaddr, it.filesize)).collect();
 
         // alloc: none for a chained image, whose binds are its slots
         let mut binds = Vec::with_capacity(if chained { 0 } else { placed.binds.len() + placed.got.len() });
@@ -1246,7 +1248,7 @@ impl MachO {
                 // gigabytes of pages.
                 let pages = (segments.iter())
                     .filter(|it| it.prot & macho::VM_PROT_WRITE.0 != 0)
-                    .map(|it| it.vmsize.div_ceil(chained::PAGE) as usize)
+                    .map(|it| it.filesize.div_ceil(chained::PAGE) as usize)
                     .sum::<usize>();
                 let names = placed.imports.iter().map(|it| it.name.len() + 2).sum::<usize>();
                 64 + 40 * laid.len() + 2 * pages + 8 * placed.imports.len() + names

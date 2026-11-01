@@ -7,7 +7,7 @@
 
 use std::{
     ffi::OsString,
-    path::{Path, PathBuf},
+    path::Path,
 };
 
 use blaze_units::stdlib::target;
@@ -29,7 +29,7 @@ impl Toolchain {
 }
 
 /// Where blaze's release is, found with nothing run.
-fn sysroot() -> Option<PathBuf> {
+fn sysroot() -> Option<&'static Path> {
     crate::toolchain::sysroot()
 }
 

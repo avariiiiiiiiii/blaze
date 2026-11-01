@@ -2862,3 +2862,103 @@ fn main() {
 "#,
     );
 }
+
+/// The proc-macro bridge's `rpc.rs` shape: impls whose headers leave lifetimes out
+/// (`for &[u8]`, `DecodeMut<'a, '_, S>`), each a lifetime parameter of the impl, and
+/// `Option<T>`'s decode needing `T: for<'s> DecodeMut<'a, 's, S>` of one.
+#[test]
+fn impls_with_elided_header_lifetimes_evaluate() {
+    check_pass(
+        r#"
+//- minicore: sized, copy, slice, index, range, option, panic, fmt
+type Reader<'a> = &'a [u8];
+
+struct Writer { buf: [u8; 8], len: usize }
+
+impl Writer {
+    fn push(&mut self, b: u8) {
+        self.buf[self.len] = b;
+        self.len += 1;
+    }
+}
+
+trait Encode<S>: Sized {
+    fn encode(self, w: &mut Writer, s: &mut S);
+}
+
+trait DecodeMut<'a, 's, S>: Sized {
+    fn decode(r: &mut Reader<'a>, s: &'s mut S) -> Self;
+}
+
+impl<S> Encode<S> for u8 {
+    fn encode(self, w: &mut Writer, _: &mut S) {
+        w.push(self)
+    }
+}
+
+impl<S> DecodeMut<'_, '_, S> for u8 {
+    fn decode(r: &mut Reader<'_>, _: &mut S) -> Self {
+        let x = r[0];
+        *r = &r[1..];
+        x
+    }
+}
+
+impl<S> Encode<S> for &[u8] {
+    fn encode(self, w: &mut Writer, s: &mut S) {
+        (self.len() as u8).encode(w, s);
+        let mut i = 0;
+        while i < self.len() {
+            w.push(self[i]);
+            i += 1;
+        }
+    }
+}
+
+impl<'a, S> DecodeMut<'a, '_, S> for &'a [u8] {
+    fn decode(r: &mut Reader<'a>, s: &mut S) -> Self {
+        let len = u8::decode(r, s) as usize;
+        let xs = &r[..len];
+        *r = &r[len..];
+        xs
+    }
+}
+
+impl<S, T: Encode<S>> Encode<S> for Option<T> {
+    fn encode(self, w: &mut Writer, s: &mut S) {
+        match self {
+            None => 0u8.encode(w, s),
+            Some(x) => {
+                1u8.encode(w, s);
+                x.encode(w, s);
+            }
+        }
+    }
+}
+
+impl<'a, S, T: for<'s> DecodeMut<'a, 's, S>> DecodeMut<'a, '_, S> for Option<T> {
+    fn decode(r: &mut Reader<'a>, s: &mut S) -> Self {
+        match u8::decode(r, s) {
+            0 => None,
+            _ => Some(T::decode(r, s)),
+        }
+    }
+}
+
+fn main() {
+    let mut w = Writer { buf: [0; 8], len: 0 };
+    let data: [u8; 3] = [7, 8, 9];
+    Some(&data[..]).encode(&mut w, &mut ());
+    let mut r: Reader<'_> = &w.buf[..w.len];
+    let back = <Option<&[u8]>>::decode(&mut r, &mut ());
+    match back {
+        Some(xs) if xs.len() == 3 && xs[0] == 7 && xs[2] == 9 => {}
+        _ => panic!("decoded wrong"),
+    }
+    if r.len() != 0 {
+        panic!("left over");
+    }
+}
+"#,
+    );
+}

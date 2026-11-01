@@ -39,7 +39,7 @@ use crate::{
     },
 };
 
-/// `main`'s bodies are the ones stored; `other` comes first in the second database, so `main`'s
+/// `main`'s bodies are the ones stored; [`PAD`] comes first in the second database, so `main`'s
 /// ids there are not the first one's.
 pub(super) const FIXTURE: &str = r#"
 //- minicore: sized, copy, clone, add, fn
@@ -88,14 +88,23 @@ pub(super) fn function(db: &Db, name: &str) -> DefWithBodyId {
         .unwrap_or_else(|| panic!("no function `{name}`"))
 }
 
-/// The second database: `other` inferred first, so `main`'s ids differ from the first's.
+/// The second database: `fixture` with a crate `pad` before its own, so `main`'s ids differ
+/// from the first's. Name resolution interns every crate's items as the database is made, in
+/// the crate graph's order, so only items made before `main`'s can move them, not what is
+/// asked of the database afterwards.
 pub(super) fn second(fixture: &str) -> Db {
-    let db = db_of(fixture);
-    for def in crate_body_owners(&db, crate_named(&db, "other")) {
-        let _ = InferenceResult::of(&db, def);
-    }
-    db
+    let at = fixture.find("//- /").expect("a fixture with a file");
+    db_of(&format!("{}{PAD}{}", &fixture[..at], &fixture[at..]))
 }
+
+/// A crate of nothing the fixtures' crates name, its functions interned before theirs.
+pub(super) const PAD: &str = "//- /pad.rs crate:pad deps:core new_source_root:library
+pub fn p1() {}
+pub fn p2() {}
+pub fn p3() {}
+pub struct P;
+impl P { pub fn p4(&self) {} }
+";
 
 const BODIES: [&str; 4] = ["uses_show", "plain", "seven", "closures"];
 

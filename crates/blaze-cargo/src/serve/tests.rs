@@ -35,8 +35,8 @@ use super::{
     Daemon, Options,
     plane::{Inline, Runner},
     work::{
-        Compiled, Failed, Front, FrontEnd, Goal, Image, JobInput, Kept, KeptDb, Library, Output, Phase, Put, Runs,
-        Selection, Source, SourceFile, Steps, Writer,
+        Broke, Compiled, Failed, Front, FrontEnd, Goal, Image, JobInput, Kept, KeptDb, Library, Output, Phase, Put,
+        Runs, Selection, Source, SourceFile, Steps, Writer, applying,
     },
 };
 
@@ -62,8 +62,12 @@ thread_local! {
     static SAW: RefCell<Vec<BuildConfig>> = const { RefCell::new(Vec::new()) };
     /// How many build scripts' runs were asked of a writer.
     static ASKED: Cell<usize> = const { Cell::new(0) };
+    /// Whether a build script's run is [`Lost`].
+    static LOSES_RUNS: Cell<bool> = const { Cell::new(false) };
     /// How many times a writer applied what was asked of it.
     static APPLIES: Cell<usize> = const { Cell::new(0) };
+    /// The build script's run whose write panics as it is applied, as a maintainer's would.
+    static PANICS_RUN: Cell<Option<usize>> = const { Cell::new(None) };
     /// Each compile's unit, and the runs applied in the front end it read.
     static SEEN: RefCell<Vec<(usize, Vec<usize>)>> = const { RefCell::new(Vec::new()) };
     /// Each phase of a unit's compile as it ran, in order.
@@ -346,7 +350,7 @@ impl Steps for Fake {
                 FakeInputs::default()
             }
         };
-        let writer = FakeWriter { inputs: Arc::new(inputs), asked: Vec::new() };
+        let writer = FakeWriter { inputs: Arc::new(inputs), asked: Vec::new(), broke: Vec::new() };
         Ok(FrontEnd { front: Arc::new(FakeFront { goal: job.goal }), writer, puts: Vec::new() })
     }
 
@@ -390,6 +394,7 @@ impl KeptDb for FakeInputs {
 struct FakeWriter {
     inputs: Arc<FakeInputs>,
     asked: Vec<usize>,
+    broke: Vec<Broke>,
 }
 
 /// A shared reference to the inputs, as the loop posted a task with it.
@@ -436,9 +441,21 @@ impl Writer<Fake> for FakeWriter {
             return Ok(true);
         }
         let Some(inputs) = Arc::get_mut(&mut self.inputs) else { return Ok(false) };
-        inputs.runs.append(&mut self.asked);
+        for run in self.asked.drain(..) {
+            let applied = applying(run, "a build script's run", || {
+                assert_ne!(PANICS_RUN.get(), Some(run), "serve-test: the run's write panics");
+                inputs.runs.push(run);
+            });
+            if let Err(broke) = applied {
+                self.broke.push(broke);
+            }
+        }
         APPLIES.with(|it| it.set(it.get() + 1));
         Ok(true)
+    }
+
+    fn broke(&mut self) -> Option<Broke> {
+        self.broke.pop()
     }
 
     fn tables(&mut self) -> Result<Vec<(&'static str, u64, u64)>, Failed> {
@@ -460,6 +477,7 @@ impl Writer<Fake> for FakeWriter {
 enum FakeRuns {
     Script(Script),
     Over(Over),
+    Lost(Lost),
 }
 
 impl Runs<Fake> for FakeRuns {
@@ -473,6 +491,7 @@ impl Runs<Fake> for FakeRuns {
         match self {
             FakeRuns::Script(it) => it.start(store, writer, effects, out),
             FakeRuns::Over(it) => it.start(store, writer, effects, out),
+            FakeRuns::Lost(it) => it.start(store, writer, effects, out),
         }
     }
 
@@ -480,6 +499,7 @@ impl Runs<Fake> for FakeRuns {
         match self {
             FakeRuns::Script(it) => it.owns(tag),
             FakeRuns::Over(it) => it.owns(tag),
+            FakeRuns::Lost(it) => it.owns(tag),
         }
     }
 
@@ -494,6 +514,7 @@ impl Runs<Fake> for FakeRuns {
         match self {
             FakeRuns::Script(it) => it.complete(completion, store, writer, effects, out),
             FakeRuns::Over(it) => it.complete(completion, store, writer, effects, out),
+            FakeRuns::Lost(it) => it.complete(completion, store, writer, effects, out),
         }
     }
 
@@ -501,6 +522,7 @@ impl Runs<Fake> for FakeRuns {
         match self {
             FakeRuns::Script(it) => it.cancel(effects),
             FakeRuns::Over(it) => it.cancel(effects),
+            FakeRuns::Lost(it) => it.cancel(effects),
         }
     }
 }
@@ -512,6 +534,35 @@ impl Runs<Fake> for Script {
     fn start(&mut self, _: &Store, writer: Option<&mut FakeWriter>, _: &mut Vec<Effect>, _: &mut Vec<Response>) -> Option<bool> {
         let writer = writer.expect("a build script's run is given its job's writer");
         Some(writer.ran(self.0, blaze_lower::Ran::default()).is_ok())
+    }
+
+    fn owns(&self, _: Tag) -> bool {
+        false
+    }
+
+    fn complete(
+        &mut self,
+        _: Completion,
+        _: &mut Store,
+        _: Option<&mut FakeWriter>,
+        _: &mut Vec<Effect>,
+        _: &mut Vec<Response>,
+    ) -> Option<bool> {
+        unreachable!("it asked for nothing")
+    }
+
+    fn cancel(&mut self, _: &mut Vec<Effect>) -> Option<bool> {
+        Some(false)
+    }
+}
+
+/// A build script's run whose end never comes: it says it waits on its effects and asked
+/// for none, as a run whose completion was lost.
+struct Lost;
+
+impl Runs<Fake> for Lost {
+    fn start(&mut self, _: &Store, _: Option<&mut FakeWriter>, _: &mut Vec<Effect>, _: &mut Vec<Response>) -> Option<bool> {
+        None
     }
 
     fn owns(&self, _: Tag) -> bool {
@@ -598,7 +649,10 @@ impl Front<Fake> for FakeFront {
     }
 
     fn script(&self, unit: usize, _: u64) -> Result<FakeRuns, ApiError> {
-        Ok(FakeRuns::Script(Script(unit)))
+        Ok(match LOSES_RUNS.get() {
+            true => FakeRuns::Lost(Lost),
+            false => FakeRuns::Script(Script(unit)),
+        })
     }
 
     fn tests(&self, _: &[Artifact], selection: Selection<'_>, _: u64) -> Result<FakeRuns, ApiError> {
@@ -855,6 +909,37 @@ fn a_build_of_a_checkout_goes_from_the_server_to_built() {
     assert!(built.is_some() && built < worked, "`Built`, then `Work`: {got:#?}");
     assert_eq!(daemon.driver().contents(&name("w/Cargo.lock")), b"# a lock\n");
     assert!(daemon.mounts().has(DEP) && daemon.mounts().has(INDEX) && daemon.mounts().has(LIBRARY));
+}
+
+/// A build script's run whose end never comes (as a lost completion) leaves the build with
+/// nothing that can move it: no task runs, no effect is in flight. The build fails within
+/// seconds with the stall, naming the run still open and the program waiting on it, rather
+/// than waiting for the watchdog, which only watches tasks that run.
+#[test]
+fn a_build_nothing_can_move_fails_with_the_stall_naming_each_wait() {
+    LOSES_RUNS.set(true);
+    let mut sim = Sim::new(3, Faults::default());
+    checkout(&mut sim, "[package]\nname = \"app\"\n");
+    let steps = Arc::new(Fake::default());
+    let mut daemon = start(sim, &steps, 3);
+    let mut client = dial(&mut daemon);
+    let id = client.send(&mut daemon, Request::Build { view: ViewRef::Head("/w".into()), targets: agent() });
+    let got = client.wait(&mut daemon, id);
+    LOSES_RUNS.set(false);
+
+    assert_eq!(got.last(), Some(&Response::Done { ok: false }), "{got:#?}");
+    let said = got
+        .iter()
+        .find_map(|it| match it {
+            Response::Error(error) if error.what.starts_with("blaze stalled: for") => Some(error.what.clone()),
+            _ => None,
+        })
+        .unwrap_or_else(|| panic!("the build fails with the stall: {got:#?}"));
+    for part in ["nothing could move the build", "1 loop tasks open", "waits on node"] {
+        assert!(said.contains(part), "the stall says `{part}`: {said}");
+    }
+    let quiet: f64 = said["blaze stalled: for ".len()..].split(' ').next().unwrap().parse().unwrap();
+    assert!((2.0..10.0).contains(&quiet), "the stall is said within seconds of the build going still: {said}");
 }
 
 /// What a daemon of one `BLAZE_HOME` shares of the standard library, a daemon of another finds
@@ -1201,6 +1286,53 @@ fn a_build_whose_load_fails_before_its_units_ends_not_ok_and_the_daemon_answers_
     assert_eq!(got.last(), Some(&Response::Done { ok: true }), "{got:#?}");
 }
 
+/// A write to the front end that panics as it is applied on the loop, as a maintainer's did
+/// (the self-build of 2026-11-01 00:17), fails the units after it with a typed error naming
+/// the panic, while keep-going builds the unit that does not depend on it, and the daemon
+/// answers the next request: the build script's run (unit 2) panics as it is applied, the
+/// program (unit 3) is never compiled, and dep's library (unit 0) is.
+#[test]
+fn a_write_that_panics_fails_the_units_after_it_and_keep_going_builds_the_rest() {
+    PHASES.with(|it| it.borrow_mut().clear());
+    PANICS_RUN.set(Some(2));
+    let mut sim = Sim::new(44, Faults::default());
+    checkout(&mut sim, "[package]\nname = \"app\"\n");
+    let steps = Arc::new(Fake::default());
+    let mut daemon = start(sim, &steps, 44);
+    let mut client = dial(&mut daemon);
+    let cargo = blaze_api::Cargo {
+        cwd: "/w".into(),
+        env: Vec::new(),
+        args: vec!["--keep-going".into()],
+        root: "/w".into(),
+        color: false,
+        files: Vec::new(),
+        width: None,
+        command: "build".into(),
+        refused: None,
+        verbose: 0,
+    };
+    let targets = Targets { cargo: Some(cargo), ..agent() };
+    let id = client.send(&mut daemon, Request::Build { view: ViewRef::Head("/w".into()), targets });
+    let got = client.wait(&mut daemon, id);
+    PANICS_RUN.set(None);
+
+    assert_eq!(got.last(), Some(&Response::Done { ok: false }), "{got:#?}");
+    let named = got.iter().any(|it| {
+        matches!(it, Response::Error(error) if error.what.contains("panicked")
+            && error.what.contains("serve-test: the run's write panics")
+            && error.what.contains("applying a build script's run"))
+    });
+    assert!(named, "the build's error names the panic and the write: {got:#?}");
+    let ran = PHASES.with(|it| it.take());
+    assert!(ran.contains(&(0, Phase::Store)), "dep's library, which needs no run, is built: {ran:?}");
+    assert!(!ran.iter().any(|it| it.0 == 3), "the program, after the run, is never compiled: {ran:?}");
+
+    let id = client.send(&mut daemon, Request::Build { view: ViewRef::Head("/w".into()), targets: agent() });
+    let got = client.wait(&mut daemon, id);
+    assert_eq!(got.last(), Some(&Response::Done { ok: true }), "the daemon builds the next: {got:#?}");
+}
+
 #[test]
 fn a_build_cancelled_while_nothing_of_it_runs_ends_not_ok_and_the_daemon_answers_the_next() {
     let sim = Sim::new(43, Faults::default());
@@ -1261,12 +1393,12 @@ fn each_kind_of_batch_runs_its_own_step_of_the_front_end() {
     let codegen = answered(run(Does::CodegenInputs { front: front.clone() }, reading()));
     assert_eq!(codegen, Response::CodegenInputs(Vec::new()));
 
-    let writer = FakeWriter { inputs: Arc::new(FakeInputs { runs: vec![1, 2, 3] }), asked: Vec::new() };
+    let writer = FakeWriter { inputs: Arc::new(FakeInputs { runs: vec![1, 2, 3] }), asked: Vec::new(), broke: Vec::new() };
     let tables = Does::Tables { front: front.clone(), images: Vec::new() };
     let tables = answered(run(tables, Readers { writer: Some(writer), ..Readers::default() }));
     assert_eq!(tables, Response::Tables(vec![Table { name: "run".into(), elements: 3, bytes: 0 }]));
 
-    let writer = FakeWriter { inputs: Arc::new(FakeInputs { runs: vec![1] }), asked: vec![2] };
+    let writer = FakeWriter { inputs: Arc::new(FakeInputs { runs: vec![1] }), asked: vec![2], broke: Vec::new() };
     let pack = Does::Pack { front: front.clone(), program: "app".into() };
     let packed = answered(run(pack, Readers { writer: Some(writer), ..Readers::default() }));
     assert_eq!(packed, Response::Packed { pack: b"app [1, 2]".to_vec() }, "a write asked for is applied first");

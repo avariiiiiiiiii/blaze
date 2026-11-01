@@ -96,12 +96,47 @@ unsafe fn parked(_: NonNull<Header>) {
 /// A pool joins the scheduler: a member of its own placement, whose woken jobs `wake(ctx,
 /// token)` takes back, `token` the address of the job's header (a [`Job`] to queue). `wake` is
 /// called under the scheduler's lock: it must not call into the scheduler.
-pub(crate) fn join_pool(wake: fn(usize, usize), ctx: usize) -> u32 {
+/// `idle(ctx)` says, under the scheduler's lock, whether every worker of the pool sleeps
+/// with nothing queued ([`check_stall`]).
+pub(crate) fn join_pool(wake: fn(usize, usize), idle: fn(usize) -> bool, ctx: usize) -> u32 {
     carry_stack_limit();
     let mut g = global();
     let member = g.world.join_own();
-    set_own(&mut g, member, OwnIo { wake, ctx });
+    set_own(&mut g, member, OwnIo { wake, ctx, idle: Some(idle) });
     member
+}
+
+/// Jobs a stall woke that were not told yet ([`World::stall`]): while 0, a wait that ends
+/// asks nothing more.
+static STALLED: crate::sync::atomic::AtomicUsize = crate::sync::atomic::AtomicUsize::new(0);
+
+/// A pool's last awake worker found it idle a while with jobs parked: if every pool is idle
+/// and no wait in the graph can end ([`World::stall`]), every waiting job wakes to fail with
+/// the [`super::Stalled`] naming each wait, rather than all of them waiting forever.
+pub(crate) fn check_stall() {
+    let mut g = global();
+    if !g.own.iter().flatten().all(|io| io.idle.is_none_or(|idle| idle(io.ctx))) {
+        return;
+    }
+    let woke = g.world.stall();
+    if woke != 0 {
+        STALLED.fetch_add(woke, crate::sync::atomic::Ordering::Release);
+        dispatch_global(&mut g, None);
+    }
+}
+
+/// A wait of `job` ended: if a stall ended it, the job fails with the stall, here.
+#[inline(never)]
+fn fail_if_stalled(job: JobId) {
+    if STALLED.load(crate::sync::atomic::Ordering::Acquire) == 0 {
+        return;
+    }
+    let stalled = global().world.take_stall(job);
+    if let Some((stalled, scope)) = stalled {
+        STALLED.fetch_sub(1, crate::sync::atomic::Ordering::AcqRel);
+        SCOPE.set(scope.map_or(super::NONE, |it| it.0));
+        panic!("{stalled}");
+    }
 }
 
 /// The pool stopped, none of its jobs in the graph.
@@ -368,7 +403,10 @@ unsafe fn wait_thunk(cx: *const (), on: Wait) -> Result<(), Cycle> {
     let back = cx.yielder.suspend(Out::Wait(job, on));
     enter(cx);
     match back {
-        In::Go(Answer::Ready) => Ok(()),
+        In::Go(Answer::Ready) => {
+            fail_if_stalled(job);
+            Ok(())
+        }
         In::Go(Answer::Cycle(cycle)) => Err(cycle),
         In::Go(Answer::Raise(panic)) => panic::resume_unwind(panic),
         In::Start(_) | In::Exit => unreachable!("a parked job is only resumed"),
@@ -432,7 +470,7 @@ static CLIENTS: OnceLock<u32> = OnceLock::new();
 fn clients(g: &mut Global) -> u32 {
     *CLIENTS.get_or_init(|| {
         let member = g.world.join_own();
-        set_own(g, member, OwnIo { wake: wake_client, ctx: 0 });
+        set_own(g, member, OwnIo { wake: wake_client, ctx: 0, idle: None });
         member
     })
 }
@@ -477,7 +515,7 @@ fn client_job() -> JobId {
 fn client_wait(on: Wait) -> Result<(), Cycle> {
     assert!(!matches!(on, Wait::Job(_) | Wait::Until(_)), "a thread on no fiber waits for a key or a counter");
     CLIENT.with(|client| {
-        {
+        let job = {
             let mut g = global();
             let member = clients(&mut g);
             let job = client.register(&mut g, member);
@@ -485,10 +523,12 @@ fn client_wait(on: Wait) -> Result<(), Cycle> {
             if g.world.suspended(member, job, on)? == Suspend::Ready {
                 return Ok(());
             }
-        }
+            job
+        };
         while !client.woken.load(Ordering::Acquire) {
             thread::park();
         }
+        fail_if_stalled(job);
         Ok(())
     })
 }

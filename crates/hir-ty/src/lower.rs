@@ -4346,6 +4346,31 @@ pub(crate) fn callable_item_signature<'db>(
     }
 }
 
+/// The signature the solver takes for the function item `def` (`Interner::fn_sig`): rustc's,
+/// each lifetime its parameters leave out a late-bound one of its own
+/// ([`bind_elided_lifetimes`]), so `Location::uses_memory` of `fn uses_memory(&self) -> bool`
+/// is `for<'a> FnMut(&'a Location) -> bool`. [`callable_item_signature`] keeps them errors
+/// for inference, which gives each call's its own region ([`ElidedLifetimes`]).
+pub(crate) fn solver_fn_sig<'db>(
+    db: &'db Db,
+    def: CallableDefId,
+) -> EarlyBinder<'db, PolyFnSig<'db>> {
+    match def {
+        CallableDefId::FunctionId(f) => fn_sig_with_elided_bound(db, f).get(),
+        CallableDefId::StructId(_) | CallableDefId::EnumVariantId(_) => {
+            callable_item_signature(db, def)
+        }
+    }
+}
+
+#[blaze_query::tracked(returns(ref), mem_tag = Infer)]
+fn fn_sig_with_elided_bound(db: &Db, def: FunctionId) -> StoredEarlyBinder<StoredPolyFnSig> {
+    let interner = DbInterner::new_no_crate(db);
+    let sig = callable_item_signature(db, def.into()).skip_binder();
+    let sig = blaze_mem::frame::current(|frame| bind_elided_lifetimes(db, def, sig, frame));
+    StoredEarlyBinder::bind(interner, StoredPolyFnSig::new(sig))
+}
+
 #[blaze_query::tracked(returns(ref), mem_tag = Infer)]
 pub(crate) fn fn_sig_for_fn<'db>(
     db: &'db Db,

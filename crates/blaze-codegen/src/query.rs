@@ -6,9 +6,9 @@
 //! | value | key | a function of |
 //! |---|---|---|
 //! | a dev template | [`keys::template`] | the instance key: code hash, type-argument facts, settings (the policy among them) |
-//! | a release template | [`keys::release`] | [`crate::summary::Imports::blob_key`]: the instance key and everything imported and assumed |
+//! | a release template | [`keys::release`] | [`crate::summary::Imports::blob_key`] of [`crate::backend::laid_out`]: the instance key, which of its and its imports' references are one target, and everything imported and assumed |
 //! | a summary | [`keys::summary`] | the instance key, what it builds in and its callees' keys, which the instance key takes by their interface (`driver::summarized`) |
-//! | a masked shape | [`keys::masked`] | the instance key |
+//! | a masked shape | [`keys::masked`] | the instance key; read and put by no build, as each fold candidate is masked from its IR in the build that folds it (`driver::dev`) |
 //! | a folded body | [`keys::folded`] | the group's key: masked shape, settings, which constants vary |
 //! | a thunk | [`keys::thunk`] | the group's key and the member's instance key, which holds its constants |
 //! | a static's template | [`keys::static_value`] | the value's content (with its layout) and the settings |

@@ -84,6 +84,7 @@ use crate::{BlockId, expr_store::body::body_syntax};
 
 pub(crate) use crate::item_tree::{
     attrs::*,
+    items::deferred_item_shape,
     lower::{lower_use_tree, visibility_from_ast},
 };
 
@@ -227,7 +228,17 @@ fn file_item_tree_query(
     file_id: HirFileId,
     krate: Crate,
 ) -> Arc<ItemTree> {
-    let _p = tracing::info_span!("file_item_tree_query", ?file_id).entered();
+    let _p = crate::span_names::of_file(
+        db,
+        file_id,
+        krate,
+        tracing::info_span!(
+            "file_item_tree_query",
+            krate = tracing::field::Empty,
+            function = tracing::field::Empty
+        ),
+    )
+    .entered();
     match file_id {
         HirFileId::FileId(file) => items::file_item_tree(db, file, krate),
         // alloc: the tree's handle, once an expansion's tree

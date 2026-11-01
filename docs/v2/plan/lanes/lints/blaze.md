@@ -75,8 +75,8 @@ to its answer.
 The walk stops at a function of a workspace member (a crate whose origin is local): its
 allocations are found in its own body, once, and a call of it is not a finding. It goes on
 through std and registry crates, and through a workspace function they call back through a
-generic only for `hot_alloc_call`. So a crate denying `hot_alloc` (`[lints.blaze] hot_alloc =
-"deny"`) is told where each allocation is made, not at every caller up the stack.
+generic only for `hot_alloc_call`. So a crate denying `hot_alloc` (`hot_alloc = "deny"` in
+`[workspace.metadata.blaze.lints]`, or `#![deny(blaze::hot_alloc)]` in its root) is told where each allocation is made, not at every caller up the stack.
 
 Flagged: `String::from`, `.to_string()`, `.to_owned()`, `.to_vec()`, `Vec::with_capacity`,
 `.collect()` into an owning type, `Box::new`, `Arc::new`, a call of a registry crate's function

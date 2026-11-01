@@ -17,7 +17,7 @@
 
 use super::DbInterner;
 use base_db::{Db, Crate, Nonce};
-use blaze_mem::{Cache, Pool, Pooled, Tag, pool::Limbo};
+use blaze_mem::{Cache, Pool, Pooled, Tag, lock::SpinLock, pool::Limbo};
 use rustc_hash::FxBuildHasher;
 use rustc_type_ir::search_graph::GlobalCache;
 use blaze_query::db::View;
@@ -27,7 +27,7 @@ use std::{
     mem,
     ptr::{self, NonNull},
     sync::{
-        LazyLock, Mutex,
+        LazyLock,
         atomic::{AtomicBool, AtomicPtr, AtomicU64, Ordering},
     },
 };
@@ -111,8 +111,9 @@ struct Shared<'p, K, S, T> {
     generations: Box<[AtomicPtr<Generation<K, S, T>>]>,
     /// Where generations are made, each published from [`Pooled::into_raw`].
     pool: &'p Pool<Generation<K, S, T>>,
-    /// Locked only to make or replace a generation.
-    slots: Mutex<Slots<'p, Generation<K, S, T>>>,
+    /// Locked only to make or replace a generation. Not `std`'s mutex, which on macOS boxes a
+    /// pthread mutex on its first lock: a table's first miss would allocate.
+    slots: SpinLock<Slots<'p, Generation<K, S, T>>>,
 }
 
 /// A table's way into its pool: the cache it makes generations from, and the limbo holding
@@ -212,7 +213,7 @@ where
             // alloc: setup, once per table and process.
             generations: (0..len).map(|_| AtomicPtr::new(ptr::null_mut())).collect(),
             pool,
-            slots: Mutex::new(Slots {
+            slots: SpinLock::new(Slots {
                 cache: pool.cache(),
                 limbo: Limbo::new(pool)
                     .unwrap_or_else(|error| panic!("the trait solver's cache: {error}")),
@@ -321,7 +322,7 @@ where
         key: K,
         state: S,
     ) -> Result<&T, Option<&T>> {
-        let mut slots = self.slots.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut slots = self.slots.lock();
         let made = slots
             .cache
             .alloc(Generation {
@@ -363,7 +364,7 @@ where
 
     /// Unlinks every generation.
     fn clear(&self) {
-        let mut slots = self.slots.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut slots = self.slots.lock();
         for (hint, slot) in self.hints.iter().zip(&self.generations) {
             hint.store(EMPTY, Ordering::Release);
             if let Some(held) = NonNull::new(slot.swap(ptr::null_mut(), Ordering::AcqRel)) {

@@ -22,8 +22,14 @@ pub struct EditionedFileId {
 /// when the trees outgrow [`Tag::Parse`]'s budget), and the trees count against that tag.
 #[blaze_query::tracked(self_ty = EditionedFileId, lru = 0, mem_tag = Parse, returns(ref))]
 fn parse_(db: &Db, file: EditionedFileId) -> syntax::Parse<ast::SourceFile> {
-    let _p = tracing::info_span!("parse", ?file).entered();
     let (file_id, edition) = file.unpack(db);
+    let span = tracing::info_span!("parse_query", function = tracing::field::Empty);
+    if !span.is_disabled() {
+        // alloc: only while a subscriber records the span, which interns it
+        let path = db.path_for_file(file_id).map_or_else(|| format!("{{file {}}}", file_id.index()), |it| it.to_string());
+        span.record("function", path.as_str());
+    }
+    let _p = span.entered();
     let input = db.file_text(file_id);
     let stored = db.trees().map(|it| &**it);
     let parse = input.reparse_field(db).parse(input.text(db), edition, file.is_library(db), stored);

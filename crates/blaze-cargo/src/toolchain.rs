@@ -141,9 +141,14 @@ fn chosen_at(dir: PathBuf) -> Chosen {
     if own.as_deref() == Some(&*dir) { Chosen::Own(dir) } else { Chosen::Rustup(dir) }
 }
 
-/// The sysroot of blaze's release: what blaze answers `rustc --print sysroot` with.
-pub fn sysroot() -> Option<PathBuf> {
-    found().map(|it| it.dir().to_owned())
+/// The sysroot of blaze's release: what blaze answers `rustc --print sysroot` with. Looked for
+/// on disk once ([`found`]), then fixed for the process: the daemon asks at its start, so a
+/// build's task only reads it.
+pub fn sysroot() -> Option<&'static Path> {
+    if FOUND.get().is_none() {
+        found()?;
+    }
+    FOUND.get().map(PathBuf::as_path)
 }
 
 /// `file` under `base` (an address ending in `/`) from byte `offset` on, through blaze-registry's

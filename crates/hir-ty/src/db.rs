@@ -1309,6 +1309,7 @@ pub mod kinds {
         CRATE_IMPL_PREDICATES = 0x2439, "crate_impl_predicates";
         CONST_PARAM_TY_ERRORS = 0x243a, "const_param_ty_errors";
         INHERENT_ASSOC_TYPES = 0x243b, "inherent_assoc_types";
+        FN_SIG_WITH_ELIDED_BOUND = 0x243c, "fn_sig_with_elided_bound";
 
         // Variance, dyn compatibility, representability.
         VARIANCES_OF = 0x2440, "variances_of_query";

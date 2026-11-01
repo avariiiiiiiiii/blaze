@@ -2,7 +2,77 @@
 //! E0405) or something else (E0573, E0404), private items (E0603), parameters of an outer item
 //! (E0401), undeclared lifetimes (E0261) and re-exports of private items (E0365).
 
-use crate::tests::{assert_reports, error, items::ui_core, ui};
+use crate::tests::{assert_reports, checked, error, items::ui_core, ui};
+
+#[test]
+fn items_a_macro_makes_in_a_file_of_two_crates_see_their_impl_and_generics() {
+    // Our own: llvm-sys's build script and blaze-mem (derives, `lazy_static!`, its `shelves!`),
+    // whose files are in two crates; `b` mounts `a`'s root, so either crate is the other's first
+    // module of the file.
+    let fixture = r#"//- minicore: sized, deref, fn, derive, clone, eq
+//- /a/main.rs crate:other:a edition:2021
+#[derive(Clone, PartialEq)]
+struct Pair(u32, u32);
+macro_rules! wrapper {
+    ($name:ident, $target:ty) => {
+        struct $name($target);
+        impl $name {
+            fn new(it: $target) -> Self { Self(it) }
+        }
+        impl core::ops::Deref for $name {
+            type Target = $target;
+            fn deref(&self) -> &Self::Target { &self.0 }
+        }
+        fn with<R>(it: &$name, f: impl FnOnce(&$name) -> R) -> R { f(it) }
+    };
+}
+wrapper!(Wrapper, u32);
+fn main() {}
+//- /b/main.rs crate:other:b edition:2021
+#[path = "../a/main.rs"]
+mod a;
+fn main() {}
+"#;
+    let messages = checked(fixture).messages();
+    let names = ["E0411", "E0425", "E0401", "E0433"];
+    assert!(!messages.iter().any(|it| names.iter().any(|code| it.starts_with(code))), "{messages:?}");
+}
+
+#[test]
+fn a_derive_and_a_macros_impl_in_a_file_of_two_crates_see_self_and_their_generics() {
+    // Our own: blaze-mem's derives and llvm-sys's build script, at the root and in an inline
+    // `mod`, whose module the walk out of the expansion comes to in the file.
+    let fixture = r#"//- minicore: sized, clone, hash, derive
+//- /a/main.rs crate:other:a edition:2021
+pub trait Tr {
+    fn f(&self) -> Self;
+}
+macro_rules! make {
+    ($s:ident) => {
+        impl<T: Clone> Tr for $s<T> {
+            fn f(&self) -> Self { self.clone() }
+        }
+    };
+}
+#[derive(Clone, Hash)]
+pub struct S<T>(T);
+make!(S);
+mod inner {
+    use super::Tr;
+    #[derive(Clone, Hash)]
+    pub struct I<T>(T);
+    make!(I);
+}
+fn main() {}
+//- /b/main.rs crate:other:b edition:2021
+#[path = "../a/main.rs"]
+mod a;
+fn main() {}
+"#;
+    let messages = checked(fixture).messages();
+    let names = ["E0411", "E0425", "E0401", "E0433", "E0412"];
+    assert!(!messages.iter().any(|it| names.iter().any(|code| it.starts_with(code))), "{messages:?}");
+}
 
 #[test]
 fn an_impl_of_a_struct_is_not_a_trait() {

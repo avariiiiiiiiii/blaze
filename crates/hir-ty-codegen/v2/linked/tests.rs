@@ -143,13 +143,22 @@ fn a_position_of_no_table_the_build_has_is_an_error() {
     let (db, frontend) = frontend(SPANNED);
     let func = function(db, "f");
     let stray = SpanRef { anchor: ContentId([9; 32]), index: 0 };
+    let unknown = ItemKey(ContentId([7; 32]));
     let built = Built {
         functions: vec![compiled(1, vec![Line { at: 0, span: stray }])],
-        items: vec![item_key(db, ItemId::Function(func))],
+        items: vec![item_key(db, ItemId::Function(func)), unknown],
+        debug_names: vec![(InstanceKey(ContentId([1; 32])), "lib::f".to_owned())],
         ..Built::default()
     };
     let error = frontend.link_inputs(&built).unwrap_err();
     assert!(error.what.contains(&format!("{:?}", stray.anchor)), "{}", error.what);
+    assert!(error.what.contains("a line row of the function"), "says what names it: {}", error.what);
+    assert!(error.what.contains("`lib::f`"), "names the function: {}", error.what);
+    assert!(
+        error.what.contains(&format!("1 of the build's 2 items resolve to no item of the database, among them {unknown:?}")),
+        "names an item it could not look in: {}",
+        error.what
+    );
 }
 
 #[test]

@@ -6,7 +6,7 @@ mod db;
 
 use blaze_ids::ContentId;
 use blaze_items::{CodeHash, ItemId};
-use hir_def::{FunctionId, TypeAliasId, expr_store::Body as BodyStore};
+use hir_def::{DefWithBodyId, FunctionId, TypeAliasId, expr_store::Body as BodyStore};
 use hir_ty::{TyDefId, consteval::usize_const, db::HirDatabase};
 use hir_ty_mir::mir::MirSpan;
 use hir_expand::fixture;
@@ -218,6 +218,34 @@ fn moving_a_function_that_reads_its_line_keeps_its_code() {
     assert_eq!(after[0], before[0], "the line is read where the code runs");
     assert_ne!(after[1], before[1], "a `#[track_caller]` function's line is its value");
     assert_ne!(after[2], before[2], "a promoted line is its value");
+}
+
+const WRITTEN_TWICE: &str = r#"
+//- /a.rs crate:a
+pub fn here() -> u32 { 1 }
+//- /main.rs crate:main deps:a
+pub fn here() -> u32 { 1 }
+"#;
+
+/// A function written alike in two crates, as build scripts copy `cargo_env_var` between
+/// packages, is two codes: a template's positions name its own crate's span tables, which a
+/// link of the other crate's program does not have.
+#[test]
+fn a_function_written_alike_in_two_crates_is_two_codes() {
+    let db = fixture::db(WRITTEN_TWICE).into_db();
+    let main = fixture::test_crate(&db);
+    let dep = main.data(&db).dependencies.iter().map(|it| it.crate_id).find(|it| !it.data(&db).origin.is_lang());
+    let theirs = hir_def::test_items::function(&db, dep.expect("crate a"), "here");
+    let ours = function(&db, "here");
+    let code = |func: FunctionId| hashes().code(&db, Body::Item(func.into())).unwrap();
+    assert_ne!(code(ours), code(theirs));
+    let root = |func: FunctionId| {
+        let owner = DefWithBodyId::FunctionId(func);
+        hashes().span(&db, owner, MirSpan::ExprId(BodyStore::of(&db, owner).root_expr())).unwrap()
+    };
+    let (ours, theirs) = (root(ours), root(theirs));
+    assert_eq!(ours.index, theirs.index, "the same span of each");
+    assert_ne!(ours.anchor, theirs.anchor, "each in a table of its own crate's");
 }
 
 #[test]

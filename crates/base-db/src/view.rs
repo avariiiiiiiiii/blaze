@@ -428,6 +428,8 @@ impl Files {
                 .is_library;
             let durability = if is_library { Durability::HIGH } else { Durability::LOW };
             let file = view.files[write.at].id;
+            let text_of = text.as_ref().map(|text| (text, file));
+            self.write_aliases(writer, db, write.id, text_of, Some(durability), |alias| set.push(alias));
             let content = self.write_text(
                 writer,
                 db,
@@ -450,6 +452,8 @@ impl Files {
         sort_roots(&mut roots);
         roots.dedup();
         self.write_root_files(writer, db, &plan, &roots, &mut changed_roots, frame);
+        let gone = plan.removed.iter().map(|&(_, id)| id);
+        self.drop_orphan_aliases(writer, db, gone, |alias| removed.push(alias));
         self.write_root_contents(writer, db, &changed_roots, frame);
         writer.named.publish(db, frame);
 
@@ -589,6 +593,11 @@ fn rebuilt<'p>(
     for (id, _, path) in added {
         // clone: an added file's path in the set.
         files.insert(*id, path.clone());
+    }
+    for (alias, of) in old.aliases() {
+        if !gone.contains(&of) {
+            files.alias(alias, of);
+        }
     }
     let mut ids = 0;
     let mut named_back = 0;

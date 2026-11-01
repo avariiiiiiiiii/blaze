@@ -235,6 +235,10 @@ fn serve(args: impl IntoIterator<Item = OsString>) -> anyhow::Result<()> {
     // Read once: the explorer and live SQL run this DuckDB; set wrong, the daemon does not start.
     let duckdb = observe::duckdb(std::env::var_os(observe::DUCKDB)).map_err(|why| anyhow::anyhow!(why))?;
     let (profiling, keeper) = observe::keep_history(&paths.state, duckdb).map_err(|why| anyhow::anyhow!(why))?;
+    // Fixed for the daemon's life before any job: a build's tasks only read it.
+    let sysroot = crate::toolchain::sysroot()
+        .with_context(|| format!("blaze's toolchain ({}) is not on this machine: `blaze toolchain` installs it", crate::toolchain::name()))?;
+    tracing::info!(sysroot = %sysroot.display(), "blaze's toolchain");
     let build = build_id(&paths.launcher)?;
     let std = machine()?.join("std").join(format!("{build:x}"));
     std::fs::create_dir_all(&std).with_context(|| format!("making the standard library's shared directory {}", std.display()))?;

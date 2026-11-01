@@ -871,3 +871,95 @@ pub fn f() {}
     check_db(&loaded.db, "a body the attribute rejects", &Exempt::NONE, false, &mut failures);
     assert!(failures.is_empty(), "{failures}");
 }
+
+/// An item with `#[derive]` first waits at round 0 behind the derive's directive, and its
+/// collection reads the rest of it later: an edit of its later attributes or its visibility,
+/// which keeps its ast id, changes its directive and so the round-0 log, and the maintained map
+/// follows it. An edit of a body leaves the log as it was (`random`, `coerce_pointee_errors`).
+#[test]
+fn an_attribute_or_visibility_edit_of_a_deferred_item_changes_the_round_0_log() {
+    use crate::nameres::facts::{
+        ops::{DeclOp, MacroOp, MacroOpKind},
+        queries,
+    };
+    let mut loaded = Loaded::new("//- minicore: derive, clone\n//- /lib.rs\n#[derive(Clone)]\n#[repr(C)]\nstruct S;\nfn f() {}\n");
+    let krate = loaded.krate();
+    let root = loaded.file("/lib.rs");
+    let directives = |db: &Db| -> Vec<MacroOp> {
+        let ops = &queries::module_decls(db, queries::root_decl(db, krate)).ops;
+        // clone: a test's copy of the directives, to compare across a write
+        ops.iter().filter_map(|op| if let DeclOp::Macro(it) = op { Some(it.clone()) } else { None }).collect()
+    };
+    let first = directives(&loaded.db);
+    assert!(matches!(&first[..], [MacroOp { kind: MacroOpKind::Attr { .. }, .. }]), "loaded: {first:?}");
+    let mut failures = String::new();
+    for (what, text, changes) in [
+        ("a later attribute", "#[derive(Clone)]\n#[S]\nstruct S;\nfn f() {}\n", true),
+        ("the visibility", "#[derive(Clone)]\n#[S]\npub struct S;\nfn f() {}\n", true),
+        ("a body", "#[derive(Clone)]\n#[S]\npub struct S;\nfn f() { let _ = 1; }\n", false),
+    ] {
+        let before = directives(&loaded.db);
+        loaded.db.set_file_text(root, text);
+        let after = directives(&loaded.db);
+        assert_eq!(after != before, changes, "{what}: the log changed: {}\nbefore {before:?}\nafter {after:?}", after != before);
+        check_db(&loaded.db, what, &Exempt::NONE, true, &mut failures);
+    }
+    assert!(failures.is_empty(), "{failures}");
+}
+
+/// A `macro_rules!` of a `#[macro_use]` file module inside an inline `#[macro_use]` module
+/// reaches the crate root's textual scope and the scope a later sibling file module starts with;
+/// removing it from the file takes it out of both (`random`, generated 0x7d5e).
+#[test]
+fn a_macro_removed_from_a_nested_macro_use_file_leaves_the_textual_scopes() {
+    let mut loaded = Loaded::new(
+        "//- /lib.rs\n#[macro_use]\npub mod a {\n#[macro_use]\npub mod b;\n}\npub mod b;\n\
+         //- /a/b.rs\nmacro_rules! m1 { () => {} }\n//- /b.rs\npub struct T;\n",
+    );
+    let krate = loaded.krate();
+    let has_m1 = |db: &Db, path: &[&str]| {
+        let module = module_at(db, krate, path);
+        let map = crate_local_def_map(db, krate).def_map(db);
+        map.module(db, module).scope(db).get_legacy_macro(&name("m1")).is_some()
+    };
+    let paths: [&[&str]; 3] = [&[], &["a"], &["b"]];
+    for path in paths {
+        assert!(has_m1(&loaded.db, path), "loaded: `m1` is not in the textual scope of {path:?}");
+    }
+    let file = loaded.file("/a/b.rs");
+    loaded.db.set_file_text(file, "");
+    for path in paths {
+        assert!(!has_m1(&loaded.db, path), "removed: `m1` is still in the textual scope of {path:?}");
+    }
+    let mut failures = String::new();
+    check_db(&loaded.db, "a nested macro_use macro removed", &Exempt::NONE, true, &mut failures);
+    assert!(failures.is_empty(), "{failures}");
+}
+
+/// An import of a dependency's trait item that a macro in the trait makes, by name or by a glob
+/// of the trait, goes unresolved when the macro goes: the trait's items are no binding of its
+/// module, so the import's read wakes on the trait (`random`,
+/// `trait_item_imports_differing_crate#0`).
+#[test]
+fn removing_the_macro_that_makes_a_dependencys_trait_item_unresolves_its_import() {
+    const TRAIT: &str = "pub trait Trait {\n    fn method(&self);\n    m!(MACRO_CONST);\n}\n";
+    const MACRO: &str = "macro_rules! m {\n    ($name:ident) => { const $name: () = (); };\n}\n";
+    let mut failures = String::new();
+    for import in ["use lib::Trait::{method, MACRO_CONST};", "use lib::Trait::*;"] {
+        let mut loaded = Loaded::new(&format!(
+            "//- /main.rs deps:lib crate:main\n{import}\n//- /lib.rs crate:lib\n{MACRO}{TRAIT}"
+        ));
+        let main = loaded.krate();
+        let has_const = |db: &Db| {
+            let root = module_at(db, main, &[]);
+            let map = crate_local_def_map(db, main).def_map(db);
+            map.module(db, root).scope(db).get(&name("MACRO_CONST")).take_values().is_some()
+        };
+        assert!(has_const(&loaded.db), "{import}: loaded: `MACRO_CONST` is not imported");
+        let lib = loaded.file("/lib.rs");
+        loaded.db.set_file_text(lib, TRAIT);
+        assert!(!has_const(&loaded.db), "{import}: the macro removed: `MACRO_CONST` is still imported");
+        check_db(&loaded.db, import, &Exempt::NONE, true, &mut failures);
+    }
+    assert!(failures.is_empty(), "{failures}");
+}

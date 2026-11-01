@@ -20,19 +20,33 @@ pub fn lend<T: Default + 'static, R>(
 
     impl<T: 'static> Drop for Return<'_, T> {
         fn drop(&mut self) {
-            if let Some(lent) = self.slot.with(|slot| slot.borrow_mut().take()) {
+            if let Some(lent) = give_back(self.slot) {
                 *self.value = lent;
             }
         }
     }
 
+    lend_to(slot, std::mem::take(value));
+    let _return = Return { slot, value };
+    f()
+}
+
+// `f` may wait and resume on another thread: each access to the slot is its own call, never
+// inlined into `lend`, whose inlined access could reuse the first thread's slot address
+// (docs/v2/plan/lanes/may-suspend.md).
+
+#[inline(never)]
+fn lend_to<T: 'static>(slot: &'static LocalKey<RefCell<Option<T>>>, value: T) {
     slot.with(|slot| {
         let mut slot = slot.borrow_mut();
         assert!(slot.is_none(), "scopes lending one thread-local do not nest");
-        *slot = Some(std::mem::take(value));
+        *slot = Some(value);
     });
-    let _return = Return { slot, value };
-    f()
+}
+
+#[inline(never)]
+fn give_back<T: 'static>(slot: &'static LocalKey<RefCell<Option<T>>>) -> Option<T> {
+    slot.with(|slot| slot.borrow_mut().take())
 }
 
 /// The `take` of a pair that carries a thread-local with a job that switches out (a job on a

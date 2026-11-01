@@ -46,14 +46,17 @@ the same passes. v2 does that per body, as queries:
 
 ## Blaze's own lints (`blaze::`)
 
-`hot_clone`, `hot_alloc`, `hot_dyn` and `std_hashmap` (all four the group `blaze::hot`, as
-hot_lint.py checks SipHash maps in hot crates too), typed, in
+`hot_clone`, `hot_alloc`, `hot_alloc_call`, `hot_dyn` and `std_hashmap` (all five the group
+`blaze::hot`, as hot_lint.py checks SipHash maps in hot crates too), typed, in
 `crates/blaze-lints/src/blaze/` ([lints/blaze.md](lints/blaze.md)). They are `allow` by
-default, so a crate that doesn't opt in sees nothing (superset-of-rust). A crate opts in by
-`[lints.blaze]` in its manifest (`hot_alloc = "deny"`), which blaze gives as
-`--deny=blaze::hot_alloc` as cargo gives `[lints.clippy]`. **Hot is where the lint is on**: a
-crate is declared hot by turning a `blaze::hot*` lint on for the crate (`[lints.blaze]` or
-`#![deny(blaze::hot)]`), and a function is marked hot by `#[deny(blaze::hot)]` on it or on an
+default, so a crate that doesn't opt in sees nothing (superset-of-rust). A workspace turns one
+on for every member in its root manifest's `[workspace.metadata.blaze.lints]` (`hot_alloc =
+"warn"`), which blaze gives each member as `--warn=blaze::hot_alloc`; not in `[lints.blaze]`,
+which cargo hands rustc, which stops at a tool it doesn't know (E0602), so every cargo build of
+the workspace breaks. A crate sets its own level in its root, which rustc reads too:
+`#![feature(register_tool)] #![register_tool(blaze)] #![deny(blaze::hot_alloc)]`. **Hot is
+where the lint is on**: a crate is declared hot by turning a `blaze::hot*` lint on for the
+crate (the workspace's table or `#![deny(blaze::hot)]`), and a function is marked hot by `#[deny(blaze::hot)]` on it or on an
 item around it; `#[allow(blaze::hot_alloc)]` marks a cold path inside a hot crate. This is
 rustc's lint-level scoping, so no new attribute and no name that can clash with the `blaze`
 crate of `#[blaze::cache]`. A line keeps the cost with a reason: `// clone: <why>`,
@@ -65,8 +68,8 @@ their tests.
 `parallelizable` and `serial_dependence` (child `lints-parallel`,
 [lints/parallel.md](lints/parallel.md)) are judged on MIR, in `crates/blaze-lints/src/blaze/parallel*`.
 They are the same kind of `blaze::Lint` (in `Lint::ALL`, with a bit of `On` past the hot lints',
-`allow` by default, opted in by `[lints.blaze]`), but in no group: `blaze::hot` stays the four
-hot lints.
+`allow` by default, opted in by `[workspace.metadata.blaze.lints]`), but in no group:
+`blaze::hot` stays the hot lints.
 
 ## Done when
 

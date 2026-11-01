@@ -174,12 +174,14 @@ pub(crate) fn run(
     // so the crates' sweeps below diff memos.
     let mut swept = std::mem::take(&mut scratch.swept);
     swept.clear();
+    let sweep_span = tracing::info_span!(target: "blaze", "impls modules").entered();
     for &krate in crates.iter() {
         let fresh = scratch.deltas.get(&krate).is_some_and(|&at| last.crates[at].fresh);
         if (fresh || written.crates) && !frozen::served(&*db, krate) {
             swept.extend(crate_def_map(&*db, krate).modules(&*db).map(|(module, _)| module));
         }
     }
+    drop(sweep_span);
     if swept.len() > 1 {
         db.run_all(Tag::Infer, swept.len(), |db, at| _ = body_part(db, swept[at]));
     }
@@ -224,6 +226,18 @@ fn run_crate(
     changed: bool,
     out: &mut Vec<ImplsDelta>,
 ) -> Work {
+    let _span = tracing::info_span!(
+        target: "blaze",
+        "impls crate",
+        krate = hir_def::span_names::crate_name(&*db, krate)
+    )
+    .entered();
+    macro_rules! phase {
+        ($name:literal, $run:expr) => {{
+            let _phase = tracing::info_span!(target: "blaze", $name).entered();
+            $run
+        }};
+    }
     let mut work = Work::default();
     let fresh = delta.is_some_and(|it| it.fresh);
     state.scratch.keys_changed.clear();
@@ -244,21 +258,21 @@ fn run_crate(
         state.scratch.name_keys.extend(names);
     }
     if let Some(delta) = delta {
-        apply_impls(db, state, &mut crate_state, krate, delta, &mut work);
-        apply_derives(db, &mut crate_state, delta, &mut work);
-        apply_traits(db, state, &mut crate_state, delta, &mut work);
+        phase!("impls apply_impls", apply_impls(db, state, &mut crate_state, krate, delta, &mut work));
+        phase!("impls apply_derives", apply_derives(db, &mut crate_state, delta, &mut work));
+        phase!("impls apply_traits", apply_traits(db, state, &mut crate_state, delta, &mut work));
     }
-    rekey(db, state, &mut crate_state, krate, crates_changed, &mut work);
+    phase!("impls rekey", rekey(db, state, &mut crate_state, krate, crates_changed, &mut work));
     if crates_changed || changed {
-        rename_wild_traits(db, state, &mut crate_state, &mut work);
+        phase!("impls rename_wild_traits", rename_wild_traits(db, state, &mut crate_state, &mut work));
     }
     let lang_check = fresh || crates_changed || delta.is_some_and(touches_traits);
-    relang(db, &mut crate_state, krate, lang_check, &mut work);
+    phase!("impls relang", relang(db, &mut crate_state, krate, lang_check, &mut work));
     let sweep = fresh || crates_changed;
     if sweep || changed || delta.is_some() {
         apply_bodies(&*db, state, &mut crate_state, krate, delta, sweep, &mut work);
     }
-    publish(db, state, &mut crate_state, krate, fresh, &mut work);
+    phase!("impls publish", publish(db, state, &mut crate_state, krate, fresh, &mut work));
     state.crates.insert(krate, crate_state);
     let scratch = &mut state.scratch;
     if !scratch.keys_changed.is_empty() || !scratch.traits_changed.is_empty() {
@@ -713,6 +727,7 @@ fn apply_bodies(
     sweep: bool,
     work: &mut Work,
 ) {
+    let _span = tracing::info_span!(target: "blaze", "apply_bodies", sweep).entered();
     let def_map = crate_def_map(db, krate);
     let macros = macros_writing_impls(db, krate);
     let sweep = sweep || crate_state.macros.as_deref() != Some(macros);

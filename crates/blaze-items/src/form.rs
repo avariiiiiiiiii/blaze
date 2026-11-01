@@ -1002,9 +1002,12 @@ impl<'db> Cx<'db> {
         // function's own attributes.
         f.u8(hir_def::attrs::disabled_sanitizers(db, func));
         f.bool(flags.contains(AttrFlags::RUSTC_NOUNWIND));
-        let linked = flags.intersects(AttrFlags::NO_MANGLE | AttrFlags::LINKED_BY_NAME)
-            || matches!(loc.container, ItemContainerId::ExternBlockId(_));
-        self.linked_name(f, linked, data.name.as_str());
+        // An intrinsic's name is what calling it does, and codegen expands it into its
+        // callers' code: `simd_lt` and `simd_ge` share a signature.
+        let named = flags.intersects(AttrFlags::NO_MANGLE | AttrFlags::LINKED_BY_NAME)
+            || matches!(loc.container, ItemContainerId::ExternBlockId(_))
+            || FunctionSignature::is_intrinsic(db, func);
+        self.linked_name(f, named, data.name.as_str());
         // A `const fn`'s body is what its callers' constants evaluate.
         if data.flags.contains(FnFlags::CONST) && data.has_body() {
             if self.leak_free {

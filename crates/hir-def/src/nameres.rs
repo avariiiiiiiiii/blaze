@@ -687,7 +687,7 @@ fn crate_display_name(db: &Db, krate: Crate) -> SmolStr {
 
 #[blaze_query::tracked(returns(ref))]
 pub(crate) fn crate_local_def_map(db: &Db, crate_id: Crate) -> DefMapPair<'_> {
-    let _p = tracing::info_span!("crate_def_map_query", name = ?crate_display_name(db, crate_id)).entered();
+    let _p = tracing::info_span!("crate_def_map_query", krate = ?crate_display_name(db, crate_id)).entered();
 
     if let Some((def_map, local_def_map)) = frozen::served(db, crate_id) {
         return DefMapPair::new(db, def_map, local_def_map);

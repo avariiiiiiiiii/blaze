@@ -75,12 +75,14 @@ pub(crate) enum Tier {
 pub(crate) struct Policy {
     /// Runs in the evaluator before a crate runs compiled.
     pub(crate) warm: u64,
-    /// Whether this blaze runs the compiled tier: on the machines [`machine`] runs code on.
+    /// Whether this blaze runs the compiled tier. Not yet: every macro reaches std, which is
+    /// planned at its shipped opt-level 3 until a policy can plan it at opt-level 0 (codegen,
+    /// queue 01466), and the tier refuses a unit planned for LLVM. Then: [`machine::SUPPORTED`].
     pub(crate) compiled: bool,
 }
 
 impl Policy {
-    pub(crate) const DEFAULT: Policy = Policy { warm: 1, compiled: machine::SUPPORTED };
+    pub(crate) const DEFAULT: Policy = Policy { warm: 1, compiled: false };
 
     /// The decision is the same for every code hash: by its runs alone.
     pub(crate) fn choose(&self, _code: ContentId, runs: u64) -> Tier {

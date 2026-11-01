@@ -4,7 +4,9 @@
 //! - A body's code is [`hir_ty_share::code`]'s: its item's code hash, which takes each callee by
 //!   its interface hash, with its bindings' names and the positions its MIR names (the spans of
 //!   [`ItemHashes::span`]) beside it: a template that names an expression by its id is never
-//!   reused once that id is another expression's.
+//!   reused once that id is another expression's. With it the key of the store the body is
+//!   written in, which its spans' anchors are of: the template's positions name those anchors,
+//!   so one body written alike in two crates is two codes, each naming its own tables.
 //! - A type or constant is [`hir_ty_share::identity`]'s spelling by content, the one the share
 //!   key reads too: an ADT by its key, its interface, its layout and what drop glue reads of
 //!   it, a coroutine by its compiled code, and its arguments the same way. Regions are left out.
@@ -37,6 +39,7 @@ use blaze_query::db::FromId;
 use super::{Body, Hashes};
 
 pub const SPAN_DOMAIN: &str = "blaze v2 codegen span table 1";
+pub const OWNED_DOMAIN: &str = "blaze v2 codegen owned code 1";
 
 /// The table of a function's declaration, apart from its body's.
 const DECLARATION: u8 = TABLES as u8;
@@ -92,18 +95,28 @@ impl Hashes for ItemHashes {
 
     fn code(&self, db: &Db, body: Body) -> Result<CodeHash, String> {
         hir_ty::attach_db(db, || {
-            let code = match body {
-                Body::Item(def) => code::of_item(db, def),
-                Body::Closure(id) => code::of_closure(db, InternedClosureId::from_id(id)),
-                Body::Coroutine(id) => code::of_coroutine(db, InternedCoroutineId::from_id(id)),
+            let (code, store) = match body {
+                Body::Item(def) => (code::of_item(db, def), ExpressionStoreOwnerId::Body(def)),
+                Body::Closure(id) => {
+                    let id = InternedClosureId::from_id(id);
+                    (code::of_closure(db, id), id.loc(db).owner.expression_store_owner(db))
+                }
+                Body::Coroutine(id) => {
+                    let id = InternedCoroutineId::from_id(id);
+                    (code::of_coroutine(db, id), id.loc(db).owner.expression_store_owner(db))
+                }
                 Body::CoroutineByMove(id) => {
-                    code::of_coroutine_by_move(db, InternedCoroutineId::from_id(id))
+                    let id = InternedCoroutineId::from_id(id);
+                    (code::of_coroutine_by_move(db, id), id.loc(db).owner.expression_store_owner(db))
                 }
             };
-            match code {
-                Ok(code) => Ok(CodeHash(*code)),
-                Err(why) => Err(why.to_string()), // alloc: the error's message
-            }
+            let code = match code {
+                Ok(code) => code,
+                Err(why) => return Err(why.to_string()), // alloc: the error's message
+            };
+            let mut h = Hasher::new(OWNED_DOMAIN);
+            h.id(code).id(&key::store_key(db, store).0);
+            Ok(CodeHash(h.finish()))
         })
     }
 

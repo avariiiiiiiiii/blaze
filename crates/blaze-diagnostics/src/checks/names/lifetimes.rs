@@ -8,7 +8,7 @@
 //! `LifetimeBinderKind::descr`) and `late/diagnostics.rs` (`emit_undeclared_lifetime_error`,
 //! `suggest_introducing_lifetime_filtered`) (MIT or Apache-2.0).
 
-use hir::InFile;
+use hir::{HirFileId, InFile};
 use stdx::edit_distance::edit_distance;
 use syntax::{
     TextRange,
@@ -133,7 +133,27 @@ fn declared<'t>(list: ast::GenericParamList<'t>, name: &str) -> Option<ast::Life
     list.lifetime_params().filter_map(|it| it.lifetime()).find(|it| it.text() == name)
 }
 
-pub(super) fn check(cx: &Cx<'_, '_>, signature: &Signature<'_>, lifetime: ast::Lifetime<'_>) -> Option<Found> {
+/// The impl or trait among whose items a macro call emitted `item`, through the calls of
+/// expansions emitted at the top of another: its generics are a rib of `item`'s, as in rustc,
+/// where a `macro_rules!` lifetime has no hygiene and resolves where the macro expands.
+fn around_call<'db>(cx: &Cx<'_, 'db>, mut file: HirFileId, item: ast::Node<'db>) -> Option<ast::Node<'db>> {
+    if item.parent()?.parent().is_some() {
+        return None;
+    }
+    loop {
+        let call = file.macro_file()?.loc(cx.db).to_node_view(cx.db);
+        let parent = call.value.parent()?;
+        if ast::AssocItemList::can_cast(parent.kind()) {
+            return parent.parent();
+        }
+        if parent.parent().is_some() {
+            return None;
+        }
+        file = call.file_id;
+    }
+}
+
+pub(super) fn check<'db>(cx: &Cx<'_, 'db>, signature: &Signature<'db>, lifetime: ast::Lifetime<'db>) -> Option<Found> {
     let name = lifetime.text();
     if name == "'static" || name == "'_" {
         return None;
@@ -157,7 +177,11 @@ pub(super) fn check(cx: &Cx<'_, '_>, signature: &Signature<'_>, lifetime: ast::L
             Some(node)
         })
     };
-    for node in ribs() {
+    let around = match inner == signature.node.value {
+        true => around_call(cx, signature.node.file_id, inner),
+        false => None,
+    };
+    for node in ribs().chain(around) {
         if ast::ConstParam::can_cast(node.kind()) {
             return None;
         }

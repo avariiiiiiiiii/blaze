@@ -29,6 +29,9 @@ struct Function {
     symbol: Option<String>,
     /// The places among its references it builds in.
     built_in: Vec<u32>,
+    /// The outside symbol it calls, its last reference: no part of its code hash, so two
+    /// builds can differ in it with every key the same.
+    outside: &'static str,
 }
 
 #[derive(Default)]
@@ -52,6 +55,7 @@ impl Program {
             origin: Origin::Member(Package::new("app")),
             symbol: None,
             built_in: Vec::new(),
+            outside: "memcpy",
         };
         self.functions.insert(id, function);
         self.functions.get_mut(&id).unwrap()
@@ -77,7 +81,7 @@ impl Frontend for Program {
             .iter()
             .map(|it| FrontRef::Function(*it))
             .chain(function.statics.iter().map(|it| FrontRef::Static(*it)))
-            .chain([FrontRef::Extern("memcpy".to_owned())])
+            .chain([FrontRef::Extern(function.outside.to_owned())])
             .collect();
         // The code takes callees by their interface, here their number: not their bodies.
         let mut code = Hasher::new("blaze v2 test code 1");
@@ -553,6 +557,25 @@ fn a_summary_names_the_callees_its_body_calls() {
     let after = build(&program, &Machine::default(), &policy, &Memo::new(), &store).unwrap();
     assert!(main(&after).contains(&0x45), "{:x?}", main(&after));
     assert!(!main(&after).contains(&0x44), "{:x?}", main(&after));
+}
+
+/// 4 calls `memmove` where it called `memcpy`, which no key holds: 1 and 2, which import 4,
+/// have one reference more than their stored templates were made against, as `memmove` is
+/// none of theirs, so they are compiled again; 4's own template, and 3's and 5's, still fit.
+#[test]
+fn a_release_compile_is_kept_by_which_of_its_references_are_one() {
+    let (mut program, policy) = (program(), policy(OptLevel::O3, Mode::Output));
+    let mut store = Store::default();
+    let cold = build(&program, &Machine::default(), &policy, &Memo::new(), &store).unwrap();
+    store.keep(&cold.puts);
+
+    program.functions.get_mut(&4).unwrap().outside = "memmove";
+    let machine = Machine::default();
+    let after = build(&program, &machine, &policy, &Memo::new(), &store).unwrap();
+    assert_eq!(after.functions.len(), 5);
+    assert_eq!(machine.emitted.load(Ordering::Relaxed), 2);
+    let memmove = Target::Extern("memmove".to_owned());
+    assert!(after.functions.iter().any(|it| it.relocs.targets().contains(&memmove)));
 }
 
 #[test]

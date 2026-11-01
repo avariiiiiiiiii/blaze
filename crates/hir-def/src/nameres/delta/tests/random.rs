@@ -318,20 +318,24 @@ fn edit_scripts_over_the_fixtures() {
         let fixture = tc.draw(gs::integers::<usize>().max_value(all.len() - 1));
         let edits = tc.draw(gs::vecs(text_edit()).min_size(1).max_size(6));
         let fast_path = tc.draw(gs::booleans());
-        let (name, text, exempt) = &all[fixture];
-        with_fast_path(fast_path, || {
-            let mut loaded = Loaded::new(text);
-            check(&loaded, &format!("{name} (fast path {fast_path}), loaded"), exempt);
-            for (step, &edit) in edits.iter().enumerate() {
-                let Some(write_) = apply_text_edit(&loaded, edit) else { continue };
-                if !write(&mut loaded, &[write_]) {
-                    continue;
-                }
-                let what = format!("{name} (fast path {fast_path}), after edit {step} {edit:?}");
-                check(&loaded, &what, exempt);
-            }
-        })
+        fixture_script(&all[fixture], &edits, fast_path);
     });
+}
+
+/// `fixture` maintained through `edits`, one write each, checked after each.
+fn fixture_script((name, text, exempt): &(String, &'static str, Exempt), edits: &[TextEdit], fast_path: bool) {
+    with_fast_path(fast_path, || {
+        let mut loaded = Loaded::new(text);
+        check(&loaded, &format!("{name} (fast path {fast_path}), loaded"), exempt);
+        for (step, &edit) in edits.iter().enumerate() {
+            let Some(write_) = apply_text_edit(&loaded, edit) else { continue };
+            if !write(&mut loaded, &[write_]) {
+                continue;
+            }
+            let what = format!("{name} (fast path {fast_path}), after edit {step} {edit:?}");
+            check(&loaded, &what, exempt);
+        }
+    })
 }
 
 /// A script whose edits touch two files at once: one write, one maintenance pass over both.
@@ -341,24 +345,55 @@ fn batched_edits_over_the_fixtures() {
     run_scripts(64, |tc| {
         let fixture = tc.draw(gs::integers::<usize>().max_value(all.len() - 1));
         let edits = tc.draw(gs::vecs(gs::tuples!(text_edit(), text_edit())).min_size(1).max_size(4));
-        let (name, text, exempt) = &all[fixture];
-        let mut loaded = Loaded::new(text);
-        for (step, &(first, second)) in edits.iter().enumerate() {
-            let mut texts: Vec<(FileId, String)> = Vec::new();
-            for edit in [first, second] {
-                let Some((file, new)) = apply_text_edit(&loaded, edit) else { continue };
-                // Two edits of one file: the first one's text is written.
-                if texts.iter().all(|(it, _)| *it != file) {
-                    texts.push((file, new));
-                }
-            }
-            if !write(&mut loaded, &texts) {
-                continue;
-            }
-            let what = format!("{name}, after batch {step} {first:?} {second:?}");
-            check(&loaded, &what, exempt);
-        }
+        fixture_batches(&all[fixture], &edits);
     });
+}
+
+/// `fixture` maintained through `batches`, each pair of edits one write, checked after each.
+fn fixture_batches((name, text, exempt): &(String, &'static str, Exempt), batches: &[(TextEdit, TextEdit)]) {
+    let mut loaded = Loaded::new(text);
+    for (step, &(first, second)) in batches.iter().enumerate() {
+        let mut texts: Vec<(FileId, String)> = Vec::new();
+        for edit in [first, second] {
+            let Some((file, new)) = apply_text_edit(&loaded, edit) else { continue };
+            // Two edits of one file: the first one's text is written.
+            if texts.iter().all(|(it, _)| *it != file) {
+                texts.push((file, new));
+            }
+        }
+        if !write(&mut loaded, &texts) {
+            continue;
+        }
+        let what = format!("{name}, after batch {step} {first:?} {second:?}");
+        check(&loaded, &what, exempt);
+    }
+}
+
+fn fixture_named(name: &str) -> &'static (String, &'static str, Exempt) {
+    all_fixtures().iter().find(|it| it.0 == name).unwrap_or_else(|| panic!("no fixture `{name}` loads"))
+}
+
+/// Scripts the fixture tests above once failed, as they printed them: their draws are fresh
+/// each run, so each is kept here.
+#[test]
+fn the_fixture_scripts_that_once_failed_keep_the_maps_equal() {
+    // 2026-10-31: the maintained map kept a module, `company_name::network::v1::ip_address`,
+    // the fresh one did not have.
+    fixture_script(fixture_named("tests/macros.rs::nested_include#0"), &[TextEdit::Remove { at: 1 }], false);
+    // 2026-10-31: the fresh map reported an attribute `S` unresolved, the maintained one did not.
+    fixture_batches(
+        fixture_named("../macro_expansion_tests/builtin_derive_macro.rs::coerce_pointee_errors#0"),
+        &[(TextEdit::Rename { at: 1932032, to: 0 }, TextEdit::Remove { at: 0 })],
+    );
+    // 2026-11-01: removing `#![crate_type="proc-macro"]` left the maintained root censored, its
+    // `S` and fn `pub(crate)`.
+    fixture_batches(
+        fixture_named("tests/uses.rs::a_derive_helper_before_its_derive_resolves_as_rustc_s_compat_helper#0"),
+        &[
+            (TextEdit::Insert { at: 0, snippet: 0 }, TextEdit::Insert { at: 513, snippet: 0 }),
+            (TextEdit::Remove { at: 0 }, TextEdit::Remove { at: 1 }),
+        ],
+    );
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -611,31 +646,52 @@ fn texts(loaded: &Loaded, generated: &Generated) -> Vec<(FileId, String)> {
     out
 }
 
+/// The crate generated from `seed`, maintained through `edits`, checked after each.
+fn generated_script(seed: u64, edits: &[ModelEdit], fast_path: bool) {
+    with_fast_path(fast_path, || {
+        let mut generated = Generated { model: Model::generate(&mut SplitMix64::new(seed)), extras: Vec::new() };
+        let mut loaded = Loaded::new(&generated.fixture());
+        let what = |step: &str| format!("generated {seed:#x} (fast path {fast_path}), {step}");
+        check(&loaded, &what("loaded"), &Exempt::NONE);
+        for (step, &edit) in edits.iter().enumerate() {
+            if !edit.apply(&mut generated, &loaded.files) {
+                continue;
+            }
+            let texts = texts(&loaded, &generated);
+            if !write(&mut loaded, &texts) {
+                continue;
+            }
+            let what = what(&format!("after edit {step} {edit:?}, now\n{}", generated.fixture()));
+            check(&loaded, &what, &Exempt::NONE);
+        }
+    })
+}
+
 #[test]
 fn edit_scripts_over_generated_crates() {
     run_scripts(160, |tc| {
         let seed: u64 = tc.draw(gs::integers());
         let edits = tc.draw(gs::vecs(model_edit()).min_size(1).max_size(8));
         let fast_path = tc.draw(gs::booleans());
-        with_fast_path(fast_path, || {
-            let mut generated =
-                Generated { model: Model::generate(&mut SplitMix64::new(seed)), extras: Vec::new() };
-            let mut loaded = Loaded::new(&generated.fixture());
-            let what = |step: &str| format!("generated {seed:#x} (fast path {fast_path}), {step}");
-            check(&loaded, &what("loaded"), &Exempt::NONE);
-            for (step, &edit) in edits.iter().enumerate() {
-                if !edit.apply(&mut generated, &loaded.files) {
-                    continue;
-                }
-                let texts = texts(&loaded, &generated);
-                if !write(&mut loaded, &texts) {
-                    continue;
-                }
-                let what = what(&format!("after edit {step} {edit:?}, now\n{}", generated.fixture()));
-                check(&loaded, &what, &Exempt::NONE);
-            }
-        })
+        generated_script(seed, &edits, fast_path);
     });
+}
+
+/// Scripts [`edit_scripts_over_generated_crates`] once failed, as it printed them (seed, fast
+/// path, the edits up to the failing one): its seeds are fresh each run, so each is kept here.
+const PINNED_GENERATED: &[(u64, bool, &[ModelEdit])] = &[
+    // 2026-10-31: the maintained map differed from a fresh one after the edit.
+    (0x7d5e, false, &[ModelEdit::RemoveItem { module: 4, at: 0 }]),
+    // 2026-11-01: removing a `macro_rules!` panicked in `incremental`, which read the log of a
+    // group whose key still inherited it ("Can't find ast id MacroRules").
+    (0, false, &[ModelEdit::RemoveItem { module: 0, at: 0 }]),
+];
+
+#[test]
+fn the_generated_scripts_that_once_failed_keep_the_maps_equal() {
+    for &(seed, fast_path, edits) in PINNED_GENERATED {
+        generated_script(seed, edits, fast_path);
+    }
 }
 
 /// Undoing every edit of a script brings back the map the crate started with: the maintained

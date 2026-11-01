@@ -102,7 +102,7 @@ error: `guard` (`MutexGuard<'_, Vec<u32>>`) is held across a call that may suspe
 13 |     guard.push(v);
    |     ----- and used after it
    = note: the job may resume on another thread, and `MutexGuard` is `#[must_not_suspend]`
-   = help: drop it before the call, or take what you need out of it first
+   = help: end its scope before the call (a block around its uses), or take what you need out of it first
 ```
 
 It is an error, not a lint: a value that crosses threads under a type that says it must not is
@@ -131,8 +131,11 @@ std's `Mutex`/`MutexGuard` (`#[must_not_suspend]`), `RefCell`, `Rc` and `Cell`.
 
 - `a_guard_held_across_a_query_call_is_rejected_naming_the_path`: the error is at the call, names
   `guard`, and its path is `variance → fetch → get_or_run → suspend`.
-- `the_same_guard_dropped_before_the_call_is_accepted`: `drop(guard)` before the call; also a
-  guard in an inner block that ends before it.
+- `the_same_guard_dropped_before_the_call_is_accepted`: the guard moved away before the call;
+  also a guard in an inner block that ends before it.
+- `a_guard_borrowed_then_moved_away_is_held_until_its_scope_ends`: as rustc holds it across an
+  `.await` (`MaybeRequiresStorage` keeps a borrowed local's storage after a move), so the way
+  to release a guard that was used is to end its scope.
 - `a_dyn_method_without_the_marker_whose_impl_suspends_is_rejected`: the error is at the
   `&x as &dyn Trait` cast and names the method.
 - `a_marked_dyn_method_suspends_its_callers`: a guard across `d.m()` on a `&dyn Trait` whose `m`

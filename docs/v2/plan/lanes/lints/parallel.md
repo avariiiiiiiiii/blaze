@@ -7,7 +7,7 @@ date: 2026-10-29
 
 `crates/blaze-lints/src/blaze/parallel.rs` and `src/blaze/parallel/`. Both are blaze's own
 lints, allow by default and outside the group `blaze::hot`; turn them on with
-`[lints.blaze] parallelizable = "warn"`, `--warn=blaze::parallelizable` or
+`parallelizable = "warn"` in `[workspace.metadata.blaze.lints]`, `--warn=blaze::parallelizable` or
 `#[warn(blaze::parallelizable)]`.
 
 ```rust

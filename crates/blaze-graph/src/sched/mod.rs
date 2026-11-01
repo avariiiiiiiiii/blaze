@@ -33,6 +33,9 @@
 //!   and calls [`Sched::yielded`], and moves to the big core. Nothing is preempted.
 
 mod cores;
+pub mod fiber;
+#[cfg(all(test, not(blaze_check)))]
+mod fiber_tests;
 #[cfg(test)]
 mod tests;
 
@@ -494,10 +497,11 @@ impl Sched {
             );
             self.jobs[parent.0 as usize].core
         });
+        let critical = how.critical;
         let home = match how.hint {
             Affinity::Spawner => match spawner {
                 Some(core) => core,
-                None => self.least_loaded(|_, _| true),
+                None => self.least_loaded(critical, |_, _| true),
             },
             Affinity::Core(core) => {
                 assert!((core.0 as usize) < self.cores.len(), "job {} hinted to core {}, past the shape", job.0, core.0);
@@ -505,13 +509,13 @@ impl Sched {
             }
             Affinity::L3(l3) => match spawner.filter(|&core| self.cores.in_l3(core, l3)) {
                 Some(core) => core,
-                None => self.least_loaded(|cores, core| cores.in_l3(core, l3)),
+                None => self.least_loaded(critical, |cores, core| cores.in_l3(core, l3)),
             },
             Affinity::Node(node) => match spawner.filter(|&core| self.cores.in_node(core, node)) {
                 Some(core) => core,
-                None => self.least_loaded(|cores, core| cores.in_node(core, node)),
+                None => self.least_loaded(critical, |cores, core| cores.in_node(core, node)),
             },
-            Affinity::Any => self.least_loaded(|_, _| true),
+            Affinity::Any => self.least_loaded(critical, |_, _| true),
         };
         self.jobs[j] = Job { state: JobState::Queued, critical: how.critical, core: home, ..VACANT };
         self.cold[j] = COLD;
@@ -764,7 +768,8 @@ impl Sched {
     }
 
     /// `job`, running, saw its core's move flag at a query miss. It moves to the nearest idle
-    /// core of the highest capacity, if one is still idle.
+    /// core of the highest capacity, if one is still idle and the flag is not stale (the job
+    /// stopped being critical since).
     ///
     /// # Panics
     ///
@@ -773,7 +778,11 @@ impl Sched {
         let j = job.0 as usize;
         assert!(self.state_of(job.0) == JobState::Running, "job {} yielded while not running", job.0);
         let core = self.jobs[j].core;
+        let asked = get(&self.yield_sent, core);
         set(&mut self.yield_sent, core, false);
+        if !asked {
+            return Yielded::Stay;
+        }
         let Some(big) = self.search_parked(core, Some(self.cores.big())) else { return Yielded::Stay };
         self.vacate(core);
         self.jobs[j].state = JobState::Queued;
@@ -1048,10 +1057,11 @@ impl Sched {
         self.cores.tiers(core).find_map(|(_, mask)| first_from(&self.parked, mask, filter, start))
     }
 
-    /// A parked core of those `keep` accepts, else the one with the fewest jobs (running,
-    /// slot, inbox and queues), the lowest id on a tie.
-    fn least_loaded(&self, keep: impl Fn(&Cores, u32) -> bool) -> u32 {
-        let mut best: Option<(usize, u32)> = None;
+    /// Of the cores `keep` accepts, the one with the fewest jobs (running, slot, inbox and
+    /// queues), then of the job's class (the top capacity for a critical job, a smaller one
+    /// for another), then the lowest id.
+    fn least_loaded(&self, critical: bool, keep: impl Fn(&Cores, u32) -> bool) -> u32 {
+        let mut best: Option<((usize, bool), u32)> = None;
         for core in 0..self.cores.len() as u32 {
             if !keep(&self.cores, core) {
                 continue;
@@ -1068,9 +1078,10 @@ impl Sched {
                         + self.urgent[c].len()
                 }
             };
-            if best.is_none_or(|(least, _)| load < least) {
-                best = Some((load, core));
-                if load == 0 {
+            let rank = (load, self.cores.is_big(core) != critical);
+            if best.is_none_or(|(least, _)| rank < least) {
+                best = Some((rank, core));
+                if rank == (0, false) {
                     break;
                 }
             }

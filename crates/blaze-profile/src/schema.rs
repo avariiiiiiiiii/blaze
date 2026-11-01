@@ -89,7 +89,11 @@ pub const SPANS: Table = Table {
         opt("parent", Type::U64, "the span it is inside; null at a root"),
         col("depth", Type::U16, "how many spans its thread was inside when it began"),
         col("name", Type::Dict, "the span's name"),
-        col("target", Type::Dict, "the module path it was made in"),
+        col(
+            "target",
+            Type::Dict,
+            "its tracing target: the module path it was made in, unless it names one (`blaze` for blaze's steps)",
+        ),
         col("start_ns", Type::I64, "when it began"),
         col("dur_ns", Type::I64, "how long it was open"),
         opt(
@@ -238,7 +242,7 @@ pub const OPEN: Table = Table {
         THREAD_NAME,
         col("depth", Type::U16, "its place on its thread's stack, 0 outermost"),
         col("name", Type::Dict, "the span's name"),
-        col("target", Type::Dict, "the module path it was made in"),
+        col("target", Type::Dict, "its tracing target, as in `spans`"),
         col("start_ns", Type::I64, "when it began"),
     ],
 };

@@ -74,6 +74,21 @@ pub(crate) fn keep(batch: &[Sample]) {
     }
 }
 
+/// The samples kept since sample number `next` (of every sample ever kept), into `into`; moves
+/// `next` past them. Samples written over before they were read are left out: their count is
+/// the result.
+pub(crate) fn since(next: &mut u64, into: &mut Vec<Sample>) -> u64 {
+    let samples = lock(&SAMPLES);
+    let total = samples.next;
+    let first = (*next).max(total.saturating_sub(KEPT as u64));
+    let skipped = first.saturating_sub(*next);
+    for i in first..total {
+        into.push(samples.ring[(i % KEPT as u64) as usize]);
+    }
+    *next = total;
+    skipped
+}
+
 /// Why the process takes no CPU samples.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Unsampled(pub String);

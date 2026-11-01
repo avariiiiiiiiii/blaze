@@ -10,7 +10,8 @@
 //! - [`frame`]: what the daemon answers: a header padded so the Arrow IPC stream after it starts
 //!   8-aligned, then one IPC stream, then FIN; and the live stream's frames.
 //! - [`tiles`]: the spans of a range per (process, thread, depth, pixel-wide bucket).
-//! - `ops`: the answer to each op, with no transport in it; `server`: the transport.
+//! - `ops`: the answer to each op, with no transport in it; [`server`]: the transport, the
+//!   sessions and the live stream.
 //!
 //! The server runs on a thread of its own with a one-thread tokio runtime: the daemon's workers
 //! never wait on a page, and the work of an answer (DuckDB, Arrow encoding) runs on tokio's
@@ -23,7 +24,7 @@ pub mod cert;
 pub mod frame;
 pub mod link;
 mod ops;
-mod server;
+pub mod server;
 pub mod tiles;
 pub mod wire;
 

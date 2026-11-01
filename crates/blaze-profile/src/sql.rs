@@ -11,7 +11,7 @@ use std::{
     fmt, fs, io,
     path::{Path, PathBuf},
     process::{Command, Stdio},
-    sync::atomic::{AtomicU64, Ordering},
+    sync::atomic::{AtomicBool, AtomicU64, Ordering},
     time::Duration,
 };
 
@@ -47,6 +47,8 @@ pub enum SqlError {
     Duckdb { message: String, sql: String, script: PathBuf },
     /// DuckDB's answer did not read back.
     Answer { path: PathBuf, error: String },
+    /// The caller stopped the query ([`run_with`]); DuckDB was killed.
+    Stopped,
 }
 
 impl SqlError {
@@ -54,6 +56,7 @@ impl SqlError {
     pub fn kind(&self) -> &'static str {
         match self {
             SqlError::Views(error) => error.kind(),
+            SqlError::Stopped => "cancelled",
             _ => "sql",
         }
     }
@@ -78,6 +81,7 @@ impl fmt::Display for SqlError {
             SqlError::Answer { path, error } => {
                 write!(f, "reading DuckDB's answer {}: {error}", path.display())
             }
+            SqlError::Stopped => f.write_str("the query was stopped before DuckDB answered"),
         }
     }
 }
@@ -99,7 +103,7 @@ impl From<ViewError> for SqlError {
     }
 }
 
-fn io_error(path: &Path, doing: &'static str) -> impl FnOnce(io::Error) -> SqlError + '_ {
+fn io_error<'a>(path: &'a Path, doing: &'static str) -> impl FnOnce(io::Error) -> SqlError + 'a {
     // alloc: an error
     move |error| SqlError::Io { path: path.to_owned(), doing, error }
 }
@@ -138,33 +142,51 @@ impl Drop for Scratch {
 
 /// Runs `query` over the history; its answer as Arrow record batches.
 pub fn run(query: &Query<'_>) -> Result<Vec<RecordBatch>, SqlError> {
+    run_with(query, &AtomicBool::new(false))
+}
+
+/// [`run`], killing DuckDB and answering [`SqlError::Stopped`] once `stop` is set: what the
+/// explorer does when the page cancels a query.
+pub fn run_with(query: &Query<'_>, stop: &AtomicBool) -> Result<Vec<RecordBatch>, SqlError> {
     let mut scratch = Scratch::new()?;
-    let answer = run_in(&scratch.dir, query, &[query.history]);
-    scratch.keep = answer.is_err();
+    let answer = run_in(&scratch.dir, query, &[query.history], stop);
+    scratch.keep = answer.as_ref().is_err_and(|it| !matches!(it, SqlError::Stopped));
     answer
 }
 
 /// Runs `query` over the history and the last `window` of this process's flight recorder:
 /// what the daemon answers `blaze debug sql --live`.
 pub fn run_live(query: &Query<'_>, window: Duration) -> Result<Vec<RecordBatch>, SqlError> {
+    run_live_with(query, window, &AtomicBool::new(false))
+}
+
+/// [`run_live`], stopped as [`run_with`] is.
+pub fn run_live_with(
+    query: &Query<'_>,
+    window: Duration,
+    stop: &AtomicBool,
+) -> Result<Vec<RecordBatch>, SqlError> {
     let mut scratch = Scratch::new()?;
     let live = scratch.dir.join("live");
     let answer = history::write_live(window, &live)
         .map_err(SqlError::Live)
-        .and_then(|_| run_in(&scratch.dir, query, &[query.history, &live]));
-    scratch.keep = answer.is_err();
+        .and_then(|_| run_in(&scratch.dir, query, &[query.history, &live], stop));
+    scratch.keep = answer.as_ref().is_err_and(|it| !matches!(it, SqlError::Stopped));
     answer
 }
+
+/// How often a running query looks at its `stop`.
+const STOP_POLL: Duration = Duration::from_millis(5);
 
 /// The DuckDB script of `sql` over `dirs`: no extension installed, the views, then the query
 /// copied to `answer` as Parquet.
 fn script(sql: &str, dirs: &[&Path], answer: &Path) -> Result<String, SqlError> {
     let prelude = views::prelude(dirs)?;
-    let answer = answer.to_str().ok_or_else(|| SqlError::NoDuckdb {
+    let answer = answer.to_str().ok_or_else(|| SqlError::Answer {
         // alloc: an error
         path: answer.to_owned(),
         // alloc: an error
-        why: "is not UTF-8".to_owned(),
+        error: "its path is not UTF-8, and the script DuckDB runs names it".to_owned(),
     })?;
     let sql = sql.trim().trim_end_matches(';').trim_end();
     // alloc: the script, once a query
@@ -179,7 +201,12 @@ fn script(sql: &str, dirs: &[&Path], answer: &Path) -> Result<String, SqlError> 
     Ok(out)
 }
 
-fn run_in(scratch: &Path, query: &Query<'_>, dirs: &[&Path]) -> Result<Vec<RecordBatch>, SqlError> {
+fn run_in(
+    scratch: &Path,
+    query: &Query<'_>,
+    dirs: &[&Path],
+    stop: &AtomicBool,
+) -> Result<Vec<RecordBatch>, SqlError> {
     let duckdb = query.duckdb;
     let no_duckdb = |why: &str| SqlError::NoDuckdb {
         // alloc: an error
@@ -203,16 +230,32 @@ fn run_in(scratch: &Path, query: &Query<'_>, dirs: &[&Path]) -> Result<Vec<Recor
     // An empty init file, so the user's ~/.duckdbrc does not change what the query means.
     fs::write(&init, b"").map_err(io_error(&init, "writing"))?;
     let stdin = fs::File::open(&script_path).map_err(io_error(&script_path, "opening"))?;
-    let output = Command::new(duckdb)
+    // To a file, not a pipe: the query is polled for `stop`, so nothing drains a pipe meanwhile.
+    let stderr_path = scratch.join("stderr");
+    let stderr_file = fs::File::create(&stderr_path).map_err(io_error(&stderr_path, "making"))?;
+    let mut child = Command::new(duckdb)
         .arg("-batch")
         .arg("-bail")
         .arg("-init")
         .arg(&init)
         .stdin(Stdio::from(stdin))
         .stdout(Stdio::null())
-        .stderr(Stdio::piped())
-        .output()
+        .stderr(Stdio::from(stderr_file))
+        .spawn()
         .map_err(io_error(duckdb, "running"))?;
+    let status = loop {
+        if stop.load(Ordering::Relaxed) {
+            // A child already gone is fine: either way it is reaped by the wait.
+            _ = child.kill();
+            _ = child.wait();
+            return Err(SqlError::Stopped);
+        }
+        match child.try_wait().map_err(io_error(duckdb, "waiting for"))? {
+            Some(status) => break status,
+            None => std::thread::sleep(STOP_POLL),
+        }
+    };
+    let stderr = fs::read(&stderr_path).map_err(io_error(&stderr_path, "reading"))?;
     let refused = |message: String| SqlError::Duckdb {
         message,
         // alloc: an error
@@ -221,10 +264,10 @@ fn run_in(scratch: &Path, query: &Query<'_>, dirs: &[&Path]) -> Result<Vec<Recor
         script: script_path.clone(),
     };
     // alloc: DuckDB's message, once a query
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    if !output.status.success() {
+    let stderr = String::from_utf8_lossy(&stderr);
+    if !status.success() {
         // alloc: an error
-        return Err(refused(format!("{} ({})", stderr.trim(), output.status)));
+        return Err(refused(format!("{} ({status})", stderr.trim())));
     }
     if !answer.exists() {
         // alloc: an error
@@ -266,6 +309,36 @@ mod tests {
         assert!(script.starts_with("SET autoinstall_known_extensions = false;"));
         assert!(script.contains("read_parquet(['/h/*.spans.parquet'], union_by_name = true)"));
         assert!(script.ends_with("COPY (\nSELECT 1\n) TO '/tmp/it''s/answer.parquet' (FORMAT parquet, COMPRESSION zstd);\n"), "{script}");
+    }
+
+    #[test]
+    fn a_stopped_query_kills_duckdb_and_says_so() {
+        // A stand-in for DuckDB that never answers; the query must end anyway.
+        let dir = std::env::temp_dir().join(format!("blaze-sql-stop-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let fake = dir.join("duckdb");
+        fs::write(&fake, "#!/bin/sh\nexec sleep 600\n").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&fake, fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let stop = std::sync::Arc::new(AtomicBool::new(false));
+        let stopper = {
+            let stop = stop.clone();
+            std::thread::spawn(move || {
+                std::thread::sleep(Duration::from_millis(50));
+                stop.store(true, Ordering::Relaxed);
+            })
+        };
+        let started = std::time::Instant::now();
+        let query = Query { duckdb: &fake, history: &dir, sql: "SELECT 1" };
+        let error = run_with(&query, &stop).unwrap_err();
+        stopper.join().unwrap();
+        assert!(matches!(error, SqlError::Stopped), "{error}");
+        assert_eq!(error.kind(), "cancelled");
+        assert!(started.elapsed() < Duration::from_secs(5), "stopped within a few polls");
+        _ = fs::remove_dir_all(&dir);
     }
 
     #[test]

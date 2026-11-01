@@ -44,6 +44,10 @@ pub struct Frame {
     pub spans: Vec<u8>,
     pub counters: Vec<u8>,
     pub open: Vec<u8>,
+    /// Rows of each table, so a reader can skip an empty one without decoding it.
+    pub spans_rows: usize,
+    pub counters_rows: usize,
+    pub open_rows: usize,
 }
 
 /// A subscriber's place in the rings.
@@ -74,6 +78,8 @@ impl Feed {
         frame.at_ns = self.read.at_ns;
         frame.skipped = self.read.skipped;
         frame.lost = self.read.lost;
+        (frame.spans_rows, frame.counters_rows, frame.open_rows) =
+            (spans.num_rows(), counters.num_rows(), open.num_rows());
         ipc(&spans, &mut frame.spans)?;
         ipc(&counters, &mut frame.counters)?;
         ipc(&open, &mut frame.open)
@@ -448,6 +454,7 @@ mod tests {
         };
         feed.next(&mut frame).unwrap();
         assert_eq!(count(&frame), 1);
+        assert!(frame.spans_rows >= 1);
         feed.next(&mut frame).unwrap();
         assert_eq!(count(&frame), 0, "a span closed before the last frame is not sent again");
     }

@@ -51,8 +51,9 @@ pub struct Provenance {
     /// Its node: what a [`Cause::Changed`] names.
     pub node: u32,
     pub key: DatabaseKeyIndex,
+    /// Over the whole view: a memo first made in it is [`Outcome::Reran`] however it ran after.
     pub outcome: Outcome,
-    /// Why it ran; `None` when verified.
+    /// Why it last ran in the view; `None` when verified.
     pub cause: Option<Cause>,
 }
 

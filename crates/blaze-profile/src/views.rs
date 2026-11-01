@@ -299,7 +299,7 @@ pub fn render(view: &View, args: &Map<String, Value>) -> Result<String, ViewErro
     Ok(out)
 }
 
-fn literal(view: &View, arg: &'static Arg, value: Option<&Value>, out: &mut String) -> Result<(), ViewError> {
+fn literal(view: &View, arg: &Arg, value: Option<&Value>, out: &mut String) -> Result<(), ViewError> {
     let bad = |got: &Value| ViewError::BadArg {
         view: view.name,
         arg: arg.name,

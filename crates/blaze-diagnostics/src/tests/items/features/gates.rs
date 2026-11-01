@@ -3,7 +3,7 @@
 //! the soft gates `feature_warn` gives, and `PostExpansionVisitor`'s gates.
 
 use super::{ui, ui_core};
-use crate::tests::{assert_reports, error};
+use crate::tests::{assert_reports, error, lints::bodies::types::ui_std};
 
 #[test]
 fn become_is_gated_before_expansion() {
@@ -429,6 +429,21 @@ warning: 1 warning emitted
     assert_eq!(ui("soft-feature-gate-auto_traits.rs", "2015", source), stderr);
 }
 
+/// std's `Box`, with `Box::new`, as the test uses it, and std's prelude of it.
+const BOX_STD: (&str, &str) = (
+    "pub use crate::boxed::Box;",
+    "pub mod boxed {
+    #[lang = \"owned_box\"]
+    pub struct Box<T: ?Sized>(*mut T);
+    impl<T> Box<T> {
+        pub fn new(x: T) -> Box<T> {
+            loop {}
+        }
+    }
+}
+",
+);
+
 #[test]
 fn a_box_pattern_is_removed_syntax() {
     // tests/ui/parser/removed-syntax/removed-syntax-box-patterns.rs: `box_patterns` is removed, and the parser errors at each `box` of a pattern, a field shorthand's too
@@ -446,7 +461,7 @@ fn a_box_pattern_is_removed_syntax() {
 "#;
     let removed = ["`box` patterns have been removed (feature `box_patterns`)", "deref!("];
     assert_reports(
-        &ui_core("removed-syntax-box-patterns.rs", "2015", "sized", source),
+        &ui_std("removed-syntax-box-patterns.rs", "2015", "sized", BOX_STD, source),
         &[error(2, &removed), error(7, &removed), error(10, &removed)],
     );
 }

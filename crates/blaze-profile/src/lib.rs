@@ -41,11 +41,17 @@ use std::{
 use rustc_hash::FxHashMap;
 use serde_derive::{Deserialize, Serialize};
 
+pub mod arrow;
+pub mod batches;
 pub mod clock;
 pub mod flight;
+pub mod history;
+pub mod live;
 pub mod sampler;
 pub mod schema;
+pub mod sql;
 mod symbols;
+pub mod views;
 pub mod watchdog;
 
 pub use flight::{Plot, moved, plot};

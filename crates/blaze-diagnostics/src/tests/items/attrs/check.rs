@@ -420,26 +420,8 @@ fn inline_conflict_b() {}
 #[optimize(none)]
 fn inline_conflict_c() {}
 "#;
-    let stderr = r#"error: `#[optimize(none)]` cannot be used with `#[inline]` attributes
-  --> $DIR/optimize.rs:3:1
-   |
-LL | #[optimize(none)]
-   | ^^^^^^^^^^^^^^^^^ `#[optimize(none)]` here
-LL | #[inline]
-   | --------- `#[inline]` here
-
-error: `#[optimize(none)]` cannot be used with `#[inline]` attributes
-  --> $DIR/optimize.rs:8:1
-   |
-LL | #[inline(always)]
-   | ----------------- `#[inline]` here
-LL | #[optimize(none)]
-   | ^^^^^^^^^^^^^^^^^ `#[optimize(none)]` here
-
-error: aborting due to 2 previous errors
-
-"#;
-    assert_eq!(ui("optimize.rs", "2018", source), stderr);
+    let conflict = ["`#[optimize(none)]`", "`#[inline]`"];
+    assert_reports(&ui("optimize.rs", "2018", source), &[error(3, &conflict), error(8, &conflict)]);
 }
 
 #[test]

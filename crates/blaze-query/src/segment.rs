@@ -352,7 +352,12 @@ impl Segments {
             }
             open.seal();
         }
-        let cap = open.next_cap.max(self.first);
+        // A copy up to a quarter of `max` comes here, which can be more than the doubling's next
+        // size; grow until it fits, as `put` writes `len` bytes into it unchecked in release.
+        let mut cap = open.next_cap.max(self.first);
+        while cap < len {
+            cap = (cap * 2).min(self.max);
+        }
         open.next_cap = (cap * 2).min(self.max);
         let segment = self.make(cap, OPEN, false);
         open.current = segment;
@@ -363,8 +368,18 @@ impl Segments {
     }
 
     /// Copies `bytes` in at `at`; the caller has counted the span's hold.
+    ///
+    /// # Panics
+    ///
+    /// If `bytes` don't fit at `at`: a copy past the segment is a write out of bounds, so it
+    /// is checked in release too.
     fn put(segment: &Segment, at: usize, bytes: &[u8]) -> Span {
-        debug_assert!(at + bytes.len() <= segment.cap);
+        assert!(
+            at + bytes.len() <= segment.cap,
+            "a copy of {} bytes at {at} into a segment of {}",
+            bytes.len(),
+            segment.cap
+        );
         // SAFETY: `at..at + len` is inside the segment, and past what its lane copied in
         // before, so no reader has these bytes.
         let to = unsafe { segment.base.as_ptr().add(at) };
@@ -429,6 +444,44 @@ impl Drop for Segments {
                 at = *segment.as_ref().next.get();
                 Segment::free(segment);
             }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use hegel::{TestCase, generators as gs};
+
+    use super::{Segments, Span};
+
+    #[test]
+    fn a_copy_bigger_than_the_lanes_next_segment_still_fits_in_it() {
+        let segments = Segments::new(64, 1024, 8);
+        for (len, fill) in [(100, 1), (256, 2), (40, 3), (250, 4)] {
+            let bytes = vec![fill; len];
+            let span = segments.copy(&bytes, 8);
+            assert_eq!(span.bytes(), &bytes[..]);
+        }
+    }
+
+    /// Copies of any sizes and alignments, in any order (past a lane's next segment, past a
+    /// quarter of the largest), each keep their own bytes at their alignment: none was written
+    /// past its segment or over another.
+    #[hegel::test]
+    fn every_copy_keeps_its_bytes_whatever_the_sizes(tc: TestCase) {
+        let segments = Segments::new(64, 1024, 8);
+        let count: usize = tc.draw(gs::integers::<usize>().min_value(1).max_value(40));
+        let spans: Vec<(Span, Vec<u8>, usize)> = (0..count)
+            .map(|at| {
+                let len: usize = tc.draw(gs::integers::<usize>().max_value(400));
+                let align = 1 << tc.draw(gs::integers::<u32>().max_value(4));
+                let bytes: Vec<u8> = (0..len).map(|i| (at * 31 + i) as u8).collect();
+                (segments.copy(&bytes, align), bytes, align)
+            })
+            .collect();
+        for (span, bytes, align) in &spans {
+            assert_eq!(span.bytes(), &bytes[..]);
+            assert_eq!(span.bytes().as_ptr() as usize % align, 0, "aligned to {align}");
         }
     }
 }

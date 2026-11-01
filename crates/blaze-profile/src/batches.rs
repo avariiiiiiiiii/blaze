@@ -3,17 +3,22 @@
 //! the ring keeps as numbers (sites and [`flight::Sym`]s) are resolved here, once per distinct
 //! number a batch, into each dictionary column's values.
 
-use std::sync::{Arc, OnceLock};
+use std::{
+    sync::{Arc, OnceLock},
+    time::Instant,
+};
 
 use arrow_array::{
+    builder::{ListBuilder, StringDictionaryBuilder},
     Array, ArrayRef, DictionaryArray, Float64Array, Int64Array, RecordBatch, StringArray, UInt16Array,
     UInt32Array, UInt64Array, types::UInt32Type,
 };
-use arrow_schema::{ArrowError, SchemaRef};
+use arrow_schema::{ArrowError, DataType, SchemaRef};
 use rustc_hash::FxHashMap;
 
 use crate::{
     flight::{self, CounterRow, Read, SpanRow, ThreadNow},
+    sampler::Sample,
     schema::{self, Table},
 };
 
@@ -196,6 +201,43 @@ pub fn open(threads: &[ThreadNow], at_ns: i64, process: Process<'_>) -> Result<R
     RecordBatch::try_new(schema_of(&schema::OPEN), columns)
 }
 
+/// The `samples` rows of `samples`, each frame named by `names` (which has every address in
+/// them), all from `process`. `at` is one reading of both clocks: an `Instant` and the schema's
+/// nanoseconds then ([`crate::clock::mono_ns`]).
+pub(crate) fn samples(
+    samples: &[Sample],
+    names: &FxHashMap<u64, String>,
+    at: (Instant, i64),
+    process: Process<'_>,
+) -> Result<RecordBatch, ArrowError> {
+    let rows = samples.len();
+    let schema = schema_of(&schema::SAMPLES);
+    let stack = schema::SAMPLES.column("stack").unwrap_or_else(|| unreachable!("samples has a stack"));
+    let DataType::List(frame) = schema.field(stack).data_type() else {
+        unreachable!("a stack is a list (arrow.rs)")
+    };
+    // clone: an `Arc` of the schema's field, once a batch
+    let mut stacks = ListBuilder::new(StringDictionaryBuilder::<UInt32Type>::new()).with_field(frame.clone());
+    for sample in samples {
+        // Outermost first; the sampler keeps the innermost first.
+        for pc in sample.pcs[..usize::from(sample.depth)].iter().rev() {
+            stacks.values().append_value(names.get(pc).map_or("?", String::as_str));
+        }
+        stacks.append(true);
+    }
+    let t_ns = |it: &Sample| at.1 - at.0.saturating_duration_since(it.at).as_nanos() as i64;
+    // alloc: a batch's list of columns, once a read
+    let columns: Vec<ArrayRef> = vec![
+        column(UInt64Array::new_null(rows)),
+        column(UInt32Array::from_value(process.pid, rows)),
+        column(UInt32Array::from_iter_values(samples.iter().map(|it| it.tid as u32))),
+        column(Int64Array::from_iter_values(samples.iter().map(t_ns))),
+        column(stacks.finish()),
+        column(UInt64Array::new_null(rows)),
+    ];
+    RecordBatch::try_new(schema, columns)
+}
+
 /// Both tables of a read: `spans` then `counters`.
 pub fn of(read: &Read, process: Process<'_>) -> Result<[RecordBatch; 2], ArrowError> {
     Ok([spans(&read.spans, process)?, counters(&read.counters, process)?])
@@ -244,6 +286,28 @@ mod tests {
         assert_eq!(column("build_id").as_primitive::<arrow_array::types::UInt64Type>().value(at), 9);
         let plotted = counters.column(schema::COUNTERS.column("value").unwrap());
         assert!(plotted.as_primitive::<arrow_array::types::Float64Type>().values().contains(&4.0));
+    }
+
+    #[test]
+    fn a_samples_stack_is_outermost_first_and_named() {
+        let now = Instant::now();
+        let mut pcs = [0; crate::sampler::DEPTH];
+        pcs[..3].copy_from_slice(&[0x30, 0x20, 0x10]);
+        let sample = Sample { at: now, tid: 12, depth: 3, pcs };
+        let names: FxHashMap<u64, String> = [(0x10, "main"), (0x20, "build"), (0x30, "typeck")]
+            .into_iter()
+            .map(|(pc, it)| (pc, it.to_owned()))
+            .collect();
+        let process = Process { pid: 7, name: "blaze serve", commit: None };
+        let batch = samples(&[sample], &names, (now, 1_000), process).unwrap();
+        assert_eq!(batch.num_rows(), 1);
+        let stack = batch.column(schema::SAMPLES.column("stack").unwrap()).as_list::<i32>().value(0);
+        let frames = stack.as_dictionary::<UInt32Type>();
+        let values = frames.values().as_string::<i32>();
+        let named: Vec<&str> = frames.keys().values().iter().map(|it| values.value(*it as usize)).collect();
+        assert_eq!(named, ["main", "build", "typeck"]);
+        let t_ns = batch.column(schema::SAMPLES.column("t_ns").unwrap());
+        assert_eq!(t_ns.as_primitive::<arrow_array::types::Int64Type>().value(0), 1_000);
     }
 
     #[test]

@@ -14,7 +14,11 @@ repository.workspace = true
 doctest = false
 
 [dependencies]
+arrow-array.workspace = true
+arrow-ipc.workspace = true
+arrow-schema.workspace = true
 object.workspace = true
+parquet.workspace = true
 rustc-demangle.workspace = true
 rustc-hash.workspace = true
 serde.workspace = true

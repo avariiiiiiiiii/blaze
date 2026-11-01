@@ -1023,6 +1023,8 @@ fn a_view_tells_what_each_memo_did_and_why_it_ran() {
     assert!(first.iter().all(|it| (it.outcome, it.cause) == (Outcome::Reran, Some(Cause::New))));
     ask(&db);
     assert_eq!(table(&db), first, "a hit records nothing");
+    let kept = Cell::new(&db, 11, 0);
+    assert_eq!(*get::<TensReader>(&db, kept), 2);
 
     cell.set_a(&mut db, 3);
     ask(&db);
@@ -1043,12 +1045,15 @@ fn a_view_tells_what_each_memo_did_and_why_it_ran() {
     assert_eq!((read.key.key_index(), read.kind), (cell.0, ReadKind::InputField(0)));
     assert_eq!(db.storage().node_read(double).key, key_of::<Double>(cell));
 
-    assert_eq!(*get::<TensReader>(&db, cell), 1);
+    assert_eq!(*get::<TensReader>(&db, kept), 2);
     assert_eq!(evict_values::<Tens>(&mut db), 1);
-    assert_eq!(*get::<Tens>(&db, cell), 0);
+    assert_eq!(*get::<Tens>(&db, kept), 1);
+    let evicted = table(&db);
+    assert_eq!(did::<TensReader>(&evicted, kept), Some((Outcome::Verified, None)));
     assert_eq!(
-        did::<Tens>(&table(&db), cell),
-        Some((Outcome::ReranSameOutput, Some(Cause::Evicted)))
+        did::<Tens>(&evicted, kept),
+        Some((Outcome::ReranSameOutput, Some(Cause::Evicted))),
+        "a value of an earlier view, evicted and made again equal"
     );
 }
 

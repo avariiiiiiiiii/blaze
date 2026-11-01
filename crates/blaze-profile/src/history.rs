@@ -18,7 +18,7 @@ use std::{
     fmt, fs, io,
     path::{Path, PathBuf},
     sync::Arc,
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use arrow_array::{
@@ -36,8 +36,11 @@ use parquet::{
 
 use crate::{
     batches::{self, Process},
+    clock,
     flight::{self, Cursor, Read, SpanRow},
+    sampler::{self, Sample},
     schema::{self, Column, Table, Type},
+    symbols,
 };
 
 /// What the history keeps by default: 1 GiB, about 50 million spans at the ~20 bytes a span
@@ -109,9 +112,10 @@ pub struct Flushed {
     pub spans: usize,
     pub counters: usize,
     pub builds: usize,
+    pub samples: usize,
     pub files: u32,
     pub bytes: u64,
-    /// Rows the rings wrote over before this flush read them.
+    /// Rows the rings wrote over before this flush read them, CPU samples included.
     pub skipped: u64,
     /// Old files deleted to stay under the cap.
     pub deleted: u32,
@@ -150,7 +154,7 @@ impl std::error::Error for HistoryError {
     }
 }
 
-fn io_error(path: &Path, doing: &'static str) -> impl FnOnce(io::Error) -> HistoryError + '_ {
+fn io_error<'a>(path: &'a Path, doing: &'static str) -> impl FnOnce(io::Error) -> HistoryError + 'a {
     // alloc: an error
     move |error| HistoryError::Io { path: path.to_owned(), doing, error }
 }
@@ -315,6 +319,9 @@ pub struct History {
     /// The files written, oldest first, and their bytes all told.
     kept: VecDeque<Kept>,
     total: u64,
+    /// The CPU sampler's samples taken so far, and a flush's new ones.
+    sampled: u64,
+    samples: Vec<Sample>,
 }
 
 impl History {
@@ -358,6 +365,9 @@ impl History {
             ended: Vec::new(),
             kept: kept.into(),
             total,
+            sampled: 0,
+            // alloc: once a history
+            samples: Vec::new(),
         };
         history.trim()?;
         Ok(history)
@@ -405,18 +415,26 @@ impl History {
         let counters =
             [batches::counters(&self.read.counters, self.process).map_err(arrow_error(&schema::COUNTERS))?];
         let builds = [builds(&self.ended).map_err(arrow_error(&schema::BUILDS))?];
+        self.samples.clear();
+        let samples_skipped = sampler::since(&mut self.sampled, &mut self.samples);
+        let samples = [self.samples_batch().map_err(arrow_error(&schema::SAMPLES))?];
         let rows = |parts: &[RecordBatch]| parts.iter().map(RecordBatch::num_rows).sum::<usize>();
         let mut flushed = Flushed {
             seq,
             spans: rows(&spans),
             counters: rows(&counters),
             builds: rows(&builds),
-            skipped: self.read.skipped,
+            samples: rows(&samples),
+            skipped: self.read.skipped + samples_skipped,
             ..Flushed::default()
         };
         let build = build.unwrap_or(0);
-        let tables: [(&'static Table, &[RecordBatch]); 3] =
-            [(&schema::SPANS, &spans), (&schema::COUNTERS, &counters), (&schema::BUILDS, &builds)];
+        let tables: [(&'static Table, &[RecordBatch]); 4] = [
+            (&schema::SPANS, &spans),
+            (&schema::COUNTERS, &counters),
+            (&schema::BUILDS, &builds),
+            (&schema::SAMPLES, &samples),
+        ];
         for (table, parts) in tables {
             if rows(parts) == 0 {
                 continue;
@@ -432,6 +450,19 @@ impl History {
         self.ended.clear();
         flushed.deleted = self.trim()?;
         Ok(flushed)
+    }
+
+    /// The flush's CPU samples as a `samples` batch, their frames named.
+    fn samples_batch(&self) -> Result<RecordBatch, ArrowError> {
+        let pcs: Vec<u64> =
+            // alloc: a flush's addresses, once a flush
+            self.samples.iter().flat_map(|it| it.pcs[..usize::from(it.depth)].iter().copied()).collect();
+        let mut names = symbols::names(&pcs);
+        for pc in pcs {
+            // alloc: a name for an address no symbol covers, once an address a flush
+            names.entry(pc).or_insert_with(|| format!("{pc:#x}"));
+        }
+        batches::samples(&self.samples, &names, (Instant::now(), clock::mono_ns()), self.process)
     }
 
     /// Deletes the oldest files until the rest fit under the cap, keeping at least the newest.
@@ -643,6 +674,46 @@ mod tests {
         assert!(name(3, seqs[2]).exists(), "the newest file stays, though it is past the cap alone");
         assert!(dir.join("schema.spans.parquet").exists(), "the schema files are not the cap's");
         assert_eq!(history.kept.len(), 1);
+    }
+
+    /// The flush's cost a span, in release: what docs/v2/plan/lanes/observe/history.md bounds.
+    #[test]
+    #[ignore = "a measurement: blaze test -p blaze-profile --release -- --ignored --nocapture what_a_flush_costs"]
+    fn what_a_flush_costs() {
+        let functions: Vec<flight::Sym> = (0..1000).map(|i| flight::intern(&format!("app::f{i}"))).collect();
+        let rows: Vec<SpanRow> = (0..1_000_000u64)
+            .map(|i| SpanRow {
+                build: 1,
+                thread: (i % 16) as u32,
+                thread_name: 0,
+                span_id: i,
+                parent: i / 4,
+                depth: (i % 8) as u16,
+                site: 0,
+                start_ns: (i * 1000) as i64,
+                dur_ns: ((i * 7919) % 100_000) as i64,
+                alloc: Some(Allocated { bytes: i % 4096, count: i % 17 }),
+                krate: 0,
+                function: functions[(i % 1000) as usize],
+                unit: 0,
+            })
+            .collect();
+        let dir = scratch("cost");
+        let mut writer = Writer::new();
+        let start = std::time::Instant::now();
+        let batch = batches::spans(&rows, Process::this()).unwrap();
+        let arrow = start.elapsed();
+        let path = dir.join("1-00000001.spans.parquet");
+        let bytes = writer.write(&path, &schema::SPANS, std::slice::from_ref(&batch)).unwrap();
+        let whole = start.elapsed();
+        let n = rows.len() as f64;
+        println!(
+            "{} spans: {:.0} ns a span to Arrow, {:.0} ns a span to Parquet, {:.1} bytes a span",
+            rows.len(),
+            arrow.as_nanos() as f64 / n,
+            (whole - arrow).as_nanos() as f64 / n,
+            bytes as f64 / n,
+        );
     }
 
     #[test]

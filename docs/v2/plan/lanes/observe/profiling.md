@@ -54,7 +54,7 @@ outermost first. `?` marks a nullable column.
 | parent | u64? | the span it is inside; null at a root |
 | depth | u16 | how many spans its thread was inside when it began |
 | name | dict | the span's name |
-| target | dict | the module path it was made in |
+| target | dict | its tracing target: the module path it was made in, unless it names one (`blaze` for blaze's steps) |
 | start_ns | i64 | when it began |
 | dur_ns | i64 | how long it was open |
 | self_cpu_ns | i64? | its thread's CPU time less that of the spans under it; only while `BLAZE_PROFILE` is on |

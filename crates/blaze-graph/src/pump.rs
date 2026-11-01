@@ -21,6 +21,11 @@
 //! Nothing here allocates once warm (docs/v2/plan/lanes/mem/core/plane.md) but a value's
 //! clones: a waiter is a node on its own stack, linked into its run's entry, and the runner
 //! writes each waiter its clone; a thread's slot, once freed, is linked through its own stack.
+//!
+//! A task on a fiber of [`crate::sched::fiber`] pumps nothing: it is its job, each run it
+//! starts is a flight in the scheduler, and a wait suspends the job on the flight it waits for
+//! and resumes when the runner has written its end; a wait the scheduler refuses as a cycle is
+//! [`Cancelled`].
 
 use std::{
     cell::{Cell, UnsafeCell},
@@ -36,6 +41,7 @@ use rustc_hash::{FxBuildHasher, FxHashSet};
 
 use crate::{
     Cancelled, Key,
+    sched::{JobId, Wait, fiber},
     sync::{
         MutexGuard, OnceLock,
         atomic::{AtomicU8, AtomicU32, AtomicU64, Ordering},
@@ -448,6 +454,9 @@ impl<V: Clone + Send + Sync + 'static> Flights<V> {
         key: Key,
         run: impl FnOnce() -> Result<V, Cancelled>,
     ) -> Result<V, Cancelled> {
+        if let Some(job) = fiber::current_job() {
+            return self.get_or_run_on_fiber(fiber_task(job), key, run);
+        }
         let me = current();
         loop {
             let waiter = Waiter::new(me);
@@ -461,7 +470,34 @@ impl<V: Clone + Send + Sync + 'static> Flights<V> {
                 return Ok(value);
             }
         }
-        let mut ending = Ending { flights: self, key, runner: me, ended: false };
+        let mut ending = Ending { flights: self, key, runner: me, flight: None, ended: false };
+        let result = run();
+        ending.end(result.as_ref().ok());
+        result
+    }
+
+    /// [`Flights::get_or_run`] for a task on a fiber (docs/v2/plan/lanes/sched.md, phase 2):
+    /// the task is its job, a wait suspends the job on its run's flight in the scheduler
+    /// instead of pumping, and a wait the scheduler refuses as a cycle gives way.
+    #[inline(never)]
+    fn get_or_run_on_fiber(
+        &self,
+        me: u64,
+        key: Key,
+        run: impl FnOnce() -> Result<V, Cancelled>,
+    ) -> Result<V, Cancelled> {
+        fiber::miss();
+        loop {
+            let waiter = Waiter::new(me);
+            let Some(runner) = self.join_fiber(key, me, &waiter) else { break };
+            let linked = Linked { flights: self, key, waiter: &waiter };
+            let got = wait_on_fiber(&waiter, self.flight(key, runner));
+            drop(linked);
+            if let Some(value) = got? {
+                return Ok(value);
+            }
+        }
+        let mut ending = Ending { flights: self, key, runner: me, flight: Some(self.flight(key, me)), ended: false };
         let result = run();
         ending.end(result.as_ref().ok());
         result
@@ -474,17 +510,22 @@ impl<V: Clone + Send + Sync + 'static> Flights<V> {
         key: Key,
         run: impl FnOnce() -> Result<V, Cancelled>,
     ) -> Option<Result<V, Cancelled>> {
-        let me = current();
+        let on_fiber = fiber::current_job();
+        let me = on_fiber.map_or_else(current, fiber_task);
         match self.shard(&key).lock().entry(key) {
             Entry::Vacant(slot) => {
                 slot.insert(InFlight { runner: me, waiters: Waiters(ptr::null()) });
+                if on_fiber.is_some() {
+                    self.claim_flight(key, me);
+                }
             }
             Entry::Occupied(slot) if slot.get().runner == me => {
                 panic!("key {} is asked by the task that runs it: its value depends on itself", hex(&key))
             }
             Entry::Occupied(_) => return None,
         }
-        let mut ending = Ending { flights: self, key, runner: me, ended: false };
+        let flight = on_fiber.map(|_| self.flight(key, me));
+        let mut ending = Ending { flights: self, key, runner: me, flight, ended: false };
         let result = run();
         ending.end(result.as_ref().ok());
         Some(result)
@@ -498,6 +539,52 @@ impl<V: Clone + Send + Sync + 'static> Flights<V> {
     fn shard(&self, key: &Key) -> &Lock<ByKey<InFlight<V>>> {
         // Bytes the shard's table does not hash by, so a shard's keys spread over its table.
         &self.shards[word(key, 8) as usize & self.mask].0
+    }
+
+    /// The scheduler's flight of one run of `key`: by `runner`, in these flights. Each run has
+    /// its own, so a run that starts while the last one's waiters are being woken never finds
+    /// the key's flight taken.
+    fn flight(&self, key: Key, runner: u64) -> Key {
+        let mut bytes = key.0;
+        let mix = |bytes: &mut [u8; 32], at: usize, word: u64| {
+            for (byte, add) in bytes[at..at + 8].iter_mut().zip(word.to_le_bytes()) {
+                *byte ^= add;
+            }
+        };
+        mix(&mut bytes, 0, runner);
+        mix(&mut bytes, 8, ptr::from_ref(self).addr() as u64);
+        Key(bytes)
+    }
+
+    /// Claims the scheduler's flight of `me`'s run of `key`, under the key's shard lock, so a
+    /// waiter that finds the run finds its flight (or none, once it ended).
+    fn claim_flight(&self, key: Key, me: u64) {
+        let claimed = fiber::claim(self.flight(key, me));
+        assert_eq!(claimed, Some(true), "the flight of key {}'s run by task {me:#x} is new and on a fiber", hex(&key));
+    }
+
+    /// As [`Flights::join`], for a task on a fiber: `None` when this caller is to run `key`
+    /// (its flight claimed), else the runner `waiter` is linked to wait for. The cycle check
+    /// is the scheduler's, at the wait.
+    fn join_fiber(&self, key: Key, me: u64, waiter: &Waiter<V>) -> Option<u64> {
+        let mut shard = self.shard(&key).lock();
+        let entry = match shard.entry(key) {
+            Entry::Vacant(slot) => {
+                slot.insert(InFlight { runner: me, waiters: Waiters(ptr::null()) });
+                self.claim_flight(key, me);
+                return None;
+            }
+            Entry::Occupied(slot) => slot.into_mut(),
+        };
+        let runner = entry.runner;
+        if runner == me {
+            panic!("key {} is asked by the task that runs it: its value depends on itself", hex(&key));
+        }
+        // SAFETY: as in `join`: `next` is the waiter's own until it is linked, here, under the
+        // shard's lock, and the caller keeps it in place until its run ends ([`Linked`]).
+        unsafe { *waiter.next.get() = entry.waiters.0 };
+        entry.waiters.0 = ptr::from_ref(waiter);
+        Some(runner)
     }
 
     /// `false` when this caller is to run `key`; `true` when `waiter` is linked into the run
@@ -592,6 +679,8 @@ struct Ending<'a, V: Clone + Send + Sync + 'static> {
     flights: &'a Flights<V>,
     key: Key,
     runner: u64,
+    /// The scheduler's flight of a run on a fiber, ended once every waiter has its end.
+    flight: Option<Key>,
     ended: bool,
 }
 
@@ -636,6 +725,9 @@ impl<V: Clone + Send + Sync + 'static> Ending<'_, V> {
             at = next;
             thread.unpark();
         }
+        if let Some(flight) = self.flight {
+            fiber::key_done(flight).expect("a run on a fiber ends on its fiber");
+        }
     }
 }
 
@@ -657,6 +749,34 @@ fn wait<V>(waiter: &Waiter<V>) -> Option<V> {
         DONE => unsafe { (*waiter.value.get()).take() },
         _ => None,
     }
+}
+
+/// A fiber task's id: its job, in slot 0, which is no thread's, so it is never a thread's
+/// task and the thread-stack cycle check finds no edge of it (the scheduler checks its waits).
+fn fiber_task(job: JobId) -> u64 {
+    u64::from(job.0) + 1
+}
+
+/// Waits on a fiber for the run `waiter` is linked into, suspending the job on the run's
+/// `flight`: its value, `None` when it was cancelled, or `Cancelled` when the wait would close
+/// a cycle. A run by a thread, not a fiber, has no flight to suspend on: the wait comes back
+/// at once and the fiber spins on the waiter until that run ends.
+fn wait_on_fiber<V>(waiter: &Waiter<V>, flight: Key) -> Result<Option<V>, Cancelled> {
+    while waiter.state.load(Ordering::Acquire) == RUNNING {
+        match fiber::wait(Wait::Key(flight)) {
+            Some(Ok(())) => {}
+            Some(Err(_)) => return Err(Cancelled),
+            None => unreachable!("a fiber task waits on its fiber"),
+        }
+        if waiter.state.load(Ordering::Acquire) == RUNNING {
+            hint::spin_loop();
+        }
+    }
+    Ok(match waiter.state.load(Ordering::Acquire) {
+        // SAFETY: as in `wait`: the runner wrote the value before it stored `DONE`.
+        DONE => unsafe { (*waiter.value.get()).take() },
+        _ => None,
+    })
 }
 
 /// Waits until `ended` is true, as a wait for a key does: on a pool's worker it runs that

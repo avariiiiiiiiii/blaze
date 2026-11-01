@@ -114,6 +114,7 @@ blaze-core = { path = "crates/blaze-core" }
 blaze-graph = { path = "crates/blaze-graph" }
 blaze-image = { path = "crates/blaze-image" }
 blaze-profile = { path = "crates/blaze-profile" }
+blaze-web = { path = "crates/blaze-web" }
 blaze-protocol = { path = "crates/blaze-protocol" }
 blaze-ui = { path = "crates/blaze-ui" }
 # v2 (docs/v2/plan/reference/crates.md)
@@ -209,12 +210,26 @@ cranelift-interpreter = "=0.137.1"
 cranelift-reader = "=0.137.1"
 # `vendor/llvm-sys` by the patch above.
 llvm-sys = "231"
+# The stackful fibers blaze-graph's scheduler parks a waiting job on (docs/v2/plan/lanes/sched.md, Phase 2).
+corosensei = "0.3.4"
 crossbeam-channel = "0.5.17"
 crossbeam-deque = "0.8.8"
 base64 = "0.23"
 ring = "0.17"
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
 rustls-native-certs = "0.8"
+# The explorer's transport (crates/blaze-explore): HTTP/3 WebTransport on 127.0.0.1 with a
+# self-signed certificate the page pins by hash. `ring` is the crypto rustls already uses here;
+# no `self-signed` (rcgen is called directly, so its validity comes from a clock blaze passes).
+wtransport = { version = "0.7.2", default-features = false, features = ["ring"] }
+# The explorer's ECDSA P-256 certificate, made at start and rotated before it expires.
+rcgen = { version = "0.14.10", default-features = false, features = ["ring"] }
+# blaze's own profiler (crates/blaze-profile): the schema's Arrow types, the live feed's IPC
+# batches and the Parquet history. Pure Rust; DuckDB stays outside blaze (`blaze debug sql`).
+arrow-array = { version = "60.1.0", default-features = false }
+arrow-ipc = { version = "60.1.0", default-features = false, features = ["zstd"] }
+arrow-schema = { version = "60.1.0", default-features = false }
+parquet = { version = "60.1.0", default-features = false, features = ["arrow", "zstd", "simdutf8"] }
 # `zdict_builder` trains the store's dictionary per kind; `zstdmt` lets long cold values use workers.
 zstd = { version = "0.14.3", default-features = false, features = ["zdict_builder", "zstdmt"] }
 # `tt`'s proc-macro wire views its columns as bytes with no unsafe code of its own.

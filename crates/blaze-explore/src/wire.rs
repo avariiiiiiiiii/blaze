@@ -54,6 +54,8 @@ pub enum Kind {
     Overloaded,
     /// The answer could not be encoded as Arrow IPC.
     Encode,
+    /// The page stopped the request: DuckDB was killed before it answered.
+    Cancelled,
 }
 
 impl Kind {
@@ -70,6 +72,7 @@ impl Kind {
             Kind::World => "world",
             Kind::Overloaded => "overloaded",
             Kind::Encode => "encode",
+            Kind::Cancelled => "cancelled",
         }
     }
 }
@@ -127,7 +130,7 @@ pub fn parse(bytes: &[u8]) -> Result<Request, WireError> {
     let value: Value = serde_json::from_slice(bytes)
         .map_err(|why| WireError::new(Kind::BadArgs, format!("the request is not JSON: {why}")))?;
     let op = match value.get("op") {
-        // alloc: once a request, its op's name for the errors below
+        // clone: once a request, its op's name for the errors below
         Some(Value::String(op)) => op.clone(),
         _ => return Err(WireError::new(Kind::BadArgs, "the request has no string `op`")),
     };

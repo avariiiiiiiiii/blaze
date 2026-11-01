@@ -23,8 +23,6 @@
 //! util.rs` (`parse_version`), `compiler/rustc_span/src/symbol.rs` (`find_similar`) and
 //! `compiler/rustc_span/src/source_map.rs` (`span_extend_to_line`) (MIT or Apache-2.0).
 
-mod unstable;
-
 use hir::InFile;
 use rustc_hash::{FxHashMap, FxHashSet};
 use smallvec::SmallVec;
@@ -129,7 +127,7 @@ pub(super) fn check(cx: &Cx<'_, '_>, owners: &[Owner<'_>], features: &Features) 
             libraries.load_all();
             let libraries: Vec<(hir::Crate, &Library)> = libraries.all();
             // alloc: on the error path, an unknown feature
-            let mut names: Vec<&str> = unstable::UNSTABLE.to_vec();
+            let mut names: Vec<&str> = table::unstable_declared().collect();
             for (_, library) in &libraries {
                 let start = names.len();
                 names.extend(library.features.keys().map(String::as_str));

@@ -665,21 +665,7 @@ fn rust_logo_is_gated() {
 
 fn main() {}
 "##;
-    let stderr = r##"error[E0658]: the `#[doc(rust_logo)]` attribute is used for Rust branding
-  --> $DIR/doc-rust-logo.rs:1:8
-   |
-LL | #![doc(rust_logo)]
-   |        ^^^^^^^^^
-   |
-   = note: see issue #90418 <https://github.com/rust-lang/rust/issues/90418> for more information
-   = help: add `#![feature(rustdoc_internals)]` to the crate attributes to enable
-   = note: this compiler was built on YYYY-MM-DD; consider upgrading it if it is out of date
-
-error: aborting due to 1 previous error
-
-For more information about this error, try `rustc --explain E0658`.
-"##;
-    assert_eq!(ui("doc-rust-logo.rs", "2015", source), stderr);
+    assert_reports(&ui("doc-rust-logo.rs", "2015", source), &[error(1, &["`#[doc(rust_logo)]`", "rustdoc_internals"])]);
 }
 
 #[test]

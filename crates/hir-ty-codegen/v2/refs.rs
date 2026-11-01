@@ -730,7 +730,7 @@ impl<'cx, 'db> Walk<'_, 'cx, 'db> {
         if is_dyn_method(self.fx.interner, self.fx.env.param_env, func, generic_args).is_some() {
             return Ok(());
         }
-        let (callee, callee_args) = db.lookup_impl_method(self.fx.env, func, generic_args);
+        let (callee, callee_args) = crate::impl_method(db, self.fx.env, func, generic_args)?;
         let callee = match callee {
             either::Either::Left(callee) => callee,
             either::Either::Right(derived) => {
@@ -1379,7 +1379,7 @@ impl<'cx, 'db> Walk<'_, 'cx, 'db> {
         }
         let mut by_ref = None;
         while let TyKind::Ref(_, inner, mutability) = ty.kind() {
-            if self.fx.implements_fn_itself(method, ty, tuple_ty) {
+            if self.fx.implements_fn_itself(method, ty, tuple_ty)? {
                 break;
             }
             by_ref = Some((ty, mutability));

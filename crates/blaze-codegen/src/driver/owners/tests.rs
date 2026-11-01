@@ -16,7 +16,7 @@ fn code(n: u8) -> CodeHash {
 }
 
 fn function(n: u8, owner: Owner, refs: &[Target]) -> Function<'_> {
-    Function { key: key(n), item: item(n), owner, code: code(n), refs, name: "f", origin: Origin::Std, owned_as: None }
+    Function { key: key(n), item: item(n), owner, code: code(n), refs, name: "f", origin: Origin::Std }
 }
 
 fn static_of<'a>(id: (ItemKey, ContentId), unit: InstanceKey, owner: Owner, refs: &'a [Target]) -> StaticOf<'a> {
@@ -100,7 +100,6 @@ fn refusals_across_cores_come_in_key_order() {
             refs: if n % 3 == 1 { &calls_workspace } else { &none },
             name: "f",
             origin: Origin::Std,
-            owned_as: None,
         })
         .chain(std::iter::once(Function {
             key: workspace,
@@ -110,7 +109,6 @@ fn refusals_across_cores_come_in_key_order() {
             refs: &none,
             name: "g",
             origin: Origin::Std,
-            owned_as: None,
         }))
         .collect();
     let mut errors = Vec::new();
@@ -145,33 +143,4 @@ fn a_refusal_names_both_sides_and_their_packages() {
     let static_ = &errors[1].what;
     assert!(static_.starts_with("a static (of dependency `regex`) is a dependency's"), "{static_}");
     assert!(static_.contains("refers to the static `APP_TABLE` (of member `app`), Static {"), "{static_}");
-}
-
-/// A generic made for a workspace type whose key another describer, a dependency's, made the
-/// image's: the refusal names that describer too, the one that put it in the image.
-#[test]
-fn a_refusal_names_the_describer_that_made_its_key_the_image_s() {
-    use crate::plan::Package;
-    let calls_workspace = [Target::Direct(key(1))];
-    let none: [Target; 0] = [];
-    let functions = [
-        Function { name: "<*mut u8>::cast::<app::Flag>", ..function(1, Owner::Workspace, &none) },
-        Function {
-            name: "<RawTable<app::Flag>>::reserve_rehash::{closure#1}",
-            origin: Origin::BuildTime(Package::new("app")),
-            owned_as: Some(("<RawTable<u32>>::reserve_rehash::{closure#1}", Origin::Dependency(Package::new("regex")))),
-            ..function(2, Owner::Dependency, &calls_workspace)
-        },
-    ];
-    let mut errors = Vec::new();
-    owners(functions.into_iter(), std::iter::empty(), &mut errors);
-    assert_eq!(errors.len(), 1, "{errors:?}");
-    let what = &errors[0].what;
-    assert!(
-        what.starts_with(
-            "`<RawTable<app::Flag>>::reserve_rehash::{closure#1}` (of build-time `app`) is a dependency's, \
-             as its key is also `<RawTable<u32>>::reserve_rehash::{closure#1}` (of dependency `regex`), so"
-        ),
-        "{what}"
-    );
 }

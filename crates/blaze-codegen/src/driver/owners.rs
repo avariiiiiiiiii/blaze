@@ -51,9 +51,6 @@ pub(super) struct Function<'a> {
     /// What its refusal names it by: rustc's demangled name of the instance.
     pub(super) name: &'a str,
     pub(super) origin: Origin,
-    /// The name and origin of the describer of its key that made it the image's, where the
-    /// one it is named by made it the workspace's.
-    pub(super) owned_as: Option<(&'a str, Origin)>,
 }
 
 /// A static of the build as [`owners`] takes it.
@@ -112,19 +109,12 @@ where
     // clone: the columns' iterators, a few pointers each; a refusal reads them again
     let (dependency_functions, dependency_statics) = (functions.clone(), statics.clone());
     let checked: Vec<Checked<'a>> = (dependency_functions.filter(|it| it.owner == Owner::Dependency))
-        .map(|it| Checked {
-            unit: it.key,
-            item: it.item,
-            refs: it.refs,
-            named: Named::Function(it.name, it.origin),
-            owned_as: it.owned_as,
-        })
+        .map(|it| Checked { unit: it.key, item: it.item, refs: it.refs, named: Named::Function(it.name, it.origin) })
         .chain(dependency_statics.filter(|it| it.owner == Owner::Dependency).map(|it| Checked {
             unit: it.unit,
             item: it.id.0,
             refs: it.refs,
             named: Named::Static(it.symbol, it.origin),
-            owned_as: None,
         }))
         // alloc: per build, the dependency's code, a few words each
         .collect();
@@ -148,20 +138,12 @@ where
             Some(to) => format!("{to}, {target:?}"), // alloc: an error
             None => format!("{target:?}"),           // alloc: an error
         };
-        let whose = match it.owned_as {
-            // alloc: an error
-            Some((name, origin)) => format!(
-                "a dependency's, as its key is also {}",
-                Named::Function(name, origin)
-            ),
-            None => "a dependency's".to_owned(), // alloc: an error
-        };
         errors.push(CodegenError {
             unit: it.unit,
             item: it.item,
             // alloc: an error
             what: format!(
-                "{} is {whose}, so it goes in the dependency image, and it refers to \
+                "{} is a dependency's, so it goes in the dependency image, and it refers to \
                  {to}, which is the workspace's: the image would change with workspace code",
                 it.named,
             ),
@@ -176,7 +158,6 @@ struct Checked<'a> {
     item: ItemKey,
     refs: &'a [Target],
     named: Named<'a>,
-    owned_as: Option<(&'a str, Origin)>,
 }
 
 /// What a refusal names a function or static by: its name and whose code it is.

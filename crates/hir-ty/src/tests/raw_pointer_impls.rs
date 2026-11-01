@@ -30,6 +30,7 @@ fn fixture_with(origin: &str) -> String {
         "//- /dep.rs crate:dep{origin}
 pub trait P {{
     fn distance(self, origin: Self) -> usize;
+    fn provided(self) -> usize where Self: Sized {{ 2 }}
 }}
 impl<T> P for *const T {{
     fn distance(self, _: Self) -> usize {{ 0 }}
@@ -160,7 +161,11 @@ fn a_lookup_that_finds_no_impl_says_why() {
     let ModuleDefId::AdtId(AdtId::StructId(s)) = root_def(&db, main, "S") else { panic!("`S` is a struct") };
     let distance = p.trait_items(&db).method_by_name(&Name::new_root("distance")).expect("`P::distance`");
     let function = |krate: Crate, name: &str| -> FunctionId {
-        let ModuleDefId::FunctionId(it) = root_def(&db, krate, name) else { panic!("`{name}` is a function") };
+        let root = crate_def_map(&db, krate).root_module_id();
+        let scope = root.def_map(&db).module(&db, root).scope(&db);
+        let Some(ModuleDefId::FunctionId(it)) = scope.get(&Name::new_root(name)).take_values() else {
+            panic!("`{name}`, a function at the root")
+        };
         it
     };
     let (f, measure, bounded) = (function(main, "f"), function(dep, "measure"), function(dep, "bounded"));
@@ -177,5 +182,25 @@ fn a_lookup_that_finds_no_impl_says_why() {
         assert_eq!(why(f, s.into()), Some(NoImplMethod::Unimplemented));
         assert_eq!(why(bounded, param(bounded).into()), Some(NoImplMethod::Param));
         assert_eq!(why(measure, param(measure).into()), Some(NoImplMethod::Generic));
+    });
+}
+
+/// A provided method the impl leaves out runs the trait's default body, as rustc's `leaf_def`
+/// finds it: the lookup names the trait's own method, and that is no error.
+#[test]
+fn a_provided_method_the_impl_leaves_out_is_the_traits() {
+    let db = fixture::db(&fixture_with("")).into_db();
+    let (main, dep) = (crate_named(&db, "main"), crate_named(&db, "dep"));
+    let ModuleDefId::TraitId(p) = root_def(&db, dep, "P") else { panic!("`P` is a trait") };
+    let ModuleDefId::AdtId(AdtId::StructId(s)) = root_def(&db, main, "S") else { panic!("`S` is a struct") };
+    let provided = p.trait_items(&db).method_by_name(&Name::new_root("provided")).expect("`P::provided`");
+    attach_db(&db, || {
+        let interner = DbInterner::new_with(&db, main);
+        let s = Ty::new_adt(interner, AdtId::StructId(s), GenericArgs::empty());
+        let ptr = Ty::new_ptr(interner, s, Mutability::Not);
+        let env = ParamEnvAndCrate { param_env: ParamEnv::empty(), krate: main };
+        let args = GenericArgs::new_from_slice(&[ptr.into()]);
+        let found = db.lookup_impl_method_or_why(env, provided, args).map(|(found, args)| (found, args.to_vec()));
+        assert_eq!(found, Ok((Either::Left(provided), args.to_vec())));
     });
 }

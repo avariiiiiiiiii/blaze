@@ -588,12 +588,11 @@ fn lookup_impl_assoc_item_for_trait_ref<'db>(
     let impl_id = match impl_id {
         AnyImplId::ImplId(it) => it,
         AnyImplId::BuiltinDeriveImplId(impl_) => {
-            return impl_
-                .loc(infcx.interner.db)
-                .trait_
-                .get_method(name.symbol())
-                .map(|method| (Either::Right((impl_, method)), impl_subst))
-                .ok_or(NoImplMethod::NoItem);
+            // A derive writes the methods it must; `PartialEq::ne` and the like are the trait's.
+            return match impl_.loc(infcx.interner.db).trait_.get_method(name.symbol()) {
+                Some(method) => Ok((Either::Right((impl_, method)), impl_subst)),
+                None => provided(infcx.interner.db, trait_ref, name),
+            };
         }
     };
     let db = infcx.interner.db;
@@ -608,10 +607,13 @@ fn lookup_impl_assoc_item_for_trait_ref<'db>(
         return Ok((Either::Left(item), impl_subst));
     }
     // A specializing impl takes the items it leaves out from the impl it specializes: the
-    // closest one that has the item.
-    let parent =
+    // closest one that has the item. One that none has is the trait's default, as rustc's
+    // `leaf_def` finds it.
+    let Some(parent) =
         crate::specialization::specialized_ancestor(db, impl_id, |it| item_of(it).is_some())
-            .ok_or(NoImplMethod::NoItem)?;
+    else {
+        return provided(db, trait_ref, name);
+    };
     let parent_args = infcx.fresh_args_for_item(Span::Dummy, parent.into());
     let parent_trait_ref = db
         .impl_trait(parent)
@@ -627,6 +629,30 @@ fn lookup_impl_assoc_item_for_trait_ref<'db>(
     }
     let parent_args = parent_args.fold_with(&mut ReplaceInferWithError::new(infcx.interner));
     Ok((Either::Left(item_of(parent).ok_or(NoImplMethod::NoItem)?), parent_args))
+}
+
+/// The trait's own item named `name`, with the trait ref's arguments, where it has a default:
+/// a provided method's body or an associated constant's value. What an impl that leaves the
+/// item out runs, `Write::write_fmt` of `Stderr`.
+fn provided<'db>(
+    db: &'db Db,
+    trait_ref: TraitRef<'db>,
+    name: &Name,
+) -> Result<
+    (Either<AssocItemId, (BuiltinDeriveImplId, BuiltinDeriveImplMethod)>, GenericArgs<'db>),
+    NoImplMethod,
+> {
+    // clone: the tracked query's key; a `Name` is an interned symbol, so a count bump
+    let item = match trait_value_item(db, trait_ref.def_id.0, name.clone()) {
+        Some(CandidateId::FunctionId(f)) if FunctionSignature::of(db, f).has_body() => {
+            AssocItemId::FunctionId(f)
+        }
+        Some(CandidateId::ConstId(c)) if ConstSignature::of(db, c).has_body() => {
+            AssocItemId::ConstId(c)
+        }
+        _ => return Err(NoImplMethod::NoItem),
+    };
+    Ok((Either::Left(item), trait_ref.args))
 }
 
 /// The function or constant of `impl_` named `name`, the first if there are more: all that a
@@ -766,7 +792,8 @@ pub enum NoImplMethod {
     Ambiguous,
     /// The trait ref's projections do not normalize.
     Unnormalized,
-    /// The impl found has no method of the name, nor does an impl it specializes.
+    /// The impl found has no method of the name, nor does an impl it specializes, and the
+    /// trait's has no default body.
     NoItem,
     /// The lookup asks itself again.
     Cycle,
@@ -787,7 +814,9 @@ impl NoImplMethod {
             NoImplMethod::Unimplemented => "no impl holds",
             NoImplMethod::Ambiguous => "more than one impl may hold",
             NoImplMethod::Unnormalized => "its projections do not normalize",
-            NoImplMethod::NoItem => "the impl found has no method of that name",
+            NoImplMethod::NoItem => {
+                "the impl found has no method of that name and the trait's has no default body"
+            }
             NoImplMethod::Cycle => "the lookup depends on itself",
         }
     }

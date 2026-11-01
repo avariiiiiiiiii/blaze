@@ -3033,7 +3033,7 @@ fn main() {
 fn a_box_with_an_allocator_unsizes_a_closure_to_dyn_fn() {
     check_pass(
         r#"
-//- minicore: fn, unsize, coerce_unsized
+//- minicore: fn, unsize, coerce_unsized, dispatch_from_dyn
 use core::marker::Unsize;
 use core::ops::CoerceUnsized;
 
@@ -3054,6 +3054,48 @@ fn main() {
     let unsized_: Box<dyn Fn() -> i32, Global> = boxed;
     let f: &dyn Fn() -> i32 = unsafe { &*unsized_.0 };
     if f() != 7 {
+        should_not_reach();
+    }
+}
+"#,
+    );
+}
+
+#[test]
+fn a_box_of_a_unique_with_phantom_data_unsizes_a_fn_to_dyn_fn() {
+    check_pass(
+        r#"
+//- minicore: fn, unsize, coerce_unsized, dispatch_from_dyn, phantom_data
+use core::marker::{PhantomData, Unsize};
+use core::ops::CoerceUnsized;
+
+pub struct Global;
+
+pub struct Unique<T: ?Sized> {
+    pointer: *const T,
+    _marker: PhantomData<T>,
+}
+
+impl<T: ?Sized + Unsize<U>, U: ?Sized> CoerceUnsized<Unique<U>> for Unique<T> {}
+
+pub struct Box<T: ?Sized, A = Global>(Unique<T>, A);
+
+impl<T: ?Sized + Unsize<U>, U: ?Sized, A> CoerceUnsized<Box<U, A>> for Box<T, A> {}
+
+fn should_not_reach() {
+    _ // FIXME: replace this function with panic when that works
+}
+
+fn default_hook(x: &i32) -> i32 {
+    *x + 2
+}
+
+fn main() {
+    let hook = default_hook;
+    let boxed = Box(Unique { pointer: &hook as *const _, _marker: PhantomData }, Global);
+    let unsized_: Box<dyn Fn(&i32) -> i32, Global> = boxed;
+    let f: &dyn Fn(&i32) -> i32 = unsafe { &*unsized_.0.pointer };
+    if f(&5) != 7 {
         should_not_reach();
     }
 }

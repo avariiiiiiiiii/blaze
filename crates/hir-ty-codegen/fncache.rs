@@ -1810,7 +1810,10 @@ fn library_operand<'db>(
             if rustc_type_ir::TypeVisitableExt::has_param(&args) {
                 return None;
             }
-            let (either::Either::Left(it), _) = db.lookup_impl_method(env, func, args) else {
+            let (either::Either::Left(it), _) = (match crate::impl_method(db, env, func, args) {
+                Ok(found) => found,
+                Err(why) => return Some(why),
+            }) else {
                 return None;
             };
             if !FunctionSignature::of(db, it).has_body() {

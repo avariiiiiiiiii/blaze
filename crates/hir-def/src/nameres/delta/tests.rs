@@ -475,6 +475,29 @@ fn editing_a_dependencys_macro_body_expands_its_calls_again() {
     assert!(failures.is_empty(), "{failures}");
 }
 
+/// `foo` is made by a dependency's `mk_foo!()`, so its definition is in a macro file of the
+/// call's own crate: the file a call of `foo` reads it from is the dependency's, up the chain.
+#[test]
+fn editing_the_body_of_a_macro_a_dependencys_macro_made_expands_its_calls_again() {
+    const LIB: &str = "#[macro_export]\nmacro_rules! mk_foo {\n    () => {\n        macro_rules! foo {\n            () => { struct Ok; }\n        }\n    }\n}\n";
+    let mut loaded = Loaded::new(&format!(
+        "//- /main.rs crate:main deps:lib\n#[macro_use]\nextern crate lib;\nmk_foo!();\nmod a {{\n    foo!();\n}}\n//- /lib.rs crate:lib\n{LIB}"
+    ));
+    let main = loaded.krate();
+    let lib = loaded.file("/lib.rs");
+    let has = |db: &Db, it: &str| {
+        let a = module_at(db, main, &["a"]);
+        let map = crate_local_def_map(db, main).def_map(db);
+        map.module(db, a).scope(db).get(&name(it)).take_types().is_some()
+    };
+    assert!(has(&loaded.db, "Ok"), "loaded: `foo!()` declares `Ok`");
+    loaded.db.set_file_text(lib, &LIB.replace("struct Ok;", "struct Fine;"));
+    assert!(!has(&loaded.db, "Ok") && has(&loaded.db, "Fine"), "`foo!()` expands to the old body");
+    let mut failures = String::new();
+    check_db(&loaded.db, "a macro-made macro's body edited", &Exempt::NONE, false, &mut failures);
+    assert!(failures.is_empty(), "{failures}");
+}
+
 /// A `mod` whose file is configured out by its `#![cfg]` has no module, so no group holds the
 /// file: a write of the file alone that drops the `#![cfg]` still brings the module in.
 #[test]
@@ -983,6 +1006,22 @@ fn a_body_edit_beside_a_globbed_enum_runs_no_group_and_a_new_variant_is_imported
     assert!(map.module(&loaded.db, root).scope(&loaded.db).get(&name("C")).take_types().is_some(), "`C` is not imported");
     let mut failures = String::new();
     check_db(&loaded.db, "a new variant", &Exempt::NONE, true, &mut failures);
+    assert!(failures.is_empty(), "{failures}");
+}
+
+#[test]
+fn removing_a_globbed_enum_reads_no_variants_of_it_and_unbinds_them() {
+    let mut loaded = Loaded::new("//- /main.rs crate:main\nenum E { A, B }\nuse E::*;\nfn f() {}\n");
+    let main = loaded.krate();
+    let file = loaded.file("/main.rs");
+    // A touch first, so the enum's variants are the ones its glob last woke on.
+    loaded.db.set_file_text(file, "enum E { A, B }\nuse E::*;\nfn f() { () }\n");
+    loaded.db.set_file_text(file, "use E::*;\nfn f() { () }\n");
+    let root = module_at(&loaded.db, main, &[]);
+    let map = crate_local_def_map(&loaded.db, main).def_map(&loaded.db);
+    assert!(map.module(&loaded.db, root).scope(&loaded.db).get(&name("A")).is_none(), "`A` is still imported");
+    let mut failures = String::new();
+    check_db(&loaded.db, "a globbed enum removed", &Exempt::NONE, true, &mut failures);
     assert!(failures.is_empty(), "{failures}");
 }
 

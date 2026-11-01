@@ -416,6 +416,21 @@ fn inline_items(item_tree: &ItemTree, item: ModItemId, module: ModuleId) -> &[Mo
     }
 }
 
+/// The files a declarative macro call's expansion reads its macro from: the file of the
+/// macro's definition, and where that definition is itself in an expansion of a declarative
+/// macro (`macro_rules! foo` made by `mk_foo!()`), the file of that macro's, up the chain. Each
+/// may be another crate's, whose edit changes no binding when the macros keep their ids.
+pub(in crate::nameres) fn definition_files(db: &Db, call: MacroCallId, mut each: impl FnMut(span::FileId)) {
+    let mut call = call;
+    while let MacroDefKind::Declarative(ast, _) = call.loc(db).def.kind {
+        each(ast.file_id.original_file(db).file_id(db));
+        match ast.file_id {
+            HirFileId::MacroFile(maker) => call = maker,
+            HirFileId::FileId(_) => return,
+        }
+    }
+}
+
 /// The round-0 sink of [`module_decls`]: the module's own row (scope `Building`) and the rows of
 /// the children it has declared (each scope the child's `Scope::Decl` fact) in a view `DefMap`
 /// that reads every other module through [`decl_row`]; the crate env; the log.
@@ -752,15 +767,13 @@ impl<'a, 'db, 'f> Sink<'db> for DeclSink<'a, 'db, 'f> {
 
     fn collecting_expansion(&mut self, call: MacroCallId) {
         let db = self.cx.db;
-        // A declarative macro's body is an input of the expansion, and its file may be
-        // another crate's, whose edit changes no binding when the macro keeps its id.
-        if let MacroDefKind::Declarative(ast, _) = call.loc(db).def.kind {
-            let file = ast.file_id.original_file(db).file_id(db);
-            let own = HirFileId::from(call).original_file(db).file_id(db);
-            if file != own && !self.other_files.contains(&file) {
-                self.other_files.push(file);
+        let own = HirFileId::from(call).original_file(db).file_id(db);
+        let other_files = &mut self.other_files;
+        definition_files(db, call, |file| {
+            if file != own && !other_files.contains(&file) {
+                other_files.push(file);
             }
-        }
+        });
     }
 
     fn child(&mut self, request: ChildRequest<'_>) -> ChildMode {

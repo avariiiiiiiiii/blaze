@@ -10,23 +10,21 @@
 #[cfg(test)]
 mod tests;
 
-use std::collections::BTreeSet;
+use std::{collections::BTreeSet, path::Path, sync::OnceLock};
 
 use blaze_codegen::{
     Arch,
     settings::{Relocation, Toolchain},
 };
-use blaze_ids::ContentId;
+use blaze_ids::{ContentId, Hasher};
 
 use crate::{ObjectFormat, Target};
 
-const ID_DOMAIN: &str = "blaze v2 toolchain id 2";
+const ID_DOMAIN: &str = "blaze v2 toolchain id 3";
+const BUILD_DOMAIN: &str = "blaze v2 codegen build 1";
 
 /// The nightly blaze is pinned to (`harness/toolchain`).
 pub(crate) const NIGHTLY: &str = include_str!("../../../harness/toolchain").trim_ascii_end();
-
-/// The code generator's producer: bump it whenever what it emits for the same input changes.
-const PRODUCER: &str = "blaze v2 codegen 1";
 
 /// The version of Cranelift blaze is built with, as `Cargo.lock` has it (checked there).
 const CRANELIFT: &str = "0.137.1";
@@ -206,7 +204,7 @@ pub fn toolchain(target: &str, rustflags: &[String], runs: Runs) -> Result<Toolc
         }
     };
     Ok(Toolchain {
-        id: id(),
+        id: id_of(&build()?),
         // alloc: per toolchain made, a few names
         target: target.to_owned(),
         arch,
@@ -238,14 +236,45 @@ pub fn select(toolchain: &Toolchain) -> Result<(), String> {
     Ok(())
 }
 
-/// The pinned nightly blaze compiles against and the code generator's producer (#1439): the
-/// backends' versions are fields of their own.
-fn id() -> ContentId {
-    let mut named = [0u8; NIGHTLY.len() + 1 + PRODUCER.len()];
-    named[..NIGHTLY.len()].copy_from_slice(NIGHTLY.as_bytes());
-    named[NIGHTLY.len()] = b'\n';
-    named[NIGHTLY.len() + 1..].copy_from_slice(PRODUCER.as_bytes());
-    ContentId::of(ID_DOMAIN, &named)
+/// The pinned nightly blaze compiles against and the blaze build that makes the code (#1439):
+/// the backends' versions are fields of their own.
+fn id_of(build: &ContentId) -> ContentId {
+    let mut hasher = Hasher::new(ID_DOMAIN);
+    hasher.update(NIGHTLY.as_bytes()).update(b"\n").id(build);
+    hasher.finish()
+}
+
+/// Which blaze build this process is: the hash of its executable's bytes, read once. The code
+/// made for one code hash is what this blaze's front end and code generator make of it, and the
+/// code hash reads neither (it is of the item's source, its callees by their interfaces), so a
+/// store kept across blaze builds would hold another build's code under every key.
+pub fn build() -> Result<ContentId, String> {
+    static BUILD: OnceLock<Result<ContentId, String>> = OnceLock::new();
+    BUILD
+        .get_or_init(|| {
+            // alloc: an error, once a process
+            let exe = std::env::current_exe().map_err(|why| format!("the path of blaze itself: {why}"))?;
+            build_of(&exe)
+        })
+        // clone: a content ID, or the error that stops every toolchain of the process
+        .clone()
+}
+
+fn build_of(exe: &Path) -> Result<ContentId, String> {
+    use std::io::Read as _;
+    // alloc: an error, once a process
+    let failed = |why: std::io::Error| format!("reading blaze itself, {}: {why}", exe.display());
+    let mut file = std::fs::File::open(exe).map_err(failed)?;
+    let mut hasher = Hasher::new(BUILD_DOMAIN);
+    // alloc: one buffer, once a process
+    let mut chunk = vec![0u8; 1 << 20];
+    loop {
+        let read = file.read(&mut chunk).map_err(failed)?;
+        if read == 0 {
+            return Ok(hasher.finish());
+        }
+        hasher.update(&chunk[..read]);
+    }
 }
 
 /// The pinned LLVM's version and commit; `None` for a blaze built without it.

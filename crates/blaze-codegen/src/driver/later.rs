@@ -33,7 +33,7 @@ use rustc_hash::{FxHashMap, FxHashSet};
 
 use super::{
     Build, Built, FnNode, FrontInstance, FrontStatic, Lookup, Node, Out, Put, Sorted, StaticId, StaticNode, callee,
-    error, stopped, stored, stored_function, unkept_inline,
+    Whence, error, placed, stopped, stored, stored_function, unfit, unkept_inline,
 };
 use crate::{
     Backend, CodegenError, CompiledFunction, Instance, InstanceKey, Unit,
@@ -163,8 +163,7 @@ fn stored_one<I, S, L: Lookup + ?Sized>(
         Ok(None) => Ok(None),
         Ok(Some(bytes)) => match stored_function(bytes, key, &node.refs) {
             Ok(Ok(function)) => Ok(Some(function)),
-            // alloc: an error
-            Ok(Err(why)) => Err(error(key, node.unit.item, why.to_string())),
+            Ok(Err(why)) => Err(unfit(key, node.unit.item, &node.described.name, Whence::Store(at), why)),
             // alloc: an error
             Err(why) => Err(error(key, node.unit.item, format!("the store's {at:?}: {why}"))),
         },
@@ -179,15 +178,17 @@ fn put_of(at: &InstanceKey, template: &Template) -> Put {
     Put { key: keys::template(at), kind: Kind::Code, bytes: blob::encode(template) }
 }
 
-/// The function for `key` from the memo's `template`, with the template's [`Put`] under `at`.
+/// The function for `key` from the memo's `template` of `shape`, with the template's [`Put`]
+/// under `at`.
 fn memoized<I, S>(
     node: &FnNode<I, S>,
     key: InstanceKey,
     at: &InstanceKey,
+    shape: ContentId,
     template: &Template,
 ) -> Result<(CompiledFunction, Vec<Put>), CodegenError> {
-    // alloc: an error
-    let function = template.instantiate(key, &node.refs).map_err(|why| error(key, node.unit.item, why.to_string()))?;
+    let unfit = |why| unfit(key, node.unit.item, &node.described.name, Whence::Shape(shape), why);
+    let function = template.instantiate(key, &node.refs).map_err(unfit)?;
     // alloc: the store's value of a memo hit, once a function
     Ok((function, vec![put_of(at, template)]))
 }
@@ -205,11 +206,11 @@ fn compiled<B: Prepare>(
     spec: &Spec,
 ) -> Result<(CompiledFunction, Vec<Put>, Made, ContentId), CodegenError> {
     let (key, item) = (unit.instance.key(), unit.item);
-    let at = stored(key, &node.built_in);
+    let at = placed(stored(key, &node.built_in), &node.refs);
     let (shape, made) = backend.prepare(frontend, unit, spec, &node.instance, &node.refs)?;
     let shape = shape.key();
     if let Some(template) = memo.get(&shape) {
-        let (function, puts) = memoized(node, key, &at, template)?;
+        let (function, puts) = memoized(node, key, &at, shape, template)?;
         return Ok((function, puts, Made::Memo, shape));
     }
     let emitted = backend.emit(unit, spec, made, &node.refs, None)?;
@@ -233,8 +234,8 @@ fn compiled<B: Prepare>(
         .map_err(|why| error(key, item, why.to_string()))?;
     let kept = memo.put(shape, template);
     puts.push(put_of(&at, kept));
-    // alloc: an error
-    let function = kept.instantiate(key, &node.refs).map_err(|why| error(key, item, why.to_string()))?;
+    let unfit = |why| unfit(key, item, &node.described.name, Whence::Shape(shape), why);
+    let function = kept.instantiate(key, &node.refs).map_err(unfit)?;
     Ok((function, puts, Made::Compiled, shape))
 }
 
@@ -253,7 +254,7 @@ fn claimed<B: Prepare>(
     spec: &Spec,
     check: impl Fn() -> Result<(), CodegenError>,
 ) -> Result<(CompiledFunction, Vec<Put>, Made, ContentId), CodegenError> {
-    let (key, at) = (unit.instance.key(), stored(unit.instance.key(), &node.built_in));
+    let (key, at) = (unit.instance.key(), placed(stored(unit.instance.key(), &node.built_in), &node.refs));
     let flights = memo.flights();
     loop {
         let mut claims = flights.claims();
@@ -276,7 +277,9 @@ fn claimed<B: Prepare>(
             }
         };
         return match memo.get(&shape) {
-            Some(template) => memoized(node, key, &at, template).map(|(function, puts)| (function, puts, Made::Flown, shape)),
+            Some(template) => {
+                memoized(node, key, &at, shape, template).map(|(function, puts)| (function, puts, Made::Flown, shape))
+            }
             // alloc: an error
             None => Err(error(key, unit.item, format!("its compile landed under shape {shape:?}, which the memo has no template of"))),
         };
@@ -327,9 +330,10 @@ fn at_tier<I, S>(key: InstanceKey, node: &FnNode<I, S>, backend: Backend, counte
 impl<I, S> Later<I, S> {
     /// `key`'s node and the memo's template of the shape its check recorded: no allocation,
     /// no lock but the memo's.
-    fn recorded<'m>(&self, memo: &'m Memo, key: InstanceKey) -> Option<(&FnNode<I, S>, &'m Template)> {
+    fn recorded<'m>(&self, memo: &'m Memo, key: InstanceKey) -> Option<(&FnNode<I, S>, &'m Template, ContentId)> {
         let node = self.nodes.get(&key).filter(|it| is_dev(it.spec.backend))?;
-        Some((node, memo.get(self.shapes.get(&key)?)?))
+        let shape = *self.shapes.get(&key)?;
+        Some((node, memo.get(&shape)?, shape))
     }
 
     /// The memo's function for `key`, as [`Later::compile_kept`] gives it from the memo, with
@@ -340,15 +344,15 @@ impl<I, S> Later<I, S> {
     /// end and no lock but the memo's. An `Err` is the instantiation's, which `compile_kept`
     /// gives too.
     pub fn memo_hit(&self, memo: &Memo, key: InstanceKey) -> Option<Result<CompiledFunction, CodegenError>> {
-        let (node, template) = self.recorded(memo, key)?;
-        // alloc: an error
-        Some(template.instantiate(key, &node.refs).map_err(|why| error(key, node.unit.item, why.to_string())))
+        let (node, template, shape) = self.recorded(memo, key)?;
+        let unfit = |why| unfit(key, node.unit.item, &node.described.name, Whence::Shape(shape), why);
+        Some(template.instantiate(key, &node.refs).map_err(unfit))
     }
 
     /// The store's value of [`Later::memo_hit`]'s template, under `key`'s stored key: `None`
     /// where `memo_hit` is.
     pub fn memo_put(&self, memo: &Memo, key: InstanceKey) -> Option<Put> {
-        let (node, template) = self.recorded(memo, key)?;
+        let (node, template, _) = self.recorded(memo, key)?;
         Some(put_of(&node.stored(), template))
     }
 
@@ -376,8 +380,8 @@ impl<I, S> Later<I, S> {
             // alloc: none, empty
             return Ok((function, Vec::new()));
         }
-        if let Some((_, template)) = self.recorded(memo, key) {
-            return memoized(node, key, &node.stored(), template);
+        if let Some((_, template, shape)) = self.recorded(memo, key) {
+            return memoized(node, key, &node.stored(), shape, template);
         }
         let check = || same_code(frontend, node, key);
         claimed(backend, frontend, memo, &self.nodes, node, &node.unit, &node.spec, check).map(|it| (it.0, it.1))
@@ -407,7 +411,7 @@ impl<I, S> Later<I, S> {
         let node = lazy_node(&self.nodes, key)?;
         let (unit, spec) = at_tier(key, node, to, counted)?;
         let tiered = unit.instance.key();
-        if let Some(function) = stored_one(node, stored(tiered, &node.built_in), tiered, store)? {
+        if let Some(function) = stored_one(node, placed(stored(tiered, &node.built_in), &node.refs), tiered, store)? {
             // alloc: none, empty
             return Ok((function, Vec::new()));
         }

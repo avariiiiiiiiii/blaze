@@ -1650,12 +1650,15 @@ impl<S: Steps> Jobs<S> {
             Stage::Lower(at, input, root) if at == node => match job.take_value(node) {
                 Some(Value::Lowered(Ok(FrontEnd { front, writer, puts }))) => {
                     for put in puts {
-                        let key = put.key;
+                        let (key, kind) = (put.key, put.kind);
                         match w.store.put(put.key, put.kind, put.bytes) {
                             Ok(ticket) => self.put = Some(ticket),
                             Err(mismatch) => {
                                 // alloc: an error, once
-                                let what = format!("the store holds other bytes under {key:?}: {mismatch:?}");
+                                let what = format!(
+                                    "the store holds other bytes under {key:?} than the front end's lowering made now, \
+                                     a {kind:?} value: {mismatch:?}"
+                                );
                                 self.end(w, id, false, Some(ApiError::new(what, None)));
                                 return;
                             }
@@ -2272,24 +2275,38 @@ impl<S: Steps> Jobs<S> {
         if let Some(unit) = ended {
             w.said.push(Said::Report(id, Response::UnitEnded(unit)));
         }
+        let named = match &job.stage {
+            Stage::Units(build) => build.input.units.graph.units.get(unit),
+            _ => None,
+        };
+        let mismatched = |store: &str, kind: blaze_cas::Kind, mismatch: blaze_cas::Mismatch| {
+            let what = match named {
+                // alloc: an error, once
+                Some(it) => format!("unit {unit} (`{}` of {})", it.target.name, it.pkg_id),
+                // alloc: an error, once
+                None => format!("unit {unit}"),
+            };
+            // alloc: an error, once
+            let what = format!("{store} holds other bytes under {:?} than {what} made now, a {kind:?} value: {mismatch:?}", mismatch.key);
+            // clone: an error, once
+            ApiError::new(what, named.map(|it| it.pkg_id.clone()))
+        };
         for put in compiled.puts {
-            let key = put.key;
+            let kind = put.kind;
             match w.store.put(put.key, put.kind, put.bytes) {
                 Ok(ticket) => self.put = Some(ticket),
                 Err(mismatch) => {
-                    // alloc: an error, once
-                    let error = ApiError::new(format!("the store holds other bytes under {key:?}: {mismatch:?}"), None);
+                    let error = mismatched("the store", kind, mismatch);
                     job.over.get_or_insert((false, Some(error)));
                 }
             }
         }
         job.shared |= !compiled.share.is_empty();
         for put in compiled.share {
-            let key = put.key;
+            let kind = put.kind;
             if let Err(mismatch) = w.std.put(put.key, put.kind, put.bytes) {
-                // alloc: an error, once
-                let what = format!("the standard library's shared store holds other bytes under {key:?}: {mismatch:?}");
-                job.over.get_or_insert((false, Some(ApiError::new(what, None))));
+                let error = mismatched("the standard library's shared store", kind, mismatch);
+                job.over.get_or_insert((false, Some(error)));
             }
         }
         let outputs = match (compiled.artifact, &mut job.stage) {

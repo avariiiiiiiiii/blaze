@@ -8,10 +8,11 @@
 //! have changed the bodies of, publishes the slices whose rows changed, and hands the next
 //! maintainer what changed ([`ImplsDelta`]). A key or body part is recomputed through the pure
 //! queries, so recomputing one that did not change costs memo validations and changes nothing.
+//! What a run reads, the maintainer's reads read first, across the crates on the database's
+//! workers ([`warm`], then [`warm_bodies`]): the run diffs memos.
 
 use base_db::{Crate, Db, Written};
 use blaze_dbsp::{Arrangement, Pos, ReadIndex, Work};
-use blaze_mem::Tag;
 use hir_def::{
     BuiltinDeriveImplId, HasModule, ImplId, ModuleDefId, ModuleId, TraitId,
     builtin_derive::BuiltinDeriveImplTrait,
@@ -20,7 +21,6 @@ use hir_def::{
         delta::{CrateDelta, LastWrite},
         crate_def_map, module_impls,
     },
-    signatures::ImplSignature,
 };
 use hir_expand::name::Name;
 use intern::Symbol;
@@ -116,10 +116,6 @@ struct Scratch {
     redo_traits: Vec<TraitId>,
     assoc: SmallVec<[Name; 8]>,
     body_modules: Vec<ModuleId>,
-    /// The impls a delta adds, each with whether it is a trait impl.
-    added: Vec<(ImplId, bool)>,
-    /// The modules of the crates a write sweeps, every crate's in graph order.
-    swept: Vec<ModuleId>,
     units: Vec<()>,
     keys_changed: Vec<ImplId>,
     traits_changed: Vec<TraitId>,
@@ -169,23 +165,6 @@ pub(crate) fn run(
     if changed {
         scratch.woken.extend(state.wild.iter().copied());
     }
-    // A load (every crate fresh) or a crate graph change sweeps every module of the crates it
-    // runs: their body parts are read as one batch across the crates on the database's workers,
-    // so the crates' sweeps below diff memos.
-    let mut swept = std::mem::take(&mut scratch.swept);
-    swept.clear();
-    let sweep_span = tracing::info_span!(target: "blaze", "impls modules").entered();
-    for &krate in crates.iter() {
-        let fresh = scratch.deltas.get(&krate).is_some_and(|&at| last.crates[at].fresh);
-        if (fresh || written.crates) && !frozen::served(&*db, krate) {
-            swept.extend(crate_def_map(&*db, krate).modules(&*db).map(|(module, _)| module));
-        }
-    }
-    drop(sweep_span);
-    if swept.len() > 1 {
-        db.run_all(Tag::Infer, swept.len(), |db, at| _ = body_part(db, swept[at]));
-    }
-    state.scratch.swept = swept;
     for &krate in crates.iter() {
         if frozen::served(&*db, krate) {
             continue;
@@ -335,22 +314,6 @@ fn apply_impls(
             state.scratch.keys_changed.push(*imp);
         }
     }
-    // An added impl's key and read set lower its header: the queries they read are run as one
-    // batch on the database's workers, and the loop below reads their memos in the delta's order.
-    let mut added = std::mem::take(&mut state.scratch.added);
-    added.clear();
-    for (imp, _, _) in delta.impls.iter().filter(|it| it.2 > 0) {
-        let module = imp.loc(&*db).container;
-        added.push((*imp, is_trait_impl(&*db, &mut state.scratch, module, *imp)));
-    }
-    if added.len() > 1 {
-        db.run_all(Tag::Infer, added.len(), |db, at| {
-            let (imp, trait_impl) = added[at];
-            _ = impl_key(db, imp, trait_impl);
-            _ = ImplSignature::of(db, imp);
-        });
-    }
-    state.scratch.added = added;
     for (imp, pos, _) in delta.impls.iter().filter(|it| it.2 > 0) {
         work.ops += 1;
         remove_impl(state, crate_state, *imp);
@@ -748,16 +711,8 @@ fn apply_bodies(
     modules.extend(crate_state.bodies.keys().copied());
     modules.sort_unstable();
     modules.dedup();
-    // A part is a query that lowers the module's bodies, and a sweep reads every module's: they
-    // are read as one batch on the database's workers, and the loop below diffs their memos in
-    // module order.
-    if modules.len() > 1 {
-        db.run_all(Tag::Infer, modules.len(), |db, at| {
-            if def_map.module_rank(db, modules[at]).is_some() {
-                _ = body_part(db, modules[at]);
-            }
-        });
-    }
+    // The parts are the maintainer's second reads ([`warm_bodies`]): the loop diffs their
+    // memos in module order.
     let empty = BodyPart::default();
     for &module in modules.iter() {
         let now = match def_map.module_rank(db, module) {
@@ -796,4 +751,174 @@ fn apply_bodies(
 fn moved<'a, K: Ord + Copy>(old: &'a [K], new: &'a [K]) -> impl Iterator<Item = (K, i32)> + 'a {
     let gone = old.iter().filter(|it| new.binary_search(it).is_err()).map(|&it| (it, -1));
     gone.chain(new.iter().filter(|it| old.binary_search(it).is_err()).map(|&it| (it, 1)))
+}
+
+/// A key of the impls maintainer's reads: what its apply reads of it is memoized by then.
+pub(crate) enum Warm {
+    /// What a crate's run reads of the crate: its def map, the macros that may write an impl in
+    /// a body, its lang items.
+    Crate(Crate),
+    /// An impl's kind, key and read set.
+    Impl(ImplId),
+    /// A built-in derive impl's key.
+    Derive(BuiltinDeriveImplId),
+    /// A trait's item names.
+    Trait(TraitId),
+    /// A module's body part, where its crate's def map has the module.
+    Body(Crate, ModuleId),
+}
+
+/// Reads what the apply will read of `warm`.
+pub(crate) fn warm_one(db: &Db, _: &Written<'_>, warm: &mut Warm) {
+    match *warm {
+        Warm::Crate(krate) => {
+            _ = crate_def_map(db, krate);
+            _ = macros_writing_impls(db, krate);
+            _ = lang_items(db, krate);
+            _ = hir_def::span_names::crate_name(db, krate);
+        }
+        Warm::Impl(imp) => {
+            // An impl the write removed, or whose module it removed, is woken by what it read and
+            // keyed by no run: a library crate's self types are one batch of the impls its
+            // modules hold now, which has no row for it.
+            let module = imp.loc(db).container;
+            if module.def_map(db).module_rank(db, module).is_none() {
+                return;
+            }
+            let impls = module_impls(db, module);
+            let trait_impl = impls.trait_impls.contains(&imp);
+            if !trait_impl && !impls.inherent_impls.contains(&imp) {
+                return;
+            }
+            _ = impl_key(db, imp, trait_impl);
+            impl_reads(db, imp, &mut Reads::default()); // alloc: an impl's read set, dropped with it
+        }
+        Warm::Derive(imp) => {
+            // As an impl: one the write removed is keyed by no run.
+            let module = derive_module(db, imp);
+            if module.def_map(db).module_rank(db, module).is_none()
+                || !module_impls(db, module).builtin_derive_impls.contains(&imp)
+            {
+                return;
+            }
+            _ = derive_key(db, imp, lang_items(db, module.krate(db)));
+        }
+        Warm::Trait(trait_) => {
+            assoc_names(db, trait_, &mut SmallVec::new());
+            _ = trait_.trait_items(db);
+        }
+        Warm::Body(krate, module) => {
+            if crate_def_map(db, krate).module_rank(db, module).is_some() {
+                _ = body_part(db, module);
+            }
+        }
+    }
+}
+
+/// Each maintained crate's delta of `last`, by crate.
+fn deltas(last: &LastWrite) -> FxHashMap<Crate, &CrateDelta> {
+    last.crates.iter().map(|it| (it.krate, it)).collect() // alloc: a crate's delta each, once per write
+}
+
+/// Whether the write changed a binding or re-read a def: what wakes the impls that read none
+/// in particular (`wild`), and the traits a macro writes the items of.
+fn changed(last: &LastWrite) -> bool {
+    last.crates.iter().any(|it| !it.bindings.is_empty() || !it.touched.is_empty())
+}
+
+/// The first reads of a write ([`run`]'s, but for the body parts): each maintained crate, the
+/// impls the write woke or added, the derive impls and traits it may rekey.
+pub(crate) fn warm(db: &Db, state: &State, last: &LastWrite, written: &Written<'_>) -> Vec<Warm> {
+    let deltas = deltas(last);
+    let changed = changed(last);
+    let mut impls: FxHashSet<ImplId> = FxHashSet::default(); // alloc: the impls the write reads, once per write
+    for delta in &last.crates {
+        impls.extend(delta.touched_impls.iter().copied());
+        for &(_, name) in &delta.bindings {
+            impls.extend(state.by_name.readers(name));
+        }
+        for &def in &delta.touched {
+            impls.extend(state.by_def.readers(def));
+        }
+    }
+    if changed {
+        impls.extend(state.wild.iter().copied());
+    }
+    let mut out = Vec::new(); // alloc: the keys the write reads, once per write
+    for &krate in base_db::all_crates(db).iter() {
+        if frozen::served(db, krate) {
+            continue;
+        }
+        out.push(Warm::Crate(krate));
+        let delta = deltas.get(&krate).copied();
+        let crate_state = state.crates.get(&krate);
+        if let Some(delta) = delta {
+            impls.extend(delta.impls.iter().filter(|it| it.2 > 0).map(|it| it.0));
+            out.extend(delta.derive_impls.iter().filter(|it| it.2 > 0).map(|it| Warm::Derive(it.0)));
+            out.extend(delta.traits.iter().filter(|it| it.1 > 0).map(|it| Warm::Trait(it.0)));
+            out.extend(delta.touched.iter().filter_map(|it| match *it {
+                ModuleDefId::TraitId(it) => Some(Warm::Trait(it)),
+                _ => None,
+            }));
+        }
+        let Some(crate_state) = crate_state else { continue };
+        if written.crates {
+            impls.extend(crate_state.impls.keys().copied());
+        }
+        if written.crates || changed {
+            // A trait the write removed leaves the wild ones before they are read again.
+            let gone = |it: &TraitId| {
+                delta.is_some_and(|delta| {
+                    delta.traits.iter().any(|&(t, w)| t == *it && w < 0)
+                        && !delta.traits.iter().any(|&(t, w)| t == *it && w > 0)
+                })
+            };
+            out.extend(crate_state.wild_traits.iter().filter(|it| !gone(it)).map(|&it| Warm::Trait(it)));
+        }
+        let fresh = delta.is_some_and(|it| it.fresh);
+        if fresh || written.crates || delta.is_some_and(touches_traits) || crate_state.lang.is_none() {
+            out.extend(crate_state.derives.keys().map(|&it| Warm::Derive(it)));
+        }
+    }
+    out.extend(impls.into_iter().map(Warm::Impl));
+    out
+}
+
+/// The second reads of a write: the body parts of the modules each crate's run reads
+/// ([`apply_bodies`]), by the def maps and macros the first reads read.
+pub(crate) fn warm_bodies(db: &Db, state: &State, last: &LastWrite, written: &Written<'_>) -> Vec<Warm> {
+    let deltas = deltas(last);
+    let changed = changed(last);
+    let mut out = Vec::new(); // alloc: the modules the write reads, once per write
+    let mut modules = Vec::new(); // alloc: a crate's modules, the buffer reused across crates
+    for &krate in base_db::all_crates(db).iter() {
+        if frozen::served(db, krate) {
+            continue;
+        }
+        let delta = deltas.get(&krate).copied();
+        let fresh = delta.is_some_and(|it| it.fresh);
+        let crate_state = state.crates.get(&krate);
+        let sweep = fresh || written.crates;
+        if !(sweep || changed || delta.is_some()) {
+            continue;
+        }
+        let def_map = crate_def_map(db, krate);
+        let macros = macros_writing_impls(db, krate);
+        modules.clear();
+        if sweep || crate_state.and_then(|it| it.macros.as_deref()) != Some(macros) {
+            modules.extend(def_map.modules(db).map(|(module, _)| module));
+        } else if let Some(delta) = delta {
+            modules.extend(delta.touched.iter().filter_map(|def| def.module(db)));
+            modules.extend(delta.touched_impls.iter().map(|imp| imp.loc(db).container));
+            modules.extend(delta.bindings.iter().map(|&(module, _)| module));
+        }
+        if let Some(crate_state) = crate_state {
+            modules.extend(crate_state.bodies.keys().copied());
+        }
+        // In module order, as the run diffs them: a test database reads them in this order.
+        modules.sort_unstable();
+        modules.dedup();
+        out.extend(modules.iter().map(|&module| Warm::Body(krate, module)));
+    }
+    out
 }

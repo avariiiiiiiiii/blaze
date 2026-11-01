@@ -35,8 +35,8 @@ pub enum Relocation {
 /// for every function of a build.
 #[derive(Serialize, Deserialize, Clone, PartialEq, Eq, Hash, Debug)] // clone: setup, once per plan and per unit's settings
 pub struct Toolchain {
-    /// The pinned nightly's and blaze's own code identity (`harness/toolchain` and the
-    /// codegen producer): another blaze is other code.
+    /// The pinned nightly's and blaze's own code identity (`harness/toolchain` and the hash of
+    /// the blaze executable, `hir_ty_codegen::v2::build`): another blaze is other code.
     pub id: ContentId,
     /// The target triple.
     pub target: String,

@@ -372,6 +372,11 @@ fn declarations(db: &Db, krate: Crate) -> Vec<String> {
 /// Each root trait's slice as the impl-set hash reads it: every row's module, impl identity and
 /// head, its derives, the body modules it lists, and the hash of their impls.
 fn slice_rows(db: &Db, krate: Crate) -> Vec<String> {
+    // The rows' simplified types name solver ids, whose `Debug` reads the attached database.
+    crate::attach_db(db, || slice_rows_attached(db, krate))
+}
+
+fn slice_rows_attached(db: &Db, krate: Crate) -> Vec<String> {
     use crate::method_resolution::delta::{
         impl_identity,
         publish::trait_slice,

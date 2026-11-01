@@ -9,17 +9,27 @@
 //! maintainer makes itself are not noted and run no maintenance: what a maintainer sets is its
 //! own output, not a change to the program.
 //!
+//! A maintainer runs in two phases, a step at a time ([`Maintainer`]): its reads, on `&Db`,
+//! name what the step reads as batches of [`Reads`], which run as one batch on the database's
+//! workers; then its apply, on `&mut Db`, diffs what they computed and sets inputs. Apply reads
+//! only what the reads did: a query apply executes is a bug, and a database that logs its
+//! events ([`Db::for_tests`], [`Db::logged`]) stops the write with it, so the serial phase
+//! cannot grow back. A step's reads see what every earlier step applied: a maintainer whose
+//! work for one crate reads what it set for another (name resolution, by the crate graph) asks
+//! for another step ([`Reads::again`]).
+//!
 //! A panic in a write or a maintainer drops every maintainer's state: the next write maintains
 //! from empty, which is the cold run, not another path.
 
 use std::{
     any::{Any, TypeId},
     panic::{self, AssertUnwindSafe},
-    sync::OnceLock,
+    sync::{Mutex, MutexGuard, OnceLock, PoisonError},
 };
 
 use blaze_dbsp::Work;
 use blaze_ids::ContentId;
+use blaze_mem::{Tag, frame};
 use rustc_hash::FxHashMap;
 use smallvec::SmallVec;
 use span::FileId;
@@ -58,12 +68,140 @@ impl Written<'_> {
 
 /// A write-side view maintainer, registered with `inventory::submit!` by the crate with the code
 /// (as `hir-ty/src/providers.rs` registers MIR): nothing installs anything.
+///
+/// Each pass runs it a step at a time from step 0: `reads`, then the batches it asked for on
+/// the database's workers, then `apply`; another step follows while `reads` asks for one.
 pub struct Maintainer {
     /// When it runs among the others: lower first. hir-def's name resolution is `100`, hir-ty's
     /// impls and trait candidates `200`.
     pub order: u16,
     pub name: &'static str,
-    pub run: fn(&mut Db, &Written<'_>),
+    /// What the step reads: pure, on `&Db`. It may read its state ([`Db::lend_state`]) and
+    /// queries, and asks for the step's reads as batches ([`Reads::each`]), which may own what
+    /// they compute and hand it to `apply`.
+    pub reads: fn(&Db, &Written<'_>, &mut Reads),
+    /// The step's writes: what the reads computed diffed against the state, and the inputs
+    /// that changed set. It executes no query: what it reads, the reads read first.
+    pub apply: fn(&mut Db, &Written<'_>, &Reads),
+}
+
+/// What one step of a maintainer reads ([`Maintainer::reads`]): batches of keys, each read by a
+/// function on `&Db`, all of a step's run as one batch on the database's workers in no order
+/// (as [`Db::run_all`] runs its tasks). A key is the read's own: it may carry what the read
+/// computes to `apply`, which takes it back ([`Reads::take`]).
+pub struct Reads {
+    step: u32,
+    again: bool,
+    // dyn: a batch per kind of key a step reads, a few a step
+    batches: Vec<Box<dyn Batch>>,
+}
+
+impl Reads {
+    fn new(step: u32) -> Reads {
+        Reads { step, again: false, batches: Vec::new() } // alloc: none until a batch is asked for
+    }
+
+    /// Which step of this pass it is, from 0.
+    pub fn step(&self) -> u32 {
+        self.step
+    }
+
+    /// Asks for another step after this one's apply: its reads see what this one set.
+    pub fn again(&mut self) {
+        self.again = true;
+    }
+
+    /// Reads each of `keys` with `read`, in a frame tagged `tag`: `read` is handed the write too.
+    pub fn each<K: Send + 'static>(
+        &mut self,
+        tag: Tag,
+        keys: impl IntoIterator<Item = K>,
+        read: fn(&Db, &Written<'_>, &mut K),
+    ) {
+        // alloc: a step's keys, once per batch asked for
+        let keys: Box<[Mutex<Option<K>>]> = keys.into_iter().map(|key| Mutex::new(Some(key))).collect();
+        if !keys.is_empty() {
+            // alloc: a batch, once per kind of key a step reads
+            self.batches.push(Box::new(Each { tag, read, keys }));
+        }
+    }
+
+    /// The keys of every batch of `K` after their reads, in the order they were asked for: each
+    /// is taken once.
+    pub fn take<K: Send + 'static>(&self) -> impl Iterator<Item = K> + '_ {
+        self.batches
+            .iter()
+            .filter_map(|batch| batch.as_any().downcast_ref::<Each<K>>())
+            .flat_map(|batch| batch.keys.iter())
+            .filter_map(|slot| lock(slot).take())
+    }
+
+    /// How many keys the step reads.
+    pub fn len(&self) -> usize {
+        self.batches.iter().map(|batch| batch.len()).sum()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.batches.is_empty()
+    }
+
+    /// Runs every batch's reads as one batch on `db`'s workers.
+    fn run(&self, db: &Db, written: &Written<'_>) {
+        let mut starts = Vec::with_capacity(self.batches.len()); // alloc: a step's batches' starts, a few
+        let mut count = 0;
+        for batch in &self.batches {
+            starts.push(count);
+            count += batch.len();
+        }
+        db.run_every(count, |db, at| {
+            let which = starts.partition_point(|&start| start <= at) - 1;
+            let batch = &self.batches[which];
+            frame::task(batch.tag(), |_| batch.read(db, written, at - starts[which]));
+        });
+    }
+}
+
+/// A batch of [`Reads`], its key type erased.
+trait Batch: Send + Sync {
+    fn len(&self) -> usize;
+    fn tag(&self) -> Tag;
+    fn read(&self, db: &Db, written: &Written<'_>, at: usize);
+    // dyn: the batch, to find its key type again
+    fn as_any(&self) -> &dyn Any;
+}
+
+struct Each<K> {
+    tag: Tag,
+    read: fn(&Db, &Written<'_>, &mut K),
+    /// Each key out of its slot while its read runs: no lock is held across a query, which may
+    /// move the read to another thread.
+    keys: Box<[Mutex<Option<K>>]>,
+}
+
+impl<K: Send + 'static> Batch for Each<K> {
+    fn len(&self) -> usize {
+        self.keys.len()
+    }
+
+    fn tag(&self) -> Tag {
+        self.tag
+    }
+
+    fn read(&self, db: &Db, written: &Written<'_>, at: usize) {
+        let slot = &self.keys[at];
+        let mut key = lock(slot).take().expect("each key of a batch is read once");
+        (self.read)(db, written, &mut key);
+        *lock(slot) = Some(key);
+    }
+
+    // dyn: the batch, to find its key type again
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+}
+
+fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
+    mutex.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
 inventory::collect!(Maintainer);
@@ -101,8 +239,11 @@ pub fn maintainers() -> &'static [&'static Maintainer] {
 /// The [`Db`] field behind maintenance.
 #[derive(Default)]
 pub(crate) struct Maintenance {
+    /// Behind a lock so a maintainer's reads, on `&Db`, can have it lent ([`Db::lend_state`]).
     // dyn: write-side state, one lookup per maintainer per write
-    state: FxHashMap<TypeId, Box<dyn Any + Send + Sync>>,
+    state: Mutex<FxHashMap<TypeId, Box<dyn Any + Send + Sync>>>,
+    /// Whether a maintainer's reads are running: only they are lent state on `&Db`.
+    reading: bool,
     pending: Pending,
     /// How many [`Db::batch`]es are open.
     depth: u32,
@@ -218,38 +359,23 @@ impl Db {
         &mut self,
         f: impl FnOnce(&mut Db, &mut T) -> R,
     ) -> R {
-        let id = TypeId::of::<T>();
-        let mut state = match self.maintenance.state.get_mut(&id) {
-            Some(slot) => {
-                // One placeholder per state while it is out: a zero-sized `Box` allocates nothing.
-                let taken = std::mem::replace(slot, Box::new(InUse)); // alloc: zero-sized, allocates nothing
-                match taken.downcast::<T>() {
-                    Ok(state) => state,
-                    Err(_) => panic!(
-                        "`Db::with_state::<{}>` inside a call that has it out",
-                        std::any::type_name::<T>()
-                    ),
-                }
-            }
-            None => {
-                // alloc: a maintainer's state, once per database (and after a panic dropped it)
-                let state = Box::new(T::default());
-                self.maintenance.state.insert(id, Box::new(InUse)); // alloc: zero-sized, allocates nothing
-                state
-            }
-        };
-        match panic::catch_unwind(AssertUnwindSafe(|| f(self, &mut *state))) {
-            Ok(result) => {
-                let state: Box<dyn Any + Send + Sync> = state; // dyn: write-side state, one lookup per maintainer per write
-                self.maintenance.state.insert(id, state);
-                result
-            }
-            Err(panic) => {
-                self.maintenance.state.remove(&id);
-                drop(state);
-                panic::resume_unwind(panic)
-            }
-        }
+        let mut state = take_state::<T>(self.maintenance.state.get_mut().unwrap_or_else(PoisonError::into_inner));
+        let ran = panic::catch_unwind(AssertUnwindSafe(|| f(self, &mut *state)));
+        put_state(self.maintenance.state.get_mut().unwrap_or_else(PoisonError::into_inner), state, ran)
+    }
+
+    /// [`Db::with_state`] for a maintainer's reads, which have the database by `&`: `f` gets the
+    /// state `T` alone, and may run queries and batches with the `&Db` it has. Two reads running
+    /// at once may not ask for one state.
+    ///
+    /// # Panics
+    ///
+    /// Outside a maintainer's reads, or when `T` is out already.
+    pub fn lend_state<T: Default + Send + Sync + 'static, R>(&self, f: impl FnOnce(&mut T) -> R) -> R {
+        assert!(self.maintenance.reading, "`Db::lend_state` outside a maintainer's reads");
+        let mut state = take_state::<T>(&mut lock(&self.maintenance.state));
+        let ran = panic::catch_unwind(AssertUnwindSafe(|| f(&mut *state)));
+        put_state(&mut lock(&self.maintenance.state), state, ran)
     }
 
     /// Runs `f` with maintenance held back, then runs each maintainer once over everything `f`
@@ -404,10 +530,12 @@ impl Db {
             let written = pending.written();
             for maintainer in all {
                 let _span = tracing::info_span!(target: "blaze", "maintainer", function = maintainer.name).entered();
-                (maintainer.run)(self, &written);
+                self.run_maintainer(maintainer, &written);
             }
         }));
         self.maintenance.maintaining = false;
+        self.maintenance.reading = false;
+        self.end_apply();
         let mut pending = pending;
         pending.clear();
         self.maintenance.pending = pending;
@@ -417,13 +545,94 @@ impl Db {
         }
     }
 
+    /// Runs `maintainer` a step at a time over `written`.
+    fn run_maintainer(&mut self, maintainer: &Maintainer, written: &Written<'_>) {
+        let mut step = 0;
+        loop {
+            let mut reads = Reads::new(step);
+            {
+                let _span = tracing::info_span!(target: "blaze", "maintainer reads", function = maintainer.name, step).entered();
+                self.maintenance.reading = true;
+                (maintainer.reads)(&*self, written, &mut reads);
+                reads.run(&*self, written);
+                self.maintenance.reading = false;
+            }
+            {
+                let _span = tracing::info_span!(target: "blaze", "maintainer apply", function = maintainer.name, step).entered();
+                self.begin_apply();
+                (maintainer.apply)(self, written, &reads);
+                let executed = self.end_apply();
+                assert!(
+                    executed.is_empty(),
+                    "maintainer `{}`, step {step}: its apply executed {executed:?}, which its reads \
+                     did not read: they move to its reads",
+                    maintainer.name,
+                );
+            }
+            if !reads.again {
+                return;
+            }
+            step += 1;
+        }
+    }
+
     /// Drops every maintainer's state, so the next write maintains from empty, and has it
     /// re-check everything.
     fn forget_maintained_state(&mut self) {
-        self.maintenance.state.clear();
+        self.maintenance.state.get_mut().unwrap_or_else(PoisonError::into_inner).clear();
         self.maintenance.pending.crates = true;
     }
 }
 
 /// What a state's slot holds while [`Db::with_state`] has it out.
 struct InUse;
+
+/// Takes the state `T` out of `states` (made by `Default` if there is none), leaving its slot
+/// marked out.
+fn take_state<T: Default + Send + Sync + 'static>(
+    // dyn: write-side state, one lookup per maintainer per write
+    states: &mut FxHashMap<TypeId, Box<dyn Any + Send + Sync>>,
+) -> Box<T> {
+    let id = TypeId::of::<T>();
+    match states.get_mut(&id) {
+        Some(slot) => {
+            // One placeholder per state while it is out: a zero-sized `Box` allocates nothing.
+            let taken = std::mem::replace(slot, Box::new(InUse)); // alloc: zero-sized, allocates nothing
+            match taken.downcast::<T>() {
+                Ok(state) => state,
+                Err(_) => panic!(
+                    "`Db::with_state::<{}>` inside a call that has it out",
+                    std::any::type_name::<T>()
+                ),
+            }
+        }
+        None => {
+            states.insert(id, Box::new(InUse)); // alloc: zero-sized, allocates nothing
+            // alloc: a maintainer's state, once per database (and after a panic dropped it)
+            Box::new(T::default())
+        }
+    }
+}
+
+/// Puts `state` back in `states` after the call `ran`, or drops it if the call unwound, and
+/// goes on with the call's result or its panic.
+fn put_state<T: Send + Sync + 'static, R>(
+    // dyn: write-side state, one lookup per maintainer per write
+    states: &mut FxHashMap<TypeId, Box<dyn Any + Send + Sync>>,
+    state: Box<T>,
+    ran: std::thread::Result<R>,
+) -> R {
+    let id = TypeId::of::<T>();
+    match ran {
+        Ok(result) => {
+            let state: Box<dyn Any + Send + Sync> = state; // dyn: write-side state, one lookup per maintainer per write
+            states.insert(id, state);
+            result
+        }
+        Err(panic) => {
+            states.remove(&id);
+            drop(state);
+            panic::resume_unwind(panic)
+        }
+    }
+}

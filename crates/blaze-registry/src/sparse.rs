@@ -14,7 +14,6 @@ use std::{
 
 use anyhow::{Context, bail};
 use rustc_hash::FxHashSet;
-use serde_derive::Deserialize;
 
 use blaze_source::SourceId;
 
@@ -23,22 +22,7 @@ use crate::{
     http::{Http, HttpNotSuccessful, Response, Retry},
 };
 
-/// The `config.json` at the root of an index.
-#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "kebab-case")]
-pub struct RegistryConfig {
-    /// Where a `.crate` file is: a template of `{crate}`, `{version}`, `{prefix}`,
-    /// `{lowerprefix}` and `{sha256-checksum}`, or, with none of them, a URL that
-    /// `/{crate}/{version}/download` is added to.
-    pub dl: String,
-    pub api: Option<String>,
-    #[serde(default)]
-    pub auth_required: bool,
-}
-
-impl RegistryConfig {
-    pub const NAME: &str = "config.json";
-}
+pub use blaze_units::index::RegistryConfig;
 
 /// What reading an index file came to.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -61,6 +45,7 @@ pub struct SparseIndex {
     base: String,
     /// `$CARGO_HOME/registry/index/<name>`.
     dir: PathBuf,
+    // dyn: the I/O driver, chosen once per process; each call is a network round trip.
     http: Arc<dyn Http>,
     retry: Retry,
     offline: bool,
@@ -86,6 +71,7 @@ impl SparseIndex {
     pub fn new(
         source: SourceId,
         dir: PathBuf,
+        // dyn: the I/O driver, as on the field.
         http: Arc<dyn Http>,
         retry: Retry,
         offline: bool,
@@ -169,13 +155,13 @@ impl SparseIndex {
         if on_disk().is_some_and(|it| it.auth_required) {
             self.auth_required.store(true, Ordering::Relaxed);
         }
-        let fetched = match crate::block_on(self.fetch(RegistryConfig::NAME, None)) {
+        let fetched = match blaze_resolve::block_on(self.fetch(RegistryConfig::NAME, None)) {
             Err(e)
                 if !self.auth_required.load(Ordering::Relaxed)
                     && e.downcast_ref::<HttpNotSuccessful>().is_some_and(|it| it.code == 401) =>
             {
                 self.auth_required.store(true, Ordering::Relaxed);
-                crate::block_on(self.fetch(RegistryConfig::NAME, None))
+                blaze_resolve::block_on(self.fetch(RegistryConfig::NAME, None))
             }
             fetched => fetched,
         };

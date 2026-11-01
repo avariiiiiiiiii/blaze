@@ -67,9 +67,6 @@ pub mod ext {
     pub fn expr_unreachable() -> ast::Expr {
         expr_from_text("unreachable!()")
     }
-    pub fn expr_todo() -> ast::Expr {
-        expr_from_text("todo!()")
-    }
     pub fn expr_underscore() -> ast::Expr {
         expr_from_text("_")
     }
@@ -126,7 +123,7 @@ pub mod ext {
     }
 
     pub fn token_tree_from_node(node: &ast::SyntaxNode) -> ast::TokenTree {
-        ast_from_text(&format!("todo!{node}"))
+        ast_from_text(&format!("m!{node}"))
     }
 }
 

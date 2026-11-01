@@ -16,6 +16,7 @@ use std::{
 
 use anyhow::bail;
 use blaze_manifest::config::{Config, OptValue, PathAndArgs, Value, env_key};
+use blaze_manifest::files::Disk;
 use blaze_source::SourceId;
 use rustc_hash::FxHashMap;
 use serde_derive::Serialize;
@@ -288,11 +289,12 @@ impl fmt::Display for AuthorizationError {
 /// once, as cargo, which asks from one thread.
 pub struct Auth {
     state: Mutex<State>,
+    // dyn: the CLI's output, written to only while a token is found, once per registry per run.
     shell: Box<dyn Shell>,
 }
 
 struct State {
-    config: Config,
+    config: Config<Disk>,
     /// By the registry's canonical URL.
     tokens: FxHashMap<String, Cached>,
     /// By the registry's canonical URL, cargo's `registry_config` cache.
@@ -300,7 +302,8 @@ struct State {
 }
 
 impl Auth {
-    pub fn new(config: Config, shell: Box<dyn Shell>) -> Auth {
+    // dyn: the CLI's output, as on `Auth::shell`.
+    pub fn new(config: Config<Disk>, shell: Box<dyn Shell>) -> Auth {
         let state =
             State { config, tokens: FxHashMap::default(), registries: FxHashMap::default() };
         Auth { state: Mutex::new(state), shell }
@@ -405,6 +408,7 @@ impl State {
     /// cargo's `auth_token_optional`.
     fn token_optional(
         &mut self,
+        // dyn: the CLI's output, as on `Auth::shell`.
         shell: &dyn Shell,
         registry: Named<'_>,
         operation: Operation<'_>,
@@ -448,6 +452,7 @@ impl State {
     /// cargo's `credential_action`: each provider in turn, until one answers.
     fn action(
         &mut self,
+        // dyn: the CLI's output, as on `Auth::shell`.
         shell: &dyn Shell,
         registry: Named<'_>,
         action: &Action<'_>,
@@ -515,6 +520,7 @@ impl State {
     /// `credentials.toml` by `login` and `logout`.
     fn cargo_token(
         &mut self,
+        // dyn: the CLI's output, as on `Auth::shell`.
         shell: &dyn Shell,
         registry: Named<'_>,
         action: &Action<'_>,
@@ -588,6 +594,7 @@ impl State {
     /// cargo's `AuthorizationError::new`.
     fn authorization_error(
         &mut self,
+        // dyn: the CLI's output, as on `Auth::shell`.
         shell: &dyn Shell,
         registry: Named<'_>,
         login_url: Option<&str>,
@@ -614,6 +621,7 @@ impl State {
     /// cargo's `registry_credential_config_raw`, read once per registry.
     fn credentials(
         &mut self,
+        // dyn: the CLI's output, as on `Auth::shell`.
         shell: &dyn Shell,
         registry: Named<'_>,
     ) -> anyhow::Result<Option<Credentials>> {
@@ -631,6 +639,7 @@ impl State {
     /// `registry_config` and `registry_credentials`).
     fn credentials_uncached(
         &self,
+        // dyn: the CLI's output, as on `Auth::shell`.
         shell: &dyn Shell,
         registry: Named<'_>,
     ) -> anyhow::Result<Option<Credentials>> {
@@ -674,6 +683,7 @@ impl State {
     /// arguments, with cargo's warnings of a token none of them reads.
     fn providers(
         &mut self,
+        // dyn: the CLI's output, as on `Auth::shell`.
         shell: &dyn Shell,
         registry: Named<'_>,
         require_provider: bool,
@@ -742,7 +752,7 @@ impl State {
 
 /// The `[registries]` name of a registry by its index URL: the `CARGO_REGISTRIES_<NAME>_INDEX`
 /// variables first, else the configuration's tables; an error when two names have it.
-fn registry_name(config: &Config, source: &SourceId) -> anyhow::Result<Option<String>> {
+fn registry_name(config: &Config<Disk>, source: &SourceId) -> anyhow::Result<Option<String>> {
     let index = source.canonical_url();
     let mut names: Vec<String> = config
         .env_vars()
@@ -780,7 +790,8 @@ fn registry_name(config: &Config, source: &SourceId) -> anyhow::Result<Option<St
 
 /// cargo's `resolve_credential_alias`: a provider of no arguments named in
 /// `[credential-alias]`, unless that would shadow a built-in one; the program resolved.
-fn resolve_alias(config: &Config, shell: &dyn Shell, mut provider: PathAndArgs) -> Vec<String> {
+// dyn: the CLI's output, as on `Auth::shell`.
+fn resolve_alias(config: &Config<Disk>, shell: &dyn Shell, mut provider: PathAndArgs) -> Vec<String> {
     if provider.args.is_empty() {
         let name = provider.path.raw_value().to_owned();
         let key = format!("credential-alias.{name}");

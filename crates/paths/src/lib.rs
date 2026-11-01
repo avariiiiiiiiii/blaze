@@ -411,12 +411,13 @@ impl RelPath {
 /// Taken from <https://github.com/rust-lang/cargo/blob/79c769c3d7b4c2cf6a93781575b7f592ef974255/src/cargo/util/paths.rs#L60-L85>
 fn normalize_path(path: &Utf8Path) -> Utf8PathBuf {
     let mut components = path.components().peekable();
-    let mut ret = if let Some(c @ Utf8Component::Prefix(..)) = components.peek().copied() {
+    // Normalizing only drops components and separators, so the result fits in the path's length
+    // and is one allocation.
+    let mut ret = Utf8PathBuf::with_capacity(path.as_str().len());
+    if let Some(c @ Utf8Component::Prefix(..)) = components.peek().copied() {
         components.next();
-        Utf8PathBuf::from(c.as_str())
-    } else {
-        Utf8PathBuf::new()
-    };
+        ret.push(c.as_str());
+    }
 
     for component in components {
         match component {

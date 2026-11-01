@@ -1,0 +1,23 @@
+{
+  "id": "01428",
+  "from_lane": "sched",
+  "owner": "cargo",
+  "paths": [
+    "crates/blaze-cargo/src/toolchain.rs"
+  ],
+  "what": "crates/blaze-cargo/src/toolchain.rs:229-234 finds the sysroot by scanning rustup's toolchains/ directory, and it is reached from Front::compile via sysroot() on a pool worker. Blaze is its own toolchain (AGENTS.md rule 6, own-nightly): it should take the sysroot from its pinned nightly (harness/toolchain), fixed at daemon start as an input, never from rustup. Found while listing the IO reachable from job code: docs/v2/plan/lanes/sched/io.md, section Found on the way.",
+  "state": "open",
+  "created": "2026-11-01T02:06:22Z",
+  "updated": "2026-11-01T02:06:22Z",
+  "taken_by": null,
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-11-01T02:06:22Z",
+      "by": "sched",
+      "action": "add",
+      "note": ""
+    }
+  ]
+}

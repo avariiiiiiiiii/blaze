@@ -1,16 +1,14 @@
 //! Pre-type IR item generics
 use std::{ops, sync::LazyLock};
 
-use base_db::SourceDatabase;
+use base_db::Db;
 use hir_expand::name::Name;
 use la_arena::{Arena, Idx, RawIdx};
-use salsa::SalsaValue;
 use stdx::impl_from;
-use thin_vec::ThinVec;
 
 use crate::{
     AdtId, ConstParamId, GenericDefId, LifetimeParamId, TypeOrConstParamId, TypeParamId,
-    expr_store::{ExpressionStore, ExpressionStoreSourceMap},
+    expr_store::{ExpressionStore, ExpressionStoreSourceMap, path::Names},
     signatures::{
         ConstSignature, EnumSignature, FunctionSignature, ImplSignature, StaticSignature,
         StructSignature, TraitSignature, TypeAliasSignature, UnionSignature,
@@ -70,7 +68,7 @@ pub enum TypeParamProvenance {
     ArgumentImplTrait,
 }
 
-#[derive(Clone, PartialEq, Eq, Debug, Hash, SalsaValue)]
+#[derive(Clone, PartialEq, Eq, Debug, Hash, blaze_query::Value)]
 pub enum TypeOrConstParamData {
     TypeParamData(TypeParamData),
     ConstParamData(ConstParamData),
@@ -190,10 +188,11 @@ impl ops::Index<LocalLifetimeParamId> for GenericParams {
 /// A single predicate from a where clause, i.e. `where Type: Trait`. Combined
 /// where clauses like `where T: Foo + Bar` are turned into multiple of these.
 /// It might still result in multiple actual predicates though, because of
-/// associated type bindings like `Iterator<Item = u32>`.
-#[derive(Clone, PartialEq, Eq, Debug, Hash)]
+/// associated type bindings like `Iterator<Item = u32>`. `lifetimes` is the predicate's
+/// `for<..>` binder, a run in the store of the generics ([`ExpressionStore::names`]).
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Hash)]
 pub enum WherePredicate {
-    TypeBound { lifetimes: Option<ThinVec<Name>>, target: TypeRefId, bound: TypeBound },
+    TypeBound { lifetimes: Option<Names>, target: TypeRefId, bound: TypeBound },
     Lifetime { target: LifetimeRefId, bound: LifetimeRefId },
 }
 
@@ -214,12 +213,12 @@ impl GenericParams {
         LazyLock::force(&EMPTY)
     }
 
-    pub fn of(db: &dyn SourceDatabase, def: GenericDefId) -> &GenericParams {
+    pub fn of(db: &Db, def: GenericDefId) -> &GenericParams {
         Self::with_store(db, def).0
     }
 
     pub fn with_store(
-        db: &dyn SourceDatabase,
+        db: &Db,
         def: GenericDefId,
     ) -> (&GenericParams, &ExpressionStore) {
         match def {
@@ -263,7 +262,7 @@ impl GenericParams {
     }
 
     pub fn with_source_map(
-        db: &dyn SourceDatabase,
+        db: &Db,
         def: GenericDefId,
     ) -> (&GenericParams, &ExpressionStore, &ExpressionStoreSourceMap) {
         match def {

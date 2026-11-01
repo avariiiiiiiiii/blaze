@@ -41,181 +41,79 @@ pub struct SourceConfig {
     pub crates_io_git: bool,
 }
 
-#[derive(Clone)]
-struct Replacement {
-    id: SourceId,
-    /// The source's name and where its `replace-with` is defined.
-    with: Option<(String, String)>,
+pub use blaze_units::sources::SourceMap;
+
+/// The map `config` makes, as cargo's `SourceConfigMap::new`: each `[source]` table, then each
+/// `[registries]` name a `replace-with` gives, read as cargo's `SourceId::alt_registry` reads
+/// it (one it refuses is left out, as cargo's `load` passes over it).
+pub fn source_map(config: &SourceConfig) -> anyhow::Result<SourceMap> {
+    let crates_io =
+        if config.crates_io_git { SourceId::crates_io() } else { SourceId::crates_io_sparse() };
+    let mut map = SourceMap::new(crates_io);
+    for (name, def) in &config.sources {
+        add_def(&mut map, name, def)?;
+    }
+    for name in map.unknown_replacements() {
+        let Some(index) = config.registries.get(&name) else { continue };
+        let Ok(url) = url::Url::parse(index) else { continue };
+        if let Ok(id) = SourceId::for_alt_registry(&url, &name) {
+            map.add_registry(name, id);
+        }
+    }
+    Ok(map)
 }
 
-/// The sources cargo knows by name, and which of them replaces which.
-pub struct SourceMap {
-    by_name: FxHashMap<String, Replacement>,
-    names: FxHashMap<SourceId, String>,
-    registries: FxHashMap<String, String>,
-    crates_io: SourceId,
-}
-
-impl SourceMap {
-    pub fn new(config: &SourceConfig) -> anyhow::Result<SourceMap> {
-        let crates_io =
-            if config.crates_io_git { SourceId::crates_io() } else { SourceId::crates_io_sparse() };
-        let mut map = SourceMap {
-            by_name: FxHashMap::default(),
-            names: FxHashMap::default(),
-            registries: config.registries.clone(),
-            crates_io,
+/// One `[source.<name>]` table, as cargo's `SourceConfigMap::add_config`.
+fn add_def(map: &mut SourceMap, name: &str, def: &SourceDef) -> anyhow::Result<()> {
+    let url = |it: &str, key: &str| -> anyhow::Result<url::Url> {
+        url::Url::parse(it).with_context(|| {
+            format!(
+                "configuration key `source.{name}.{key}` specified an invalid URL (in {})",
+                def.definition
+            )
+        })
+    };
+    let mut ids = Vec::new();
+    if let Some(registry) = &def.registry {
+        ids.push(SourceId::for_source_replacement_registry(&url(registry, "registry")?, name)?);
+    }
+    if let Some(path) = &def.local_registry {
+        ids.push(SourceId::for_local_registry(path)?);
+    }
+    if let Some(path) = &def.directory {
+        ids.push(SourceId::for_directory(path)?);
+    }
+    if let Some(git) = &def.git {
+        let reference = match (&def.branch, &def.tag, &def.rev) {
+            (Some(branch), _, _) => GitReference::Branch(branch.clone()),
+            (None, Some(tag), _) => GitReference::Tag(tag.clone()),
+            (None, None, Some(rev)) => GitReference::Rev(rev.clone()),
+            (None, None, None) => GitReference::DefaultBranch,
         };
-        map.add(CRATES_IO_REGISTRY, Replacement { id: SourceId::crates_io(), with: None })?;
-        map.add(CRATES_IO_REGISTRY, Replacement { id: crates_io, with: None })?;
-        for (name, def) in &config.sources {
-            map.add_def(name, def)?;
-        }
-        Ok(map)
-    }
-
-    fn add(&mut self, name: &str, replacement: Replacement) -> anyhow::Result<()> {
-        if let Some(old) = self.names.insert(replacement.id, name.to_owned())
-            && name != CRATES_IO_REGISTRY
-        {
-            bail!(
-                "source `{name}` defines source {}, but that source is already defined by `{old}`\n\
-                 note: Sources are not allowed to be defined multiple times.",
-                replacement.id
-            );
-        }
-        self.by_name.insert(name.to_owned(), replacement);
-        Ok(())
-    }
-
-    fn add_def(&mut self, name: &str, def: &SourceDef) -> anyhow::Result<()> {
-        let url = |it: &str, key: &str| -> anyhow::Result<url::Url> {
-            url::Url::parse(it).with_context(|| {
-                format!(
-                    "configuration key `source.{name}.{key}` specified an invalid URL (in {})",
+        ids.push(SourceId::for_git(&url(git, "git")?, reference)?);
+    } else {
+        for (key, value) in [("branch", &def.branch), ("tag", &def.tag), ("rev", &def.rev)] {
+            if value.is_some() {
+                bail!(
+                    "source definition `source.{name}` specifies `{key}`, but that requires a \
+                     `git` key to be specified (in {})",
                     def.definition
-                )
-            })
-        };
-        let mut ids = Vec::new();
-        if let Some(registry) = &def.registry {
-            ids.push(SourceId::for_source_replacement_registry(&url(registry, "registry")?, name)?);
-        }
-        if let Some(path) = &def.local_registry {
-            ids.push(SourceId::for_local_registry(path)?);
-        }
-        if let Some(path) = &def.directory {
-            ids.push(SourceId::for_directory(path)?);
-        }
-        if let Some(git) = &def.git {
-            let reference = match (&def.branch, &def.tag, &def.rev) {
-                (Some(branch), _, _) => GitReference::Branch(branch.clone()),
-                (None, Some(tag), _) => GitReference::Tag(tag.clone()),
-                (None, None, Some(rev)) => GitReference::Rev(rev.clone()),
-                (None, None, None) => GitReference::DefaultBranch,
-            };
-            ids.push(SourceId::for_git(&url(git, "git")?, reference)?);
-        } else {
-            for (key, value) in [("branch", &def.branch), ("tag", &def.tag), ("rev", &def.rev)] {
-                if value.is_some() {
-                    bail!(
-                        "source definition `source.{name}` specifies `{key}`, but that requires a \
-                         `git` key to be specified (in {})",
-                        def.definition
-                    );
-                }
-            }
-        }
-        if name == CRATES_IO_REGISTRY && ids.is_empty() {
-            ids.push(self.crates_io);
-        }
-        let id = match ids.len() {
-            0 => bail!(
-                "no source location specified for `source.{name}`, need `registry`, \
-                 `local-registry`, `directory`, or `git` defined"
-            ),
-            1 => ids.pop().expect("one"),
-            _ => bail!("more than one source location specified for `source.{name}`"),
-        };
-        let with = def.replace_with.clone().map(|it| (it, def.definition.clone()));
-        self.add(name, Replacement { id, with })
-    }
-
-    /// The source the packages of `id` come from: `id` itself, or the end of its chain of
-    /// `replace-with`. A vendored replacement of a git source needs `id` to be pinned, as a
-    /// lock file pins it to a commit.
-    pub fn replacement(&self, id: SourceId) -> anyhow::Result<SourceId> {
-        let Some(original) = self.names.get(&id) else { return Ok(id) };
-        let mut name = original;
-        let mut at = "";
-        let replaced = loop {
-            let Some(replacement) = self.by_name.get(name) else {
-                if let Some(id) = self.registry(name) {
-                    break id?;
-                }
-                bail!(
-                    "could not find a configured source with the name `{name}` when attempting \
-                     to lookup `{original}` (configuration in `{at}`)"
-                );
-            };
-            match &replacement.with {
-                Some((with, definition)) => {
-                    name = with;
-                    at = definition;
-                }
-                None if replacement.id == id => return Ok(id),
-                None => break replacement.id,
-            }
-            if name == original {
-                bail!(
-                    "detected a cycle of `replace-with` sources, the source `{name}` is \
-                     eventually replaced with itself (configuration in `{at}`)"
                 );
             }
-        };
-        if supports_checksums(id) && !supports_checksums(replaced) {
-            bail!(
-                "cannot replace `{original}` with `{name}`, the source `{original}` supports \
-                 checksums, but `{name}` does not\n\na lock file compatible with `{original}` \
-                 cannot be generated in this situation"
-            );
         }
-        if requires_precise(id) && !id.has_precise() {
-            bail!(
-                "the source {original} requires a lock file to be present first before it can be\n\
-                 used against vendored source code\n\nremove the source replacement \
-                 configuration, generate a lock file, and then\nrestore the source replacement \
-                 configuration to continue the build"
-            );
-        }
-        Ok(replaced)
     }
-
-    /// `[registries.<name>]` as a source, as cargo's `SourceId::alt_registry`.
-    fn registry(&self, name: &str) -> Option<anyhow::Result<SourceId>> {
-        if name == CRATES_IO_REGISTRY {
-            return Some(Ok(SourceId::crates_io()));
-        }
-        let index = self.registries.get(name)?;
-        let url = url::Url::parse(index).map_err(anyhow::Error::from);
-        Some(url.and_then(|url| SourceId::for_alt_registry(&url, name)).with_context(|| {
-            format!("invalid index URL for registry `{name}` defined in configuration")
-        }))
+    if name == CRATES_IO_REGISTRY && ids.is_empty() {
+        ids.push(map.crates_io());
     }
-}
-
-fn supports_checksums(id: SourceId) -> bool {
-    matches!(
-        id.kind(),
-        SourceKind::Registry
-            | SourceKind::SparseRegistry
-            | SourceKind::LocalRegistry
-            | SourceKind::Directory
-    )
-}
-
-fn requires_precise(id: SourceId) -> bool {
-    matches!(id.kind(), SourceKind::Git(_) | SourceKind::Directory)
+    let id = match ids.len() {
+        0 => bail!(
+            "no source location specified for `source.{name}`, need `registry`, \
+             `local-registry`, `directory`, or `git` defined"
+        ),
+        1 => ids.pop().expect("one"),
+        _ => bail!("more than one source location specified for `source.{name}`"),
+    };
+    map.add(name, id, def.replace_with.clone().map(|it| (it, def.definition.clone())))
 }
 
 /// A package of a lock file: its source as the lock file names it, pinned (a git source to its
@@ -237,7 +135,7 @@ pub struct Sources {
 impl Sources {
     pub fn new(config: &SourceConfig, context: Arc<Context>) -> anyhow::Result<Sources> {
         Ok(Sources {
-            map: SourceMap::new(config)?,
+            map: source_map(config)?,
             context,
             registries: Mutex::default(),
             directories: Mutex::default(),
@@ -346,7 +244,7 @@ mod tests {
 
     fn map(sources: Vec<(&str, SourceDef)>) -> anyhow::Result<SourceMap> {
         let mine = ("mine".to_owned(), "sparse+https://mine.example.com/index/".to_owned());
-        SourceMap::new(&SourceConfig {
+        source_map(&SourceConfig {
             sources: sources.into_iter().map(|(name, def)| (name.to_owned(), def)).collect(),
             registries: [mine].into_iter().collect(),
             crates_io_git: false,
@@ -371,7 +269,7 @@ mod tests {
         let other = crate::registry_source("sparse+https://other.example.com/").unwrap();
         assert_eq!(map.replacement(other).unwrap(), other);
 
-        let git = SourceMap::new(&SourceConfig { crates_io_git: true, ..SourceConfig::default() })
+        let git = source_map(&SourceConfig { crates_io_git: true, ..SourceConfig::default() })
             .unwrap();
         assert_eq!(git.replacement(SourceId::crates_io()).unwrap(), SourceId::crates_io());
     }

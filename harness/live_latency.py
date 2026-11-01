@@ -2,7 +2,7 @@
 """Save-to-running latency of live edits (macOS on AArch64, Windows on x86-64), step by step.
 
 usage: live_latency.py [--program probe|life|bevy|egui] [cargo|socket|burst|replay|restart ...]
-       (BLAZE_BIN names the blaze built; blaze and blaze-rustc are found next to it)
+       (BLAZE_BIN names the blaze built; blaze is found next to it)
 
 The program is harness/live (`probe`, the default: a few functions and blaze-live), the Game
 of Life demo (`life`: demo/life with eframe, a 38 MB debug executable, run without its window

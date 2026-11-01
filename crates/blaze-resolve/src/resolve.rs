@@ -68,6 +68,7 @@ impl ResolveVersion {
 }
 
 /// Unrecognized `[metadata]` of a lock file, kept as found.
+// BTreeMap: serialized into the lock file as a map.
 pub type LockfileMetadata = BTreeMap<String, String>;
 
 /// Packages and the edges between them, each edge with the dependencies of `Cargo.toml` it

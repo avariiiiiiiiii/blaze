@@ -55,8 +55,9 @@
 //!     iterators: iterator, fn
 //!     manually_drop: drop
 //!     matches:
+//!     mul:
 //!     non_null: pat
-//!     non_zero: pat, transmute, option
+//!     non_zero: pat, transmute, option, copy
 //!     option: panic
 //!     ord: eq, option
 //!     panic: fmt
@@ -90,7 +91,7 @@
 //!     cfg:
 
 #![rustc_coherence_is_core]
-#![feature(lang_items)]
+#![feature(lang_items, staged_api)]
 
 pub mod marker {
     // region:sized
@@ -234,6 +235,11 @@ pub mod marker {
     #[rustc_builtin_macro]
     pub macro ConstParamTy($item:item) {}
     // endregion:const_param_ty
+
+    // region:eq
+    #[lang = "structural_peq"]
+    pub trait StructuralPartialEq {}
+    // endregion:eq
 }
 
 // region:default
@@ -264,6 +270,15 @@ pub mod default {
     }
     impl_default! {
         0.0; f16 f32 f64 f128
+    }
+    impl_default! {
+        false; bool
+    }
+    impl_default! {
+        '\x00'; char
+    }
+    impl Default for () {
+        fn default() -> Self {}
     }
     // endregion:builtin_impls
 }
@@ -1226,6 +1241,35 @@ pub mod ops {
     // endregion:builtin_impls
     // endregion:add
 
+    // region:mul
+    #[lang = "mul"]
+    pub const trait Mul<Rhs = Self> {
+        type Output;
+        fn mul(self, rhs: Rhs) -> Self::Output;
+    }
+
+    #[lang = "mul_assign"]
+    pub const trait MulAssign<Rhs = Self> {
+        fn mul_assign(&mut self, rhs: Rhs);
+    }
+
+    // region:builtin_impls
+    macro_rules! mul_impl {
+        ($($t:ty)*) => ($(
+            impl const Mul for $t {
+                type Output = $t;
+                fn mul(self, other: $t) -> $t { self * other }
+            }
+            impl const MulAssign for $t {
+                fn mul_assign(&mut self, other: $t) { *self *= other; }
+            }
+        )*)
+    }
+
+    mul_impl! { usize u8 u16 u32 u64 u128 isize i8 i16 i32 i64 i128 f16 f32 f64 f128 }
+    // endregion:builtin_impls
+    // endregion:mul
+
     // region:unary_ops
     #[lang = "not"]
     pub const trait Not {
@@ -1387,6 +1431,65 @@ pub mod cmp {
     pub macro Ord($item:item) {}
     // endregion:derive
 
+    // region:builtin_impls
+    macro_rules! impl_cmp {
+        ($($t:ty)*) => {
+            $(
+                impl PartialEq for $t {
+                    fn eq(&self, other: &$t) -> bool {
+                        (*self) == (*other)
+                    }
+                }
+                impl Eq for $t {}
+                impl PartialOrd for $t {
+                    fn partial_cmp(&self, other: &$t) -> Option<Ordering> {
+                        Some(Ord::cmp(self, other))
+                    }
+                }
+                impl Ord for $t {
+                    fn cmp(&self, other: &$t) -> Ordering {
+                        if *self < *other {
+                            Ordering::Less
+                        } else if *self == *other {
+                            Ordering::Equal
+                        } else {
+                            Ordering::Greater
+                        }
+                    }
+                }
+            )*
+        }
+    }
+
+    impl_cmp! {
+        usize u8 u16 u32 u64 u128
+        isize i8 i16 i32 i64 i128
+    }
+    // endregion:builtin_impls
+
+    impl<A: ?Sized, B: ?Sized> PartialEq<&B> for &A
+    where
+        A: PartialEq<B>,
+    {
+        fn eq(&self, other: &&B) -> bool {
+            PartialEq::eq(*self, *other)
+        }
+    }
+    impl<A: ?Sized + Eq> Eq for &A {}
+    impl<A: ?Sized, B: ?Sized> PartialOrd<&B> for &A
+    where
+        A: PartialOrd<B>,
+    {
+        fn partial_cmp(&self, other: &&B) -> Option<Ordering> {
+            PartialOrd::partial_cmp(*self, *other)
+        }
+    }
+    impl<A: ?Sized + Ord> Ord for &A {
+        fn cmp(&self, other: &Self) -> Ordering {
+            Ord::cmp(*self, *other)
+        }
+    }
+
     // endregion:ord
 }
 // endregion:eq
@@ -1492,6 +1595,10 @@ pub mod fmt {
             pub fn new_display<'b, T: crate::fmt::Display>(x: &'b T) -> Argument<'_> {
                 Self::new(x, crate::fmt::Display::fmt)
             }
+
+            pub fn new_debug<'b, T: crate::fmt::Debug>(x: &'b T) -> Argument<'_> {
+                Self::new(x, crate::fmt::Debug::fmt)
+            }
         }
 
         #[lang = "format_alignment"]
@@ -1557,11 +1664,9 @@ pub mod fmt {
         }
     }
 
+    // The rest of the primitives get Debug from impl_fmt_traits! above; a second impl is ambiguous.
     impl_debug! {
-        usize u8 u16 u32 u64 u128
-        isize i8 i16 i32 i64 i128
-        f16 f32 f64 f128
-        bool char
+        f16 f128
     }
 
     impl<T: Debug> Debug for [T] {
@@ -1570,9 +1675,9 @@ pub mod fmt {
         }
     }
 
-    impl<T: Debug + PointeeSized> Debug for &T {
-        fn fmt(&self, f: &mut Formatter<'_>) -> Result {
-            (&**self).fmt(f)
+    impl<T: Debug, const N: usize> Debug for [T; N] {
+        fn fmt(&self, _f: &mut Formatter<'_>) -> Result {
+            Ok(())
         }
     }
     // endregion:builtin_impls
@@ -1587,6 +1692,12 @@ pub mod slice {
         pub fn len(&self) -> usize {
             loop {}
         }
+
+        // region:iterator
+        pub fn iter(&self) -> crate::iter::Iter<'_, T> {
+            loop {}
+        }
+        // endregion:iterator
     }
 
     // region:default
@@ -1606,6 +1717,7 @@ pub mod slice {
 
 // region:option
 pub mod option {
+    #[derive(PartialEq, Eq)] // :eq, derive
     #[lang = "Option"]
     pub enum Option<T> {
         #[lang = "None"]
@@ -1714,6 +1826,19 @@ pub mod result {
                 Err(_) => default,
             }
         }
+
+        // region:fmt
+        #[track_caller]
+        pub fn unwrap(self) -> T
+        where
+            E: crate::fmt::Debug,
+        {
+            match self {
+                Ok(t) => t,
+                Err(_) => panic!("called `Result::unwrap()` on an `Err` value"),
+            }
+        }
+        // endregion:fmt
 
         // region:fn
         pub const fn or_else<F, O>(self, op: O) -> Result<T, F>
@@ -1880,7 +2005,7 @@ pub mod iter {
             type Item = B;
 
             #[inline]
-            fn next(&mut self) -> B {
+            fn next(&mut self) -> Option<B> {
                 loop {}
             }
         }
@@ -1901,7 +2026,7 @@ pub mod iter {
             }
         }
     }
-    pub use self::adapters::{Filter, FilterMap, Take};
+    pub use self::adapters::{Filter, FilterMap, Map, Take};
 
     mod sources {
         mod repeat {
@@ -1945,6 +2070,15 @@ pub mod iter {
                 {
                     self
                 }
+                // region:ord
+                fn min(self) -> Option<Self::Item>
+                where
+                    Self: Sized,
+                    Self::Item: crate::cmp::Ord,
+                {
+                    loop {}
+                }
+                // endregion:ord
                 // region:iterators
                 fn take(self, n: usize) -> crate::iter::Take<Self>
                 where
@@ -2052,9 +2186,10 @@ pub mod iter {
                 fn from_iter<T: IntoIterator<Item = A>>(iter: T) -> Self;
             }
         }
-        pub use self::collect::{FromIterator, IntoIterator};
+        pub use self::collect::{FromIterator, IntoIterator, Iter};
     }
     pub use self::traits::{FromIterator, IntoIterator, Iterator};
+    pub(crate) use self::traits::Iter;
 }
 // endregion:iterator
 
@@ -2112,12 +2247,9 @@ pub mod panic {
     // endregion:panic_location
 
     pub macro panic_2021 {
-        () => ({
-            const fn panic_cold_explicit() -> ! {
-                $crate::panicking::panic_explicit()
-            }
-            panic_cold_explicit();
-        }),
+        () => (
+            $crate::panicking::panic_default_msg()
+        ),
         // Special-case the single-argument case for const_panic.
         ("{}", $arg:expr $(,)?) => ({
             #[rustc_const_panic_str] // enforce a &&str argument in const-check and hook this by const-eval
@@ -2135,7 +2267,7 @@ pub mod panic {
     }
 }
 
-mod panicking {
+pub mod panicking {
     #[rustc_const_panic_str] // enforce a &&str argument in const-check and hook this by const-eval
     pub const fn panic_display<T: crate::fmt::Display>(x: &T) -> ! {
         panic_fmt(crate::format_args!("{}", *x));
@@ -2160,6 +2292,12 @@ mod panicking {
     #[lang = "panic"]
     pub const fn panic(expr: &'static str) -> ! {
         panic_fmt(crate::fmt::Arguments::from_str(expr))
+    }
+
+    // panic!() without args expands to this
+    #[track_caller]
+    pub const fn panic_default_msg() -> ! {
+        panic("explicit panic")
     }
 }
 // endregion:panic
@@ -2392,6 +2530,42 @@ pub mod pat {
         }
     }
 
+    impl const RangePattern for u32 {
+        const MIN: u32 = 0;
+        const MAX: u32 = 0xFFFF_FFFF;
+        fn sub_one(self) -> Self {
+            if self == Self::MIN {
+                panic!("exclusive range end at minimum value of type")
+            } else {
+                self - 1
+            }
+        }
+    }
+
+    impl const RangePattern for u64 {
+        const MIN: u64 = 0;
+        const MAX: u64 = 0xFFFF_FFFF_FFFF_FFFF;
+        fn sub_one(self) -> Self {
+            if self == Self::MIN {
+                panic!("exclusive range end at minimum value of type")
+            } else {
+                self - 1
+            }
+        }
+    }
+
+    impl const RangePattern for i8 {
+        const MIN: i8 = -128;
+        const MAX: i8 = 127;
+        fn sub_one(self) -> Self {
+            if self == Self::MIN {
+                panic!("exclusive range end at minimum value of type")
+            } else {
+                self - 1
+            }
+        }
+    }
+
     // region:coerce_unsized
     impl<T: crate::marker::PointeeSized, U: crate::marker::PointeeSized>
         crate::ops::CoerceUnsized<pattern_type!(*const U is !null)> for pattern_type!(*const T is !null)
@@ -2414,6 +2588,31 @@ pub mod pat {
 pub mod num {
     #[repr(transparent)]
     pub struct NonZeroU8(crate::pattern_type!(u8 is 1..));
+
+    pub(crate) mod niche_types {
+        #[repr(transparent)]
+        pub struct NonZeroU32Inner(crate::pattern_type!(u32 is 1..));
+
+        impl Clone for NonZeroU32Inner {
+            fn clone(&self) -> Self {
+                *self
+            }
+        }
+        impl Copy for NonZeroU32Inner {}
+    }
+
+    pub unsafe trait ZeroablePrimitive: Sized + Copy {
+        type NonZeroInner: Sized + Copy;
+    }
+
+    unsafe impl ZeroablePrimitive for u32 {
+        type NonZeroInner = niche_types::NonZeroU32Inner;
+    }
+
+    #[rustc_nonnull_optimization_guaranteed]
+    #[rustc_diagnostic_item = "NonZero"]
+    #[repr(transparent)]
+    pub struct NonZero<T: ZeroablePrimitive>(T::NonZeroInner);
 }
 // endregion:non_zero
 

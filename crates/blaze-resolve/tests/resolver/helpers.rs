@@ -323,7 +323,7 @@ pub(crate) fn resolve_summaries(
             &self,
             dep: &Dependency,
             kind: QueryKind,
-            f: &mut dyn FnMut(IndexSummary),
+            f: &mut impl FnMut(IndexSummary),
         ) -> CargoResult<()> {
             for summary in self.list.iter() {
                 let matched = match kind {

@@ -12,9 +12,10 @@ then `bun tools/agents/rules.ts --write`). Skills: .agents/skills/.
    build`/`cargo test` or sccache. Where blaze can't build itself yet, fix that. See
    [docs/contributing.md](docs/contributing.md).
 3. **no-fallback**: No fallback, ever. When blaze can't do something it stops with an error naming what
-   and where, never quietly takes another path (rustc, a full rebuild instead of a patch, a slower
-   backend, an older cached result). A change that touches an existing fallback turns it into an
-   error.
+   and where, never quietly takes another path (rustc, a full link or rebuild instead of a patch, a
+   slower backend, an older cached result, a default guessed for a missing value). A fallback that
+   only logs its reason is still a fallback. A change that touches an existing fallback turns it
+   into an error, and a bench or test that hits one fails instead of timing the slow path.
 4. **superset-of-rust**: Own every layer from source to running code, never by narrowing what blaze
    accepts: every program the pinned nightly builds must build and behave the same under blaze, with
    the real std, C dependencies, build scripts and proc macros. The one allowed difference is
@@ -22,69 +23,78 @@ then `bun tools/agents/rules.ts --write`). Skills: .agents/skills/.
    attributes, semantics) only has to work under blaze, never under rustc, as long as it is opt-in
    and every program that doesn't use it behaves exactly as under rustc. See
    [docs/no-rustc.md](docs/no-rustc.md).
-5. **own-nightly**: blaze is its own toolchain: it builds every project with its pinned nightly
+5. **useful-not-parity**: rustc and cargo are references, never specs. Judge everything blaze does by
+   how useful it is to the person or agent using it, not by how closely it matches them: errors,
+   warnings, lints, CLI commands and flags, printed and JSON output, progress, the target
+   directory's layout, file formats, caches, symbol names, debug info, what a build or test run does
+   and in what order. Match them only where real code or tools depend on it (a program's behavior, a
+   published crate's manifest, an editor reading the JSON); everywhere else pick the better design
+   and delete the copy. Tests check what makes the result useful and correct, never that it equals
+   rustc's or cargo's. `superset-of-rust` is unchanged: every program the pinned nightly builds
+   still builds and runs as it does under rustc.
+6. **own-nightly**: blaze is its own toolchain: it builds every project with its pinned nightly
    (`harness/toolchain`, bumped daily), ignoring rust-toolchain files, rustup, `RUSTUP_TOOLCHAIN`
    and `RUSTC`. Projects pin the blaze version, not Rust's. See
    [docs/toolchain.md](docs/toolchain.md).
-6. **sandbox-everything**: Build scripts and proc macros always run sandboxed, on every platform; where
+7. **sandbox-everything**: Build scripts and proc macros always run sandboxed, on every platform; where
    no sandbox can be made, blaze stops. Sandboxed tests are an opt-in experiment. The only ways out
    are the documented manifest opt-outs and `BLAZE_SANDBOX=off`; nothing new that runs user code
    runs outside by default. See
    [docs/cargo.md#build-scripts-and-proc-macros-run-in-a-sandbox](docs/cargo.md#build-scripts-and-proc-macros-run-in-a-sandbox).
-7. **best-long-term-design**: Pick the best long-term design, not the least work: own the layer or port
-   rustc's rule properly, and spend the effort on proving it right (differential tests against
-   rustc, fuzzing, real crates). See
+8. **best-long-term-design**: Pick the best long-term design, not the least work: own the layer or port
+   rustc's rule properly, and spend the effort on proving it right: real crates' own test suites
+   passing under blaze, and fuzzing of blaze's own invariants. See
    [docs/contributing.md#rules-for-code](docs/contributing.md#rules-for-code).
-8. **semantics-in-front-end**: Language semantics (MIR building and passes, borrow checking, const
+9. **semantics-in-front-end**: Language semantics (MIR building and passes, borrow checking, const
    eval, layout, code-identity hashes) go in the front end's salsa crates in `crates/` (`hir-ty`,
    `hir-def` and the rest, derived from rust-analyzer but no longer synced with it), in a crate of
    their own where possible. Codegen, the store, the daemon, cargo integration and the runtime stay
    outside the front end. See
    [docs/contributing.md#where-new-code-goes](docs/contributing.md#where-new-code-goes).
-9. **no-mcp**: No MCP. Agent-facing interfaces are a Unix socket or HTTP with one versioned schema in
-   deterministic CBOR; the CLI is a client of the same API. See
-   [docs/roadmap.md#8-the-agent-api](docs/roadmap.md#8-the-agent-api).
-10. **work-in-ix-vms**: Builds, tests, benchmarks and experiments run in an ix VM, one per lane (`ix
+10. **no-mcp**: No MCP. Agent-facing interfaces are a Unix socket or HTTP with one versioned schema in
+    deterministic CBOR; the CLI is a client of the same API. See
+    [docs/roadmap.md#8-the-agent-api](docs/roadmap.md#8-the-agent-api).
+11. **work-in-ix-vms**: Builds, tests, benchmarks and experiments run in an ix VM, one per lane (`ix
     new`, `ix shell`, `ix rm`), never on the Mac or AWS. Where an ix VM can't do it, stop and say
     what is missing. See
     [docs/contributing.md#working-in-parallel](docs/contributing.md#working-in-parallel).
-11. **worktree-per-lane**: One uniquely named worktree per lane with its own `CARGO_TARGET_DIR`; never
+12. **worktree-per-lane**: One uniquely named worktree per lane with its own `CARGO_TARGET_DIR`; never
     `git stash`.
-12. **land-through-pr**: Land small and often through a pull request: `python3 .github/scripts/land.py
+13. **land-through-pr**: Land small and often through a pull request: `python3 .github/scripts/land.py
     "what the branch does"` opens it, turns on auto-merge and waits for the merge gate (`--wait`
     resumes). Harnesses run after merge in the release train. Never push to main. See
     [docs/contributing.md#landing-a-change](docs/contributing.md#landing-a-change).
-13. **own-prs-to-merge**: Any agent may take any open pull request or issue to done (merge main, resolve
+14. **own-prs-to-merge**: Any agent may take any open pull request or issue to done (merge main, resolve
     conflicts, fix its gate, finish a draft) rather than hand it back; tell the owning lane what
     changed. Close one only when it is wrong, saying why.
-14. **clean-up-lane**: When a lane is done, delete its worktree, target directory, ix VM and merged
+15. **clean-up-lane**: When a lane is done, delete its worktree, target directory, ix VM and merged
     branch.
-15. **credit-people**: A commit or pull request built on someone's suggestion, diagnosis or patch gets a
+16. **credit-people**: A commit or pull request built on someone's suggestion, diagnosis or patch gets a
     `Co-authored-by: Name <id+login@users.noreply.github.com>` trailer for each of them and says
     where it came from. See [docs/contributing.md#credit](docs/contributing.md#credit).
-16. **docs-say-what-they-are**: Every doc under `docs/` has front matter: `current` (kept true), `plan`,
+17. **docs-say-what-they-are**: Every doc under `docs/` has front matter: `current` (kept true), `plan`,
     `record` (dated history) or `superseded` (naming its replacement). Trust current docs; read
     plans and records as of their date. A change that makes a current doc untrue fixes it or marks
     it superseded in the same change; `python3 tools/docs.py check` holds them to the tree. See
     [docs/contributing.md#documents](docs/contributing.md#documents).
-17. **scripts-take-typed-input**: A script takes one JSON value (a file path, `-` or inline), parsed
+18. **scripts-take-typed-input**: A script takes one JSON value (a file path, `-` or inline), parsed
     into a frozen dataclass that refuses unknown fields, not a set of flags or hidden environment
     variables. An existing script moves to this when next changed.
 
 ## Code Review Rules
 
-These guide Codex code review on pull requests. They add to the rustc comparison harnesses and a
-maintainer's approval; they replace neither.
+These guide Codex code review on pull requests. They add to the harnesses and a maintainer's
+approval; they replace neither.
 
 ### Compiler correctness
 
 - Flag any change that can make a program built by blaze behave differently from the same program
   built by the pinned nightly rustc (`harness/toolchain`): layout, ABI, drop order, overflow and
   panic behavior, const eval, trait and method resolution, MIR passes, borrow checking, linking.
-  Safe path: port rustc's rule and add a differential test against rustc. The one allowed difference
-  is sandboxing build scripts and proc macros. Code that opts into a blaze extension is exempt: it
-  need not build under rustc, but enabling the extension must not change any program that doesn't
-  use it.
+  Safe path: port rustc's rule and add a test (a crate whose own tests exercise it, or a unit test).
+  The one allowed difference is sandboxing build scripts and proc macros. Code that opts into a
+  blaze extension is exempt: it need not build under rustc, but enabling the extension must not
+  change any program that doesn't use it.
 - Flag a fallback: a path that, when blaze can't do something, quietly takes another route (rustc or
   cargo, rustc's copy of a function or static, a whole rebuild in place of a refused patch, a slower
   backend, an older cached result). Safe path: stop with an error that names what and where.

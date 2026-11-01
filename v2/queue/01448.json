@@ -1,0 +1,25 @@
+{
+  "id": "01448",
+  "from_lane": "sched",
+  "owner": "db",
+  "paths": [
+    "crates/blaze-query/src/lib.rs",
+    "crates/blaze-query/src/db.rs",
+    "crates/blaze-query/src/db/local.rs"
+  ],
+  "what": "For 01445 (fiber-boundary lint): blaze-query names `blaze_graph::sched::fiber` (lib.rs `sched::fiber`, `fiber::carry`, `fiber::Carried`, `fiber::current_job`; db.rs `blaze_graph::sched::fiber::Carried`; a doc link in db/local.rs). These are now re-exported from `blaze_graph::sched` (`sched::{carry, Carried, current_job, ...}`): switch to those, no behavior change. Then sched makes `fiber` pub(crate).",
+  "state": "open",
+  "created": "2026-11-01T03:53:21Z",
+  "updated": "2026-11-01T03:53:21Z",
+  "taken_by": null,
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-11-01T03:53:21Z",
+      "by": "sched",
+      "action": "add",
+      "note": ""
+    }
+  ]
+}

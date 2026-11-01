@@ -4,10 +4,10 @@ use core::fmt;
 use std::any::Any;
 use std::{panic::RefUnwindSafe, sync};
 
-use base_db::{Crate, CrateBuilderId, CratesIdMap, Env, ProcMacroLoadingError, SourceDatabase};
+use base_db::{Crate, CrateBuilderId, CratesIdMap, Db, Env, ProcMacroLoadingError};
 use intern::Symbol;
 use rustc_hash::FxHashMap;
-use salsa::{Durability, Setter};
+use blaze_query::db::{Durability, Setter};
 use span::Span;
 use triomphe::Arc;
 
@@ -20,6 +20,22 @@ pub enum ProcMacroKind {
     Attr,
 }
 
+/// One call of a proc macro: what every expander is given.
+#[derive(Clone, Copy, Debug)]
+pub struct ProcMacroCall<'a> {
+    /// The input: the item for a derive or attribute, the arguments for a bang macro.
+    pub subtree: &'a tt::TopSubtree,
+    /// The attribute's own arguments, for [`ProcMacroKind::Attr`].
+    pub attrs: Option<&'a tt::TopSubtree>,
+    /// The calling crate's environment variables.
+    pub env: &'a Env,
+    pub def_site: Span,
+    pub call_site: Span,
+    pub mixed_site: Span,
+    /// The calling crate's proc-macro working directory.
+    pub current_dir: &'a str,
+}
+
 /// A proc-macro expander implementation.
 pub trait ProcMacroExpander: fmt::Debug + Send + Sync + RefUnwindSafe + Any {
     /// Whether calls share mutable state within one calling crate's compilation.
@@ -27,46 +43,40 @@ pub trait ProcMacroExpander: fmt::Debug + Send + Sync + RefUnwindSafe + Any {
         false
     }
 
-    /// Run the expander with the given input subtree, optional attribute input subtree (for
-    /// [`ProcMacroKind::Attr`]), environment variables, and span information.
+    /// The content ID of the library the macro is code of: what the key of a crate that
+    /// uses it covers (`hir_def::deps`). `None` when it is not known, which keeps the crates
+    /// that use the macro out of dependency images.
+    fn code(&self) -> Option<base_db::ContentId> {
+        None
+    }
+
+    /// Run the expander on one call.
     fn expand(
         &self,
-        db: &dyn SourceDatabase,
-        subtree: &tt::TopSubtree,
-        attrs: Option<&tt::TopSubtree>,
-        env: &Env,
-        def_site: Span,
-        call_site: Span,
-        mixed_site: Span,
-        current_dir: String,
+        db: &Db,
+        call: ProcMacroCall<'_>,
     ) -> Result<tt::TopSubtree, ProcMacroExpansionError>;
 
     /// Run in the calling crate's compilation session. Native expanders use `expand`.
     fn expand_in(
         &self,
-        db: &dyn SourceDatabase,
+        db: &Db,
         _calling_crate: Crate,
-        subtree: &tt::TopSubtree,
-        attrs: Option<&tt::TopSubtree>,
-        env: &Env,
-        def_site: Span,
-        call_site: Span,
-        mixed_site: Span,
-        current_dir: String,
+        call: ProcMacroCall<'_>,
     ) -> Result<tt::TopSubtree, ProcMacroExpansionError> {
-        self.expand(db, subtree, attrs, env, def_site, call_site, mixed_site, current_dir)
+        self.expand(db, call)
     }
 
-    fn eq_dyn(&self, other: &dyn ProcMacroExpander) -> bool;
+    fn eq_dyn(&self, other: &dyn ProcMacroExpander) -> bool; // dyn: comparing expanders when a crate's macros are set, not per expansion
 }
 
-impl PartialEq for dyn ProcMacroExpander {
+impl PartialEq for dyn ProcMacroExpander { // dyn: comparing expanders when a crate's macros are set, not per expansion
     fn eq(&self, other: &Self) -> bool {
         self.eq_dyn(other)
     }
 }
 
-impl Eq for dyn ProcMacroExpander {}
+impl Eq for dyn ProcMacroExpander {} // dyn: comparing expanders when a crate's macros are set, not per expansion
 
 #[derive(Debug)]
 pub enum ProcMacroExpansionError {
@@ -74,6 +84,33 @@ pub enum ProcMacroExpansionError {
     Panic(String),
     /// The server itself errored out.
     System(String),
+}
+
+/// What an expansion read besides its call and the variables it was given, as its server
+/// traced it: what the image of the calling crate is filed by (`hir_def::deps`).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ExpansionReads {
+    /// Nothing else.
+    Nothing,
+    /// The names it read, as the server encodes them, and the hash of the values they had.
+    Traced { shape: sync::Arc<[u8]>, values: base_db::ContentId },
+    /// Not known, and why: the calling crate gets no image.
+    Unknown(&'static str),
+}
+
+thread_local! {
+    static READS: std::cell::Cell<Option<ExpansionReads>> = const { std::cell::Cell::new(None) };
+}
+
+/// What the expansion running on this thread read: called by an expander before `expand`
+/// returns. An expander that does not call it has reads [`ExpansionReads::Unknown`].
+pub fn report_reads(reads: ExpansionReads) {
+    READS.set(Some(reads));
+}
+
+/// What the expander reported since the last call, cleared.
+pub(crate) fn take_reads() -> Option<ExpansionReads> {
+    READS.take()
 }
 
 pub type ProcMacroLoadResult = Result<Vec<ProcMacro>, ProcMacroLoadingError>;
@@ -92,21 +129,23 @@ impl ProcMacrosBuilder {
             // Sort proc macros to improve incrementality when only their order has changed (ideally the build system
             // will not change their order, but just to be sure).
             proc_macros.sort_unstable_by(|proc_macro, proc_macro2| {
-                (proc_macro.name.as_str(), proc_macro.kind)
-                    .cmp(&(proc_macro2.name.as_str(), proc_macro2.kind))
+                proc_macro
+                    .name
+                    .cmp_order(&proc_macro2.name)
+                    .then_with(|| proc_macro.kind.cmp(&proc_macro2.kind))
             });
         }
         self.0.insert(
             proc_macros_crate,
             match proc_macro {
-                Ok(it) => Arc::new(CrateProcMacros(Ok(it.into_boxed_slice()))),
-                Err(e) => Arc::new(CrateProcMacros(Err(e))),
+                Ok(it) => Arc::new(CrateProcMacros(Ok(it.into_boxed_slice()))), // alloc: once per crate, when its proc macros are loaded
+                Err(e) => Arc::new(CrateProcMacros(Err(e))), // alloc: once per crate, when its proc macros are loaded
             },
         );
     }
 
     /// Builds [`ProcMacros`] and adds id to `db`
-    pub(crate) fn build_in(self, db: &mut dyn SourceDatabase, crates_id_map: &CratesIdMap) {
+    pub(crate) fn build_in(self, db: &mut Db, crates_id_map: &CratesIdMap) {
         let mut map = self
             .0
             .into_iter()
@@ -118,6 +157,7 @@ impl ProcMacrosBuilder {
             .set_by_crate(db)
             .with_durability(Durability::HIGH)
             .to(map);
+        db.note_crates_changed();
     }
 }
 
@@ -135,23 +175,23 @@ impl FromIterator<(CrateBuilderId, ProcMacroLoadResult)> for ProcMacrosBuilder {
 pub struct CrateProcMacros(StoredProcMacroLoadResult);
 
 /// The proc macros. Do not use [`Self::get`]! Use [`Self::get_for_crate`] instead.
-#[salsa::input(singleton, debug)]
+#[blaze_query::input(singleton, debug)]
 pub struct ProcMacros {
     #[returns(ref)]
     pub by_crate: FxHashMap<Crate, Arc<CrateProcMacros>>,
 }
 
 impl ProcMacros {
-    pub fn init_default(db: &dyn SourceDatabase, durability: Durability) {
+    pub fn init_default(db: &mut Db, durability: Durability) {
         _ = Self::builder(Default::default()).durability(durability).new(db);
     }
 }
 
-#[salsa::tracked]
+#[blaze_query::tracked]
 impl ProcMacros {
     /// Incrementality query to prevent queries from directly depending on [`Self::get`].
-    #[salsa::tracked(returns(as_ref))]
-    pub fn get_for_crate(db: &dyn SourceDatabase, krate: Crate) -> Option<Arc<CrateProcMacros>> {
+    #[blaze_query::tracked(returns(as_ref), mem_tag = Expand)]
+    pub fn get_for_crate(db: &Db, krate: Crate) -> Option<Arc<CrateProcMacros>> {
         Self::get(db).by_crate(db).get(&krate).cloned()
     }
 }
@@ -178,7 +218,7 @@ impl CrateProcMacros {
         };
         proc_macros.get(idx as usize).ok_or_else(|| {
                 ExpandError::other(err_span,
-                    format!(
+                    format!( // alloc: an error's message, on the error path
                         "internal error: proc-macro index out of bounds: the length is {} but the index is {}",
                         proc_macros.len(),
                         idx
@@ -203,10 +243,10 @@ impl CrateProcMacros {
                     .iter()
                     .enumerate()
                     .map(|(idx, it)| {
-                        let name = crate::name::Name::new_symbol(it.name.clone(), def_site_ctx);
+                        let name = crate::name::Name::new_symbol(it.name, def_site_ctx);
                         (name, CustomProcMacroExpander::new(idx as u32), it.disabled)
                     })
-                    .collect(),
+                    .collect(), // alloc: once per crate's def map: its proc macros' names
             ),
             _ => None,
         }
@@ -215,8 +255,8 @@ impl CrateProcMacros {
 
 /// Whether this crate can call a macro whose state belongs to a compilation session,
 /// including macros reexported by a dependency.
-#[salsa::tracked(returns(copy))]
-pub fn may_have_session_macros(db: &dyn SourceDatabase, krate: Crate) -> bool {
+#[blaze_query::tracked(returns(copy), mem_tag = Expand)]
+pub fn may_have_session_macros(db: &Db, krate: Crate) -> bool {
     ProcMacros::get_for_crate(db, krate)
         .and_then(|it| {
             it.macros().map(|macros| macros.iter().any(|it| it.expander.requires_session()))
@@ -232,7 +272,7 @@ pub struct ProcMacro {
     pub name: Symbol,
     pub kind: ProcMacroKind,
     /// The expander handle for this proc macro.
-    pub expander: sync::Arc<dyn ProcMacroExpander>,
+    pub expander: sync::Arc<dyn ProcMacroExpander>, // dyn: the edge to user code (native or wasm), one call per proc-macro expansion
     /// Whether this proc-macro is disabled for early name resolution. Notably, the
     /// [`Self::expander`] is still usable.
     pub disabled: bool,
@@ -314,7 +354,7 @@ impl CustomProcMacroExpander {
     }
 
     /// Whether this resolved macro shares mutable guest state with earlier calls.
-    pub fn requires_session(self, db: &dyn SourceDatabase, def_crate: Crate) -> bool {
+    pub fn requires_session(self, db: &Db, def_crate: Crate) -> bool {
         ProcMacros::get_for_crate(db, def_crate)
             .and_then(|it| it.macros())
             .and_then(|it| it.get(self.proc_macro_id as usize))
@@ -332,7 +372,7 @@ impl CustomProcMacroExpander {
 
     pub fn expand(
         self,
-        db: &dyn SourceDatabase,
+        db: &Db,
         def_crate: Crate,
         calling_crate: Crate,
         tt: &tt::TopSubtree,
@@ -385,20 +425,17 @@ impl CustomProcMacroExpander {
 
                 // Proc macros have access to the environment variables of the invoking crate.
                 let env = calling_crate.env(db);
-                // FIXME: Can we avoid the string allocation here?
-                let current_dir = calling_crate.data(db).proc_macro_cwd.to_string();
-
-                match proc_macro.expander.expand_in(
-                    db,
-                    calling_crate,
-                    tt,
-                    attr_arg,
+                let call = ProcMacroCall {
+                    subtree: tt,
+                    attrs: attr_arg,
                     env,
                     def_site,
                     call_site,
                     mixed_site,
-                    current_dir,
-                ) {
+                    current_dir: calling_crate.data(db).proc_macro_cwd.as_str(),
+                };
+
+                match proc_macro.expander.expand_in(db, calling_crate, call) {
                     Ok(t) => ExpandResult::ok(t),
                     Err(err) => match err {
                         // Don't discard the item in case something unexpected happened while expanding attributes
@@ -406,7 +443,7 @@ impl CustomProcMacroExpander {
                             if proc_macro.kind == ProcMacroKind::Attr =>
                         {
                             ExpandResult {
-                                value: tt.clone(),
+                                value: tt.copy(), // alloc: error path: an attribute macro that failed keeps its item
                                 err: Some(ExpandError::other(call_site, text)),
                             }
                         }

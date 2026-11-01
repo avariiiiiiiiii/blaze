@@ -263,7 +263,7 @@ impl Registry {
 
     /// [`Registry::summaries`] on this thread.
     pub fn summaries_blocking(&self, name: &str) -> anyhow::Result<Arc<Summaries>> {
-        crate::block_on(self.summaries(name))
+        blaze_resolve::block_on(self.summaries(name))
     }
 
     fn forget(&self, name: &str, read: &Arc<Read>) {
@@ -363,8 +363,10 @@ impl Registry {
         let in_cache =
             std::fs::metadata(self.crate_file(name, version)).is_ok_and(|it| it.len() > 0);
         in_cache
-            || crate::download::parse_checksum(checksum)
-                .is_some_and(|key| self.context.store.as_ref().is_some_and(|store| store.has(&key)))
+            || crate::download::parse_checksum(checksum).is_some_and(|key| {
+                let key = crate::download::crate_key(&key);
+                self.context.store.is_some_and(|store| store.has(&key))
+            })
     }
 }
 

@@ -15,12 +15,14 @@ doctest = false
 
 [dependencies]
 anyhow.workspace = true
+blaze-ids.workspace = true
 blaze-source.workspace = true
 rustc-hash.workspace = true
-cargo-platform = "0.3.3"
-im-rc = "15.1.0"
+cargo-platform.workspace = true
+imbl.workspace = true
 semver.workspace = true
 serde = { workspace = true, features = ["derive"] }
+stdx.workspace = true
 toml.workspace = true
 tracing.workspace = true
 unicode-ident.workspace = true

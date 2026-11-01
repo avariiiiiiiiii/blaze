@@ -21,8 +21,8 @@ and by the keys of the crates it is built on), and the tests job takes those fro
 again. Each line of
 the run is passed on as it comes, so a CI log shows a slow build while it is slow. A failing test that is not in OPEN fails the run, and so does a test in
 OPEN that passes or no longer exists: take it out; so does the cargo run failing before any of
-its tests failed. `ide-diagnostics` is the daemon's errors (its diagnostics are the verdict).
-`hir-ide` is rust-analyzer's type inference with its own tests; the ones in OPEN are what the
+its tests failed. `blaze-diagnostics` is the daemon's errors (its diagnostics are the verdict).
+`hir-ty-mir` has rust-analyzer's type inference tests; the ones in OPEN are what the
 fork does differently from upstream that its expectations have not caught up with.
 """
 import dataclasses, json, os, re, shutil, signal, subprocess, sys, threading, time, typing
@@ -31,8 +31,8 @@ import memory
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 CRATES = [
-    "hir-ty-codegen", "blaze-store", "blaze-registry", "blaze-resolve", "blaze-build-script", "blaze-manifest", "blaze-in-place", "blaze-splice", "blaze-cargo", "blaze-engine",
-    "hir-ty", "hir-ty-mir", "hir-ty-borrowck", "hir-ty-wfcheck", "hir-def", "parser", "syntax", "const-ast", "hir-ide", "ide-diagnostics",
+    "hir-ty-codegen", "blaze-cas", "blaze-registry", "blaze-resolve", "blaze-build-script", "blaze-manifest", "blaze-cargo", "blaze-engine",
+    "hir-ty", "hir-ty-mir", "hir-ty-borrowck", "hir-ty-wfcheck", "hir-def", "parser", "syntax", "const-ast", "blaze-diagnostics",
 ]
 CRATES += ["proc-macro-api"]
 # What the build job ships blaze with: LLVM as a second code producer.
@@ -40,23 +40,23 @@ FEATURES = ["blaze-engine/llvm"]
 
 # crate::test, as libtest names it under the crate's test binary.
 OPEN = {
-    "hir_ide::tests::display_source_code::render_dyn_ty_independent_of_order",
-    "hir_ide::tests::display_source_code::render_dyn_ty_under_enclosing_binder",
-    "hir_ide::tests::incremental::add_struct_invalidates_trait_solve",
-    "hir_ide::tests::incremental::adding_enum_query_log",
-    "hir_ide::tests::incremental::adding_impl_query_log",
-    "hir_ide::tests::incremental::adding_struct_invalidates_infer",
-    "hir_ide::tests::incremental::adding_use_query_log",
-    "hir_ide::tests::mir::eval::caller_location_intrinsic",
-    "hir_ide::tests::regression::issue_6628",
-    "hir_ide::tests::regression::new_solver::trait_solving_with_error",
-    "hir_ide::tests::regression::regression_21605",
-    "hir_ide::tests::simple::box_into_vec",
-    "hir_ide::tests::traits::assoc_types_from_bounds",
-    "hir_ide::tests::traits::closure_signature_from_struct_where_clause",
-    "hir_ide::tests::traits::infer_box_fn_arg",
-    "hir_ide::tests::traits::infer_from_return_pos_impl_trait",
-    "hir_ide::tests::traits::nested_impl_traits",
+    "hir_ty_mir::tests::display_source_code::render_dyn_ty_independent_of_order",
+    "hir_ty_mir::tests::display_source_code::render_dyn_ty_under_enclosing_binder",
+    "hir_ty_mir::tests::incremental::add_struct_invalidates_trait_solve",
+    "hir_ty_mir::tests::incremental::adding_enum_query_log",
+    "hir_ty_mir::tests::incremental::adding_impl_query_log",
+    "hir_ty_mir::tests::incremental::adding_struct_invalidates_infer",
+    "hir_ty_mir::tests::incremental::adding_use_query_log",
+    "hir_ty_mir::tests::mir::eval::caller_location_intrinsic",
+    "hir_ty_mir::tests::regression::issue_6628",
+    "hir_ty_mir::tests::regression::new_solver::trait_solving_with_error",
+    "hir_ty_mir::tests::regression::regression_21605",
+    "hir_ty_mir::tests::simple::box_into_vec",
+    "hir_ty_mir::tests::traits::assoc_types_from_bounds",
+    "hir_ty_mir::tests::traits::closure_signature_from_struct_where_clause",
+    "hir_ty_mir::tests::traits::infer_box_fn_arg",
+    "hir_ty_mir::tests::traits::infer_from_return_pos_impl_trait",
+    "hir_ty_mir::tests::traits::nested_impl_traits",
 }
 # Known to fail when blaze builds and tests them, and not when rustc does: OPEN too on a blaze run.
 OPEN_BLAZE = {
@@ -72,11 +72,7 @@ OPEN_BLAZE = {
     "blaze_cargo::sandbox::linux::tests::a_confined_sandbox_writes_only_where_it_may_and_reaches_nothing",
 }
 # Pass or fail on a blaze run, by the runner's load: neither is an error.
-UNSURE_BLAZE = {
-    # A 64 MiB part has 5 s to be answered: in time on linux x64, not on arm64
-    # (https://github.com/indexable-inc/blaze/issues/893).
-    "blaze_cargo::remote::gateway::tests::what_is_over_a_put_goes_up_in_parts_checked_whole",
-}
+UNSURE_BLAZE: set[str] = set()
 
 COLOR = re.compile(r"\x1b\[[0-9;]*m")
 # A test binary is `deps/<name>-<hash>` in cargo's first layout of the build directory and
@@ -322,7 +318,7 @@ def main():
     open_ = OPEN if plain else OPEN | OPEN_BLAZE
     # Under CI rust-analyzer's slow tests run, and mark that they did in the target directory.
     env = {"CARGO_TARGET_DIR": os.path.join(ROOT, "target"), **os.environ}
-    # blaze's frames are larger than rustc's, and ide-diagnostics' 5204-arm test overflows the
+    # blaze's frames are larger than rustc's, and blaze-diagnostics' 5204-arm test overflows the
     # 2 MiB a test thread has, which aborts its whole program
     # (https://github.com/indexable-inc/blaze/issues/894). Not a `--skip`: an argument to the
     # tests has blaze run every test, not those an edit reached.

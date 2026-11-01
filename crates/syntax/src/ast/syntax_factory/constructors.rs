@@ -25,10 +25,6 @@ impl SyntaxFactory {
         make::name_ref_self_ty()
     }
 
-    pub fn expr_todo(&self) -> ast::Expr {
-        make::ext::expr_todo()
-    }
-
     pub fn expr_self(&self) -> ast::Expr {
         make::ext::expr_self()
     }

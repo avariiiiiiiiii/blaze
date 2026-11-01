@@ -22,7 +22,7 @@ mod source;
 mod tests;
 
 use hir::Crate;
-use ide_db::RootDatabase;
+use base_db::Db;
 use rustc_hash::FxHashSet;
 
 pub use crate::places::Documented;
@@ -45,7 +45,7 @@ pub struct Asked {
 /// crates of one name keep the one asked for, else as `one_per_name` says, and a crate only
 /// one left out depends on is left out too.
 pub fn crates_to_document(
-    db: &RootDatabase,
+    db: &Db,
     asked: &[Asked],
     no_deps: bool,
     test_only: &TestOnly,
@@ -116,8 +116,8 @@ pub fn crates_to_document(
     out
 }
 
-fn is_proc_macro(db: &RootDatabase, krate: Crate) -> bool {
-    ide_db::base_db::Crate::from(krate).data(db).target_kind.is_proc_macro()
+fn is_proc_macro(db: &Db, krate: Crate) -> bool {
+    base_db::Crate::from(krate).data(db).target_kind.is_proc_macro()
 }
 
 /// A dependency `cargo doc` reached.
@@ -182,30 +182,29 @@ fn version_key(version: &str) -> (Vec<u64>, bool, String) {
 }
 
 /// The name code uses for a crate: its library name, `-` as `_`.
-pub fn crate_name(db: &RootDatabase, krate: Crate) -> String {
+pub fn crate_name(db: &Db, krate: Crate) -> String {
     krate
         .display_name(db)
         .map(|it| it.crate_name().to_string())
         .unwrap_or_else(|| "unknown".to_owned())
 }
 
-fn is_sysroot(db: &RootDatabase, krate: Crate) -> bool {
-    matches!(krate.origin(db), ide_db::base_db::CrateOrigin::Lang(_))
+fn is_sysroot(db: &Db, krate: Crate) -> bool {
+    matches!(krate.origin(db), base_db::CrateOrigin::Lang(_))
 }
 
 /// Sets `cfg(doc)` on the crates documented, as rustdoc does for the crate it documents.
-pub fn set_cfg_doc(db: &mut RootDatabase, crates: &[Documented]) {
-    use ide_db::base_db::salsa::Setter as _;
+pub fn set_cfg_doc(db: &mut Db, crates: &[Documented]) {
     for documented in crates {
-        let krate: ide_db::base_db::Crate = documented.krate.into();
+        let krate: base_db::Crate = documented.krate.into();
         let mut cfg = krate.cfg_options(db).clone();
         cfg.insert_atom(intern::Symbol::intern("doc"));
-        krate.set_cfg_options(db).to(cfg);
+        krate.set_cfg_options(db, cfg);
     }
 }
 
 /// The documentation of `crates`, ready to write.
-pub fn model(db: &RootDatabase, crates: Vec<Documented>, test_only: TestOnly) -> model::Model {
+pub fn model(db: &Db, crates: Vec<Documented>, test_only: TestOnly) -> model::Model {
     let places = places::place(db, crates, test_only);
     collect::build(db, &places)
 }

@@ -1,3 +1,6 @@
+# The hot crates (blaze-query, blaze-cas, blaze-ids, blaze-reclaim, intern, blaze-graph) have a
+# `clippy.toml` of their own, which clippy reads instead of this one: these rules and a ban on
+# locks (docs/v2/plan/design/concurrency.md). A change here is made in theirs too.
 disallowed-types = [
     { path = "std::collections::HashMap", replacement = "rustc_hash::FxHashMap" },
     { path = "std::collections::HashSet", replacement = "rustc_hash::FxHashSet" },

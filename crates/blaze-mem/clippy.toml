@@ -1,0 +1,16 @@
+# A hot crate's lints (docs/v2/plan/design/concurrency.md): the root `.clippy.toml`, which clippy
+# does not read for a crate that has its own, plus no lock. Keep the first part equal to the root's.
+disallowed-types = [
+    { path = "std::collections::HashMap", replacement = "rustc_hash::FxHashMap" },
+    { path = "std::collections::HashSet", replacement = "rustc_hash::FxHashSet" },
+    { path = "std::collections::hash_map::RandomState", replacement = "std::hash::BuildHasherDefault<FxHasher>"},
+
+    { path = "std::sync::Mutex", reason = "no lock on the hot path (docs/v2/plan/design/concurrency.md): the pools and the chunk cache are lock-free stacks with tagged heads, and an allocator that waits for another thread's allocation inverts priorities" },
+    { path = "std::sync::RwLock", reason = "a read writes no shared memory (docs/v2/plan/design/concurrency.md): an RwLock's read side is an atomic write to one shared counter" },
+    { path = "parking_lot::Mutex", reason = "no lock on the hot path (docs/v2/plan/design/concurrency.md); see std::sync::Mutex", allow-invalid = true },
+    { path = "parking_lot::RwLock", reason = "a read writes no shared memory (docs/v2/plan/design/concurrency.md); see std::sync::RwLock", allow-invalid = true },
+]
+
+disallowed-methods = [
+    { path = "std::process::Command::new", replacement = "toolchain::command", reason = "the latter forces the choice of a working directory" },
+]

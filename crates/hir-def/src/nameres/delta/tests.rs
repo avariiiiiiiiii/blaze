@@ -963,3 +963,55 @@ fn removing_the_macro_that_makes_a_dependencys_trait_item_unresolves_its_import(
     }
     assert!(failures.is_empty(), "{failures}");
 }
+
+#[test]
+fn a_body_edit_beside_a_globbed_enum_runs_no_group_and_a_new_variant_is_imported() {
+    let text = |variants: &str, body: &str| {
+        format!("enum E {{ {variants} }}\nuse E::*;\nfn f() -> i32 {{ {body} }}\n")
+    };
+    let mut loaded = Loaded::new(&format!("//- /main.rs crate:main\n{}", text("A, B", "1")));
+    let main = loaded.krate();
+    let file = loaded.file("/main.rs");
+    // The first touch of the enum wakes its glob: what it last woke on is not known yet.
+    loaded.db.set_file_text(file, &text("A, B", "2"));
+    let work = work_of(&mut loaded.db, main, |db| db.set_file_text(file, &text("A, B", "3")));
+    assert_eq!(work.region, 0, "a body edit with the variants as they were ran groups: {work:?}");
+    let work = work_of(&mut loaded.db, main, |db| db.set_file_text(file, &text("A, B, C", "3")));
+    assert!(work.region > 0, "a new variant woke no glob of its enum: {work:?}");
+    let root = module_at(&loaded.db, main, &[]);
+    let map = crate_local_def_map(&loaded.db, main).def_map(&loaded.db);
+    assert!(map.module(&loaded.db, root).scope(&loaded.db).get(&name("C")).take_types().is_some(), "`C` is not imported");
+    let mut failures = String::new();
+    check_db(&loaded.db, "a new variant", &Exempt::NONE, true, &mut failures);
+    assert!(failures.is_empty(), "{failures}");
+}
+
+#[test]
+fn removing_an_item_of_a_trait_or_enum_unresolves_its_import_in_the_same_module() {
+    const FEATURE: &str = "#![feature(import_trait_associated_functions)]\n";
+    let mut failures = String::new();
+    for (import, item, removed) in [
+        ("use self::Tr::*;", "Tr", "f"),
+        ("use self::Tr::{f, C};", "Tr", "f"),
+        ("use self::E::*;", "E", "B"),
+    ] {
+        let decls = |with: bool| {
+            let f = if with { "    fn f();\n" } else { "" };
+            let b = if with { " B," } else { "" };
+            format!("{FEATURE}trait Tr {{\n{f}    const C: u8;\n}}\nenum E {{ A,{b} }}\n{import}\n")
+        };
+        let mut loaded = Loaded::new(&format!("//- /main.rs crate:main\n{}", decls(true)));
+        let main = loaded.krate();
+        let has = |db: &Db| {
+            let root = module_at(db, main, &[]);
+            let map = crate_local_def_map(db, main).def_map(db);
+            map.module(db, root).scope(db).get(&name(removed)).take_values().is_some()
+        };
+        assert!(has(&loaded.db), "{import}: loaded: `{removed}` of `{item}` is not imported");
+        let file = loaded.file("/main.rs");
+        loaded.db.set_file_text(file, &decls(false));
+        assert!(!has(&loaded.db), "{import}: `{removed}` removed from `{item}`: it is still imported");
+        check_db(&loaded.db, import, &Exempt::NONE, true, &mut failures);
+    }
+    assert!(failures.is_empty(), "{failures}");
+}

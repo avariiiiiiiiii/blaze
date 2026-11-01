@@ -358,6 +358,46 @@ fn a_crate_with_cfg_disabled_variants_builds() {
     assert_eq!(case.ok(&["run"]), "1\n");
 }
 
+/// A bin over crates.io's libc (0.2.191, which `#[link(name = "iconv")]`s on Apple targets): on
+/// the macOS 27 SDK `libiconv.tbd` re-exports `/usr/lib/libcharset.1.dylib`, and the link
+/// refused it as a library "the link line does not have", so no program over libc linked.
+#[test]
+fn a_program_calling_libc_links() {
+    let case = Case::new("a_program_calling_libc_links");
+    assert_eq!(case.ok(&["run"]), "true\n");
+}
+
+/// serde_derive's `Deserialize`, run on blaze's evaluator: every derive of the 00:49 self-build
+/// stopped building the MIR of the bridge's `run_client` closure (`MissingFunctionDefinition`),
+/// 26 of them across blaze-protocol, blaze-core, rustc_abi and paths. The struct it derives
+/// reads its fields in any order and defaults the one it is not given.
+#[test]
+fn a_struct_deriving_deserialize_reads_its_fields() {
+    let case = Case::new("a_struct_deriving_deserialize_reads_its_fields");
+    assert_eq!(case.ok(&["run"]), "3 -4 None\n");
+}
+
+/// `#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]` on a tuple struct with a const
+/// parameter (blaze-mem's `swiss::Ctrl`): the lint pass warned "unreachable pattern ... no value
+/// can reach this" at the derive, on code blaze itself wrote, and on llvm-sys's `include!`.
+#[test]
+fn a_derived_impl_warns_of_no_unreachable_pattern() {
+    let case = Case::new("a_derived_impl_warns_of_no_unreachable_pattern");
+    let out = case.ok_in("", &["run"]);
+    assert_eq!(out.stdout, "Ctrl(3) false\n");
+    assert!(!out.stderr.contains("unreachable pattern"), "a derive warned:\n{}", out.stderr);
+}
+
+/// A workspace setting blaze's own lint (`[workspace.metadata.blaze.lints] hot_alloc`, as
+/// blaze's root manifest does): every member was told `unknown lint: blaze::hot_alloc` (E0602).
+#[test]
+fn blazes_own_lint_in_a_workspaces_lints_is_known() {
+    let case = Case::new("blazes_own_lint_in_a_workspaces_lints_is_known");
+    let out = case.ok_in("", &["run"]);
+    assert_eq!(out.stdout, "linted\n");
+    assert!(!out.stderr.contains("unknown lint"), "blaze's own lint was unknown:\n{}", out.stderr);
+}
+
 /// A proc-macro package's lib, with a `#[test]` of its own, and an integration test that
 /// expands its macro (01463): the lib and its lib test were one root text, so the lib test's
 /// spans named bytes the lib's text lacks and the daemon panicked.

@@ -307,6 +307,24 @@ fn a_change_reruns_its_readers_and_an_equal_value_backdates() {
     assert_eq!((db.runs("Parity"), db.runs("Label")), (3, 2));
 }
 
+/// Each query its flight holder runs counts in [`super::completed`], what the daemon's
+/// watchdog reads to tell query work that ends from work that goes around: two for a first
+/// read of `Label` (it and `Parity`), at least one more once a write reruns `Parity`. Other
+/// tests count too, so only at least.
+#[test]
+fn each_query_run_counts_as_completed() {
+    let mut db = TestDb::new();
+    let cell = Cell::new(&db, 3, 0);
+    let before = super::completed();
+    assert_eq!(*get::<Label>(&db, cell), 11);
+    let ran = super::completed();
+    assert!(ran >= before + 2, "`Label` and `Parity` ran: {before}, then {ran}");
+    cell.set_a(&mut db, 5);
+    assert_eq!(*get::<Label>(&db, cell), 11);
+    let again = super::completed();
+    assert!(again > ran, "`Parity` reran: {ran}, then {again}");
+}
+
 #[test]
 fn each_field_has_its_own_edge() {
     let mut db = TestDb::new();

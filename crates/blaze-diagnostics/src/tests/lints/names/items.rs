@@ -252,7 +252,7 @@ fn main() {}
     );
     let stderr = checked.stderr();
     assert!(!stderr.contains("the type is defined here"), "{stderr}");
-    for diag in &checked.diags {
+    for diag in checked.diags.iter().filter(|it| !crate::tests::closing(it)) {
         assert!(diag.facts.iter().any(|it| it.what.contains("representation of") && it.what.contains("Bad")), "{diag:?}");
     }
 }
@@ -287,7 +287,10 @@ fn main() {}
 #[test]
 fn runtime_symbols() {
     let source = include_str!("items/runtime-symbols.rs");
-    let fixture = format!("{FFI_STD}//- /runtime-symbols.rs crate:other:main edition:2021 deps:core,std\n{source}");
+    // A host target, as compiletest runs it: `bcmp`'s C-variadic definition is stable there.
+    let fixture = format!(
+        "{FFI_STD}//- /runtime-symbols.rs crate:other:main edition:2021 deps:core,std cfg:target_arch=aarch64\n{source}"
+    );
     let stderr = ui_fixture(&fixture).replace("*const i8", "*const U8").replace("*const u8", "*const U8");
     assert_reports(
         &stderr,
@@ -410,7 +413,7 @@ fn fn_ptr(_: &u8) -> fn(S) -> S { loop {} }
 fn object<'a>(_: &'a u8) -> Box<dyn Tr + '_> { loop {} }
 fn outlives<'a>(x: &'a u8) -> impl Tr + '_ { x }
 impl Tr for &u8 {}
-struct Box<T: ?Sized>(T);
+struct Box<T: ?Sized>(*const T);
 trait Provided {
     fn get<'a>(&self, x: &'a u8) -> S<'a> { S(x) }
     fn mixed<'a>(&'a self) -> S { loop {} }

@@ -8,6 +8,7 @@
 use std::{
     cell::{OnceCell, RefCell},
     collections::HashMap,
+    ops::ControlFlow,
     sync::LazyLock,
 };
 
@@ -179,6 +180,31 @@ impl<'a, 'db> Cx<'a, 'db> {
     /// check, for the stability pass, the dead-code pass and the item lints after the abort.
     pub(crate) fn effective(&self) -> &Effective {
         self.effective.get_or_init(|| Effective::of(self))
+    }
+
+    /// Whether the `cfg`s of `node`, an attribute owner, keep it in the crate, its `cfg_attr`s
+    /// expanded. A node's attributes are its first children, so one without an attribute first
+    /// has none and costs one step.
+    pub(crate) fn cfg_enabled(&self, node: view::Node<'_>) -> bool {
+        if node.first_child().is_none_or(|it| it.kind() != SyntaxKind::ATTR) {
+            return true;
+        }
+        let Some(owner) = view::AnyHasAttrs::cast(node) else { return true };
+        let cfg = self.krate.cfg(self.db);
+        let off = hir_expand::attrs::expand_cfg_attr_view(
+            owner.attrs(),
+            || cfg,
+            |meta, _| {
+                if let view::Meta::CfgMeta(meta) = meta
+                    && let Some(predicate) = meta.cfg_predicate()
+                    && cfg.check(&::cfg::CfgExpr::parse_from_view(predicate)) == Some(false)
+                {
+                    return ControlFlow::Break(());
+                }
+                ControlFlow::Continue(())
+            },
+        );
+        off.is_none()
     }
 
     /// The level `lint` has at `at`, from the attributes there and around it and the lint

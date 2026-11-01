@@ -36,6 +36,12 @@ impl Watchdog {
     /// The bound `blaze serve` gives it: longer than any task that closes no info-level span
     /// should run.
     pub const BOUND: Duration = Duration::from_secs(60);
+    /// The bound of [`still::QUERIES`]: longer than any task that completes no query and ends
+    /// no other should run (a link, one function's LLVM).
+    pub const QUERY_BOUND: Duration = Duration::from_secs(120);
+    /// The bound of [`still::STEPS`]: longer than any one step of a unit should take while no
+    /// other ends.
+    pub const STEP_BOUND: Duration = Duration::from_secs(300);
 
     pub fn new(bound: Duration) -> Watchdog {
         Watchdog { bound_ns: bound.as_nanos() as u64, seen: 0, quiet_since: None, said: false }
@@ -61,18 +67,33 @@ impl Watchdog {
     }
 }
 
-/// A build that stopped: how long nothing moved, how many tasks were under way, each thread's
-/// open spans, and the flight recorder's Chrome trace of the time up to it.
+/// What a [`Watchdog`] counted that stayed still, as a stall says it.
+pub mod still {
+    /// [`crate::flight::progress`] and the tasks the plane saw end.
+    pub const SPANS: &str = "no span closed and no task ended";
+    /// The queries completed (`blaze_query::db::completed`) and the tasks the plane saw end:
+    /// still while spans close is query work that goes around without finishing.
+    pub const QUERIES: &str = "no query completed and no task ended";
+    /// The plane's nodes that settled: still while queries complete is work that never ends
+    /// a unit's step.
+    pub const STEPS: &str = "no unit's step ended";
+}
+
+/// A build that stopped: what stayed still ([`still`]) and how long, how many tasks were under
+/// way, each thread's open spans, and the flight recorder's Chrome trace of the time up to it.
 pub struct Stall {
+    pub still: &'static str,
     pub quiet_ns: u64,
     pub running: usize,
     pub threads: Vec<ThreadNow>,
     pub trace: Vec<u8>,
 }
 
-/// The stall `quiet` found, with `running` tasks under way: every thread read now.
-pub fn stall(quiet: Quiet, running: usize) -> Stall {
+/// The stall `quiet` found of what `still` names, with `running` tasks under way: every thread
+/// read now.
+pub fn stall(quiet: Quiet, running: usize, still: &'static str) -> Stall {
     Stall {
+        still,
         quiet_ns: quiet.for_ns,
         running,
         threads: flight::threads_now(),
@@ -85,7 +106,8 @@ impl fmt::Display for Stall {
         let secs = |ns: u64| ns as f64 / 1e9;
         write!(
             f,
-            "blaze stalled: no span closed and no task ended for {:.1} s while {} tasks ran",
+            "blaze stalled: {} for {:.1} s while {} tasks ran",
+            self.still,
             secs(self.quiet_ns),
             self.running
         )?;
@@ -110,6 +132,7 @@ impl fmt::Display for Stall {
 impl fmt::Debug for Stall {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("Stall")
+            .field("still", &self.still)
             .field("quiet_ns", &self.quiet_ns)
             .field("running", &self.running)
             .field("threads", &self.threads)
@@ -176,7 +199,7 @@ mod tests {
             }
             now += SEC / 10;
         };
-        let error = stall(quiet, JOBS);
+        let error = stall(quiet, JOBS, still::SPANS);
         let (released, cv) = &*gate;
         *released.lock().unwrap() = true;
         cv.notify_all();
@@ -190,6 +213,7 @@ mod tests {
         );
         let text = error.to_string();
         for name in [
+            "blaze stalled: no span closed and no task ended for",
             "job a",
             "job b",
             "job c",

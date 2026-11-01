@@ -31,6 +31,7 @@ mod value;
 mod verify;
 
 pub use capture::{Read, ReadKind, Reads, capture_reads, replay_reads, unshareable_reads};
+pub use function::completed;
 pub use id::{AsId, FromId, FromIdIn, Id};
 pub use input::Setter;
 pub use interned::NamesIds;

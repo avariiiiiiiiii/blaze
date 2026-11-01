@@ -12,10 +12,7 @@
 //! `compiler/rustc_builtin_macros/src/deriving/` (where a derive puts its impl)
 //! (MIT or Apache-2.0).
 
-use std::ops::ControlFlow;
-
 use blaze_ids::{bits::BitSet, radix};
-use cfg::CfgExpr;
 use hir::{HirFileId, InFile, ModuleSourceView, Name};
 use hir_def::{
     AdtId, BuiltinDeriveImplId, ConstId, EnumVariantId, FieldId, FunctionId, HasModule, ImplId,
@@ -368,7 +365,7 @@ struct Walk<'c, 'a, 'db> {
 
 impl<'db> Walk<'_, '_, 'db> {
     fn item(&mut self, item: InFile<ast::Item<'db>>, container: Container, parent: Parent) {
-        if !enabled(self.cx, item.value.syntax()) {
+        if !self.cx.cfg_enabled(item.value.syntax()) {
             return;
         }
         if let ast::Item::MacroCall(call) = item.value {
@@ -435,7 +432,7 @@ impl<'db> Walk<'_, '_, 'db> {
     /// a node that is no item, macro call or anonymous definition costs its children's walk.
     fn node(&mut self, file: HirFileId, node: ast::Node<'db>, parent: Parent) {
         let kind = node.kind();
-        if ast::AnyHasAttrs::can_cast(kind) && !enabled(self.cx, node) {
+        if ast::AnyHasAttrs::can_cast(kind) && !self.cx.cfg_enabled(node) {
             return;
         }
         if is_item(node) {
@@ -595,7 +592,7 @@ impl<'db> Walk<'_, '_, 'db> {
             ast::Item::Enum(it) => {
                 let db = self.cx.db;
                 for variant in it.variant_list().into_iter().flat_map(|it| it.variants()) {
-                    if !enabled(self.cx, variant.syntax()) {
+                    if !self.cx.cfg_enabled(variant.syntax()) {
                         continue;
                     }
                     let Some(id) = self.cx.vsema.to_def(variant) else { continue };
@@ -621,7 +618,7 @@ impl<'db> Walk<'_, '_, 'db> {
         match list {
             Some(ast::FieldList::RecordFieldList(it)) => {
                 for field in it.fields() {
-                    if enabled(self.cx, field.syntax()) {
+                    if self.cx.cfg_enabled(field.syntax()) {
                         let def = self.cx.vsema.to_def(field);
                         self.field(file, field.syntax(), def, owner);
                     }
@@ -629,7 +626,7 @@ impl<'db> Walk<'_, '_, 'db> {
             }
             Some(ast::FieldList::TupleFieldList(it)) => {
                 for field in it.fields() {
-                    if enabled(self.cx, field.syntax()) {
+                    if self.cx.cfg_enabled(field.syntax()) {
                         let def = self.cx.vsema.to_def(field);
                         self.field(file, field.syntax(), def, owner);
                     }
@@ -747,29 +744,4 @@ pub(super) fn anon_key<'t>(file: HirFileId, node: ast::Node<'t>) -> InFile<Synta
         next = inner(node);
     }
     InFile::new(file, ptr)
-}
-
-/// Whether the `cfg`s of `node`, an attribute owner, keep it, its `cfg_attr`s expanded. A node's
-/// attributes are its first children, so one without an attribute first has none and costs one
-/// step.
-fn enabled(cx: &Cx<'_, '_>, node: ast::Node<'_>) -> bool {
-    if node.first_child().is_none_or(|it| it.kind() != SyntaxKind::ATTR) {
-        return true;
-    }
-    let Some(owner) = ast::AnyHasAttrs::cast(node) else { return true };
-    let cfg = cx.krate.cfg(cx.db);
-    let off = hir_expand::attrs::expand_cfg_attr_view(
-        ast::HasAttrs::attrs(&owner),
-        || cfg,
-        |meta, _| {
-            if let ast::Meta::CfgMeta(meta) = meta
-                && let Some(predicate) = meta.cfg_predicate()
-                && cfg.check(&CfgExpr::parse_from_view(predicate)) == Some(false)
-            {
-                return ControlFlow::Break(());
-            }
-            ControlFlow::Continue(())
-        },
-    );
-    off.is_none()
 }

@@ -2865,13 +2865,14 @@ fn main() {
 
 /// The proc-macro bridge's `rpc.rs` shape: impls whose headers leave lifetimes out
 /// (`for &[u8]`, `DecodeMut<'a, '_, S>`), each a lifetime parameter of the impl, and
-/// `Option<T>`'s decode needing `T: for<'s> DecodeMut<'a, 's, S>` of one.
+/// `Option<T>`'s decode needing `T: for<'s> DecodeMut<'a, 's, S>` of one. Indexing is by
+/// `usize` only: minicore's `Index` impls, which a range index calls, are `loop {}`.
 #[test]
 fn impls_with_elided_header_lifetimes_evaluate() {
     check_pass(
         r#"
-//- minicore: sized, copy, slice, index, range, option, panic, fmt
-type Reader<'a> = &'a [u8];
+//- minicore: sized, copy, slice, index, option, panic, fmt
+struct Reader<'a> { bytes: &'a [u8], at: usize }
 
 struct Writer { buf: [u8; 8], len: usize }
 
@@ -2898,8 +2899,8 @@ impl<S> Encode<S> for u8 {
 
 impl<S> DecodeMut<'_, '_, S> for u8 {
     fn decode(r: &mut Reader<'_>, _: &mut S) -> Self {
-        let x = r[0];
-        *r = &r[1..];
+        let x = r.bytes[r.at];
+        r.at += 1;
         x
     }
 }
@@ -2915,12 +2916,11 @@ impl<S> Encode<S> for &[u8] {
     }
 }
 
-impl<'a, S> DecodeMut<'a, '_, S> for &'a [u8] {
-    fn decode(r: &mut Reader<'a>, s: &mut S) -> Self {
-        let len = u8::decode(r, s) as usize;
-        let xs = &r[..len];
-        *r = &r[len..];
-        xs
+impl<'a, S> DecodeMut<'a, '_, S> for &'a u8 {
+    fn decode(r: &mut Reader<'a>, _: &mut S) -> Self {
+        let x = &r.bytes[r.at];
+        r.at += 1;
+        x
     }
 }
 
@@ -2947,16 +2947,20 @@ impl<'a, S, T: for<'s> DecodeMut<'a, 's, S>> DecodeMut<'a, '_, S> for Option<T> 
 
 fn main() {
     let mut w = Writer { buf: [0; 8], len: 0 };
-    let data: [u8; 3] = [7, 8, 9];
-    Some(&data[..]).encode(&mut w, &mut ());
-    let mut r: Reader<'_> = &w.buf[..w.len];
-    let back = <Option<&[u8]>>::decode(&mut r, &mut ());
+    let data: &[u8] = &[7, 8, 9];
+    Some(data).encode(&mut w, &mut ());
+    if w.len != 5 {
+        panic!("encoded wrong");
+    }
+    let mut r = Reader { bytes: &w.buf, at: 0 };
+    // The tag, then the slice's length as a `&u8`, then its first byte.
+    let back = <Option<&u8>>::decode(&mut r, &mut ());
     match back {
-        Some(xs) if xs.len() == 3 && xs[0] == 7 && xs[2] == 9 => {}
+        Some(&3) => {}
         _ => panic!("decoded wrong"),
     }
-    if r.len() != 0 {
-        panic!("left over");
+    if u8::decode(&mut r, &mut ()) != 7 || r.at != 3 {
+        panic!("read wrong");
     }
 }
 "#,

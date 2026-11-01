@@ -988,7 +988,6 @@ mod tests {
             mir_inline: false,
             sanitize: Sanitize::default(),
             pgo: Pgo::None,
-            policy: ContentId([0; 32]),
         }
     }
 

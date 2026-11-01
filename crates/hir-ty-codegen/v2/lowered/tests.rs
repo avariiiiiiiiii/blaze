@@ -64,7 +64,6 @@ fn spec() -> Spec {
         counted: false,
         mir_inline: false,
         pgo: Pgo::None,
-        policy: ContentId::default(),
         sanitize: Sanitize::default(),
     }
 }

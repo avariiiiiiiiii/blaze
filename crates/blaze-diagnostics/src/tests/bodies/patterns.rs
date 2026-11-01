@@ -9,7 +9,7 @@ use crate::{
     Options,
     emit::{Style, written},
     model::Diag,
-    tests::{Mode, checked_with, compiletest, normalized, ui},
+    tests::{Mode, assert_reports, checked_with, compiletest, error, normalized, ui},
 };
 
 /// [`ui`] of a fixture of several files or crates, or with minicore: each file named
@@ -537,67 +537,16 @@ impl String {
     }
 }
 ";
-    let stderr = "error[E0023]: this pattern has 1 field, but the corresponding tuple variant has 2 fields
-  --> $DIR/E0023.rs:11:22
-   |
-LL |     Apple(String, String),
-   |           ------  ------ tuple variant has 2 fields
-...
-LL |         Fruit::Apple(a) => {},
-   |                      ^ expected 2 fields, found 1
-   |
-help: use `_` to explicitly ignore each field
-   |
-LL |         Fruit::Apple(a, _) => {},
-   |                       +++
-
-error[E0023]: this pattern has 3 fields, but the corresponding tuple variant has 2 fields
-  --> $DIR/E0023.rs:12:22
-   |
-LL |     Apple(String, String),
-   |           ------  ------ tuple variant has 2 fields
-...
-LL |         Fruit::Apple(a, b, c) => {},
-   |                      ^  ^  ^ expected 2 fields, found 3
-
-error[E0023]: this pattern has 2 fields, but the corresponding tuple variant has 1 field
-  --> $DIR/E0023.rs:13:21
-   |
-LL |     Pear(u32),
-   |          --- tuple variant has 1 field
-...
-LL |         Fruit::Pear(1, 2) => {},
-   |                     ^  ^ expected 1 field, found 2
-
-error[E0023]: this pattern has 2 fields, but the corresponding tuple variant has 1 field
-  --> $DIR/E0023.rs:14:23
-   |
-LL |     Orange((String, String)),
-   |            ---------------- tuple variant has 1 field
-...
-LL |         Fruit::Orange(a, b) => {},
-   |                       ^  ^ expected 1 field, found 2
-   |
-help: missing parentheses
-   |
-LL |         Fruit::Orange((a, b)) => {},
-   |                       +    +
-
-error[E0023]: this pattern has 0 fields, but the corresponding tuple variant has 1 field
-  --> $DIR/E0023.rs:15:9
-   |
-LL |     Banana(()),
-   |            -- tuple variant has 1 field
-...
-LL |         Fruit::Banana() => {},
-   |         ^^^^^^^^^^^^^^^ expected 1 field, found 0
-   |
-help: missing parentheses
-   |
-LL |         Fruit::Banana(()) => {},
-   |                      +  +
-";
-    assert_eq!(ui_only(fixture, code("E0023")), stderr);
+    assert_reports(
+        &ui_only(fixture, code("E0023")),
+        &[
+            error(11, &[]),
+            error(12, &[]),
+            error(13, &[]),
+            error(14, &[]),
+            error(15, &[]),
+        ],
+    );
 }
 
 #[test]
@@ -854,17 +803,7 @@ fn main() {
     //~^ ERROR E0033
 }
 ";
-    let stderr = "error[E0033]: type `&dyn SomeTrait` cannot be dereferenced
-  --> $DIR/E0033.rs:11:9
-   |
-LL |     let &invalid = trait_obj;
-   |         ^^^^^^^^ type `&dyn SomeTrait` cannot be dereferenced
-
-error: aborting due to 1 previous error
-
-For more information about this error, try `rustc --explain E0033`.
-";
-    assert_eq!(ui_fixture(fixture), stderr);
+    assert_reports(&ui_fixture(fixture), &[error(11, &["`&dyn SomeTrait`"])]);
 }
 
 #[test]

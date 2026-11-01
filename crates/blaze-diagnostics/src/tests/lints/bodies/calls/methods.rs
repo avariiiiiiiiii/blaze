@@ -20,10 +20,12 @@ fn compiletest(mode: crate::tests::Mode, flags: &[&str]) -> Options {
 }
 
 /// What every test's `core` starts with: `marker`'s `Sized` and `Copy`, `clone`'s `Clone` with
-/// `&T`'s no-op `clone`, the primitives' impls of both, and the `derive` attribute.
+/// `&T`'s no-op `clone`, the primitives' impls of both, and the `derive` attribute. It is a
+/// `staged_api` crate, as core is: its const stability attributes count only in one.
 const CORE: &str = r#"#![no_core]
 #![rustc_coherence_is_core]
-#![feature(no_core, lang_items, rustc_attrs, decl_macro, fundamental, auto_traits, negative_impls)]
+#![feature(no_core, lang_items, rustc_attrs, decl_macro, fundamental, auto_traits, negative_impls, staged_api)]
+#![stable(feature = "core", since = "1.6.0")]
 
 pub mod marker {
     #[lang = "pointee_sized"]

@@ -110,9 +110,12 @@ v2 interface; what changed from it is below.
   is in flight asks for one more after it. Every file is read on each scan: the drivers give
   no content hash, and `modified_ns` is not a safe skip (0 in the simulation, coarse on some
   file systems).
-- Modes: `Stat` reports no executable bit or symlink and `ReadAll` reads through a link, so a
+- Modes: a path stamped a symbolic link is read with `ReadLink`, never followed, and committed
+  as a symlink whose bytes are its target, as git keeps one, whatever it points at (a
+  directory, outside the tree, nothing); a link replaced by a file is regular. Otherwise a
   file the head has keeps its mode, a new one is regular, and a chmod alone is not seen
   (requested from core: v2/requests/vfs.md item 6). A path's mode counts in the conflict check.
+  (Updated 2026-10-31.)
 - Projection (writing a head's changes back to its directory) is not in this lane yet. Until it
   is, an agent's transaction and an editor's save of the same file race, and the disk's read
   wins unless the agent's commit lands after the report.

@@ -8,7 +8,7 @@
 use rustc_hash::FxHashMap;
 
 use super::SimFile;
-use crate::{Cursor, FileName, Journaled, Lost, S_IFDIR, S_IFREG, Stamp};
+use crate::{Cursor, FileName, Journaled, Lost, S_IFDIR, S_IFLNK, S_IFREG, Stamp};
 
 /// Which system's journal the simulation plays.
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
@@ -217,7 +217,7 @@ impl Disk {
                 size: file.len(),
                 mtime_ns: inode.mtime,
                 ctime_ns: inode.ctime,
-                mode: S_IFREG | (file.mode & 0o7777),
+                mode: if file.link { S_IFLNK | 0o777 } else { S_IFREG | (file.mode & 0o7777) },
             };
         }
         if files.keys().any(|it| it.is_under(name)) {

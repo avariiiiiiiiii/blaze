@@ -7,7 +7,7 @@
 use crate::{
     Options,
     emit::Style,
-    tests::{Mode, checked_with, compiletest, normalized, ui},
+    tests::{Mode, assert_reports, checked_with, compiletest, error, normalized, ui},
 };
 
 #[test]
@@ -666,123 +666,26 @@ fn main() {}
 #[macro_export]
 macro_rules! unsafe_macro { () => ($crate::unsf()) }
 "##;
-    let stderr = r##"error[E0133]: call to unsafe function `unsf` is unsafe and requires unsafe block
-  --> $DIR/wrapping-unsafe-block-sugg.rs:13:5
-   |
-LL |     unsf();
-   |     ^^^^^^ call to unsafe function
-   |
-   = note: consult the function's documentation for information on how to avoid undefined behavior
-note: an unsafe function restricts its caller, but its body is safe by default
-  --> $DIR/wrapping-unsafe-block-sugg.rs:11:1
-   |
-LL | pub unsafe fn foo() {
-   | ^^^^^^^^^^^^^^^^^^^
-   = note: for more information, see <https://doc.rust-lang.org/edition-guide/rust-2024/unsafe-op-in-unsafe-fn.html>
-note: the lint level is defined here
-  --> $DIR/wrapping-unsafe-block-sugg.rs:4:9
-   |
-LL | #![deny(unsafe_op_in_unsafe_fn)]
-   |         ^^^^^^^^^^^^^^^^^^^^^^
-
-error[E0133]: call to unsafe function `unsf` is unsafe and requires unsafe block
-  --> $DIR/wrapping-unsafe-block-sugg.rs:17:5
-   |
-LL |     unsf();
-   |     ^^^^^^ call to unsafe function
-   |
-   = note: consult the function's documentation for information on how to avoid undefined behavior
-   = note: for more information, see <https://doc.rust-lang.org/edition-guide/rust-2024/unsafe-op-in-unsafe-fn.html>
-
-error[E0133]: dereference of raw pointer is unsafe and requires unsafe block
-  --> $DIR/wrapping-unsafe-block-sugg.rs:25:13
-   |
-LL |     let y = *x;
-   |             ^^ dereference of raw pointer
-   |
-   = note: raw pointers may be null, dangling or unaligned; they can violate aliasing rules and cause data races: all of these are undefined behavior
-note: an unsafe function restricts its caller, but its body is safe by default
-  --> $DIR/wrapping-unsafe-block-sugg.rs:23:1
-   |
-LL | pub unsafe fn bar(x: *const i32) -> i32 {
-   | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-   = note: for more information, see <https://doc.rust-lang.org/edition-guide/rust-2024/unsafe-op-in-unsafe-fn.html>
-
-error[E0133]: dereference of raw pointer is unsafe and requires unsafe block
-  --> $DIR/wrapping-unsafe-block-sugg.rs:29:9
-   |
-LL |     y + *x
-   |         ^^ dereference of raw pointer
-   |
-   = note: raw pointers may be null, dangling or unaligned; they can violate aliasing rules and cause data races: all of these are undefined behavior
-   = note: for more information, see <https://doc.rust-lang.org/edition-guide/rust-2024/unsafe-op-in-unsafe-fn.html>
-
-error[E0133]: use of mutable static is unsafe and requires unsafe block
-  --> $DIR/wrapping-unsafe-block-sugg.rs:38:13
-   |
-LL |     let y = BAZ;
-   |             ^^^ use of mutable static
-   |
-   = note: mutable statics can be mutated by multiple threads: aliasing violations or data races will cause undefined behavior
-note: an unsafe function restricts its caller, but its body is safe by default
-  --> $DIR/wrapping-unsafe-block-sugg.rs:36:1
-   |
-LL | pub unsafe fn baz() -> i32 {
-   | ^^^^^^^^^^^^^^^^^^^^^^^^^^
-   = note: for more information, see <https://doc.rust-lang.org/edition-guide/rust-2024/unsafe-op-in-unsafe-fn.html>
-
-error[E0133]: use of mutable static is unsafe and requires unsafe block
-  --> $DIR/wrapping-unsafe-block-sugg.rs:42:9
-   |
-LL |     y + BAZ
-   |         ^^^ use of mutable static
-   |
-   = note: mutable statics can be mutated by multiple threads: aliasing violations or data races will cause undefined behavior
-   = note: for more information, see <https://doc.rust-lang.org/edition-guide/rust-2024/unsafe-op-in-unsafe-fn.html>
-
-error[E0133]: call to unsafe function `unsf` is unsafe and requires unsafe block
-  --> $DIR/wrapping-unsafe-block-sugg.rs:48:36
-   |
-LL | macro_rules! unsafe_macro { () => (unsf()) }
-   |                                    ^^^^^^ call to unsafe function
-...
-LL |     unsafe_macro!();
-   |     --------------- in this macro invocation
-   |
-   = note: consult the function's documentation for information on how to avoid undefined behavior
-note: an unsafe function restricts its caller, but its body is safe by default
-  --> $DIR/wrapping-unsafe-block-sugg.rs:58:1
-   |
-LL | pub unsafe fn unsafe_in_macro() {
-   | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-   = note: for more information, see <https://doc.rust-lang.org/edition-guide/rust-2024/unsafe-op-in-unsafe-fn.html>
-   = note: this error originates in the macro `unsafe_macro` (in Nightly builds, run with -Z macro-backtrace for more info)
-
-error[E0133]: call to unsafe function `unsf` is unsafe and requires unsafe block
-  --> $DIR/wrapping-unsafe-block-sugg.rs:48:36
-   |
-LL | macro_rules! unsafe_macro { () => (unsf()) }
-   |                                    ^^^^^^ call to unsafe function
-...
-LL |     unsafe_macro!();
-   |     --------------- in this macro invocation
-   |
-   = note: consult the function's documentation for information on how to avoid undefined behavior
-   = note: for more information, see <https://doc.rust-lang.org/edition-guide/rust-2024/unsafe-op-in-unsafe-fn.html>
-   = note: this error originates in the macro `unsafe_macro` (in Nightly builds, run with -Z macro-backtrace for more info)
-
-error: aborting due to 8 previous errors
-
-For more information about this error, try `rustc --explain E0133`.
-"##;
     let fixture = format!(
-        "//- /wrapping-unsafe-block-sugg.rs crate:other:main edition:2015 deps:external_unsafe_macro\n{source}\
+        "//- minicore: copy\n//- /wrapping-unsafe-block-sugg.rs crate:other:main edition:2015 deps:external_unsafe_macro\n{source}\
          //- /auxiliary/external_unsafe_macro.rs crate:external_unsafe_macro edition:2015\n{aux}"
     );
     let style = Style { ui_testing: true, ..Style::default() };
     let options = compiletest(Mode::Other, &Options::default());
     let written = checked_with(&fixture, "$DIR/", &options).stderr_with(style);
-    assert_eq!(normalized(&written), stderr);
+    assert_reports(
+        &normalized(&written),
+        &[
+            error(13, &["`unsf`"]),
+            error(17, &["`unsf`"]),
+            error(25, &[]),
+            error(29, &[]),
+            error(38, &[]),
+            error(42, &[]),
+            error(48, &["`unsf`"]),
+            error(48, &["`unsf`"]),
+        ],
+    );
 }
 
 /// tests/ui/rust-2024/unsafe-env-suggestion.rs needs `std::env::set_var`: the same call of a

@@ -222,6 +222,10 @@ pub enum Effect {
     ReadAll { file: FileName, tag: Tag },
     /// `len` bytes at `at`, or fewer at the end of the file.
     Read { file: FileName, at: u64, len: usize, tag: Tag },
+    /// The target of the symbolic link `file`, never followed: completes with [`Done::Read`]
+    /// of the target's bytes as the link holds them (on Windows UTF-8, `\` written `/`). A
+    /// `file` that is not a symbolic link, or is not there, fails naming it.
+    ReadLink { file: FileName, tag: Tag },
     /// Bytes added at the end of the file, creating it. Not durable until a [`Effect::Sync`] of
     /// the file asked for after this one has completed.
     Append { file: FileName, bytes: Vec<u8>, tag: Tag },
@@ -351,6 +355,7 @@ impl Effect {
         match self {
             Effect::ReadAll { tag, .. }
             | Effect::Read { tag, .. }
+            | Effect::ReadLink { tag, .. }
             | Effect::Append { tag, .. }
             | Effect::Sync { tag, .. }
             | Effect::Truncate { tag, .. }

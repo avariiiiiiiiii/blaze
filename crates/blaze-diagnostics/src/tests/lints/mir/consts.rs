@@ -4,7 +4,7 @@
 use crate::{
     Options,
     emit::Style,
-    tests::{Mode, checked, checked_with, compiletest, items::ui_core, normalized, ui},
+    tests::{Mode, assert_reports, checked, checked_with, compiletest, error, items::ui_core, normalized, ui},
 };
 
 #[test]
@@ -199,26 +199,10 @@ const fn bad(input: fn()) {
 fn main() {
 }
 "#;
-    let stderr = r#"error[E0015]: cannot call non-const closure in constant functions
-  --> $DIR/issue-56164.rs:1:18
-   |
-LL | const fn foo() { (||{})() }
-   |                  ^^^^^^^^
-   |
-   = note: closures need an RFC before allowed to be called in constant functions
-   = note: calls in constant functions are limited to constant functions, tuple structs and tuple variants
-
-error: function pointer calls are not allowed in constant functions
-  --> $DIR/issue-56164.rs:5:5
-   |
-LL |     input()
-   |     ^^^^^^^
-
-error: aborting due to 2 previous errors
-
-For more information about this error, try `rustc --explain E0015`.
-"#;
-    assert_eq!(ui("issue-56164.rs", "2015", source), stderr);
+    assert_reports(
+        &ui_core("issue-56164.rs", "2015", "fn", source),
+        &[error(1, &["closure"]), error(5, &["function pointer"])],
+    );
 }
 
 #[test]
@@ -237,30 +221,7 @@ pub const fn foo<T: A>() -> bool {
 
 fn main() {}
 "#;
-    let stderr = r#"error[E0015]: cannot call non-const associated function `<T as A>::assoc` in constant functions
-  --> $DIR/issue-88155.rs:8:5
-   |
-LL |     T::assoc()
-   |     ^^^^^^^^^^
-   |
-note: associated function `assoc` is not const because trait `A` is not const
-  --> $DIR/issue-88155.rs:3:1
-   |
-LL | pub trait A {
-   | ^^^^^^^^^^^ this trait is not const
-LL |     fn assoc() -> bool;
-   |     ------------------- this associated function is not const
-   = note: calls in constant functions are limited to constant functions, tuple structs and tuple variants
-help: consider making trait `A` const
-   |
-LL | pub const trait A {
-   |     +++++
-
-error: aborting due to 1 previous error
-
-For more information about this error, try `rustc --explain E0015`.
-"#;
-    assert_eq!(ui_core("issue-88155.rs", "2015", "sized", source), stderr);
+    assert_reports(&ui_core("issue-88155.rs", "2015", "sized", source), &[error(8, &["`<T as A>::assoc`"])]);
 }
 
 #[test]

@@ -100,30 +100,30 @@ fn a_function_pointer_call_is_refused() {
     assert_eq!(found[0].0.kind, ConstCheckKind::FnPointerCall);
 }
 
-/// `tests/ui/consts/async-block.rs`, both revisions: an `async` block in a `const fn` is a
-/// feature error without `const_async_blocks`, and allowed with it.
+/// An `async` block in a `const fn` is refused at the block, naming it and the feature that
+/// allows it, and allowed once `const_async_blocks` is on.
 #[test]
 fn an_async_block_needs_const_async_blocks() {
     let src = "const fn foo() -> impl core::future::Future<Output = ()> {\n    async {}\n}\n";
     let found = check("future", src, func("foo"));
-    assert_eq!(
-        reported(&found),
-        [("E0658", "async blocks are not allowed in constant functions", "async {}")]
-    );
-    assert_eq!(found[0].0.kind, ConstCheckKind::Coroutine { what: "async blocks", gated: true });
+    let [(refused, at)] = &found[..] else { panic!("{} diagnostics", found.len()) };
+    assert_eq!(at, "async {}");
+    assert_eq!(refused.kind, ConstCheckKind::Coroutine { what: "async blocks", gated: true });
+    assert!(refused.message.contains("async blocks"), "{}", refused.message);
     let gated = format!("#![feature(const_async_blocks)]\n{src}");
     assert_eq!(reported(&check("future", &gated, func("foo"))), []);
 }
 
-/// `tests/ui/traits/const-traits/match-non-const-eq.rs`, stock: a string pattern compares with
-/// `<str as PartialEq>::eq`, which rustc names as the match it is. minicore's `PartialEq` is not
-/// const, so the kind is the non-const one, with no code of its own.
+/// A string pattern compares with `<str as PartialEq>::eq`, a call a `const fn` can't make
+/// while `PartialEq` is not const (minicore's isn't): refused at the pattern, naming the type.
 #[test]
 fn a_string_pattern_is_a_match_comparison() {
     let src = "const fn foo(input: &'static str) {\n    match input {\n        \"a\" => (),\n        _ => (),\n    }\n}\n";
     let found = check("eq, str", src, func("foo"));
-    assert_eq!(reported(&found), [("", "cannot match on `str` in constant functions", "\"a\"")]);
-    assert!(matches!(found[0].0.kind, ConstCheckKind::NonConstMatchEq { conditionally: false, .. }));
+    let [(refused, at)] = &found[..] else { panic!("{} diagnostics", found.len()) };
+    assert_eq!(at, "\"a\"");
+    assert!(matches!(refused.kind, ConstCheckKind::NonConstMatchEq { conditionally: false, .. }));
+    assert!(refused.message.contains("`str`"), "{}", refused.message);
 }
 
 /// `tests/ui/consts/issue-28113.rs`, the constant named.

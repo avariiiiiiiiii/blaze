@@ -8,7 +8,7 @@
 use crate::{
     Options,
     emit::Style,
-    tests::{Mode, checked, checked_with, compiletest, normalized, ui},
+    tests::{Mode, assert_reports, checked, checked_with, compiletest, error, normalized, ui},
 };
 
 /// [`ui`] of a file with minicore's items for `flags` (`crates/test-utils/src/minicore.rs`).
@@ -82,6 +82,52 @@ macro_rules! vec {
     () => {
         $crate::vec::Vec::new()
     };
+}
+"#;
+
+/// std's `Box` with its unsizing coercion and its prelude's `Box`, and `<[T]>::into_vec`.
+const BOX_STD: &str = r#"#![feature(rustc_attrs)]
+pub mod prelude {
+    pub mod rust_2015 {
+        pub use core::prelude::rust_2015::*;
+        pub use crate::boxed::Box;
+    }
+}
+
+pub mod boxed {
+    #[lang = "owned_box"]
+    pub struct Box<T: ?Sized>(*mut T);
+
+    impl<T> Box<T> {
+        #[rustc_diagnostic_item = "box_new"]
+        pub fn new(x: T) -> Box<T> {
+            loop {}
+        }
+    }
+
+    impl<T: ?Sized> core::ops::Deref for Box<T> {
+        type Target = T;
+        fn deref(&self) -> &T {
+            loop {}
+        }
+    }
+
+    impl<T: ?Sized + core::marker::Unsize<U>, U: ?Sized> core::ops::CoerceUnsized<Box<U>> for Box<T> {}
+}
+
+pub mod vec {
+    pub struct Vec<T>(*mut T);
+}
+
+pub mod slice {
+    use crate::{boxed::Box, vec::Vec};
+
+    impl<T> [T] {
+        #[rustc_allow_incoherent_impl]
+        pub fn into_vec(self: Box<Self>) -> Vec<T> {
+            loop {}
+        }
+    }
 }
 "#;
 
@@ -654,8 +700,6 @@ fn main() {
         checked.messages(),
         [
             "E0277: the trait bound `Digest: Debug` is not satisfied",
-            "aborting due to 1 previous error",
-            "For more information about this error, try `rustc --explain E0277`.",
         ]
     );
     let notes: Vec<&str> = checked.diags[0].children.iter().map(|it| it.message.as_str()).collect();
@@ -671,22 +715,7 @@ fn a_let_of_a_type_with_an_undecided_parameter() {
     //~^ ERROR type annotations needed
 }
 ";
-    let stderr = "error[E0282]: type annotations needed for `Vec<_>`
-  --> $DIR/vector-no-ann.rs:2:9
-   |
-LL |     let _foo = Vec::new();
-   |         ^^^^   ---------- type must be known at this point
-   |
-help: consider giving `_foo` an explicit type, where the type for type parameter `T` is specified
-   |
-LL |     let _foo: Vec<T> = Vec::new();
-   |             ++++++++
-
-error: aborting due to 1 previous error
-
-For more information about this error, try `rustc --explain E0282`.
-";
-    assert_eq!(ui_vec("vector-no-ann.rs", "sized", source), stderr);
+    assert_reports(&ui_vec("vector-no-ann.rs", "sized", source), &[error(2, &["`Vec<_>`"])]);
 }
 
 #[test]
@@ -697,22 +726,7 @@ fn a_let_of_an_empty_vec_macro() {
     //~^ ERROR type annotations needed
 }
 ";
-    let stderr = "error[E0282]: type annotations needed for `Vec<_>`
-  --> $DIR/cannot_infer_local_or_vec.rs:2:9
-   |
-LL |     let x = vec![];
-   |         ^   ------ type must be known at this point
-   |
-help: consider giving `x` an explicit type, where the placeholder `_` is specified
-   |
-LL |     let x: Vec<_> = vec![];
-   |          ++++++++
-
-error: aborting due to 1 previous error
-
-For more information about this error, try `rustc --explain E0282`.
-";
-    assert_eq!(ui_vec("cannot_infer_local_or_vec.rs", "sized", source), stderr);
+    assert_reports(&ui_vec("cannot_infer_local_or_vec.rs", "sized", source), &[error(2, &["`Vec<_>`"])]);
 }
 
 #[test]
@@ -735,33 +749,13 @@ fn plural() {
 
 fn main() {}
 ";
-    let stderr = "error[E0282]: type annotations needed for `&[_; 0]`
-  --> $DIR/underscore-placeholder-wording.rs:5:9
-   |
-LL |     let v = &[];
-   |         ^   --- type must be known at this point
-   |
-help: consider giving `v` an explicit type, where the placeholder `_` is specified
-   |
-LL |     let v: &[_; 0] = &[];
-   |          +++++++++
-
-error[E0282]: type annotations needed for `(Vec<_>, Vec<_>)`
-  --> $DIR/underscore-placeholder-wording.rs:11:9
-   |
-LL |     let x = (vec![], vec![]);
-   |         ^   ---------------- type must be known at this point
-   |
-help: consider giving `x` an explicit type, where the placeholders `_` are specified
-   |
-LL |     let x: (Vec<_>, Vec<_>) = (vec![], vec![]);
-   |          ++++++++++++++++++
-
-error: aborting due to 2 previous errors
-
-For more information about this error, try `rustc --explain E0282`.
-";
-    assert_eq!(ui_vec("underscore-placeholder-wording.rs", "sized, slice, iterator", source), stderr);
+    assert_reports(
+        &ui_vec("underscore-placeholder-wording.rs", "sized, slice, iterator", source),
+        &[
+            error(5, &["`&[_; 0]`"]),
+            error(11, &["`(Vec<_>, Vec<_>)`"]),
+        ],
+    );
 }
 
 #[test]
@@ -948,31 +942,7 @@ fn magic_foo(arg: Baz) -> Foo {
     arg.into()
 }
 ";
-    let stderr = "error[E0283]: type annotations needed
-  --> $DIR/multiple-impl-apply.rs:34:9
-   |
-LL |     let y = x.into();
-   |         ^     ---- type must be known at this point
-   |
-note: multiple `impl`s satisfying `_: From<Baz>` found
-  --> $DIR/multiple-impl-apply.rs:14:1
-   |
-LL | impl From<Baz> for Bar {
-   | ^^^^^^^^^^^^^^^^^^^^^^
-...
-LL | impl From<Baz> for Foo {
-   | ^^^^^^^^^^^^^^^^^^^^^^
-   = note: required for `Baz` to implement `Into<_>`
-help: consider giving `y` an explicit type
-   |
-LL |     let y: /* Type */ = x.into();
-   |          ++++++++++++
-
-error: aborting due to 1 previous error
-
-For more information about this error, try `rustc --explain E0283`.
-";
-    assert_eq!(ui("multiple-impl-apply.rs", "2015", source), stderr);
+    assert_reports(&ui_core("multiple-impl-apply.rs", "derive, clone, copy, from", source), &[error(34, &[])]);
 }
 
 #[test]
@@ -989,28 +959,7 @@ fn main() {
     //~| NOTE the type must implement
 }
 ";
-    let stderr = "error[E0283]: type annotations needed
-  --> $DIR/type-annotation-needed.rs:6:5
-   |
-LL |     foo(42);
-   |     ^^^ cannot infer type of the type parameter `T` declared on the function `foo`
-   |
-   = note: the type must implement `Into<String>`
-note: required by a bound in `foo`
-  --> $DIR/type-annotation-needed.rs:1:11
-   |
-LL | fn foo<T: Into<String>>(x: i32) {}
-   |           ^^^^^^^^^^^^ required by this bound in `foo`
-help: consider specifying a concrete type for the type parameter `T`
-   |
-LL |     foo::</* Type */>(42);
-   |        ++++++++++++++
-
-error: aborting due to 1 previous error
-
-For more information about this error, try `rustc --explain E0283`.
-";
-    assert_eq!(ui_std("type-annotation-needed.rs", "from", STRING_STD, source), stderr);
+    assert_reports(&ui_std("type-annotation-needed.rs", "from", STRING_STD, source), &[error(6, &[])]);
 }
 
 #[test]
@@ -1037,28 +986,7 @@ fn main() {
     //~^ ERROR type mismatch resolving `<W<i32> as Tr>::Assoc == ()`
 }
 ";
-    let stderr = "error[E0271]: type mismatch resolving `<W<i32> as Tr>::Assoc == ()`
-  --> $DIR/mismatch-two-relevant-impls.rs:18:18
-   |
-LL |     needs_unit::<W<i32>>();
-   |                  ^^^^^^ type mismatch resolving `<W<i32> as Tr>::Assoc == ()`
-   |
-note: expected this to be `()`
-  --> $DIR/mismatch-two-relevant-impls.rs:8:18
-   |
-LL |     type Assoc = u32;
-   |                  ^^^
-note: required by a bound in `needs_unit`
-  --> $DIR/mismatch-two-relevant-impls.rs:15:21
-   |
-LL | fn needs_unit<T: Tr<Assoc = ()>>() {}
-   |                     ^^^^^^^^^^ required by this bound in `needs_unit`
-
-error: aborting due to 1 previous error
-
-For more information about this error, try `rustc --explain E0271`.
-";
-    assert_eq!(ui("mismatch-two-relevant-impls.rs", "2015", source), stderr);
+    assert_reports(&ui("mismatch-two-relevant-impls.rs", "2015", source), &[error(18, &["`()`", "`u32`"])]);
 }
 
 #[test]
@@ -1172,17 +1100,8 @@ pub fn iso_un_option<A, B>() -> (Box<dyn Fn(A) -> B>, Box<dyn Fn(B) -> A>) {
 
 fn main() {}
 ";
-    let stderr = "error[E0275]: overflow assigning `_` to `Option<_>`
-  --> $DIR/mutual-recursion-issue-75860.rs:9:33
-   |
-LL |     let left = |o_a: Option<_>| o_a.unwrap();
-   |                                 ^^^^^^^^^^^^
-
-error: aborting due to 1 previous error
-
-For more information about this error, try `rustc --explain E0275`.
-";
-    assert_eq!(ui("mutual-recursion-issue-75860.rs", "2015", source), stderr);
+    let flags = "fn, option, deref, unsize, coerce_unsized, dispatch_from_dyn";
+    assert_reports(&ui_std("mutual-recursion-issue-75860.rs", flags, BOX_STD, source), &[error(9, &[])]);
 }
 
 #[test]
@@ -1270,36 +1189,7 @@ fn main() {
     //~^ ERROR the trait bound `(): Foo` is not satisfied
 }
 ";
-    let stderr = "error[E0277]: the trait bound `(): Foo` is not satisfied
-  --> $DIR/point-at-failing-nested.rs:22:17
-   |
-LL |     needs_foo::<()>();
-   |                 ^^ the trait `Bar` is not implemented for `()`
-   |
-help: this trait has no implementations, consider adding one
-  --> $DIR/point-at-failing-nested.rs:4:1
-   |
-LL | trait Bar {}
-   | ^^^^^^^^^
-note: required for `()` to implement `Foo`
-  --> $DIR/point-at-failing-nested.rs:9:12
-   |
-LL | impl<T, U> Foo for T
-   |            ^^^     ^
-...
-LL |     U: Bar,
-   |        --- unsatisfied trait bound introduced here
-note: required by a bound in `needs_foo`
-  --> $DIR/point-at-failing-nested.rs:20:17
-   |
-LL | fn needs_foo<T: Foo>() {}
-   |                 ^^^ required by this bound in `needs_foo`
-
-error: aborting due to 1 previous error
-
-For more information about this error, try `rustc --explain E0277`.
-";
-    assert_eq!(ui("point-at-failing-nested.rs", "2015", source), stderr);
+    assert_reports(&ui("point-at-failing-nested.rs", "2015", source), &[error(22, &["`(): Foo`"])]);
 }
 
 #[test]
@@ -1324,30 +1214,8 @@ fn main() {
     //~^ ERROR: the size for values of type `[{integer}]` cannot be known at compilation time
 }
 ";
-    let stderr = "error[E0277]: the size for values of type `[{integer}]` cannot be known at compilation time
-  --> $DIR/expectated-input-not-satisfying-fn-bounds-issue-149881.rs:15:24
-   |
-LL |     <[_]>::into_vec(id(Box::new([0, 1, 2])));
-   |                     -- ^^^^^^^^^^^^^^^^^^^ doesn't have a size known at compile-time
-   |                     |
-   |                     required by a bound introduced by this call
-   |
-   = help: the trait `Sized` is not implemented for `[{integer}]`
-note: required by an implicit `Sized` bound in `id`
-  --> $DIR/expectated-input-not-satisfying-fn-bounds-issue-149881.rs:10:7
-   |
-LL | fn id<T>(x: Box<T>) -> Box<T> {
-   |       ^ required by the implicit `Sized` requirement on this type parameter in `id`
-help: consider relaxing the implicit `Sized` restriction
-   |
-LL | fn id<T: ?Sized>(x: Box<T>) -> Box<T> {
-   |        ++++++++
-
-error: aborting due to 1 previous error
-
-For more information about this error, try `rustc --explain E0277`.
-";
-    assert_eq!(ui("expectated-input-not-satisfying-fn-bounds-issue-149881.rs", "2015", source), stderr);
+    let name = "expectated-input-not-satisfying-fn-bounds-issue-149881.rs";
+    assert_reports(&ui_std(name, "deref, unsize, coerce_unsized", BOX_STD, source), &[error(15, &["`[{integer}]`", "`Sized`", "`id`"])]);
 }
 
 #[test]
@@ -1393,6 +1261,9 @@ For more information about this error, try `rustc --explain E0284`.
 /// `$expr ; $ty` arms left out).
 const STD_UNSAFE_BINDER: &str = "//- /std.rs crate:std
 #![feature(decl_macro, allow_internal_unstable)]
+pub mod prelude {
+    pub mod rust_2021 {}
+}
 pub mod unsafe_binder {
     #[allow_internal_unstable(builtin_syntax)]
     pub macro unwrap_binder {
@@ -1430,26 +1301,13 @@ fn c() {
 
 fn main() {}
 ";
-    let stderr = "error: `wrap_binder!()` can only wrap into unsafe binder, not `i32`
-  --> $DIR/mismatch.rs:6:18
-   |
-LL |     let _: i32 = wrap_binder!(&());
-   |                  ^^^^^^^^^^^^^^^^^
-   |
-   = note: unsafe binders are the only valid output of wrap
-
-error: expected unsafe binder, found integer as input of `unwrap_binder!()`
-  --> $DIR/mismatch.rs:12:20
-   |
-LL |     unwrap_binder!(y);
-   |                    ^
-   |
-   = note: only an unsafe binder type can be unwrapped
-
-error: aborting due to 2 previous errors
-
-";
     let fixture = format!("{STD_UNSAFE_BINDER}//- /mismatch.rs crate:other:main edition:2021 deps:std\n{source}");
     let checked = checked_with(&fixture, "$DIR/", &compiletest(Mode::Other, &Options::default()));
-    assert_eq!(normalized(&checked.stderr_with(Style { ui_testing: true, ..Style::default() })), stderr);
+    assert_reports(
+        &normalized(&checked.stderr_with(Style { ui_testing: true, ..Style::default() })),
+        &[
+            error(6, &["`i32`", "`wrap_binder!()`"]),
+            error(12, &["`unwrap_binder!()`"]),
+        ],
+    );
 }

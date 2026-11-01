@@ -16,7 +16,7 @@ use hir_expand::{
     FileRange, HirFileId, InFile, MacroDefKind,
     builtin::{BuiltinFnLikeExpander, EagerExpander},
 };
-use rustc_hash::FxHashMap;
+use rustc_hash::{FxHashMap, FxHashSet};
 use syntax::{
     NodeOrToken, SyntaxKind, SyntaxNodePtr, TextRange, TextSize,
     view::{self as ast, AstNode, AstToken, Element, Node},
@@ -63,6 +63,60 @@ pub fn location_macros<'db>(db: &'db Db, owner: DefWithBodyId) -> FxHashMap<Expr
         })
         // alloc: the query's value, of a body that called a location macro
         .collect()
+}
+
+/// The literals of a body that `line!()` expanded to. Lowering reads each in code where the
+/// code runs ([`slots_lines`]) from the `Location` of the literal, which the link fills, so a
+/// move above the body changes no MIR of it. `column!()` stays a literal: a `Location`'s column
+/// is rustc's display width, `column!()`'s counts chars, and no move above a body changes it.
+#[blaze_query::tracked(returns(ref))]
+pub fn line_literals<'db>(db: &'db Db, owner: DefWithBodyId) -> FxHashSet<ExprId> {
+    let line = |kind| matches!(kind, MacroDefKind::BuiltIn(_, BuiltinFnLikeExpander::Line));
+    let body = Body::of(db, owner);
+    if !body.macro_calls().iter().any(|call| line(call.loc(db).def.kind)) {
+        return FxHashSet::default();
+    }
+    let source_map = Body::unmoved_source_map(db, owner);
+    body.exprs()
+        .filter(|(_, expr)| matches!(expr, hir_def::hir::Expr::Literal(_)))
+        .filter(|&(id, _)| {
+            (source_map.expr_syntax(id).ok())
+                .and_then(|source| source.file_id.macro_file())
+                .is_some_and(|call| line(call.loc(db).def.kind))
+        })
+        .map(|(id, _)| id)
+        // alloc: the query's value, of a body that called `line!`
+        .collect()
+}
+
+/// Whether lowering `owner` reads its `line!()` literals where its code runs: in a function
+/// that is neither `#[track_caller]`, where `Location::caller` is its caller's, nor `const`,
+/// where the value is evaluated.
+pub fn slots_lines(db: &Db, owner: crate::InferBodyId<'_>) -> bool {
+    match owner {
+        crate::InferBodyId::DefWithBodyId(DefWithBodyId::FunctionId(func)) => {
+            !track_caller(db, func) && !FunctionSignature::of(db, func).is_const()
+        }
+        _ => false,
+    }
+}
+
+/// `Location::caller` of `core`'s `Location`, the lang item `location` is.
+pub fn location_caller(db: &Db, location: hir_def::StructId) -> Option<FunctionId> {
+    let self_ty = crate::method_resolution::SelfTyKey(crate::next_solver::SimplifiedType::Adt(
+        hir_def::AdtId::StructId(location).into(),
+    ));
+    let impls = crate::method_resolution::InherentImpls::in_crate_for_self_ty(
+        db,
+        location.krate(db),
+        self_ty,
+    );
+    impls.iter().find_map(|imp| {
+        imp.impl_items(db).items.iter().find_map(|(name, item)| match *item {
+            hir_def::AssocItemId::FunctionId(func) if name.as_str() == "caller" => Some(func),
+            _ => None,
+        })
+    })
 }
 
 /// The literals of a body that `concat!` made of arguments with `file!()` among them, each with

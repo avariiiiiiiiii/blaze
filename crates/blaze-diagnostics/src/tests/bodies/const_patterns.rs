@@ -7,6 +7,7 @@ use crate::tests::{
     lints::bodies::{reachable::PRINTLN, types::ui_std},
     ui,
 };
+use crate::tests::{assert_reports, error, warning};
 
 #[test]
 fn a_range_with_its_lower_bound_above_its_upper_is_e0030() {
@@ -89,29 +90,7 @@ fn main() {
     }
 }
 "##;
-    let stderr = r##"error: constant of non-structural type `Foo` in a pattern
-  --> $DIR/no-eq-branch-fail.rs:19:9
-   |
-LL | enum Foo {
-   | -------- `Foo` must be annotated with `#[derive(PartialEq)]` to be usable in patterns
-...
-LL | const BAR_BAZ: Foo = if 42 == 42 {
-   | ------------------ constant defined here
-...
-LL |         BAR_BAZ => panic!(),
-   |         ^^^^^^^ constant of non-structural type
-   |
-   = note: see https://doc.rust-lang.org/stable/std/marker/trait.StructuralPartialEq.html for details
-help: add a condition to the match arm checking for equality
-   |
-LL -         BAR_BAZ => panic!(),
-LL +         binding if binding == BAR_BAZ => panic!(),
-   |
-
-error: aborting due to 1 previous error
-
-"##;
-    assert_eq!(ui_core("no-eq-branch-fail.rs", "2015", "panic", source), stderr);
+    assert_reports(&ui_core("no-eq-branch-fail.rs", "2015", "panic", source), &[error(19, &["`Foo`"])]);
 }
 
 #[test]
@@ -505,201 +484,28 @@ fn main() {
     }
 }
 "##;
-    let stderr = r##"error: multiple ranges are one apart
-  --> $DIR/gap_between_ranges.rs:15:9
-   |
-LL |         20..30 => {}
-   |         ^^^^^^
-   |         |
-   |         this range doesn't match `30_u8` because `..` is an exclusive range
-   |         help: use an inclusive range instead: `20_u8..=30_u8`
-LL |         31..=40 => {}
-   |         ------- this could appear to continue range `20_u8..30_u8`, but `30_u8` isn't matched by either of them
-   |
-note: the lint level is defined here
-  --> $DIR/gap_between_ranges.rs:1:9
-   |
-LL | #![deny(non_contiguous_range_endpoints)]
-   |         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-
-error: multiple ranges are one apart
-  --> $DIR/gap_between_ranges.rs:20:9
-   |
-LL |         20..30 => {}
-   |         ^^^^^^
-   |         |
-   |         this range doesn't match `30_u8` because `..` is an exclusive range
-   |         help: use an inclusive range instead: `20_u8..=30_u8`
-LL |         31 => {}
-   |         -- this could appear to continue range `20_u8..30_u8`, but `30_u8` isn't matched by either of them
-
-error: multiple ranges are one apart
-  --> $DIR/gap_between_ranges.rs:25:13
-   |
-LL |     m!(0u8, 20..30, 31..=40);
-   |             ^^^^^^  ------- this could appear to continue range `20_u8..30_u8`, but `30_u8` isn't matched by either of them
-   |             |
-   |             this range doesn't match `30_u8` because `..` is an exclusive range
-   |             help: use an inclusive range instead: `20_u8..=30_u8`
-
-error: multiple ranges are one apart
-  --> $DIR/gap_between_ranges.rs:26:22
-   |
-LL |     m!(0u8, 31..=40, 20..30);
-   |             -------  ^^^^^^
-   |             |        |
-   |             |        this range doesn't match `30_u8` because `..` is an exclusive range
-   |             |        help: use an inclusive range instead: `20_u8..=30_u8`
-   |             this could appear to continue range `20_u8..30_u8`, but `30_u8` isn't matched by either of them
-
-warning: multiple patterns overlap on their endpoints
-  --> $DIR/gap_between_ranges.rs:27:21
-   |
-LL |     m!(0u8, 20..30, 29..=40);
-   |             ------  ^^^^^^^ ... with this range
-   |             |
-   |             this range overlaps on `29_u8`...
-   |
-   = note: you likely meant to write mutually exclusive ranges
-   = note: `#[warn(overlapping_range_endpoints)]` on by default
-
-error: multiple ranges are one apart
-  --> $DIR/gap_between_ranges.rs:29:13
-   |
-LL |     m!(0u8, 20..30, 31..=40);
-   |             ^^^^^^  ------- this could appear to continue range `20_u8..30_u8`, but `30_u8` isn't matched by either of them
-   |             |
-   |             this range doesn't match `30_u8` because `..` is an exclusive range
-   |             help: use an inclusive range instead: `20_u8..=30_u8`
-
-error: multiple ranges are one apart
-  --> $DIR/gap_between_ranges.rs:31:13
-   |
-LL |     m!(0u8, 20..30, 31..=32);
-   |             ^^^^^^  ------- this could appear to continue range `20_u8..30_u8`, but `30_u8` isn't matched by either of them
-   |             |
-   |             this range doesn't match `30_u8` because `..` is an exclusive range
-   |             help: use an inclusive range instead: `20_u8..=30_u8`
-
-error: exclusive range missing `u8::MAX`
-  --> $DIR/gap_between_ranges.rs:41:9
-   |
-LL |         0..255 => {}
-   |         ^^^^^^
-   |         |
-   |         this range doesn't match `u8::MAX` because `..` is an exclusive range
-   |         help: use an inclusive range instead: `0_u8..=u8::MAX`
-
-error: multiple ranges are one apart
-  --> $DIR/gap_between_ranges.rs:70:9
-   |
-LL |         0..10 => {}
-   |         ^^^^^
-   |         |
-   |         this range doesn't match `10_u8` because `..` is an exclusive range
-   |         help: use an inclusive range instead: `0_u8..=10_u8`
-LL |         11..20 => {}
-   |         ------ this could appear to continue range `0_u8..10_u8`, but `10_u8` isn't matched by either of them
-LL |         11..30 => {}
-   |         ------ this could appear to continue range `0_u8..10_u8`, but `10_u8` isn't matched by either of them
-
-error: multiple ranges are one apart
-  --> $DIR/gap_between_ranges.rs:76:9
-   |
-LL |         0..10 => {}
-   |         ^^^^^
-   |         |
-   |         this range doesn't match `10_u8` because `..` is an exclusive range
-   |         help: use an inclusive range instead: `0_u8..=10_u8`
-LL |         11..20 => {}
-   |         ------ this could appear to continue range `0_u8..10_u8`, but `10_u8` isn't matched by either of them
-
-error: multiple ranges are one apart
-  --> $DIR/gap_between_ranges.rs:77:9
-   |
-LL |         11..20 => {}
-   |         ^^^^^^
-   |         |
-   |         this range doesn't match `20_u8` because `..` is an exclusive range
-   |         help: use an inclusive range instead: `11_u8..=20_u8`
-LL |         21..30 => {}
-   |         ------ this could appear to continue range `11_u8..20_u8`, but `20_u8` isn't matched by either of them
-
-error: multiple ranges are one apart
-  --> $DIR/gap_between_ranges.rs:82:9
-   |
-LL |         00..20 => {}
-   |         ^^^^^^
-   |         |
-   |         this range doesn't match `20_u8` because `..` is an exclusive range
-   |         help: use an inclusive range instead: `0_u8..=20_u8`
-LL |         10..20 => {}
-LL |         21..30 => {}
-   |         ------ this could appear to continue range `0_u8..20_u8`, but `20_u8` isn't matched by either of them
-LL |         21..40 => {}
-   |         ------ this could appear to continue range `0_u8..20_u8`, but `20_u8` isn't matched by either of them
-
-error: multiple ranges are one apart
-  --> $DIR/gap_between_ranges.rs:83:9
-   |
-LL |         10..20 => {}
-   |         ^^^^^^
-   |         |
-   |         this range doesn't match `20_u8` because `..` is an exclusive range
-   |         help: use an inclusive range instead: `10_u8..=20_u8`
-LL |         21..30 => {}
-   |         ------ this could appear to continue range `10_u8..20_u8`, but `20_u8` isn't matched by either of them
-LL |         21..40 => {}
-   |         ------ this could appear to continue range `10_u8..20_u8`, but `20_u8` isn't matched by either of them
-
-error: multiple ranges are one apart
-  --> $DIR/gap_between_ranges.rs:91:10
-   |
-LL |         (0..10, true) => {}
-   |          ^^^^^
-   |          |
-   |          this range doesn't match `10_u8` because `..` is an exclusive range
-   |          help: use an inclusive range instead: `0_u8..=10_u8`
-LL |         (11..20, true) => {}
-   |          ------ this could appear to continue range `0_u8..10_u8`, but `10_u8` isn't matched by either of them
-
-error: multiple ranges are one apart
-  --> $DIR/gap_between_ranges.rs:96:16
-   |
-LL |         (true, 0..10) => {}
-   |                ^^^^^
-   |                |
-   |                this range doesn't match `10_u8` because `..` is an exclusive range
-   |                help: use an inclusive range instead: `0_u8..=10_u8`
-LL |         (true, 11..20) => {}
-   |                ------ this could appear to continue range `0_u8..10_u8`, but `10_u8` isn't matched by either of them
-
-error: multiple ranges are one apart
-  --> $DIR/gap_between_ranges.rs:102:10
-   |
-LL |         (0..10, true) => {}
-   |          ^^^^^
-   |          |
-   |          this range doesn't match `10_u8` because `..` is an exclusive range
-   |          help: use an inclusive range instead: `0_u8..=10_u8`
-LL |         (11..20, false) => {}
-   |          ------ this could appear to continue range `0_u8..10_u8`, but `10_u8` isn't matched by either of them
-
-error: multiple ranges are one apart
-  --> $DIR/gap_between_ranges.rs:112:14
-   |
-LL |         Some(0..10) => {}
-   |              ^^^^^
-   |              |
-   |              this range doesn't match `10_u8` because `..` is an exclusive range
-   |              help: use an inclusive range instead: `0_u8..=10_u8`
-LL |         Some(11..20) => {}
-   |              ------ this could appear to continue range `0_u8..10_u8`, but `10_u8` isn't matched by either of them
-
-error: aborting due to 16 previous errors; 1 warning emitted
-
-"##;
-    assert_eq!(ui_core("gap_between_ranges.rs", "2015", "option", source), stderr);
+    assert_reports(
+        &ui_core("gap_between_ranges.rs", "2015", "option", source),
+        &[
+            error(15, &[]),
+            error(20, &[]),
+            error(25, &[]),
+            error(26, &[]),
+            warning(27, &[]),
+            error(29, &[]),
+            error(31, &[]),
+            error(41, &["`u8::MAX`"]),
+            error(70, &[]),
+            error(76, &[]),
+            error(77, &[]),
+            error(82, &[]),
+            error(83, &[]),
+            error(91, &[]),
+            error(96, &[]),
+            error(102, &[]),
+            error(112, &[]),
+        ],
+    );
 }
 
 #[test]
@@ -737,29 +543,13 @@ fn main() {
     }
 }
 "##;
-    let stderr = r##"error: constant of non-structural type `Thing<Incomparable>` in a pattern
-  --> $DIR/derive-and-manual-partialeq-issue-147714.rs:27:12
-   |
-LL | enum Thing<T> {
-   | ------------- `Thing<Incomparable>` must be annotated with `#[derive(PartialEq)]` to be usable in patterns
-...
-LL | const X: Thing<Incomparable> = Thing::B;
-   | ---------------------------- constant defined here
-...
-LL |     if let X = X {
-   |            ^ constant of non-structural type
-   |
-help: if `Thing<Incomparable>` manually implemented `PartialEq`, you could check for equality instead of pattern matching
-   |
-LL -     if let X = X {
-LL +     if X == X {
-   |
-
-error: aborting due to 1 previous error
-
-"##;
     let name = "derive-and-manual-partialeq-issue-147714.rs";
-    assert_eq!(ui_std(name, "2015", "sized, fmt, derive, eq, panic", PRINTLN, source), stderr);
+    assert_reports(
+        &ui_std(name, "2015", "sized, fmt, derive, eq, panic", PRINTLN, source),
+        &[
+            error(27, &["`Thing<Incomparable>`"]),
+        ],
+    );
 }
 
 #[test]

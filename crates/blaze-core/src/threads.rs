@@ -868,6 +868,7 @@ pub(crate) fn run(root: &Path, effect: Effect) -> io::Result<Done> {
             Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(Done::Read(Vec::new())),
             Err(error) => Err(error),
         },
+        Effect::ReadLink { file, .. } => read_link(root, &file),
         Effect::Read { file, at: from, len, .. } => {
             let file = at(root, &file, |path| File::open(path))?;
             // alloc: the read's payload.
@@ -960,6 +961,31 @@ pub(crate) fn run(root: &Path, effect: Effect) -> io::Result<Done> {
         | Effect::Hangup { .. } => {
             unreachable!("timers, watches, processes and sockets are kept by the driver")
         }
+    }
+}
+
+/// [`Effect::ReadLink`] of `file` under `root`.
+pub(crate) fn read_link(root: &Path, file: &crate::FileName) -> io::Result<Done> {
+    match at(root, file, |path| std::fs::read_link(path)) {
+        Ok(target) => Ok(Done::Read(link_bytes(file, target)?)),
+        // alloc: an error path.
+        Err(error) => Err(io::Error::new(error.kind(), format!("{file}: {error}"))),
+    }
+}
+
+/// The bytes of the symbolic link `file`'s `target`, as [`Effect::ReadLink`] gives them.
+#[cfg(unix)]
+fn link_bytes(_: &crate::FileName, target: std::path::PathBuf) -> io::Result<Vec<u8>> {
+    Ok(std::os::unix::ffi::OsStringExt::into_vec(target.into_os_string()))
+}
+
+/// The bytes of the symbolic link `file`'s `target`, as [`Effect::ReadLink`] gives them.
+#[cfg(windows)]
+fn link_bytes(file: &crate::FileName, target: std::path::PathBuf) -> io::Result<Vec<u8>> {
+    match target.into_os_string().into_string() {
+        Ok(target) => Ok(target.replace('\\', "/").into_bytes()),
+        // alloc: an error path.
+        Err(_) => Err(io::Error::new(io::ErrorKind::InvalidData, format!("{file}: a link's target that is not UTF-8"))),
     }
 }
 

@@ -49,10 +49,10 @@ pub(crate) const MEMORY: u64 = 1 << 32;
 /// The functions of the `proc_macro` crate a run calls or claims.
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct Bridge {
-    expand1: FunctionId,
-    expand2: FunctionId,
-    buffer_new: FunctionId,
-    closure_call: FunctionId,
+    pub(crate) expand1: FunctionId,
+    pub(crate) expand2: FunctionId,
+    pub(crate) buffer_new: FunctionId,
+    pub(crate) closure_call: FunctionId,
 }
 
 /// The method `name` of an inherent impl in the module at `path` of `krate`.
@@ -279,7 +279,7 @@ impl<'db, 'r: 'db, 'e: 'db> Foreign<'db> for Host<'r, 'e> {
 
 /// Whether `st` is the standard library's (`std`, `core`, `alloc`, `proc_macro` and the
 /// rest of the sysroot): its state is the runtime's, made again each run.
-fn of_sysroot(db: &Db, st: StaticId) -> bool {
+pub(crate) fn of_sysroot(db: &Db, st: StaticId) -> bool {
     matches!(st.module(db).krate(db).data(db).origin, CrateOrigin::Lang(_))
 }
 
@@ -298,7 +298,7 @@ pub(crate) fn run(
 ) -> Result<Ran, Stop> {
     match tier::choose(code, runs) {
         Tier::Evaluator => evaluate(db, bridge, env, preset, expansions),
-        Tier::Compiled => tier::run(db, code, env, preset, expansions),
+        Tier::Compiled => tier::run(db, bridge, code, env, preset, expansions),
     }
 }
 

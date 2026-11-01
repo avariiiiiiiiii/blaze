@@ -360,6 +360,60 @@ pub(crate) fn dispatch_address() -> u64 {
     dispatch as extern "C" fn(u64, u64, u64) as usize as u64
 }
 
+/// The address of the host's own function `symbol` (libm, compiler-rt), as the dynamic
+/// linker finds it among the process's objects: what a call bound to
+/// [`super::bind::Binding::Pure`] jumps to. `None` when the process exports no such symbol.
+#[cfg(unix)]
+pub(crate) fn host_symbol(symbol: &str) -> Option<u64> {
+    let name = std::ffi::CString::new(symbol).ok()?; // alloc: once per pure symbol, per crate compiled
+    // SAFETY: `name` is NUL-terminated and outlives the call; `RTLD_DEFAULT` searches the
+    // objects already loaded, and the result is only read as an address.
+    let at = unsafe { libc::dlsym(libc::RTLD_DEFAULT, name.as_ptr()) };
+    (!at.is_null()).then_some(at as u64)
+}
+
+#[cfg(not(unix))]
+pub(crate) fn host_symbol(_symbol: &str) -> Option<u64> {
+    None
+}
+
+/// The calling thread's stack, where the walk reads frame records ([`Running::new`]).
+#[cfg(target_os = "linux")]
+pub(crate) fn current_stack() -> Result<Range<u64>, Stop> {
+    // SAFETY: `attr` is initialized by `pthread_getattr_np` before it is read and destroyed
+    // once read; the out-parameters are a pointer and an integer, written by the call.
+    let (got, start, size) = unsafe {
+        let mut attr: libc::pthread_attr_t = std::mem::zeroed();
+        if libc::pthread_getattr_np(libc::pthread_self(), &mut attr) != 0 {
+            return Err(Stop("could not read its thread's stack".to_owned())); // alloc: error path
+        }
+        let mut start: *mut libc::c_void = ptr::null_mut();
+        let mut size: libc::size_t = 0;
+        let got = libc::pthread_attr_getstack(&attr, &mut start, &mut size);
+        libc::pthread_attr_destroy(&mut attr);
+        (got, start as u64, size as u64)
+    };
+    if got != 0 {
+        return Err(Stop("could not read its thread's stack".to_owned())); // alloc: error path
+    }
+    Ok(start..start + size)
+}
+
+#[cfg(target_os = "macos")]
+pub(crate) fn current_stack() -> Result<Range<u64>, Stop> {
+    // SAFETY: both calls read the calling thread's own attributes, which live as long as it.
+    let (top, size) = unsafe {
+        let this = libc::pthread_self();
+        (libc::pthread_get_stackaddr_np(this) as u64, libc::pthread_get_stacksize_np(this) as u64)
+    };
+    Ok(top.saturating_sub(size)..top)
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+pub(crate) fn current_stack() -> Result<Range<u64>, Stop> {
+    Err(Stop("can't find its thread's stack on this system".to_owned())) // alloc: error path
+}
+
 extern "C" fn dispatch(id: u64, slots: u64, fp: u64) {
     let running = RUNNING.with(Cell::get);
     // SAFETY: a stub runs only inside `Running::enter` on this thread, which set `RUNNING`

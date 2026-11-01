@@ -2153,6 +2153,8 @@ impl Driver for Uring {
                 Effect::Times { file, modified_ns, .. } => {
                     under(&self.root, &file, |path| crate::fs::set_times(path, modified_ns)).map(|()| Some(Done::Timed))
                 }
+                // No io_uring op reads a link: one `readlink` here, as a file's times are set.
+                Effect::ReadLink { file, .. } => crate::threads::read_link(&self.root, &file).map(Some),
                 Effect::Remove { file, .. } => self.remove(tag, &file).map(|()| None),
                 Effect::Watch { dir, .. } => self.watch(tag, dir, false).map(|()| None),
                 // Linux keeps no journal across a restart: the first batch says what of the

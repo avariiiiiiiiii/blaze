@@ -7,7 +7,7 @@
 use crate::{
     Options,
     emit::{self, Style},
-    tests::{Mode, checked_with, compiletest, normalized},
+    tests::{Mode, assert_reports, checked_with, compiletest, error, normalized},
 };
 
 /// What rustc writes compiling the UI test `source`, named `$DIR/<name>`, of edition 2015.
@@ -391,91 +391,10 @@ extern "C" {
 
 fn main() {}
 "#;
-    let expected = r#"error: unused doc comment
-  --> $DIR/unused-doc-comments-edge-cases.rs:6:9
-   |
-LL |         /// useless doc comment
-   |         ^^^^^^^^^^^^^^^^^^^^^^^
-LL |
-LL |         _ => false,
-   |         ---------- rustdoc does not generate documentation for match arms
-   |
-   = help: use `//` for a plain comment
-note: the lint level is defined here
-  --> $DIR/unused-doc-comments-edge-cases.rs:1:9
-   |
-LL | #![deny(unused_doc_comments)]
-   |         ^^^^^^^^^^^^^^^^^^^
-
-error: unused doc comment
-  --> $DIR/unused-doc-comments-edge-cases.rs:23:5
-   |
-LL |     /// useless doc comment
-   |     ^^^^^^^^^^^^^^^^^^^^^^^
-...
-LL |     num == 3
-   |     --- rustdoc does not generate documentation for expressions
-   |
-   = help: use `//` for a plain comment
-
-error: unused doc comment
-  --> $DIR/unused-doc-comments-edge-cases.rs:33:9
-   |
-LL |         /// useless doc comment
-   |         ^^^^^^^^^^^^^^^^^^^^^^^
-LL |
-LL |         foo: 3
-   |         ------ rustdoc does not generate documentation for expression fields
-   |
-   = help: use `//` for a plain comment
-
-error: unused doc comment
-  --> $DIR/unused-doc-comments-edge-cases.rs:45:9
-   |
-LL |         /// useless doc comment
-   |         ^^^^^^^^^^^^^^^^^^^^^^^
-LL |
-LL |         foo
-   |         --- rustdoc does not generate documentation for pattern fields
-   |
-   = help: use `//` for a plain comment
-
-error: unused doc comment
-  --> $DIR/unused-doc-comments-edge-cases.rs:55:27
-   |
-LL | fn doc_comment_on_generic<#[doc = "x"] T>(val: T) {}
-   |                           ^^^^^^^^^^^^ - rustdoc does not generate documentation for generic parameters
-   |
-   = help: use `//` for a plain comment
-
-error: unused doc comment
-  --> $DIR/unused-doc-comments-edge-cases.rs:59:5
-   |
-LL |       /// unused doc comment
-   |       ^^^^^^^^^^^^^^^^^^^^^^
-LL |
-LL | /     {
-LL | |         let x = 12;
-LL | |     }
-   | |_____- rustdoc does not generate documentation for expressions
-   |
-   = help: use `//` for a plain comment
-
-error: unused doc comment
-  --> $DIR/unused-doc-comments-edge-cases.rs:66:1
-   |
-LL |   /// unused doc comment
-   |   ^^^^^^^^^^^^^^^^^^^^^^
-LL |
-LL | / extern "C" {
-LL | |     fn foo();
-LL | | }
-   | |_- rustdoc does not generate documentation for extern blocks
-   |
-   = help: use `//` for a plain comment
-
-"#;
-    assert_eq!(ui_lint("unused-doc-comments-edge-cases.rs", source, "unused_doc_comments"), expected);
+    assert_reports(
+        &ui_lint("unused-doc-comments-edge-cases.rs", source, "unused_doc_comments"),
+        &[error(6, &[]), error(23, &[]), error(33, &[]), error(45, &[]), error(55, &[]), error(59, &[]), error(66, &[])],
+    );
 }
 
 #[test]
@@ -502,64 +421,18 @@ pub fn foo() {}
 //~| ERROR unknown `doc` attribute
 fn bar() {}
 "#;
-    let expected = r#"error: unknown `doc` attribute `as_ptr`
-  --> $DIR/doc-attr.rs:3:8
-   |
-LL | #![doc(as_ptr)]
-   |        ^^^^^^
-   |
-note: the lint level is defined here
-  --> $DIR/doc-attr.rs:1:9
-   |
-LL | #![deny(invalid_doc_attributes)]
-   |         ^^^^^^^^^^^^^^^^^^^^^^
-
-error: unknown `doc` attribute `as_ptr`
-  --> $DIR/doc-attr.rs:6:7
-   |
-LL | #[doc(as_ptr)]
-   |       ^^^^^^
-
-error: expected this to be of the form `... = "..."`
-  --> $DIR/doc-attr.rs:10:7
-   |
-LL | #[doc(123)]
-   |       ^^^
-   |
-   = warning: this was previously accepted by the compiler but is being phased out; it will become a hard error in a future release!
-
-error: expected this to be of the form `... = "..."`
-  --> $DIR/doc-attr.rs:13:7
-   |
-LL | #[doc("hello", "bar")]
-   |       ^^^^^^^
-   |
-   = warning: this was previously accepted by the compiler but is being phased out; it will become a hard error in a future release!
-
-error: expected this to be of the form `... = "..."`
-  --> $DIR/doc-attr.rs:13:16
-   |
-LL | #[doc("hello", "bar")]
-   |                ^^^^^
-   |
-   = warning: this was previously accepted by the compiler but is being phased out; it will become a hard error in a future release!
-
-error: unknown `doc` attribute `foo::bar`
-  --> $DIR/doc-attr.rs:18:7
-   |
-LL | #[doc(foo::bar, crate::bar::baz = "bye")]
-   |       ^^^^^^^^
-
-error: unknown `doc` attribute `crate::bar::baz`
-  --> $DIR/doc-attr.rs:18:17
-   |
-LL | #[doc(foo::bar, crate::bar::baz = "bye")]
-   |                 ^^^^^^^^^^^^^^^
-
-error: aborting due to 7 previous errors
-
-"#;
-    assert_eq!(ui("doc-attr.rs", source), expected);
+    assert_reports(
+        &ui("doc-attr.rs", source),
+        &[
+            error(3, &["`as_ptr`", "`doc`"]),
+            error(6, &["`as_ptr`", "`doc`"]),
+            error(10, &["`... = \"...\"`"]),
+            error(13, &["`... = \"...\"`"]),
+            error(13, &["`... = \"...\"`"]),
+            error(18, &["`doc`", "`foo::bar`"]),
+            error(18, &["`crate::bar::baz`", "`doc`"]),
+        ],
+    );
 }
 
 #[test]
@@ -811,61 +684,17 @@ fn arguments_where_none_are_taken_are_linted() {
 //~| WARN
 pub struct X;
 "#;
-    let expected = r#"error: didn't expect any arguments here
-  --> $DIR/invalid-doc-attr-3.rs:3:29
-   |
-LL | #![doc(test(no_crate_inject = 1))]
-   |                             ^^^
-   |
-   = warning: this was previously accepted by the compiler but is being phased out; it will become a hard error in a future release!
-note: the lint level is defined here
-  --> $DIR/invalid-doc-attr-3.rs:1:9
-   |
-LL | #![deny(invalid_doc_attributes)]
-   |         ^^^^^^^^^^^^^^^^^^^^^^
-
-error: malformed `doc` attribute input
-  --> $DIR/invalid-doc-attr-3.rs:6:1
-   |
-LL | #![doc(test(attr = 1))]
-   | ^^^^^^^^^^^^^^^^^^^^^^^
-   |
-   = warning: this was previously accepted by the compiler but is being phased out; it will become a hard error in a future release!
-
-error: didn't expect any arguments here
-  --> $DIR/invalid-doc-attr-3.rs:10:14
-   |
-LL | #[doc(hidden = true)]
-   |              ^^^^^^
-   |
-   = warning: this was previously accepted by the compiler but is being phased out; it will become a hard error in a future release!
-
-error: didn't expect any arguments here
-  --> $DIR/invalid-doc-attr-3.rs:13:13
-   |
-LL | #[doc(hidden("or you will be fired"))]
-   |             ^^^^^^^^^^^^^^^^^^^^^^^^
-   |
-   = warning: this was previously accepted by the compiler but is being phased out; it will become a hard error in a future release!
-
-error: didn't expect any arguments here
-  --> $DIR/invalid-doc-attr-3.rs:16:14
-   |
-LL | #[doc(hidden = "handled transparently by codegen")]
-   |              ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-   |
-   = warning: this was previously accepted by the compiler but is being phased out; it will become a hard error in a future release!
-
-error: malformed `doc` attribute input
-  --> $DIR/invalid-doc-attr-3.rs:19:9
-   |
-LL | #[doc = 1]
-   |         ^
-   |
-   = warning: this was previously accepted by the compiler but is being phased out; it will become a hard error in a future release!
-
-"#;
-    assert_eq!(ui_lint("invalid-doc-attr-3.rs", source, "invalid_doc_attributes"), expected);
+    assert_reports(
+        &ui_lint("invalid-doc-attr-3.rs", source, "invalid_doc_attributes"),
+        &[
+            error(3, &[]),
+            error(6, &["`doc`"]),
+            error(10, &[]),
+            error(13, &[]),
+            error(16, &[]),
+            error(19, &["`doc`"]),
+        ],
+    );
 }
 
 #[test]
@@ -901,82 +730,17 @@ pub struct Masked;
 //~^ ERROR this attribute cannot be applied to an `extern crate self` item
 pub extern crate self as reexport;
 "#;
-    let expected = r#"error: this attribute can only be applied to a `use` item
-  --> $DIR/invalid-doc-attr.rs:8:7
-   |
-LL | #[doc(inline)]
-   |       ^^^^^^ only applicable on `use` items
-LL |
-LL | pub fn foo() {}
-   | ------------ not a `use` item
-   |
-   = note: read <https://doc.rust-lang.org/nightly/rustdoc/the-doc-attribute.html#inline-and-no_inline> for more information
-note: the lint level is defined here
-  --> $DIR/invalid-doc-attr.rs:1:9
-   |
-LL | #![deny(invalid_doc_attributes)]
-   |         ^^^^^^^^^^^^^^^^^^^^^^
-
-error: conflicting doc inlining attributes
-  --> $DIR/invalid-doc-attr.rs:18:7
-   |
-LL | #[doc(inline)]
-   |       ^^^^^^ this attribute...
-LL | #[doc(no_inline)]
-   |       ^^^^^^^^^ ...conflicts with this attribute
-   |
-   = help: remove one of the conflicting attributes
-
-error: this attribute can only be applied to an `extern crate` item
-  --> $DIR/invalid-doc-attr.rs:24:7
-   |
-LL | #[doc(masked)]
-   |       ^^^^^^ only applicable on `extern crate` items
-LL |
-LL | pub struct Masked;
-   | ----------------- not an `extern crate` item
-   |
-   = note: read <https://doc.rust-lang.org/unstable-book/language-features/doc-masked.html> for more information
-
-error: this attribute cannot be applied to an `extern crate self` item
-  --> $DIR/invalid-doc-attr.rs:28:7
-   |
-LL | #[doc(masked)]
-   |       ^^^^^^ not applicable on `extern crate self` items
-LL |
-LL | pub extern crate self as reexport;
-   | --------------------------------- `extern crate self` defined here
-
-error: this attribute can only be applied to an `extern crate` item
-  --> $DIR/invalid-doc-attr.rs:5:8
-   |
-LL | / #![deny(invalid_doc_attributes)]
-LL | | #![crate_type = "lib"]
-LL | | #![feature(doc_masked)]
-LL | |
-LL | | #![doc(masked)]
-   | |        ^^^^^^ only applicable on `extern crate` items
-...  |
-LL | | pub extern crate self as reexport;
-   | |__________________________________- not an `extern crate` item
-   |
-   = note: read <https://doc.rust-lang.org/unstable-book/language-features/doc-masked.html> for more information
-
-error: this attribute can only be applied to a `use` item
-  --> $DIR/invalid-doc-attr.rs:13:11
-   |
-LL |     #[doc(inline)]
-   |           ^^^^^^ only applicable on `use` items
-LL |
-LL |     pub fn baz() {}
-   |     ------------ not a `use` item
-   |
-   = note: read <https://doc.rust-lang.org/nightly/rustdoc/the-doc-attribute.html#inline-and-no_inline> for more information
-
-error: aborting due to 6 previous errors
-
-"#;
-    assert_eq!(ui("invalid-doc-attr.rs", source), expected);
+    assert_reports(
+        &ui("invalid-doc-attr.rs", source),
+        &[
+            error(8, &["`use`"]),
+            error(18, &[]),
+            error(24, &["`extern crate`"]),
+            error(28, &["`extern crate self`"]),
+            error(5, &["`extern crate`"]),
+            error(13, &["`use`"]),
+        ],
+    );
 }
 
 #[test]

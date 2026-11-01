@@ -318,8 +318,7 @@ impl<'t> Tokens<'t> {
         };
         let range = tt.syntax().text_range();
         let mut delim = Delim::Paren;
-        let mut open = token(Kind::Open(delim), TextRange::empty(range.start()));
-        let mut close = token(Kind::Close(delim), TextRange::empty(range.end()));
+        let (mut open, mut close) = (None, None);
         let mark = scratch.len();
         // Whether the last token pushed is punctuation with nothing after it yet.
         let mut glue = false;
@@ -339,11 +338,11 @@ impl<'t> Tokens<'t> {
             let at = t.text_range();
             if kind.is_l_delimiter() && at.start() == range.start() {
                 delim = delim_of(kind);
-                open = token(Kind::Open(delim), at);
+                open = Some(token(Kind::Open(delim), at));
                 continue;
             }
             if kind.is_r_delimiter() && at.end() == range.end() {
-                close = token(Kind::Close(delim_of(kind)), at);
+                close = Some(token(Kind::Close(delim_of(kind)), at));
                 continue;
             }
             if kind.is_trivia() {
@@ -383,6 +382,12 @@ impl<'t> Tokens<'t> {
             };
             scratch.push(Tt::Token(token(kind, at)));
         }
+        let open = open.unwrap_or_else(|| token(Kind::Open(delim), TextRange::empty(range.start())));
+        let close = close.unwrap_or_else(|| {
+            // A macro file's span map has no piece at its end: the context is its last byte's.
+            let (edition, root) = span(range.end().checked_sub(TextSize::from(1)).filter(|_| !range.is_empty()).unwrap_or(range.start()));
+            Token { kind: Kind::Close(delim), range: TextRange::empty(range.end()), edition, root }
+        });
         let start = self.tts.len();
         self.tts.extend(scratch.drain(mark..));
         Group { delim, open, close, tts: Ids::of(&self.tts, start) }

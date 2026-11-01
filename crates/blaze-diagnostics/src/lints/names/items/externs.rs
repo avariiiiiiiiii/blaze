@@ -674,10 +674,8 @@ pub(super) fn abi_of(abi: Option<ast::Abi<'_>>, default: ExternAbi) -> Option<Ex
     }
 }
 
-/// Where a lint of a type is emitted and what it is printed through.
+/// Where a lint of a type is emitted.
 struct Site<'i, 'db> {
-    /// A type of the item's own, whose owner the lint's type is printed as of.
-    owner: hir::Type<'db>,
     at: InFile<SyntaxNodePtr>,
     /// The item whose signature is the lint's fact, named only once a lint fires.
     item: &'i Item<'db>,
@@ -756,7 +754,7 @@ impl<'db> Pass<'_, '_, 'db> {
         let abi = sig.abi();
         let mut types = Types::new(cx, GenericDefId::FunctionId(id));
         let sig = types.interner.instantiate_bound_regions_with_erased(sig);
-        let site = Site { owner: def.ret_type(db), at: item.ptr(), item };
+        let site = Site { at: item.ptr(), item };
         let params = f.param_list();
         let this = params.and_then(|it| it.self_param());
         let written = || params.into_iter().flat_map(|it| it.params()).filter_map(|it| it.ty());
@@ -798,7 +796,7 @@ impl<'db> Pass<'_, '_, 'db> {
         let id: hir_def::StaticId = def.into();
         let ty = cx.db.type_for_static(id).skip_binder();
         let mut types = Types::new(cx, GenericDefId::StaticId(id));
-        let site = Site { owner: def.ty(cx.db), at: item.ptr(), item };
+        let site = Site { at: item.ptr(), item };
         let mode = CItemKind::Declaration;
         let mut visitor = Visitor::new(&mut types, ty, mode);
         let result = visitor.check_type(State::static_entry(), ty);
@@ -806,10 +804,10 @@ impl<'db> Pass<'_, '_, 'db> {
     }
 
     /// rustc's `check_item` of a static, a const or a type alias.
-    fn typed(&mut self, item: &Item<'db>, owner: GenericDefId, printed: hir::Type<'db>, ty: Ty<'db>, hir_ty: Option<ast::Type<'db>>) {
+    fn typed(&mut self, item: &Item<'db>, owner: GenericDefId, ty: Ty<'db>, hir_ty: Option<ast::Type<'db>>) {
         let Some(hir_ty) = hir_ty else { return };
         let mut types = Types::new(self.cx, owner);
-        let site = Site { owner: printed, at: item.ptr(), item };
+        let site = Site { at: item.ptr(), item };
         let state = State::static_entry();
         self.fnptrs(&mut types, &site, state, item.node.with_value(hir_ty), ty, CItemKind::Definition);
     }
@@ -846,15 +844,13 @@ impl<'db> Pass<'_, '_, 'db> {
     /// rustc's `check_field_def` of each field of an ADT.
     fn fields(&mut self, item: &Item<'db>) {
         let cx = self.cx;
-        let db = cx.db;
         let Some(adt) = ast::Adt::cast(item.node.value.syntax()) else { return };
         let Some(def) = cx.vsema.to_def2(item.node.with_value(adt)) else { return };
         let mut types = Types::new(cx, GenericDefId::AdtId(AdtId::from(def)));
         for &field in &walk::fields(item) {
             let Some(ty) = field_ty(cx, field) else { continue };
             let Some(hir_ty) = field.value.children().find_map(ast::Type::cast) else { continue };
-            let Some(owner) = field_def(cx, field) else { continue };
-            let site = Site { owner: owner.ty(db), at: field.map(ast::ptr), item };
+            let site = Site { at: field.map(ast::ptr), item };
             let state = State::static_entry();
             self.fnptrs(&mut types, &site, state, field.with_value(hir_ty), ty, CItemKind::Definition);
         }
@@ -881,7 +877,7 @@ impl<'db> Pass<'_, '_, 'db> {
             CItemKind::Declaration => ("improper_ctypes", "block"),
             CItemKind::Definition => ("improper_ctypes_definitions", "fn"),
         };
-        let printed = cx.ty(&site.owner.derived_from_next_solver(ty));
+        let printed = crate::print::solver_ty(cx, ty);
         let span = cx.span(range);
         // alloc: the firing lint's message; clone: its span, labelled too
         let mut diag = Diag::lint(lint, format!("`extern` {desc} uses type `{printed}`, which is not FFI-safe"), span.clone());
@@ -977,14 +973,14 @@ pub(super) fn ctypes_item<'db>(cx: &Cx<'_, 'db>, item: &Item<'db>, krate: &Krate
             if let Some(def) = cx.vsema.to_def2(item.node.with_value(s)) {
                 let id: hir_def::StaticId = def.into();
                 let ty = db.type_for_static(id).skip_binder();
-                pass.typed(item, GenericDefId::StaticId(id), def.ty(db), ty, s.ty());
+                pass.typed(item, GenericDefId::StaticId(id), ty, s.ty());
             }
         }
         (ast::Item::Const(c), Container::Module) => {
             if let Some(def) = cx.vsema.to_def2(item.node.with_value(c)) {
                 let id: hir_def::ConstId = def.into();
                 if let Some(ty) = db.value_ty(ValueTyDefId::ConstId(id)) {
-                    pass.typed(item, GenericDefId::ConstId(id), def.ty(db), ty.skip_binder(), c.ty());
+                    pass.typed(item, GenericDefId::ConstId(id), ty.skip_binder(), c.ty());
                 }
             }
         }
@@ -992,7 +988,7 @@ pub(super) fn ctypes_item<'db>(cx: &Cx<'_, 'db>, item: &Item<'db>, krate: &Krate
             if let Some(def) = cx.vsema.to_def2(item.node.with_value(t)) {
                 let id: hir_def::TypeAliasId = def.into();
                 let ty = db.ty(TyDefId::TypeAliasId(id)).skip_binder();
-                pass.typed(item, GenericDefId::TypeAliasId(id), def.ty(db), ty, t.ty());
+                pass.typed(item, GenericDefId::TypeAliasId(id), ty, t.ty());
             }
         }
         (ast::Item::Struct(_), _) if krate.aix => pass.power_alignment(item),

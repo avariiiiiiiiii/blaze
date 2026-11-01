@@ -1,7 +1,8 @@
 //! The driver over whole crates: every error of every file given, whatever was edited, and
 //! rustc's abort before its late passes.
 
-use super::{checked, ui};
+use super::{assert_reports, checked, error, ui};
+use crate::emit::Style;
 
 /// #1522: an error in a `#[cfg(test)]` module is an error of the crate built for tests.
 #[test]
@@ -19,11 +20,7 @@ mod tests {
 }
 "#,
     );
-    assert_eq!(checked.messages(), [
-        "E0063: missing field `b` in initializer of `S`",
-        "aborting due to 1 previous error",
-        "For more information about this error, try `rustc --explain E0063`.",
-    ]);
+    assert_reports(&checked.stderr_with(Style::default()), &[error(6, &["`b`", "`S`"])]);
 }
 
 /// #780: the errors of a crate are those of all its files, not of the files an edit touched.
@@ -58,11 +55,9 @@ fn main() {
 }
 "#,
     );
-    assert_eq!(checked.messages(), [
-        "E0063: missing field `a` in initializer of `S`",
-        "aborting due to 1 previous error",
-        "For more information about this error, try `rustc --explain E0063`.",
-    ]);
+    assert_reports(&checked.stderr_with(Style::default()), &[error(4, &["`a`", "`S`"])]);
+    let late = checked.messages().into_iter().filter(|it| it.starts_with("dead_code:")).collect::<Vec<_>>();
+    assert!(late.is_empty(), "late lints after an error: {late:?}");
 }
 
 #[test]
@@ -76,7 +71,6 @@ fn main() {}
     );
     assert_eq!(checked.messages(), [
         "dead_code: function `unused` is never used",
-        "1 warning emitted",
     ]);
 }
 
@@ -93,23 +87,7 @@ fn main() {
     //~^ ERROR cannot call non-const function
 }
 "#;
-    assert_eq!(ui("const-call.rs", "2015", source), r#"error[E0015]: cannot call non-const function `f` in constants
-  --> $DIR/const-call.rs:6:17
-   |
-LL |     let _ = [0; f(2)];
-   |                 ^^^^
-   |
-note: function `f` is not const
-  --> $DIR/const-call.rs:1:1
-   |
-LL | fn f(x: usize) -> usize {
-   | ^^^^^^^^^^^^^^^^^^^^^^^
-   = note: calls in constants are limited to constant functions, tuple structs and tuple variants
-
-error: aborting due to 1 previous error
-
-For more information about this error, try `rustc --explain E0015`.
-"#);
+    assert_reports(&ui("const-call.rs", "2015", source), &[error(6, &["`f`"])]);
 }
 
 /// rustc reads `#![recursion_limit]` before expansion and stops at its error

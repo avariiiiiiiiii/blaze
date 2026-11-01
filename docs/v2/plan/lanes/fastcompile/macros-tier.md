@@ -262,25 +262,42 @@ What runs it (decided 2026-10-30 by fastcompile-next1; written, in `tier/glue.rs
   `os/thread.rs`); writes to stdout and stderr are taken and dropped, as the evaluator's run
   drops its captured output.
 
-**Building** (to write, `tier/build.rs`). The roots are the build's own list of the crate's
-macros: the static `__blaze_proc_macros::BLAZE_PROC_MACROS`
-(`hir_ty_codegen::v2::roots::proc_macros`), whose initializer is each macro's
-`Client::expand1`/`expand2`, so `Build::reach(&[], &[that static])` reaches every client's
-`run` and all it calls. Each function is `lowered` (with `Backend::Stencil`, as
-`lowered/tests.rs` makes the frontend, policy and unit), `confine`d, and compiled by
-`blaze_stencil::compile`; each static and each function's `Data` is a `load::Blob` with
-`Prepare::compile_static`'s bytes and relocations; each `Target` maps to a `load::To`
-(`Function`/`Direct` to `Code`, a function's address to `Pointer`, `Static`/`Data` to `Blob`,
-`Extern`/`Weak` through `bind::external` to a stub, `Pure` to `Host`). A `run` pointer of the
-list is read from the static's relocation at its offset. The image is kept per code hash of
-the crate's reach, so one compile serves every expansion of the crate's version.
+**Building** (`tier/build.rs`, `build::compiled`). The roots are what the evaluator's run
+calls: each macro's client, `Client::expand1::<F>`/`expand2::<F>` with `F` the macro function's
+item type (`HirFrontend::root_with_fn_items`, queue 01364), and `Buffer::new`, so
+`Build::reach` reaches every client's `run` and all it calls. The static
+`__blaze_proc_macros::BLAZE_PROC_MACROS` this note first named is not in the daemon's front
+end, and won't be: a proc-macro unit builds no native code (fastcompile-macros 7, queue
+01362). The policy is a dev build of the host with static (non-PIC) stencils, and each unit's
+spec is made the tier's (`tier_spec`: `Backend::Stencil`, nothing counted or folded, no debug
+info; overflow checks and debug assertions as the build chose). A reached function a shim
+claims (`bind::Shims::claimed`) is a stub; every other is `lowered`, `confine`d and compiled by
+`blaze_stencil::compile`. Each static and each function's `Data` is a `load::Blob` with
+`Prepare::compile_static`'s bytes and relocations, placed before the code that names them; each
+`Target` maps to a `load::To` (`Function`/`Direct` to `Code`, a function's address to
+`Pointer`, `Static`/`Data` to `Blob`, `Extern`/`Weak` through `bind::external` to a stub,
+`Pure` to `Host`, a stencil libcall by its C name). `Location`s are blobs made from the
+items' span tables. Every signature an entry is called with gets a thunk (`glue::thunk`);
+`Closure::call`'s confined signature gives where the bridge's result and buffer go
+(`BridgeAbi`). The image is kept in the process per code hash, so one compile serves every
+expansion of the crate's version; keeping it in the store and the global cache is still to
+do.
+
+**Entering** (`tier/enter.rs`, `enter::run`) mirrors `run.rs`'s `evaluate`: a `Memory` of the
+image's layout, the preset statics written, then for each expansion its client's word,
+`Buffer::new`, the input filled through the buffer's `reserve`, the 64-byte `BridgeConfig`, and
+the client's `run` called through its table pointer on the calling thread's stack (a `Stream`
+holds an `Rc`, so the expansion never moves threads). The server answers `Closure::call` as
+the evaluator's does. The statics that differ from the image afterwards, outside the
+sysroot, are what the session carries; a static holding a region address makes the session
+run its calls again instead.
 
 ## Which tier
 
 `choose(code, runs)` returns `Tier::Compiled` once the crate has run `Policy::warm` times, in
-a blaze that runs the compiled tier (`Policy::compiled`). Until the confining pass, loader and
-runner are in, `compiled` is false and every expansion is evaluated; `tier::run`, which
-`run.rs` calls for `Tier::Compiled`, stops naming what it lacks. The default `warm` is 1. This is the ski-rental rule stencil's `Tiering` uses: compile when
+a blaze that runs the compiled tier (`Policy::compiled`, true on the machines `machine`
+runs code on: x86-64 and AArch64 Linux and macOS); `run.rs` calls `tier::run` for
+`Tier::Compiled`. The default `warm` is 1. This is the ski-rental rule stencil's `Tiering` uses: compile when
 the evaluator's extra cost has reached the compile's. One serde-sized expansion on the
 evaluator (50 to 500 ms) already costs more than compiling the crate (about 8,000 functions
 at 15 µs each, 120 ms of CPU across the workers, once per macro version, kept in the store

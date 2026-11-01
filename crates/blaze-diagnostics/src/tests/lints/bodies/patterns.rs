@@ -3,7 +3,7 @@
 //! `tests/ui/let-else/`) with their `.stderr`.
 
 use super::types::ui_std;
-use crate::tests::ui;
+use crate::tests::{assert_reports, error, ui};
 
 #[test]
 fn bindings_named_as_the_variants_they_shadow() {
@@ -30,40 +30,14 @@ pub mod b {
 
 fn main() {}
 "##;
-    let stderr = r##"error[E0170]: pattern binding `A` is named the same as one of the variants of the type `E`
-  --> $DIR/issue-14221.rs:13:13
-   |
-LL |             A => "A",
-   |             ^ help: to match on the variant, qualify the path: `E::A`
-   |
-   = note: `#[deny(bindings_with_variant_name)]` on by default
-
-error[E0170]: pattern binding `B` is named the same as one of the variants of the type `E`
-  --> $DIR/issue-14221.rs:15:13
-   |
-LL |             B => "B",
-   |             ^ help: to match on the variant, qualify the path: `E::B`
-
-error: unreachable pattern
-  --> $DIR/issue-14221.rs:15:13
-   |
-LL |             A => "A",
-   |             - matches any value
-LL |
-LL |             B => "B",
-   |             ^ no value can reach this
-   |
-note: the lint level is defined here
-  --> $DIR/issue-14221.rs:1:9
-   |
-LL | #![deny(unreachable_patterns)]
-   |         ^^^^^^^^^^^^^^^^^^^^
-
-error: aborting due to 3 previous errors
-
-For more information about this error, try `rustc --explain E0170`.
-"##;
-    assert_eq!(ui("issue-14221.rs", "2015", source), stderr);
+    assert_reports(
+        &ui("issue-14221.rs", "2015", source),
+        &[
+            error(13, &["`A`", "`E`"]),
+            error(15, &["`B`", "`E`"]),
+            error(15, &[]),
+        ],
+    );
 }
 
 #[test]

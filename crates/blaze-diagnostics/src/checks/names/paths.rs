@@ -171,6 +171,17 @@ pub(super) fn check<'db>(
     }
 
     let per_ns = cx.vsema.resolve_path_per_ns(path);
+    // rustc's `visit_generic_arg`: a generic argument of one segment and no arguments
+    // (`is_potential_trivial_const_arg`) that names nothing of the type namespace and something
+    // of the value namespace is a const argument.
+    if single
+        && source == Source::Type
+        && first.generic_arg_list().is_none()
+        && ty.syntax().parent().is_some_and(|it| it.kind() == SyntaxKind::TYPE_ARG)
+        && per_ns.as_ref().is_some_and(|it| it.type_ns.is_none() && it.value_ns.is_some())
+    {
+        return None;
+    }
     let res = per_ns
         .as_ref()
         .and_then(|it| it.type_ns.or(it.value_ns).or(it.macro_ns));
@@ -466,20 +477,26 @@ fn is_own_type_param(signature: &Signature<'_>, path: ast::Path<'_>, first: ast:
     let at = path.syntax().text_range();
     let item = signature.node.value;
     let inner = outer::inner_item(item);
-    let declares = |node: ast::Node<'_>| {
-        if !ast::AnyHasGenericParams::can_cast(node.kind()) {
-            return false;
-        }
-        let Some(list) = node.child_where(ast::GenericParamList::can_cast).and_then(ast::GenericParamList::cast) else {
-            return false;
-        };
-        !list.syntax().text_range().contains_range(at)
-            && list.type_or_const_params().any(|it| match it {
-                ast::TypeOrConstParam::Type(param) => param.name().is_some_and(|it| it.text() == name),
-                ast::TypeOrConstParam::Const(_) => false,
-            })
+    let names = |list: Option<ast::GenericParamList<'_>>| {
+        list.is_some_and(|list| {
+            !list.syntax().text_range().contains_range(at)
+                && list.type_or_const_params().any(|it| match it {
+                    ast::TypeOrConstParam::Type(param) => param.name().is_some_and(|it| it.text() == name),
+                    ast::TypeOrConstParam::Const(_) => false,
+                })
+        })
     };
-    declares(item) || (inner != item && declares(inner))
+    let declares = |node: ast::Node<'_>| {
+        ast::AnyHasGenericParams::can_cast(node.kind())
+            && names(node.child_where(ast::GenericParamList::can_cast).and_then(ast::GenericParamList::cast))
+    };
+    // `for<T>` (`non_lifetime_binders`, gated apart) declares `T` for what it binds.
+    let binds = |node: ast::Node<'_>| {
+        node.children()
+            .filter(|it| it.kind() == SyntaxKind::FOR_BINDER)
+            .any(|binder| names(binder.child_where(ast::GenericParamList::can_cast).and_then(ast::GenericParamList::cast)))
+    };
+    declares(item) || (inner != item && declares(inner)) || path.syntax().ancestors().any(binds)
 }
 
 /// Whether the one-segment path of first segment `first` names a primitive type, which the

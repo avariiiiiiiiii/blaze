@@ -13,9 +13,11 @@ use blaze_codegen::{
 use blaze_ids::{ContentId, Hasher};
 use blaze_items::{CodeHash, ItemId, ItemKey};
 use hir_def::{
-    AdtId, CallableDefId, DefWithBodyId, ExpressionStoreOwnerId, FunctionId, GenericDefId, HasModule, Lookup,
+    AdtId, CallableDefId, DefWithBodyId, ExpressionStoreOwnerId, FunctionId, GenericDefId, GenericParamId,
+    HasModule, Lookup,
     attrs::AttrFlags,
     expr_store::ExpressionStore,
+    signatures::FunctionSignature,
 };
 use hir_ty::{
     InferBodyId, ParamEnvAndCrate,
@@ -304,6 +306,15 @@ impl<'db> HirFrontend<'db> {
     /// function.
     pub fn root(&self, func: FunctionId) -> HirInstance {
         self.databases.with(|db, homes| root_in(db, homes, func))
+    }
+
+    /// A root of `func` whose type parameters are, in order, the function items `items` (each
+    /// with no generic arguments of its own), every region erased: a proc macro crate's
+    /// `Client::expand1::<F>` or `expand2::<F>` for its `#[proc_macro*]` function `F`. An error
+    /// names `func` when it has a const parameter or a type parameter count other than
+    /// `items.len()`.
+    pub fn root_with_fn_items(&self, func: FunctionId, items: &[FunctionId]) -> Result<HirInstance, String> {
+        self.databases.with(|db, homes| root_with_fn_items_in(db, homes, func, items))
     }
 
     /// The C `main` of a program whose `fn main` is `main`.
@@ -602,15 +613,56 @@ impl HirInstance {
 /// [`HirFrontend::root`] in a task's `homes`. Each lifetime parameter is erased, as in the
 /// instance a call names, so the root and the call are one instance.
 pub(crate) fn root_in(db: &Db, homes: &mut Homes, func: FunctionId) -> HirInstance {
-    let krate = func.krate(db);
-    let env = ParamEnvAndCrate { param_env: ParamEnv::empty(), krate }.store();
     let interner = DbInterner::new_no_crate(db);
     let erased = Region::new_erased(interner);
-    let instance = Instance {
-        def: InstanceDef::Fn(func),
-        args: GenericArgs::for_item(interner, func.into(), |_, _, _, _| erased.into()).store(),
-        checked: false,
-    };
+    rooted(db, homes, func, GenericArgs::for_item(interner, func.into(), |_, _, _, _| erased.into()))
+}
+
+/// [`HirFrontend::root_with_fn_items`].
+fn root_with_fn_items_in(
+    db: &Db,
+    homes: &mut Homes,
+    func: FunctionId,
+    items: &[FunctionId],
+) -> Result<HirInstance, String> {
+    let interner = DbInterner::new_no_crate(db);
+    let erased = Region::new_erased(interner);
+    let mut given = items.iter();
+    let (mut types, mut consts) = (0, 0);
+    let args = GenericArgs::for_item(interner, func.into(), |_, id, _, _| match id {
+        GenericParamId::LifetimeParamId(_) => erased.into(),
+        GenericParamId::TypeParamId(_) => {
+            types += 1;
+            match given.next() {
+                Some(&item) => {
+                    let item = CallableDefId::FunctionId(item).into();
+                    Ty::new_fn_def(interner, item, GenericArgs::default()).into()
+                }
+                None => erased.into(),
+            }
+        }
+        GenericParamId::ConstParamId(_) => {
+            consts += 1;
+            erased.into()
+        }
+    });
+    if types != items.len() || consts > 0 {
+        let name = FunctionSignature::of(db, func).name.as_str();
+        // alloc: the error's message
+        return Err(format!(
+            "`{name}` has {types} type and {consts} const parameters; it is rooted with {} \
+             function items for its type parameters and nothing else",
+            items.len()
+        ));
+    }
+    Ok(rooted(db, homes, func, args))
+}
+
+/// The root of `func` instantiated with `args`, in the empty environment of its crate.
+fn rooted<'db>(db: &'db Db, homes: &mut Homes, func: FunctionId, args: GenericArgs<'db>) -> HirInstance {
+    let krate = func.krate(db);
+    let env = ParamEnvAndCrate { param_env: ParamEnv::empty(), krate }.store();
+    let instance = Instance { def: InstanceDef::Fn(func), args: args.store(), checked: false };
     let env = homes.home(db, &instance, &env);
     HirInstance(Kind::Code(instance, env))
 }

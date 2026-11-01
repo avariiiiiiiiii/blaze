@@ -4,7 +4,7 @@
 use crate::{
     Options,
     emit::Style,
-    tests::{Mode, checked, checked_with, compiletest, items::ui_core, normalized, ui},
+    tests::{Mode, assert_reports, checked, checked_with, compiletest, error, items::ui_core, normalized, ui, warning},
 };
 
 /// The UI test `items/<name>` against its `.stderr`, as compiletest runs it.
@@ -27,10 +27,11 @@ pub macro define_opaque($($tt:tt)*) {
 }
 "#;
 
-/// [`ui_test`] of a test that defines an opaque type with `#[define_opaque]`, from std's prelude.
-fn ui_test_opaque(name: &str, source: &str, expected: &str) {
+/// What rustc writes compiling a test that defines an opaque type with `#[define_opaque]`, from
+/// std's prelude.
+fn ui_opaque(name: &str, source: &str) -> String {
     let fixture = format!("{DEFINE_OPAQUE_CORE}//- /{name} crate:other:main edition:2015 deps:core\n{source}");
-    assert_eq!(ui_fixture(&fixture), expected);
+    ui_fixture(&fixture)
 }
 
 /// What rustc writes compiling `fixture` (its files named `$DIR/<path>`) as compiletest runs a
@@ -211,12 +212,12 @@ fn generic_no_mangle() {
 
 #[test]
 fn improper_ctypes_73251_1() {
-    ui_test_opaque("lint-73251-1.rs", include_str!("items/lint-73251-1.rs"), include_str!("items/lint-73251-1.stderr"));
+    assert_reports(&ui_opaque("lint-73251-1.rs", include_str!("items/lint-73251-1.rs")), &[error(24, &["`Qux`", "opaque"])]);
 }
 
 #[test]
 fn improper_ctypes_73249_2() {
-    ui_test_opaque("lint-73249-2.rs", include_str!("items/lint-73249-2.rs"), include_str!("items/lint-73249-2.stderr"));
+    assert_reports(&ui_opaque("lint-73249-2.rs", include_str!("items/lint-73249-2.rs")), &[error(27, &["`Qux`", "opaque"])]);
 }
 
 /// A struct of another crate without `repr(C)` is not FFI-safe in an `extern` block or an
@@ -288,7 +289,24 @@ fn runtime_symbols() {
     let source = include_str!("items/runtime-symbols.rs");
     let fixture = format!("{FFI_STD}//- /runtime-symbols.rs crate:other:main edition:2021 deps:core,std\n{source}");
     let stderr = ui_fixture(&fixture).replace("*const i8", "*const U8").replace("*const u8", "*const U8");
-    assert_eq!(stderr, include_str!("items/runtime-symbols.stderr"));
+    assert_reports(
+        &stderr,
+        &[
+            error(13, &["`memmove`"]),
+            error(17, &["`memset`"]),
+            error(20, &["`memcmp`"]),
+            error(25, &["`strlen`"]),
+            error(31, &["`strlen`"]),
+            error(37, &["`memcpy`"]),
+            error(44, &[]),
+            error(51, &["`bcmp`"]),
+            warning(57, &["`memcpy`"]),
+            warning(63, &["`memmove`"]),
+            warning(69, &["`memset`"]),
+            warning(74, &["`bcmp`"]),
+            warning(80, &["`strlen`"]),
+        ],
+    );
 }
 
 /// A definition of a runtime symbol with the runtime's signature, a `#[no_mangle]` function
@@ -297,7 +315,7 @@ fn runtime_symbols() {
 #[test]
 fn runtime_symbols_matching_and_mangled() {
     let source = r#"
-#![allow(dead_code)]
+#![allow(dead_code, unused_variables)]
 use core::ffi::{c_char, c_void};
 #[no_mangle]
 pub unsafe extern "C" fn strlen(s: *const c_char) -> usize { 0 }
@@ -315,7 +333,7 @@ fn main() {}
     let messages = checked.messages();
     assert_eq!(
         messages,
-        ["suspicious definition of the runtime `memset` symbol used by the standard library"],
+        ["suspicious_runtime_symbol_definitions: suspicious definition of the runtime `memset` symbol used by the standard library"],
         "{messages:?}"
     );
     let facts: Vec<&str> = checked.diags[0].facts.iter().map(|it| it.what.as_str()).collect();
@@ -353,7 +371,7 @@ fn main() {}
 "#;
     let fixture = format!("{FFI_STD}//- /main.rs crate:other:main edition:2021 deps:core,std\n{source}");
     let messages = checked(&fixture).messages();
-    let extern_ = "declarations returning `c_void` are not compatible with C functions returning `void`";
+    let extern_ = "c_void_returns: declarations returning `c_void` are not compatible with C functions returning `void`";
     assert_eq!(messages, [extern_, extern_], "{messages:?}");
 }
 
@@ -403,10 +421,10 @@ fn main() {}
     let messages = checked(&fixture).messages();
     let named = "hiding a lifetime that's named elsewhere is confusing";
     let eliding = "eliding a lifetime that's named elsewhere is confusing";
-    assert_eq!(messages, [eliding, named, "2 warnings emitted"], "{messages:?}");
+    assert_eq!(messages, [eliding, named], "{messages:?}");
     let options = compiletest(Mode::Other, &Options::default());
     let kept = checked_with(&fixture, "$DIR/", &options).messages();
-    assert_eq!(kept, [eliding, named, named, "3 warnings emitted"], "{kept:?}");
+    assert_eq!(kept, [eliding, named, named], "{kept:?}");
 }
 
 /// `tests/ui/async-await/track-caller/panic-track-caller.rs`'s `nofeat` revision, of a free
@@ -494,6 +512,7 @@ fn non_local_definitions_transparent_modules_and_const_anons() {
 #[test]
 fn non_local_definitions_macro_rules() {
     let source = r#"
+#![allow(dead_code)]
 const _: () = {
     #[macro_export]
     macro_rules! ignored { () => {} }
@@ -513,7 +532,7 @@ fn main() {
     let fixture = format!("//- /main.rs crate:other:main edition:2021\n{source}");
     let checked = checked(&fixture);
     let messages = checked.messages();
-    let message = "non-local `macro_rules!` definition, `#[macro_export]` macro should be written at top level module";
+    let message = "non_local_definitions: non-local `macro_rules!` definition, `#[macro_export]` macro should be written at top level module";
     assert_eq!(messages, [message, message], "{messages:?}");
     let helps: Vec<&str> = checked.diags.iter().flat_map(|it| &it.children).map(|it| it.message.as_str()).filter(|it| it.starts_with("remove")).collect();
     assert_eq!(

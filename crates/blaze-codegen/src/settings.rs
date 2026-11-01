@@ -7,7 +7,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::{Arch, Backend, Settings};
 
-pub const SETTINGS_DOMAIN: &str = "blaze v2 codegen settings 4";
+pub const SETTINGS_DOMAIN: &str = "blaze v2 codegen settings 5";
 
 #[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub enum Panic {
@@ -178,11 +178,6 @@ pub struct Spec {
     /// code is never a plain one's.
     pub sanitize: Sanitize,
     pub pgo: Pgo,
-    /// The content ID of the policy that gives every function of the build its settings
-    /// ([`crate::plan::Policy::id`]): a function's relocations name its callees by keys made
-    /// with their settings, so a change to how a callee is compiled is a change to the
-    /// caller's output.
-    pub policy: ContentId,
 }
 
 impl Spec {
@@ -199,7 +194,6 @@ impl Spec {
             mir_inline,
             sanitize,
             pgo,
-            policy,
         } = self;
         let Toolchain {
             id,
@@ -252,7 +246,6 @@ impl Spec {
             Pgo::Generate => hasher.update(&[1]),
             Pgo::Use(profile) => hasher.update(&[2]).id(profile),
         };
-        hasher.id(policy);
         Settings(hasher.finish())
     }
 
@@ -292,7 +285,6 @@ mod tests {
             mir_inline: false,
             sanitize: Sanitize::default(),
             pgo: Pgo::None,
-            policy: ContentId([2; 32]),
         }
     }
 
@@ -329,7 +321,6 @@ mod tests {
             |it| it.sanitize.coverage.flags = Coverage::PC_TABLE,
             |it| it.pgo = Pgo::Generate,
             |it| it.pgo = Pgo::Use(ContentId([5; 32])),
-            |it| it.policy = ContentId([4; 32]),
         ];
         let mut seen = std::collections::BTreeSet::from([base.settings()]);
         for change in changes {

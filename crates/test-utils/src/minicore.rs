@@ -1996,7 +1996,7 @@ pub mod iter {
             type Item = B;
 
             #[inline]
-            fn next(&mut self) -> B {
+            fn next(&mut self) -> Option<B> {
                 loop {}
             }
         }
@@ -2017,7 +2017,7 @@ pub mod iter {
             }
         }
     }
-    pub use self::adapters::{Filter, FilterMap, Take};
+    pub use self::adapters::{Filter, FilterMap, Map, Take};
 
     mod sources {
         mod repeat {
@@ -2261,7 +2261,7 @@ pub mod panic {
     }
 }
 
-mod panicking {
+pub mod panicking {
     #[rustc_const_panic_str] // enforce a &&str argument in const-check and hook this by const-eval
     pub const fn panic_display<T: crate::fmt::Display>(x: &T) -> ! {
         panic_fmt(crate::format_args!("{}", *x));

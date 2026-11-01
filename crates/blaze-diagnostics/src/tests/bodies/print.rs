@@ -78,7 +78,8 @@ fn main() {
 #[test]
 fn a_function_item_is_its_signature_and_its_path() {
     // tests/ui/expr/if/if-typeck.rs: "found fn item `fn() {f}`"; tests/ui/extern/
-    // extern-rust-fn-type-error-10764.rs: "found fn item `extern \"C\" fn() {bar}`".
+    // extern-rust-fn-type-error-10764.rs: "found fn item `extern \"C\" fn() {bar}`". An elided
+    // lifetime stays elided, as written, where rustc writes `for<'a> fn(&'a u8)`.
     let fixture = r#"//- /main.rs crate:other:main edition:2021
 fn f() {}
 extern "C" fn bar() {}
@@ -102,7 +103,7 @@ fn main() {
             "fn() {f}",
             "extern \"C\" fn() {bar}",
             "fn(u8) -> u8 {id::<u8>}",
-            "for<'a> fn(&'a u8) {g}",
+            "fn(&u8) {g}",
             "for<'x> fn(&'x u8) -> &'x u8 {h}",
             "unsafe extern \"C\" fn(*const u8, ...) -> i32 {printf}",
         ]
@@ -128,7 +129,7 @@ fn main() {
 ";
     assert_eq!(
         printed(fixture),
-        ["fn(u8) -> P {P}", "fn(u8) -> E {E::V}", "for<'a> fn(&'a S) {S::m}", "for<'a> fn(&'a S) {<S as Tr>::t}"]
+        ["fn(u8) -> P {P}", "fn(u8) -> E {E::V}", "fn(&S) {S::m}", "fn(&S) {<S as Tr>::t}"]
     );
 }
 

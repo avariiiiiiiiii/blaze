@@ -104,58 +104,7 @@ impl CfgExpr {
         next_cfg_expr(tt).unwrap_or(CfgExpr::Invalid)
     }
 
-    #[cfg(feature = "syntax")]
-    pub fn parse_from_ast(ast: syntax::ast::CfgPredicate) -> CfgExpr {
-        use intern::sym;
-        use syntax::ast::{self, AstToken};
-
-        match ast {
-            ast::CfgPredicate::CfgAtom(atom) => {
-                let atom = match atom.key() {
-                    Some(ast::CfgAtomKey::True) => CfgAtom::Flag(sym::true_),
-                    Some(ast::CfgAtomKey::False) => CfgAtom::Flag(sym::false_),
-                    Some(ast::CfgAtomKey::Ident(key)) => {
-                        let key = Symbol::intern(key.text());
-                        match atom.string_token().and_then(ast::String::cast) {
-                            Some(value) => {
-                                if let Ok(value) = value.value() {
-                                    CfgAtom::KeyValue { key, value: Symbol::intern(&value) }
-                                } else {
-                                    return CfgExpr::Invalid;
-                                }
-                            }
-                            None => CfgAtom::Flag(key),
-                        }
-                    }
-                    None => return CfgExpr::Invalid,
-                };
-                CfgExpr::Atom(atom)
-            }
-            ast::CfgPredicate::CfgComposite(composite) => {
-                let Some(keyword) = composite.keyword() else {
-                    return CfgExpr::Invalid;
-                };
-                match keyword.text() {
-                    "all" => CfgExpr::All(
-                        composite.cfg_predicates().map(CfgExpr::parse_from_ast).collect(),
-                    ),
-                    "any" => CfgExpr::Any(
-                        composite.cfg_predicates().map(CfgExpr::parse_from_ast).collect(),
-                    ),
-                    "not" => {
-                        let mut inner = composite.cfg_predicates();
-                        let (Some(inner), None) = (inner.next(), inner.next()) else {
-                            return CfgExpr::Invalid;
-                        };
-                        CfgExpr::Not(Box::new(CfgExpr::parse_from_ast(inner)))
-                    }
-                    _ => CfgExpr::Invalid,
-                }
-            }
-        }
-    }
-
-    /// [`Self::parse_from_ast`] over a view of the predicate.
+    /// The `CfgExpr` of a `cfg` predicate, read from a view of it.
     #[cfg(feature = "syntax")]
     pub fn parse_from_view(ast: syntax::view::CfgPredicate<'_>) -> CfgExpr {
         use intern::sym;

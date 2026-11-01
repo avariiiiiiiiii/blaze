@@ -3,6 +3,7 @@
 //! the soft gates `feature_warn` gives, and `PostExpansionVisitor`'s gates.
 
 use super::{ui, ui_core};
+use crate::tests::{assert_reports, error};
 
 #[test]
 fn become_is_gated_before_expansion() {
@@ -379,21 +380,7 @@ fn a_type_parameter_in_a_binder_is_gated() {
 
 fn main() {}
 "#;
-    let stderr = r#"error[E0658]: only lifetime parameters can be used in this context
-  --> $DIR/feature-gate-non_lifetime_binders.rs:1:20
-   |
-LL | fn foo() where for<T> T:, {}
-   |                    ^
-   |
-   = note: see issue #108185 <https://github.com/rust-lang/rust/issues/108185> for more information
-   = help: add `#![feature(non_lifetime_binders)]` to the crate attributes to enable
-   = note: this compiler was built on YYYY-MM-DD; consider upgrading it if it is out of date
-
-error: aborting due to 1 previous error
-
-For more information about this error, try `rustc --explain E0658`.
-"#;
-    assert_eq!(ui("feature-gate-non_lifetime_binders.rs", "2015", source), stderr);
+    assert_reports(&ui("feature-gate-non_lifetime_binders.rs", "2015", source), &[error(1, &[])]);
 }
 
 #[test]

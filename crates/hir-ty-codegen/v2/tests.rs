@@ -107,7 +107,6 @@ fn spec() -> Spec {
         counted: false,
         mir_inline: false,
         pgo: blaze_codegen::settings::Pgo::None,
-        policy: ContentId::default(),
         sanitize: Sanitize::default(),
     }
 }
@@ -302,6 +301,27 @@ fn a_cached_function_is_new_code_when_what_its_closure_reaches_is() {
     };
     assert_eq!(code("x ^ 1"), code("x ^ 1"));
     assert_ne!(code("x ^ 1"), code("x ^ 2"));
+}
+
+#[test]
+fn a_root_takes_function_items_for_its_type_parameters() {
+    use blaze_codegen::backend::Frontend as _;
+    let src = "pub fn expand<'a, F>(_: &'a u8) {}\npub fn two<F, G>() {}\npub fn sized<const N: usize, F>() {}\npub fn mac() {}\npub fn other() {}\n";
+    let (db, frontend) = frontend(src);
+    hir_ty::attach_db(db, || {
+        let [expand, two, sized, mac, other] =
+            ["expand", "two", "sized", "mac", "other"].map(|name| function(db, name));
+        let root = |func, items: &[_]| frontend.root_with_fn_items(func, items);
+        let with_mac = root(expand, &[mac]).unwrap();
+        assert_ne!(with_mac, root(expand, &[other]).unwrap());
+        assert_eq!(with_mac, root(expand, &[mac]).unwrap());
+        let origin = frontend.with(|hir, _| frontend.origin(hir, fixture::test_crate(&db)));
+        frontend.describe(&with_mac, &origin).unwrap_or_else(|e| panic!("{with_mac:?}: {}", e.what));
+        for (func, items, name) in [(two, &[mac][..], "two"), (expand, &[], "expand"), (sized, &[mac], "sized")] {
+            let what = root(func, items).unwrap_err();
+            assert!(what.contains(&format!("`{name}`")), "{what}");
+        }
+    });
 }
 
 /// A generic is shared under every options a unit of its origin builds a body with: the
@@ -905,4 +925,84 @@ fn inlined_statements_are_written_in_their_callees() {
     let unplaced = vec![None, Some((leaf, None))];
     let refused = crate::fragment::Source::resolved(owner, &spans, &scopes, unplaced, statements);
     assert!(refused.is_err_and(|e| e.contains("no item's body")));
+}
+
+const LOCALS: &str = r#"
+//- minicore: sized, add, mul
+pub fn counted(x: u32) -> u32 {
+    let one = x + 1;
+    let two = one * 2;
+    two
+}
+"#;
+
+/// A function's named locals are told by binding, so renaming one changes nothing its side
+/// table is made of, and the name a debugger is told is read from the database of the build.
+#[test]
+fn renaming_a_local_keeps_what_its_function_tells_a_debugger() {
+    let full = Spec { debuginfo: DebugInfo::Full, ..spec() };
+    let told = |text: &str| {
+        let (db, frontend) = frontend(text);
+        let counted = function(db, "counted");
+        let prepared = prepared(&frontend, &full, &frontend.root(counted)).1;
+        let function = prepared.function();
+        let body = hir_def::expr_store::Body::of(db, counted.into());
+        let mut names: Vec<String> = (function.variables.iter())
+            .map(|variable| {
+                let (_, binding) = (body.bindings())
+                    .find(|(id, _)| id.into_raw().into_u32() == variable.binding)
+                    .unwrap_or_else(|| panic!("binding {}", variable.binding));
+                binding.name.as_str().to_owned()
+            })
+            .collect();
+        names.sort_unstable();
+        (function.variables.clone(), format!("{:?}", function.scopes), names)
+    };
+    let (variables, scopes, names) = told(LOCALS);
+    assert_eq!(names, ["one", "two", "x"]);
+    let (renamed, renamed_scopes, renamed_names) = told(&LOCALS.replace("one", "uno"));
+    assert_eq!((renamed, renamed_scopes), (variables, scopes), "nothing of the side table changed");
+    assert_eq!(renamed_names, ["two", "uno", "x"], "the debugger is told the new name");
+}
+
+const LINE_READ: &str = r#"
+//- minicore: panic_location
+#[rustc_builtin_macro]
+macro_rules! line {() => {}}
+
+pub fn here() -> u32 {
+    line!()
+}
+"#;
+
+/// A function reads `line!()` from the `Location` of where it is written, called or MIR-inlined
+/// alike: the link fills the record with the line a fresh build has.
+#[test]
+fn a_line_is_read_from_the_location_where_it_is_written() {
+    use crate::fragment::DataRequest;
+    let fx = fixture::db(LINE_READ);
+    let file = fx.only_file();
+    let db = fx.into_db();
+    let text = db.file_text(file.file_id(&db)).text(&db).to_string();
+    let written = text[..text.find("line!()").expect("the call")].matches('\n').count() as u32 + 1;
+    let (db, frontend) = held(db);
+    let here = function(db, "here");
+    let root = frontend.root(here);
+    frontend.with(|db, _| {
+        let lines = |spec: &Spec| {
+            let super::Built::Ir(pending) = built_as(db, spec, &root) else { panic!("asm") };
+            (pending.wants.requests.datas.iter())
+                .filter_map(|it| match it {
+                    DataRequest::Location(Some((owner, span))) => {
+                        let place =
+                            *hir_ty_mir::mir::location::source_location_in_file(db, *owner, *span);
+                        Some(place.expect("a place").1)
+                    }
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(lines(&spec()), [written]);
+        assert_eq!(lines(&llvm(2)), [written], "inlined `Location::caller` reads the same");
+    });
 }

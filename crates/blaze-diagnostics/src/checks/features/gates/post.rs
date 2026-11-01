@@ -1,8 +1,8 @@
 //! rustc's `PostExpansionVisitor`: the legacy gates of the crate once it is expanded and `cfg`
 //! removed what it removes, in the order rustc's walk comes to them: `#[doc(..)]`'s unstable
 //! flavours, negative and `default` impls, auto traits, trait aliases, `macro`, `impl Trait` in
-//! type aliases and associated types, `type const`, LLVM intrinsics, extern types, `!`, pattern
-//! types, binders with more than lifetimes, `try` blocks, `f16` and `f128` literals, `X..` in
+//! type aliases and associated types, `type const`, LLVM intrinsics, extern types, pattern
+//! types (`!` is stable since 1.100.0), binders with more than lifetimes, `try` blocks, `f16` and `f128` literals, `X..` in
 //! slice patterns, `box` patterns, associated type defaults and `default` associated items.
 //!
 //! Follows rustc's `compiler/rustc_ast_passes/src/feature_gate.rs` (`PostExpansionVisitor`,
@@ -93,23 +93,6 @@ impl Visitor<'_, '_, '_, '_> {
                 }
             }
             SyntaxKind::FOR_BINDER => self.binder(file, node),
-            SyntaxKind::NEVER_TYPE => {
-                // As a return type it is a function's (not gated) or parenthesized arguments'
-                // (gated as the walk comes to the arguments).
-                let returned = node.parent().is_some_and(|it| it.kind() == SyntaxKind::RET_TYPE);
-                if !returned {
-                    self.gate(file, node, "never_type", node.text_range(), "the `!` type is experimental", None);
-                }
-            }
-            SyntaxKind::PARENTHESIZED_ARG_LIST | SyntaxKind::PARAM_LIST => {
-                if let Some(parent) = node.parent()
-                    && matches!(parent.kind(), SyntaxKind::PATH_SEGMENT | SyntaxKind::ASSOC_TYPE_ARG)
-                    && let Some(ret) = child(parent, SyntaxKind::RET_TYPE)
-                    && let Some(never) = child(ret, SyntaxKind::NEVER_TYPE)
-                {
-                    self.gate(file, node, "never_type", never.text_range(), "the `!` type is experimental", None);
-                }
-            }
             SyntaxKind::PATTERN_TYPE => {
                 self.gate(file, node, "pattern_types", node.text_range(), "pattern types are unstable", None);
             }

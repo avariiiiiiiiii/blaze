@@ -145,6 +145,8 @@ pub(crate) struct Image {
     pub(crate) readonly: Vec<u8>,
     /// Each function's table pointer, if it has an entry.
     pointers: Vec<Option<u64>>,
+    /// Each blob's guest offset.
+    offsets: Vec<u32>,
 }
 
 /// Bytes of a veneer: a jump through an address stored in it, for a call out of reach.
@@ -314,7 +316,7 @@ impl Image {
             });
             names.push(function.name);
         }
-        Ok(Image { exec, code_len, table, placed, names, layout, writable, readonly, pointers })
+        Ok(Image { exec, code_len, table, placed, names, layout, writable, readonly, pointers, offsets })
     }
 
     pub(crate) fn table(&self) -> &Table {
@@ -329,6 +331,11 @@ impl Image {
     /// Function `n`'s table pointer, if it has an entry.
     pub(crate) fn pointer(&self, n: u32) -> Option<u64> {
         self.pointers.get(n as usize).copied().flatten()
+    }
+
+    /// Blob `n`'s guest offset.
+    pub(crate) fn blob(&self, n: u32) -> Option<u32> {
+        self.offsets.get(n as usize).copied()
     }
 
     /// Whether `pc` is in the image's code.

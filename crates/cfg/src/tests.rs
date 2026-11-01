@@ -2,7 +2,7 @@ use expect_test::{Expect, expect};
 use hegel::TestCase;
 use hegel::generators as gs;
 use intern::Symbol;
-use syntax::{AstNode, Edition, SourceFile, ast, view, view::AstNode as _};
+use syntax::{Edition, SourceFile, view, view::AstNode as _};
 use syntax_bridge::{
     DocCommentDesugarMode, call_input,
     dummy_test_span_utils::{DUMMY, DummyTestSpanMap},
@@ -10,8 +10,7 @@ use syntax_bridge::{
 
 use crate::{CfgAtom, CfgExpr, CfgOptions, DnfExpr};
 
-/// The first predicate of `input`, read from its token tree and from its view. The handle's
-/// reading (`parse_from_ast`), the reference until the handles are deleted, must be the view's.
+/// The first predicate of `input`, read from its token tree and from its view.
 /// `clean`: `input` must parse without errors.
 #[track_caller]
 fn cfgs(input: &str, clean: bool) -> (CfgExpr, CfgExpr) {
@@ -22,8 +21,6 @@ fn cfgs(input: &str, clean: bool) -> (CfgExpr, CfgExpr) {
     let pred = parse.root().descendants().find_map(view::CfgPredicate::cast).unwrap();
     let tt = call_input(pred.syntax(), DummyTestSpanMap, DUMMY, DocCommentDesugarMode::ProcMacro);
     let from_view = CfgExpr::parse_from_view(pred);
-    let handle = parse.syntax_node().descendants().find_map(ast::CfgPredicate::cast).unwrap();
-    assert_eq!(CfgExpr::parse_from_ast(handle), from_view, "{input}");
     (CfgExpr::parse(&tt), from_view)
 }
 

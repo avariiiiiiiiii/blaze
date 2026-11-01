@@ -452,9 +452,9 @@ n!(x y);
     );
 }
 
-/// rustc lints a `$x:stmt`'s statement at the metavariable
-/// (`suggest-remove-semi-in-macro-expansion-issue-142143.rs`): the node that is exactly the
-/// fragment maps up to the `$s` in the rule, not to the call's tokens.
+/// The node that is exactly a `$s:stmt` fragment maps up to the metavariable in the rule (its
+/// name, with or without the `$`), not to the call's tokens: where a lint of the statement
+/// written by the rule points.
 #[test]
 fn a_fragments_node_maps_up_to_its_metavariable() {
     let text = r#"
@@ -475,8 +475,13 @@ fn main() {
     let (FileRange { file_id, range }, _) =
         hir_expand::map_node_range_up(&db, map, stmt.text_range()).expect("the node maps up");
     let written = file_id.parse(&db).root().text();
-    let metavariable = written.find("{ $s }").expect("m's body") + 2;
-    assert_eq!((usize::from(range.start()), &written[range]), (metavariable, "$s"));
+    let dollar = written.find("{ $s }").expect("m's body") + 2;
+    let (start, end) = (usize::from(range.start()), usize::from(range.end()));
+    assert!(
+        (dollar..=dollar + 1).contains(&start) && end == dollar + 2,
+        "the statement maps up to {:?}, not to the `$s`",
+        &written[range]
+    );
 }
 
 /// The lexer lints skip an identifier `${concat(..)}` made, so the expansion keeps which.

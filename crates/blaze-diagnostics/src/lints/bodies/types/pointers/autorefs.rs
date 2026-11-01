@@ -10,8 +10,10 @@ use hir_def::{
     hir::{Expr, ExprId, UnaryOp, type_ref::Rawness},
     signatures::FunctionSignature,
 };
-use hir_ty::{Adjust, Adjustment, AutoBorrow, OverloadedDeref, infer::AutoBorrowMutability};
-use rustc_type_ir::Mutability;
+use hir_ty::{
+    Adjust, Adjustment, AutoBorrow, OverloadedDeref, PointerCast, infer::AutoBorrowMutability, next_solver::TyKind,
+};
+use rustc_type_ir::{Mutability, UintTy, inherent::IntoKind};
 
 use super::{fn_def_span, has_attr, source_callsite, span, type_info};
 use crate::{
@@ -51,7 +53,11 @@ fn check(b: &BodyCx<'_, '_, '_>, expr: ExprId) -> Option<Found> {
         _ => return None,
     };
 
-    let adjustments = peel_derefs_adjustments(b.infer.expr_adjustment(inner)?);
+    let mut adjustments = b.infer.expr_adjustment(inner)?;
+    if is_builtin_index(b, expr) {
+        adjustments = without_index_borrow(adjustments);
+    }
+    let adjustments = peel_derefs_adjustments(adjustments);
     let [adjustment] = adjustments else { return None };
     let (borrow_mutbl, through_overloaded_deref) = has_implicit_borrow(adjustment)?;
     let Expr::UnaryOp { expr: dereferenced, op: UnaryOp::Deref } = store.expr(peel_place_mappers(b, inner)) else {
@@ -120,6 +126,24 @@ fn peel_place_mappers(b: &BodyCx<'_, '_, '_>, mut expr: ExprId) -> ExprId {
             Expr::Field { expr: inner, .. } => expr = inner,
             _ => return expr,
         }
+    }
+}
+
+/// Whether `expr` is an index of an array or slice by a `usize`, which rustc's writeback
+/// (`fix_index_builtin_expr`) makes the builtin index rather than a call of `Index::index`.
+fn is_builtin_index(b: &BodyCx<'_, '_, '_>, expr: ExprId) -> bool {
+    let Expr::Index { base, index } = b.store().expr(expr) else { return false };
+    let TyKind::Ref(_, base, _) = util::ty_adjusted(b, base).kind() else { return false };
+    matches!(base.kind(), TyKind::Array(..) | TyKind::Slice(_))
+        && matches!(util::ty_adjusted(b, index).kind(), TyKind::Uint(UintTy::Usize))
+}
+
+/// The adjustments of a builtin index's base once rustc's writeback drops the borrow
+/// `Index::index` took, and the unsizing of an array after it.
+fn without_index_borrow(adjustments: &[Adjustment]) -> &[Adjustment] {
+    match adjustments {
+        [rest @ .., _, Adjustment { kind: Adjust::Pointer(PointerCast::Unsize), .. }] | [rest @ .., _] => rest,
+        [] => adjustments,
     }
 }
 

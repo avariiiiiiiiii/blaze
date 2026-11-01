@@ -319,7 +319,6 @@ impl Policy {
             mir_inline: matches!(level, OptLevel::O2 | OptLevel::O3) && !live,
             sanitize: self.sanitize,
             pgo: self.pgo,
-            policy: self.id(),
         };
         // Build-time code runs out of the run's process, where no counter cells are: it is
         // compiled as an output's.
@@ -507,7 +506,7 @@ mod tests {
         output.mode = Mode::Output;
         let higher = Origin::Dependency(Package::new("nalgebra"));
         let (at_three, as_output) = (tiered.choose(&higher, None).unwrap(), output.choose(&higher, None).unwrap());
-        assert_eq!(at_three.first, Spec { policy: tiered.id(), ..as_output.first });
+        assert_eq!(at_three.first, as_output.first);
         assert_eq!((at_three.then, at_three.patchable), (as_output.then, as_output.patchable));
         assert_eq!(tiered.choose(&Origin::Std, None).unwrap().first.backend, Backend::Llvm { opt: 3 });
         let build = tiered.choose(&Origin::BuildTime(Package::new("serde_derive")), None).unwrap();
@@ -539,12 +538,23 @@ mod tests {
     }
 
     #[test]
-    fn the_policy_is_in_every_setting() {
+    fn an_override_of_another_package_changes_no_setting() {
         let a = policy(OptLevel::O0, Mode::Output);
         let mut b = a.clone();
-        b.profile.packages.insert("x".to_owned(), Override::default());
-        let (a, b) = (a.choose(&member(), None).unwrap(), b.choose(&member(), None).unwrap());
-        assert_ne!(a.first.settings(), b.first.settings());
+        b.profile.packages.insert(
+            "x".to_owned(),
+            Override { opt_level: Some(OptLevel::O3), ..Override::default() },
+        );
+        let syn = Origin::Dependency(Package::new("syn"));
+        let settings = |policy: &Policy, origin: &Origin| policy.choose(origin, None).unwrap().first.settings();
+        assert_eq!(settings(&a, &member()), settings(&b, &member()));
+        assert_eq!(settings(&a, &syn), settings(&b, &syn));
+        let mut c = a.clone();
+        c.profile.packages.insert(
+            "syn".to_owned(),
+            Override { opt_level: Some(OptLevel::O3), ..Override::default() },
+        );
+        assert_ne!(settings(&a, &syn), settings(&c, &syn));
     }
 
     fn std_hash(value: &impl std::hash::Hash) -> u64 {

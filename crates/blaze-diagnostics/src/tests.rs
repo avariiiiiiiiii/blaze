@@ -17,7 +17,7 @@ use self::db::TestDB;
 use crate::{
     Files, Options,
     emit::{Sources, Style},
-    model::{Breakage, Diag},
+    model::{Breakage, Diag, Level},
 };
 
 /// A fixture checked: its database, the names of its files and what rustc would say.
@@ -73,16 +73,24 @@ impl Checked {
         out
     }
 
-    /// The messages of the diagnostics, with their codes: `E0308: mismatched types`.
+    /// The messages of the diagnostics, with their codes: `E0308: mismatched types`, without the
+    /// closing lines that count them or name codes to explain.
     pub(crate) fn messages(&self) -> Vec<String> {
         self.diags
             .iter()
+            .filter(|it| !closing(it))
             .map(|it| match &it.code {
                 Some(code) => format!("{}: {}", code.as_str(), it.message),
                 None => it.message.clone(),
             })
             .collect()
     }
+}
+
+/// Whether `diag` is one of `emit::summary`'s closing lines.
+fn closing(diag: &Diag) -> bool {
+    let counted = |message: &str| message.starts_with(|c: char| c.is_ascii_digit()) && (message.ends_with(" warning emitted") || message.ends_with(" warnings emitted"));
+    diag.code.is_none() && (diag.level == Level::FailureNote || diag.message.starts_with("aborting due to ") || counted(&diag.message))
 }
 
 /// The paths of a fixture's files, in order, without their leading `/`.
@@ -99,6 +107,13 @@ fn paths(fixture: &str) -> Vec<String> {
 /// The workspace crates of `fixture` checked with `options`, each file named as the fixture
 /// names it, with `prefix` before it.
 pub(crate) fn checked_with(fixture: &str, prefix: &str, options: &Options) -> Checked {
+    // compiletest's `should_emit_metadata`: a `check-pass` or `check-fail` UI test is given
+    // `--emit=metadata`.
+    let checks_only = fixture.lines().any(|it| matches!(it.trim(), "//@ check-pass" | "//@ check-fail"));
+    let options = &Options {
+        lints: crate::lints::CommandLine { codegen: options.lints.codegen && !checks_only, ..options.lints.clone() },
+        ..options.clone()
+    };
     let fx = fixture::db(fixture);
     let files = fx.files().to_vec();
     let sysroot = fx.sysroot_files().to_vec();
@@ -268,7 +283,9 @@ pub mod macros {
 }
 "#;
 
-fn ui_fixture_as(mode: Mode, fixture: &str, options: &Options) -> String {
+/// What rustc writes compiling `fixture` (its files named `$DIR/<path>`) in `mode`, as
+/// compiletest runs a UI test.
+pub(crate) fn ui_fixture_as(mode: Mode, fixture: &str, options: &Options) -> String {
     let stderr = checked_with(fixture, "$DIR/", &compiletest(mode, options))
         .stderr_with(Style { ui_testing: true, ..Style::default() });
     normalized(&stderr)
@@ -290,6 +307,9 @@ pub(crate) fn compiletest(mode: Mode, options: &Options) -> Options {
     let mut lints = options.lints.clone();
     opts.append(&mut lints.lints.opts);
     lints.lints.opts = opts;
+    // compiletest gives no `--emit`, so rustc makes code, but to a `check-pass` or
+    // `check-fail` test, which `checked_with` reads.
+    lints.codegen = true;
     Options { lints, keep_duplicates: true, future_breakage_report: true }
 }
 
@@ -359,6 +379,111 @@ fn src_dir_positions(output: &str) -> String {
         out.push_str(&line[end..]);
     }
     out
+}
+
+/// What a test asserts of one diagnostic: whether it is an error or a warning, the line of the
+/// test's file it points at (`None`: a place in the library, shown as `LL:COL`), and the names
+/// and types it must mention somewhere in its text. Never its wording, code, order or closing
+/// lines: a diagnostic is right when it catches the mistake, points at it and says what is wrong.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct Expect<'a> {
+    pub(crate) error: bool,
+    pub(crate) line: Option<usize>,
+    pub(crate) mentions: &'a [&'a str],
+}
+
+/// An error at `line`, mentioning each of `mentions`.
+pub(crate) const fn error<'a>(line: usize, mentions: &'a [&'a str]) -> Expect<'a> {
+    Expect { error: true, line: Some(line), mentions }
+}
+
+/// A warning at `line`, mentioning each of `mentions`.
+pub(crate) const fn warning<'a>(line: usize, mentions: &'a [&'a str]) -> Expect<'a> {
+    Expect { error: false, line: Some(line), mentions }
+}
+
+/// One diagnostic of a test's output: whether it is an error, its primary line, its whole text.
+#[derive(Debug)]
+struct Reported<'a> {
+    error: bool,
+    line: Option<usize>,
+    text: &'a str,
+}
+
+/// The errors and warnings of `stderr`, as the user reads them: each from its heading to the
+/// next, its line the one its first `-->` names. The closing lines are none.
+fn reported(stderr: &str) -> Vec<Reported<'_>> {
+    let heading = |line: &str| {
+        let error = line.starts_with("error");
+        let rest = line.strip_prefix(if error { "error" } else { "warning" })?;
+        let rest = match rest.strip_prefix('[') {
+            Some(code) => &code[code.find(']')? + 1..],
+            None => rest,
+        };
+        let message = rest.strip_prefix(": ")?;
+        let closing = message.starts_with("aborting due to")
+            || (!error && message.ends_with("emitted") && message.as_bytes()[0].is_ascii_digit());
+        (!closing).then_some(error)
+    };
+    let mut starts: Vec<(usize, Option<bool>)> = Vec::new();
+    let mut at = 0;
+    for line in stderr.split_inclusive('\n') {
+        if line.starts_with("error") || line.starts_with("warning") {
+            starts.push((at, heading(line.trim_end())));
+        }
+        at += line.len();
+    }
+    starts.push((stderr.len(), None));
+    starts
+        .windows(2)
+        .filter_map(|pair| {
+            let error = pair[0].1?;
+            let text = &stderr[pair[0].0..pair[1].0];
+            let line = text.lines().find_map(|it| it.trim_start().strip_prefix("--> ")).and_then(|at| {
+                let mut parts = at.rsplitn(3, ':');
+                let _column = parts.next()?;
+                parts.next()?.parse().ok()
+            });
+            Some(Reported { error, line, text })
+        })
+        .collect()
+}
+
+/// Asserts that `stderr`, a test's output, reports each of `expected` and no other error. A
+/// warning not expected is no failure: which lints blaze has is its own.
+#[track_caller]
+pub(crate) fn assert_reports(stderr: &str, expected: &[Expect<'_>]) {
+    let reported = reported(stderr);
+    let mut used = vec![false; reported.len()];
+    for expect in expected {
+        let found = reported.iter().enumerate().position(|(i, it)| {
+            !used[i]
+                && it.error == expect.error
+                && it.line == expect.line
+                && expect.mentions.iter().all(|name| it.text.contains(name))
+        });
+        match found {
+            Some(i) => used[i] = true,
+            None => panic!("expected {expect:?}, not reported in:\n{stderr}"),
+        }
+    }
+    let unexpected: Vec<&Reported<'_>> =
+        reported.iter().zip(&used).filter(|(it, used)| it.error && !**used).map(|(it, _)| it).collect();
+    assert!(unexpected.is_empty(), "errors not expected: {unexpected:#?}\nin:\n{stderr}");
+}
+
+#[test]
+fn the_facts_of_an_output_are_its_diagnostics_lines_and_mentions() {
+    let stderr = "error[E0308]: mismatched types\n  --> $DIR/a.rs:3:5\n   |\nLL |     f(1u8)\n   \
+                  = note: expected `u32`, found `u8`\n\nwarning: unused variable: `x`\n  --> $DIR/a.rs:7:9\n\n\
+                  error: no main\n  --> $SRC_DIR/core/src/lib.rs:LL:COL\n\n\
+                  error: aborting due to 2 previous errors; 1 warning emitted\n";
+    assert_reports(stderr, &[error(3, &["u32", "u8"]), Expect { error: true, line: None, mentions: &["main"] }]);
+    assert_reports(stderr, &[error(3, &[]), warning(7, &["`x`"]), Expect { error: true, line: None, mentions: &[] }]);
+    let missing = std::panic::catch_unwind(|| assert_reports(stderr, &[error(3, &["i32"])]));
+    assert!(missing.is_err(), "a mention the error lacks fails");
+    let extra = std::panic::catch_unwind(|| assert_reports(stderr, &[error(3, &[])]));
+    assert!(extra.is_err(), "an error not expected fails");
 }
 
 #[test]

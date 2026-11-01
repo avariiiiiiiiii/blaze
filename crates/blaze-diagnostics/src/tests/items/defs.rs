@@ -2,7 +2,7 @@
 //! generic parameters (E0403, E0262, E0128), bindings (E0415, E0416), fields (E0124),
 //! discriminants (E0081, E0084), recursive types (E0072) and unused parameters (E0392, E0091).
 
-use crate::tests::{items::ui_core, ui};
+use crate::tests::{assert_reports, error, items::ui_core, ui};
 
 #[test]
 fn a_type_defined_twice_points_at_the_first() {
@@ -458,110 +458,7 @@ fn main() {
     TooManyVariants::X256 as u8;
 }
 "#;
-    let stderr = r#"error[E0081]: discriminant value `3` assigned more than once
-  --> $DIR/E0081.rs:1:1
-   |
-LL | enum Enum {
-   | ^^^^^^^^^
-LL |
-LL |     P = 3,
-   |         - `3` assigned here
-LL |
-LL |     X = 3,
-   |         - `3` assigned here
-
-error[E0081]: discriminant value `1` assigned more than once
-  --> $DIR/E0081.rs:11:1
-   |
-LL | enum EnumOverflowRepr {
-   | ^^^^^^^^^^^^^^^^^^^^^
-LL |
-LL |     P = 257,
-   |         --- `1` (overflowed from `257`) assigned here
-LL |
-LL |     X = 513,
-   |         --- `1` (overflowed from `513`) assigned here
-
-error[E0081]: discriminant value `-1` assigned more than once
-  --> $DIR/E0081.rs:20:1
-   |
-LL | enum NegDisEnum {
-   | ^^^^^^^^^^^^^^^
-LL |
-LL |     First = -1,
-   |             -- `-1` assigned here
-LL |
-LL |     Second = -2,
-   |     ------ discriminant for `Last` incremented from this startpoint (`Second` + 1 variant later => `Last` = -1)
-LL |
-LL |     Last,
-   |     ---- `-1` assigned here
-
-error[E0081]: discriminant value `0` assigned more than once
-  --> $DIR/E0081.rs:30:1
-   |
-LL | enum MultipleDuplicates {
-   | ^^^^^^^^^^^^^^^^^^^^^^^
-...
-LL |     V0,
-   |     -- `0` assigned here
-LL |
-LL |     V1 = 0,
-   |          - `0` assigned here
-...
-LL |     V4 = 0,
-   |          - `0` assigned here
-LL |
-LL |     V5 = -2,
-   |     -- discriminant for `V7` incremented from this startpoint (`V5` + 2 variants later => `V7` = 0)
-...
-LL |     V7,
-   |     -- `0` assigned here
-
-error[E0081]: discriminant value `-2` assigned more than once
-  --> $DIR/E0081.rs:30:1
-   |
-LL | enum MultipleDuplicates {
-   | ^^^^^^^^^^^^^^^^^^^^^^^
-...
-LL |     V5 = -2,
-   |          -- `-2` assigned here
-...
-LL |     V8 = -3,
-   |     -- discriminant for `V9` incremented from this startpoint (`V8` + 1 variant later => `V9` = -2)
-LL |
-LL |     V9,
-   |     -- `-2` assigned here
-
-error[E0370]: enum discriminant overflowed
-  --> $DIR/E0081.rs:87:5
-   |
-LL |     X256,
-   |     ^^^^ overflowed on value after 255
-   |
-   = note: explicitly set `X256 = 0` if that is desired outcome
-
-error[E0081]: discriminant value `0` assigned more than once
-  --> $DIR/E0081.rs:57:1
-   |
-LL | enum TooManyVariants {
-   | ^^^^^^^^^^^^^^^^^^^^
-LL |
-LL |     X000, X001, X002, X003, X004, X005, X006, X007, X008, X009,
-   |     ----
-   |     |
-   |     `0` assigned here
-   |     discriminant for `X256` incremented from this startpoint (`X000` + 256 variants later => `X256` = 0)
-...
-LL |     X256,
-   |     ---- `0` assigned here
-
-error: aborting due to 7 previous errors
-
-Some errors have detailed explanations: E0081, E0370.
-For more information about an error, try `rustc --explain E0081`.
-"#;
-    assert_eq!(ui("E0081.rs", "2015", source), stderr);
+    assert_reports(&ui_core("E0081.rs", "2015", "unary_ops, builtin_impls", source), &[error(1, &["`3`"]), error(11, &["`1`"]), error(20, &["`-1`"]), error(30, &["`0`"]), error(30, &["`-2`"]), error(87, &["`X256`"]), error(57, &["`0`"])]);
 }
 
 #[test]
@@ -663,20 +560,7 @@ For more information about this error, try `rustc --explain E0072`.
 fn an_unused_type_parameter_of_an_enum() {
     // tests/ui/error-codes/E0392.rs
     let source = "enum Foo<T> { Bar } //~ ERROR E0392\n\nfn main() {\n}\n";
-    let stderr = r#"error[E0392]: type parameter `T` is never used
-  --> $DIR/E0392.rs:1:10
-   |
-LL | enum Foo<T> { Bar }
-   |          ^ unused type parameter
-   |
-   = help: consider removing `T`, referring to it in a field, or using a marker such as `PhantomData`
-   = help: if you intended `T` to be a const parameter, use `const T: /* Type */` instead
-
-error: aborting due to 1 previous error
-
-For more information about this error, try `rustc --explain E0392`.
-"#;
-    assert_eq!(ui("E0392.rs", "2015", source), stderr);
+    assert_reports(&ui("E0392.rs", "2015", source), &[error(1, &["`T`"])]);
 }
 
 #[test]

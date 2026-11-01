@@ -57,6 +57,26 @@ fn seen(tree: &Tree, root: NodeId, path: &str) -> Seen {
     tree.entry(root, path).map(|(node, mode)| (tree.id(node), mode))
 }
 
+/// The read of a file stamped `stamp`. A symbolic link is an entry whose bytes are its target,
+/// as git keeps one: its target is read, never followed, whatever it points at.
+pub(crate) fn read(file: FileName, stamp: Stamp, tag: Tag) -> Effect {
+    match stamp.is_link() {
+        true => Effect::ReadLink { file, tag },
+        false => Effect::ReadAll { file, tag },
+    }
+}
+
+/// The mode a file read with [`read`] is committed with, the head having `had` there: a
+/// symbolic link's; else what the head had (an executable stays one), a link that became a
+/// file a regular file.
+pub(crate) fn file_mode(stamp: Stamp, had: Option<Mode>) -> Mode {
+    match had {
+        _ if stamp.is_link() => Mode::Symlink,
+        Some(Mode::Symlink) | None => Mode::Regular,
+        Some(mode) => mode,
+    }
+}
+
 /// How many tags a watcher uses: its journal, then one per stamp, listing or read in flight.
 const TAGS: u64 = 1 << 32;
 const FIRST: u64 = 1;
@@ -288,13 +308,14 @@ struct Work {
     root: String,
     /// A name being built before it is interned, or held while its column is walked.
     name: String,
-    /// What a batch's stamps ask: slots to read, directories to list, slots that changed.
-    reads: Vec<(usize, PathId)>,
+    /// What a batch's stamps ask: slots to read with their stamps, directories to list, slots
+    /// that changed.
+    reads: Vec<(usize, PathId, Stamp)>,
     lists: Vec<PathId>,
     changed: Vec<usize>,
-    /// What a listing asks: a slot to read (`Some`) or a directory to list, by the name the
-    /// effect takes; and directories replaced, to rescan.
-    asks: Vec<(Option<usize>, PathId, FileName)>,
+    /// What a listing asks: a slot to read with its stamp (`Some`) or a directory to list, by
+    /// the name the effect takes; and directories replaced, to rescan.
+    asks: Vec<(Option<(usize, Stamp)>, PathId, FileName)>,
     rescans: Vec<PathId>,
     /// A commit's: each slot it deletes, deletes before and after the ones under another
     /// delete go, writes, moves, paths taken, renames and their sources.
@@ -874,16 +895,16 @@ impl Watcher {
                 };
                 match from {
                     Some(from) => batch.slots[at].look = Some(Look::Moved(from)),
-                    None => reads.push((at, slot.name)),
+                    None => reads.push((at, slot.name, stamp)),
                 }
             }
             changed.clear();
             batch.open += lists.len() as u32;
         }
         for at in 0..self.work.reads.len() {
-            let (slot, name) = self.work.reads[at];
+            let (slot, name, stamp) = self.work.reads[at];
             let tag = self.tag(Pending::Read(number, slot));
-            effects.push(Effect::ReadAll { file: self.file_name(name), tag });
+            effects.push(read(self.file_name(name), stamp, tag));
         }
         self.work.reads.clear();
         for at in 0..self.work.lists.len() {
@@ -938,7 +959,7 @@ impl Watcher {
                         slot.stamp = Some(now);
                         // alloc: the name the read hands the driver, which takes it owned.
                         let file = FileName::new(paths.get(slot.name)).expect("an interned name is a name");
-                        asks.push((Some(at), slot.name, file));
+                        asks.push((Some((at, now)), slot.name, file));
                     }
                 }
                 batch.went(paths, scratch, disk, &vfs.tree, head, below);
@@ -960,7 +981,7 @@ impl Watcher {
                 } else if let Some(from) = batch.moved(&stamp) {
                     Some(Look::Moved(from))
                 } else {
-                    asks.push((Some(at), name, file));
+                    asks.push((Some((at, stamp)), name, file));
                     None
                 };
                 batch.slots.push(Slot { name, was, saved: None, stamp: Some(stamp), look });
@@ -969,9 +990,9 @@ impl Watcher {
         let mut asks = std::mem::take(&mut self.work.asks);
         for (at, name, file) in asks.drain(..) {
             match at {
-                Some(at) => {
+                Some((at, stamp)) => {
                     let tag = self.tag(Pending::Read(number, at));
-                    effects.push(Effect::ReadAll { file, tag });
+                    effects.push(read(file, stamp, tag));
                 }
                 None => {
                     let tag = self.tag(Pending::Entries(number, name));
@@ -1062,12 +1083,12 @@ impl Watcher {
                 }
                 Look::File(bytes) => {
                     room(tree, base, paths, slot.name, below, deletes);
-                    let mode = entry.filter(|_| is_file).map_or(Mode::Regular, |it| it.1);
+                    let had = entry.filter(|_| is_file).map(|it| it.1);
+                    let mode = file_mode(slot.stamp.expect("a read path is stamped"), had);
                     // Compared in place, not hashed: the commit hashes what it writes, once. A
                     // blob of the image that fails its check compares unequal, so it is replaced.
-                    let same = node
-                        .filter(|_| is_file)
-                        .is_some_and(|it| matches!(tree.bytes(it), Ok(Some(have)) if *have == *bytes));
+                    let same = had == Some(mode)
+                        && node.is_some_and(|it| matches!(tree.bytes(it), Ok(Some(have)) if *have == *bytes));
                     if !same {
                         writes.push((slot.name, bytes, mode));
                     }

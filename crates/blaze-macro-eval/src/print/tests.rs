@@ -33,7 +33,7 @@ fn print(trees: &[Tree]) -> String {
 
 fn lex(text: &str) -> Stream {
     let mut emitted = Vec::new();
-    let stream = lex::stream(text, site(), Edition::Edition2021, false, &mut emitted).expect("lexes");
+    let stream = lex::stream(text, site(), Edition::Edition2021, false, &mut emitted, &mut Vec::new()).expect("lexes");
     assert!(emitted.is_empty(), "lexing {text:?} reported {emitted:?}");
     stream
 }

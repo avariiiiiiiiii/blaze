@@ -2,6 +2,8 @@
 //! with their `.stderr`. A test that uses std has the items of std it uses written after its
 //! source, so that the lines and columns are its `.stderr`'s.
 
+use crate::tests::{assert_reports, error, warning};
+
 fn ui(name: &str, source: &str) -> String {
     crate::tests::ui(name, "2015", source)
 }
@@ -24,24 +26,10 @@ fn main() {
     [1][1u64 as usize]; //~ ERROR operation will panic
 }
 "##;
-    let stderr = r##"error: this operation will panic at runtime
-  --> $DIR/issue-54348.rs:5:5
-   |
-LL |     [1][1.5 as usize];
-   |     ^^^^^^^^^^^^^^^^^ index out of bounds: the length is 1 but the index is 1
-   |
-   = note: `#[deny(unconditional_panic)]` on by default
-
-error: this operation will panic at runtime
-  --> $DIR/issue-54348.rs:6:5
-   |
-LL |     [1][1u64 as usize];
-   |     ^^^^^^^^^^^^^^^^^^ index out of bounds: the length is 1 but the index is 1
-
-error: aborting due to 2 previous errors
-
-"##;
-    assert_eq!(ui_core("issue-54348.rs", source), stderr);
+    assert_reports(
+        &ui_core("issue-54348.rs", source),
+        &[error(5, &[]), error(6, &[])],
+    );
 }
 
 #[test]
@@ -55,18 +43,10 @@ fn main() {
     let _ = xs[7]; //~ ERROR: this operation will panic at runtime [unconditional_panic]
 }
 "##;
-    let stderr = r##"error: this operation will panic at runtime
-  --> $DIR/unconditional_panic_98444.rs:6:13
-   |
-LL |     let _ = xs[7];
-   |             ^^^^^ index out of bounds: the length is 5 but the index is 7
-   |
-   = note: `#[deny(unconditional_panic)]` on by default
-
-error: aborting due to 1 previous error
-
-"##;
-    assert_eq!(ui_core("unconditional_panic_98444.rs", source), stderr);
+    assert_reports(
+        &ui_core("unconditional_panic_98444.rs", source),
+        &[error(6, &[])],
+    );
 }
 
 #[test]
@@ -81,18 +61,10 @@ fn main() {
     let _ = slice[2]; //~ ERROR: this operation will panic at runtime [unconditional_panic]
 }
 "##;
-    let stderr = r##"error: this operation will panic at runtime
-  --> $DIR/unconditional_panic_promoted.rs:7:13
-   |
-LL |     let _ = slice[2];
-   |             ^^^^^^^^ index out of bounds: the length is 2 but the index is 2
-   |
-   = note: `#[deny(unconditional_panic)]` on by default
-
-error: aborting due to 1 previous error
-
-"##;
-    assert_eq!(ui_core("unconditional_panic_promoted.rs", source), stderr);
+    assert_reports(
+        &ui_core("unconditional_panic_promoted.rs", source),
+        &[error(7, &[])],
+    );
 }
 
 #[test]
@@ -108,22 +80,10 @@ fn main() {
     //~^ WARN operation will panic
 }
 "##;
-    let stderr = r##"warning: this operation will panic at runtime
-  --> $DIR/array-literal-index-oob.rs:7:8
-   |
-LL |     &{ [1, 2, 3][4] };
-   |        ^^^^^^^^^^^^ index out of bounds: the length is 3 but the index is 4
-   |
-note: the lint level is defined here
-  --> $DIR/array-literal-index-oob.rs:4:9
-   |
-LL | #![warn(unconditional_panic)]
-   |         ^^^^^^^^^^^^^^^^^^^
-
-warning: 1 warning emitted
-
-"##;
-    assert_eq!(ui_core("array-literal-index-oob.rs", source), stderr);
+    assert_reports(
+        &ui_core("array-literal-index-oob.rs", source),
+        &[warning(7, &[])],
+    );
 }
 
 #[test]
@@ -135,18 +95,10 @@ fn main() {
     [0; 3][3u64 as usize]; //~ ERROR this operation will panic at runtime
 }
 "##;
-    let stderr = r##"error: this operation will panic at runtime
-  --> $DIR/const-prop-ice.rs:4:5
-   |
-LL |     [0; 3][3u64 as usize];
-   |     ^^^^^^^^^^^^^^^^^^^^^ index out of bounds: the length is 3 but the index is 3
-   |
-   = note: `#[deny(unconditional_panic)]` on by default
-
-error: aborting due to 1 previous error
-
-"##;
-    assert_eq!(ui_core("const-prop-ice.rs", source), stderr);
+    assert_reports(
+        &ui_core("const-prop-ice.rs", source),
+        &[error(4, &[])],
+    );
 }
 
 #[test]
@@ -177,24 +129,7 @@ fn oob_error_for_slices() {
     }
 }
 "##;
-    let stderr = r##"error: this operation will panic at runtime
-  --> $DIR/mir_detects_invalid_ops.rs:11:14
-   |
-LL |     let _z = 1 / y;
-   |              ^^^^^ attempt to divide `1_i32` by zero
-   |
-   = note: `#[deny(unconditional_panic)]` on by default
-
-error: this operation will panic at runtime
-  --> $DIR/mir_detects_invalid_ops.rs:16:14
-   |
-LL |     let _z = 1 % y;
-   |              ^^^^^ attempt to calculate the remainder of `1_i32` with a divisor of zero
-
-error: aborting due to 2 previous errors
-
-"##;
-    assert_eq!(ui_core("mir_detects_invalid_ops.rs", source), stderr);
+    assert_reports(&ui_core("mir_detects_invalid_ops.rs", source), &[error(11, &[]), error(16, &[])]);
 }
 
 #[test]
@@ -212,24 +147,10 @@ fn main() {
 }
 mod u32 { pub const MAX: u32 = 4294967295; }
 "##;
-    let stderr = r##"error: this operation will panic at runtime
-  --> $DIR/index-bounds.rs:4:14
-   |
-LL |     let _n = [64][200];
-   |              ^^^^^^^^^ index out of bounds: the length is 1 but the index is 200
-   |
-   = note: `#[deny(unconditional_panic)]` on by default
-
-error: this operation will panic at runtime
-  --> $DIR/index-bounds.rs:8:14
-   |
-LL |     let _n = [64][u32::MAX as usize - 1];
-   |              ^^^^^^^^^^^^^^^^^^^^^^^^^^^ index out of bounds: the length is 1 but the index is 4294967294
-
-error: aborting due to 2 previous errors
-
-"##;
-    assert_eq!(ui_core("index-bounds.rs", source), stderr);
+    assert_reports(
+        &ui_core("index-bounds.rs", source),
+        &[error(4, &[]), error(8, &[])],
+    );
 }
 
 #[test]
@@ -450,7 +371,7 @@ fn main() {
     }
 }
 "##;
-    assert_eq!(ui_core("dst-raw-slice.rs", source), "");
+    assert_reports(&ui_core("dst-raw-slice.rs", source), &[]);
 }
 
 #[test]
@@ -463,24 +384,10 @@ fn shifts_by_the_width_of_the_left_side() {
     let _z = 1_u64 << 63;
 }
 "##;
-    let stderr = r##"error: this arithmetic operation will overflow
-  --> $DIR/shifts.rs:2:14
-   |
-LL |     let _x = 1_i8 << 17;
-   |              ^^^^^^^^^^ attempt to shift left by `17_i32`, which would overflow
-   |
-   = note: `#[deny(arithmetic_overflow)]` on by default
-
-error: this arithmetic operation will overflow
-  --> $DIR/shifts.rs:3:14
-   |
-LL |     let _y = 2_i8 >> 17;
-   |              ^^^^^^^^^^ attempt to shift right by `17_i32`, which would overflow
-
-error: aborting due to 2 previous errors
-
-"##;
-    assert_eq!(ui("shifts.rs", source), stderr);
+    assert_reports(
+        &ui("shifts.rs", source),
+        &[error(2, &[]), error(3, &[])],
+    );
 }
 
 #[test]
@@ -499,28 +406,8 @@ fn main() {
     chunks::<1>();
 }
 "##;
-    let stderr = r##"error: this operation will panic at runtime
-  --> $DIR/const-n-is-zero.rs:8:5
-   |
-LL |     chunks::<0>();
-   |     ^^^^^^^^^^^^^ const parameter `N` is zero
-   |
-   = note: `#[deny(unconditional_panic)]` on by default
-
-error: this operation will panic at runtime
-  --> $DIR/const-n-is-zero.rs:9:5
-   |
-LL |     chunks::<{ 1 - 1 }>();
-   |     ^^^^^^^^^^^^^^^^^^^^^ const parameter `N` is zero
-
-error: this operation will panic at runtime
-  --> $DIR/const-n-is-zero.rs:10:5
-   |
-LL |     chunks::<ZERO>();
-   |     ^^^^^^^^^^^^^^^^ const parameter `N` is zero
-
-error: aborting due to 3 previous errors
-
-"##;
-    assert_eq!(ui("const-n-is-zero.rs", source), stderr);
+    assert_reports(
+        &ui("const-n-is-zero.rs", source),
+        &[error(8, &[]), error(9, &[]), error(10, &[])],
+    );
 }

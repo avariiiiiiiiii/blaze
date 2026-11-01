@@ -1286,12 +1286,13 @@ impl FlatTree {
     }
 
     /// [`Self::subtree`] of node `at` with the nodes `elided` under it, ascending and
-    /// disjoint, each replaced by an empty node of its kind: the copy `replace_subtree` of each
-    /// in turn would make, over the text left. Made in one pass over the elements outside
-    /// them, never reading their elements, text, lazy nodes or parts. Lazy nodes outside them
-    /// stay lazy with their parsed parts moved, and the kept hashes outside them are carried
-    /// but for their ancestors', which are made again when asked.
-    pub(crate) fn subtree_without(&self, at: u32, elided: &[u32]) -> FlatTree {
+    /// disjoint, each replaced by an empty node of its kind, or of `placeholder` when given:
+    /// the copy `replace_subtree` of each in turn would make, over the text left. Made in one
+    /// pass over the elements outside them, never reading their elements, text, lazy nodes or
+    /// parts. Lazy nodes outside them stay lazy with their parsed parts moved, and the kept
+    /// hashes outside them are carried but for their ancestors', which are made again when
+    /// asked. With one `placeholder` kind, what an elided node was is nowhere in the copy.
+    pub(crate) fn subtree_without(&self, at: u32, elided: &[u32], placeholder: Option<SyntaxKind>) -> FlatTree {
         let (lo, hi) = (at, self.end(at));
         assert!(!self.is_token(at), "element {at} ({:?}) is not a node", self.kind(at));
         let mut from = lo + 1;
@@ -1347,7 +1348,7 @@ impl FlatTree {
             let parent = open.last().map_or(NO_PARENT, |top| top.new);
             let kind = self.kind(it);
             if elided.get(next) == Some(&it) {
-                packer.node(kind, 1, parent);
+                packer.node(placeholder.unwrap_or(kind), 1, parent);
                 open.last_mut().expect("an elided node is under the root").cut = true;
                 cut += u32::from(self.range(it).len());
                 next += 1;
@@ -3685,7 +3686,7 @@ mod tests {
     /// carried.
     fn check_without(tree: &FlatTree, at: u32, elided: &[u32], seed: u64) {
         let context = format!("seed {seed}, {at} without {elided:?}");
-        let without = tree.subtree_without(at, elided);
+        let without = tree.subtree_without(at, elided, None);
         let expected = without_in_turn(tree, at, elided);
         assert_eq!(without, expected, "{context}");
         for it in 0..expected.len() {
@@ -3733,7 +3734,7 @@ mod tests {
         let numbers: Vec<u32> = elided.iter().map(|it| it.flat().unwrap().1).collect();
         let at = rows.flat().unwrap().1;
         let copy = rows.clone_subtree_without(elided.iter());
-        assert_eq!(**copy.flat_tree().unwrap(), tree.subtree_without(at, &numbers));
+        assert_eq!(**copy.flat_tree().unwrap(), tree.subtree_without(at, &numbers, None));
         assert_eq!(**copy.flat_tree().unwrap(), without_in_turn(&tree, at, &numbers));
         let alone = rows.clone_subtree_without(std::iter::empty::<&SyntaxNode>());
         assert_eq!(**alone.flat_tree().unwrap(), tree.subtree(at));

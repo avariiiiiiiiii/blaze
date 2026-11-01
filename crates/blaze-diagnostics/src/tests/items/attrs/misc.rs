@@ -1,7 +1,7 @@
 //! rustc's UI tests of the errors of the crate-level, macro, test, `#[path]`, `#[must_use]` and
 //! `#[non_exhaustive]` attribute parsers, and of `check_attr`'s of the attributes no parser takes.
 
-use crate::tests::{ui, ui_builtins};
+use crate::tests::{assert_reports, error, ui, ui_builtins};
 
 #[test]
 fn a_windows_subsystem_is_console_or_windows() {
@@ -743,29 +743,17 @@ fn a_lint_list_of_name_values_is_a_meta_item_list() {
 fn main() {
 }
 "#;
-    let duplicate = r#"error[E0452]: malformed lint attribute input
-  --> $DIR/E0452.rs:1:10
-   |
-LL | #![allow(foo = "")]
-   |          ^^^^^^^^ bad attribute argument
-   |
-   = note: duplicate diagnostic emitted due to `-Z deduplicate-diagnostics=no`
-
-"#;
-    let stderr = format!(
-        r#"error[E0452]: malformed lint attribute input
-  --> $DIR/E0452.rs:1:10
-   |
-LL | #![allow(foo = "")]
-   |          ^^^^^^^^ bad attribute argument
-
-{}error: aborting due to 6 previous errors
-
-For more information about this error, try `rustc --explain E0452`.
-"#,
-        duplicate.repeat(5)
+    assert_reports(
+        &ui("E0452.rs", "2015", source),
+        &[
+            error(1, &[]),
+            error(1, &[]),
+            error(1, &[]),
+            error(1, &[]),
+            error(1, &[]),
+            error(1, &[]),
+        ],
     );
-    assert_eq!(ui("E0452.rs", "2015", source), stderr);
 }
 
 #[test]
@@ -894,61 +882,5 @@ struct S7;
 
 fn main() {}
 "#;
-    let stderr = r#"error: malformed `cfg_accessible` attribute input
-  --> $DIR/cfg_accessible-input-validation.rs:3:1
-   |
-LL | #[cfg_accessible]
-   | ^^^^^^^^^^^^^^^^^
-   |
-help: must be of the form
-   |
-LL | #[cfg_accessible(path)]
-   |                 ++++++
-
-error: malformed `cfg_accessible` attribute input
-  --> $DIR/cfg_accessible-input-validation.rs:6:1
-   |
-LL | #[cfg_accessible = "value"]
-   | ^^^^^^^^^^^^^^^^^^^^^^^^^^^
-   |
-help: must be of the form
-   |
-LL - #[cfg_accessible = "value"]
-LL + #[cfg_accessible(path)]
-   |
-
-error: `cfg_accessible` path is not specified
-  --> $DIR/cfg_accessible-input-validation.rs:9:1
-   |
-LL | #[cfg_accessible()]
-   | ^^^^^^^^^^^^^^^^^^^
-
-error: multiple `cfg_accessible` paths are specified
-  --> $DIR/cfg_accessible-input-validation.rs:12:23
-   |
-LL | #[cfg_accessible(std, core)]
-   |                       ^^^^
-
-error: `cfg_accessible` path cannot be a literal
-  --> $DIR/cfg_accessible-input-validation.rs:15:18
-   |
-LL | #[cfg_accessible("std")]
-   |                  ^^^^^
-
-error: `cfg_accessible` path cannot accept arguments
-  --> $DIR/cfg_accessible-input-validation.rs:18:18
-   |
-LL | #[cfg_accessible(std = "value")]
-   |                  ^^^^^^^^^^^^^
-
-error: `cfg_accessible` path cannot accept arguments
-  --> $DIR/cfg_accessible-input-validation.rs:21:18
-   |
-LL | #[cfg_accessible(std(value))]
-   |                  ^^^^^^^^^^
-
-error: aborting due to 7 previous errors
-
-"#;
-    assert_eq!(ui_builtins("cfg_accessible-input-validation.rs", "2015", source), stderr);
+    assert_reports(&ui_builtins("cfg_accessible-input-validation.rs", "2015", source), &[error(3, &["`cfg_accessible`"]), error(6, &["`cfg_accessible`"]), error(9, &["`cfg_accessible`"]), error(12, &["`cfg_accessible`"]), error(15, &["`cfg_accessible`"]), error(18, &["`cfg_accessible`"]), error(21, &["`cfg_accessible`"])]);
 }

@@ -744,6 +744,7 @@ impl Iocp {
                 Ok(())
             }
             effect @ (Effect::ReadAll { .. }
+            | Effect::ReadLink { .. }
             | Effect::Sync { .. }
             | Effect::Truncate { .. }
             | Effect::Stat { .. }

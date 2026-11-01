@@ -32,6 +32,12 @@ pub fn ty(cx: &Cx<'_, '_>, ty: &hir::Type<'_>) -> String {
     ty_in(cx, ty.to_next_solver(), Mode::NORMAL)
 }
 
+/// [`ty`] of a front-end type that may hold opaque types and projections left unnormalized,
+/// which a `hir::Type` can't.
+pub(crate) fn solver_ty(cx: &Cx<'_, '_>, ty: Ty<'_>) -> String {
+    ty_in(cx, ty, Mode::NORMAL)
+}
+
 /// A type with no path trimmed: rustc's `with_no_trimmed_paths!`.
 pub fn ty_untrimmed(cx: &Cx<'_, '_>, ty: &hir::Type<'_>) -> String {
     ty_in(cx, ty.to_next_solver(), Mode::UNTRIMMED)

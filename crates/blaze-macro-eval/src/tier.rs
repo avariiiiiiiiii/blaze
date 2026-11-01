@@ -30,7 +30,9 @@
 use blaze_ids::ContentId;
 
 pub(crate) mod bind;
+pub(crate) mod build;
 pub(crate) mod confine;
+pub(crate) mod enter;
 pub(crate) mod glue;
 pub(crate) mod heap;
 pub(crate) mod load;
@@ -73,14 +75,12 @@ pub(crate) enum Tier {
 pub(crate) struct Policy {
     /// Runs in the evaluator before a crate runs compiled.
     pub(crate) warm: u64,
-    /// Whether this blaze runs the compiled tier. It doesn't yet: the loader and the runner
-    /// (machine stack, shim stubs, unwinder, fault handler) are not written, so every
-    /// expansion runs in the evaluator.
+    /// Whether this blaze runs the compiled tier: on the machines [`machine`] runs code on.
     pub(crate) compiled: bool,
 }
 
 impl Policy {
-    pub(crate) const DEFAULT: Policy = Policy { warm: 1, compiled: false };
+    pub(crate) const DEFAULT: Policy = Policy { warm: 1, compiled: machine::SUPPORTED };
 
     /// The decision is the same for every code hash: by its runs alone.
     pub(crate) fn choose(&self, _code: ContentId, runs: u64) -> Tier {
@@ -98,24 +98,29 @@ pub(crate) fn choose(code: ContentId, runs: u64) -> Tier {
 /// `run.rs`'s `evaluate` runs them on the evaluator: in order, each with its own server,
 /// starting from the statics `preset`, giving what the last gave and what all of them did.
 ///
-/// The image is made first: the crate's reached functions lowered to Cranelift IR, confined,
-/// compiled by copy-and-patch and loaded. hir-ty-codegen hands out the IR and [`confine`]
-/// confines it, but nothing loads the image or runs it on its own machine stack yet, so this
-/// stops there, saying so. The policy never sends an expansion here while
-/// [`Policy::compiled`] is false.
+/// The image is made once per code hash ([`build::compiled`]): the clients of the crate's
+/// macros reached, lowered to Cranelift IR, confined, compiled by copy-and-patch and loaded.
+/// [`enter::run`] then runs each expansion on it, on this thread.
 pub(crate) fn run(
-    _db: &base_db::Db,
-    _code: ContentId,
-    _env: &base_db::Env,
-    _preset: &[(hir_def::StaticId, Vec<u8>)],
+    db: &base_db::Db,
+    bridge: &crate::run::Bridge,
+    code: ContentId,
+    env: &base_db::Env,
+    preset: &[(hir_def::StaticId, Vec<u8>)],
     expansions: &[crate::run::Expansion<'_>],
 ) -> Result<crate::run::Ran, crate::guest::Stop> {
-    if expansions.is_empty() {
+    use hir_def::HasModule as _;
+    use hir_expand::proc_macro::ProcMacroKind;
+
+    let Some(first) = expansions.first() else {
         // alloc: error path
         return Err(crate::guest::Stop("was given nothing to expand".to_owned()));
-    }
-    const NO_RUNNER: &str = "can't run on the compiled tier: blaze has no loader for a confined image \
-                             and no runner for its code yet";
-    // alloc: error path
-    Err(crate::guest::Stop(NO_RUNNER.to_owned()))
+    };
+    let krate = first.function.module(db).krate(db);
+    let macros: Vec<_> = crate::run::functions(db, krate)
+        .into_iter()
+        .map(|(_, kind, function)| (function, kind == ProcMacroKind::Attr))
+        .collect(); // alloc: once a run, the crate's macros
+    let compiled = build::compiled(db, code, krate, bridge, &macros)?;
+    enter::run(db, &compiled, env, preset, expansions)
 }

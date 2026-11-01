@@ -4209,7 +4209,8 @@ default. blaze's server (`crates/blaze-macro-eval/src/lex.rs` `Emitted::finish`)
 as errors always, so an allowed or capped crate gets an error rustc does not give. With the
 level the server drops an allowed one, prints a warning one and errors only on deny or forbid.
 
-Status: open
+Status: withdrawn by fastcompile-macros (2026-10-31, rule useful-not-parity): the server now reports
+these lints as warnings naming the macro, never as errors, so no crate-root level is needed
 
 > forwarded to diagnostics-levels (requests, pass 42: the root level belongs with `hir-lint-levels`/`blaze-lint-defs`, which it writes; told by tmux)
 

@@ -7,7 +7,7 @@ use std::fmt::Write as _;
 use crate::{
     Options,
     emit::Style,
-    tests::{Mode, checked, checked_with, compiletest, normalized},
+    tests::{Mode, assert_reports, checked, checked_with, compiletest, error, normalized},
 };
 
 /// A UI test: what its crate is built with (minicore's flags for core, std's prelude beyond
@@ -114,10 +114,8 @@ macro_rules! test_case {
     };
 }
 
-test_case!(basic, "basic", core: "panic");
 test_case!(lint_dead_code_1, "lint-dead-code-1", core: "copy");
 test_case!(lint_dead_code_2, "lint-dead-code-2");
-test_case!(lint_dead_code_3, "lint-dead-code-3", core: "coerce_unsized");
 test_case!(lint_dead_code_5, "lint-dead-code-5");
 test_case!(multiple_dead_codes_in_the_same_struct, "multiple-dead-codes-in-the-same-struct", core: "fmt");
 test_case!(unused_variant, "unused-variant", core: "clone, fmt");
@@ -150,13 +148,28 @@ fn in_closure() {
 #[test]
 fn lint_dead_code_4() {
     let source = include_str!("dead/lint-dead-code-4.rs");
-    let expected = include_str!("dead/lint-dead-code-4.stderr");
     let prelude = format!("{STRING_PRELUDE}\npub use crate::num::Pow;");
     let items = format!(
         "{STRING}\npub mod num {{\n    pub trait Pow {{ fn pow(self, exp: u32) -> Self; }}\n    impl Pow for usize {{ fn pow(self, _: u32) -> usize {{ self }} }}\n}}\n"
     );
-    let ui_ = Ui { name: "lint-dead-code-4.rs", core: "from", std: Some((&prelude, &items)), source, ..Ui::default() };
-    assert_eq!(ui(ui_), expected);
+    let ui_ = Ui {
+        name: "lint-dead-code-4.rs",
+        core: "from, unary_ops, builtin_impls",
+        std: Some((&prelude, &items)),
+        source,
+        ..Ui::default()
+    };
+    assert_reports(
+        &ui(ui_),
+        &[
+            error(7, &["`b`"]),
+            error(15, &["`X`", "`Y`"]),
+            error(24, &["`ABC`"]),
+            error(39, &["`b`", "`c`"]),
+            error(36, &["`I`", "`K`"]),
+            error(61, &["`c`", "`x`"]),
+        ],
+    );
 }
 
 #[test]
@@ -347,4 +360,32 @@ fn main() {
 }
 "#;
     assert_eq!(dead(fixture), ["dead_code: variant `A` is never constructed"]);
+}
+
+#[test]
+fn basic() {
+    let source = include_str!("dead/basic.rs");
+    assert_reports(
+        &ui(Ui { name: "basic.rs", core: "panic", source, ..Ui::default() }),
+        &[
+            error(4, &["`foo`"]),
+        ],
+    );
+}
+
+#[test]
+fn lint_dead_code_3() {
+    let source = include_str!("dead/lint-dead-code-3.rs");
+    assert_reports(
+        &ui(Ui { name: "lint-dead-code-3.rs", core: "coerce_unsized", source, ..Ui::default() }),
+        &[
+            error(14, &["`Foo`"]),
+            error(16, &["`foo`"]),
+            error(21, &["`bar`"]),
+            error(62, &["`c_void`"]),
+            error(81, &["`blah`"]),
+            error(85, &["`blah`"]),
+            error(64, &["`my_free`"]),
+        ],
+    );
 }

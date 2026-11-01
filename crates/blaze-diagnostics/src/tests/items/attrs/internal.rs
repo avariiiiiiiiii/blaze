@@ -4,7 +4,10 @@
 //! `rustc_*` attributes' tests, and small ones in the same form where no UI test isolates an
 //! error.
 
-use crate::tests::ui;
+use crate::{
+    Options,
+    tests::{Mode, assert_reports, error, ui, ui_fixture_as},
+};
 
 #[test]
 fn an_unknown_lang_item_is_an_error() {
@@ -537,161 +540,26 @@ fn bar2() {}
 
 fn main() {}
 "#;
-    let stderr = r#"error[E0539]: malformed `rustc_legacy_const_generics` attribute input
-  --> $DIR/invalid-rustc_legacy_const_generics-arguments.rs:12:3
-   |
-LL | #[rustc_legacy_const_generics(a)]
-   |   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^-^
-   |                               |
-   |                               expected an integer literal here
-   |
-help: must be of the form
-   |
-LL - #[rustc_legacy_const_generics(a)]
-LL + #[rustc_legacy_const_generics(N)]
-   |
-
-error[E0539]: malformed `rustc_legacy_const_generics` attribute input
-  --> $DIR/invalid-rustc_legacy_const_generics-arguments.rs:15:3
-   |
-LL | #[rustc_legacy_const_generics(1, a, 2, b)]
-   |   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^-^^^^^^^
-   |                                  |
-   |                                  expected an integer literal here
-   |
-help: must be of the form
-   |
-LL - #[rustc_legacy_const_generics(1, a, 2, b)]
-LL + #[rustc_legacy_const_generics(N)]
-   |
-
-error[E0539]: malformed `rustc_legacy_const_generics` attribute input
-  --> $DIR/invalid-rustc_legacy_const_generics-arguments.rs:15:3
-   |
-LL | #[rustc_legacy_const_generics(1, a, 2, b)]
-   |   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^-^
-   |                                        |
-   |                                        expected an integer literal here
-   |
-help: must be of the form
-   |
-LL - #[rustc_legacy_const_generics(1, a, 2, b)]
-LL + #[rustc_legacy_const_generics(N)]
-   |
-
-error: the `rustc_legacy_const_generics` attribute cannot be used on structs
-  --> $DIR/invalid-rustc_legacy_const_generics-arguments.rs:20:3
-   |
-LL | #[rustc_legacy_const_generics(0)]
-   |   ^^^^^^^^^^^^^^^^^^^^^^^^^^^
-   |
-   = help: the `rustc_legacy_const_generics` attribute can only be applied to functions
-
-error: suffixed literals are not allowed in attributes
-  --> $DIR/invalid-rustc_legacy_const_generics-arguments.rs:23:31
-   |
-LL | #[rustc_legacy_const_generics(0usize)]
-   |                               ^^^^^^
-   |
-   = help: instead of using a suffixed literal (`1u8`, `1.0f32`, etc.), use an unsuffixed version (`1`, `1.0`, etc.)
-
-error[E0539]: malformed `rustc_legacy_const_generics` attribute input
-  --> $DIR/invalid-rustc_legacy_const_generics-arguments.rs:23:3
-   |
-LL | #[rustc_legacy_const_generics(0usize)]
-   |   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^------^
-   |                               |
-   |                               expected an integer literal here
-   |
-help: must be of the form
-   |
-LL - #[rustc_legacy_const_generics(0usize)]
-LL + #[rustc_legacy_const_generics(N)]
-   |
-
-error: the `rustc_legacy_const_generics` attribute cannot be used on foreign functions
-  --> $DIR/invalid-rustc_legacy_const_generics-arguments.rs:29:7
-   |
-LL |     #[rustc_legacy_const_generics(1)]
-   |       ^^^^^^^^^^^^^^^^^^^^^^^^^^^
-   |
-   = help: the `rustc_legacy_const_generics` attribute can only be applied to functions
-
-error: the `rustc_legacy_const_generics` attribute cannot be used on inherent methods
-  --> $DIR/invalid-rustc_legacy_const_generics-arguments.rs:37:7
-   |
-LL |     #[rustc_legacy_const_generics(0)]
-   |       ^^^^^^^^^^^^^^^^^^^^^^^^^^^
-   |
-   = help: the `rustc_legacy_const_generics` attribute can only be applied to functions
-
-error[E0539]: malformed `rustc_legacy_const_generics` attribute input
-  --> $DIR/invalid-rustc_legacy_const_generics-arguments.rs:41:3
-   |
-LL | #[rustc_legacy_const_generics]
-   |   ^^^^^^^^^^^^^^^^^^^^^^^^^^^ expected this to be a list
-   |
-help: must be of the form
-   |
-LL | #[rustc_legacy_const_generics(N)]
-   |                              +++
-
-error[E0539]: malformed `rustc_legacy_const_generics` attribute input
-  --> $DIR/invalid-rustc_legacy_const_generics-arguments.rs:44:3
-   |
-LL | #[rustc_legacy_const_generics = 1]
-   |   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^---
-   |                               |
-   |                               expected this to be a list
-   |
-help: must be of the form
-   |
-LL - #[rustc_legacy_const_generics = 1]
-LL + #[rustc_legacy_const_generics(N)]
-   |
-
-error: #[rustc_legacy_const_generics] must have one index for each generic parameter
-  --> $DIR/invalid-rustc_legacy_const_generics-arguments.rs:3:1
-   |
-LL | #[rustc_legacy_const_generics(0)]
-   | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-LL | fn foo1() {}
-   |        - generic parameters
-
-error: index exceeds number of arguments
-  --> $DIR/invalid-rustc_legacy_const_generics-arguments.rs:6:31
-   |
-LL | #[rustc_legacy_const_generics(1)]
-   |                               ^ there is only 1 argument
-
-error: index exceeds number of arguments
-  --> $DIR/invalid-rustc_legacy_const_generics-arguments.rs:9:31
-   |
-LL | #[rustc_legacy_const_generics(2)]
-   |                               ^ there are only 2 arguments
-
-error: #[rustc_legacy_const_generics] functions must only have const generics
-  --> $DIR/invalid-rustc_legacy_const_generics-arguments.rs:33:1
-   |
-LL | #[rustc_legacy_const_generics(0)]
-   | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-LL | fn foo8<X>() {}
-   |         - non-const generic parameter
-
-error[E0044]: foreign items may not have const parameters
-  --> $DIR/invalid-rustc_legacy_const_generics-arguments.rs:30:5
-   |
-LL |     fn foo7<const X: usize>();
-   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^ can't have const parameters
-   |
-   = help: replace the const parameters with concrete consts
-
-error: aborting due to 15 previous errors
-
-Some errors have detailed explanations: E0044, E0539.
-For more information about an error, try `rustc --explain E0044`.
-"#;
-    assert_eq!(ui("invalid-rustc_legacy_const_generics-arguments.rs", "2015", source), stderr);
+    assert_reports(
+        &ui("invalid-rustc_legacy_const_generics-arguments.rs", "2015", source),
+        &[
+            error(12, &["`rustc_legacy_const_generics`"]),
+            error(15, &["`rustc_legacy_const_generics`"]),
+            error(15, &["`rustc_legacy_const_generics`"]),
+            error(20, &["`rustc_legacy_const_generics`"]),
+            error(23, &[]),
+            error(23, &["`rustc_legacy_const_generics`"]),
+            error(29, &["`rustc_legacy_const_generics`"]),
+            error(37, &["`rustc_legacy_const_generics`"]),
+            error(41, &["`rustc_legacy_const_generics`"]),
+            error(44, &["`rustc_legacy_const_generics`"]),
+            error(3, &[]),
+            error(6, &[]),
+            error(9, &[]),
+            error(33, &[]),
+            error(30, &[]),
+        ],
+    );
 }
 
 #[test]
@@ -1023,69 +891,14 @@ struct CountTooLarge(f32);
 
 fn main() {}
 "#;
-    let stderr = r#"error[E0539]: malformed `rustc_scalable_vector` attribute input
-  --> $DIR/scalable-vector-count.rs:3:3
-   |
-LL | #[rustc_scalable_vector("4")]
-   |   ^^^^^^^^^^^^^^^^^^^^^^---^
-   |                         |
-   |                         expected an integer literal here
-   |
-help: try changing it to one of the following valid forms of the attribute
-   |
-LL - #[rustc_scalable_vector("4")]
-LL + #[rustc_scalable_vector]
-   |
-LL - #[rustc_scalable_vector("4")]
-LL + #[rustc_scalable_vector(count)]
-   |
-
-error[E0805]: malformed `rustc_scalable_vector` attribute input
-  --> $DIR/scalable-vector-count.rs:7:3
-   |
-LL | #[rustc_scalable_vector(4, 2)]
-   |   ^^^^^^^^^^^^^^^^^^^^^------
-   |                        |
-   |                        expected a single argument here
-   |
-help: try changing it to one of the following valid forms of the attribute
-   |
-LL - #[rustc_scalable_vector(4, 2)]
-LL + #[rustc_scalable_vector]
-   |
-LL - #[rustc_scalable_vector(4, 2)]
-LL + #[rustc_scalable_vector(count)]
-   |
-
-error[E0539]: malformed `rustc_scalable_vector` attribute input
-  --> $DIR/scalable-vector-count.rs:11:3
-   |
-LL | #[rustc_scalable_vector(count = "4")]
-   |   ^^^^^^^^^^^^^^^^^^^^^^-----------^
-   |                         |
-   |                         expected an integer literal here
-   |
-help: try changing it to one of the following valid forms of the attribute
-   |
-LL - #[rustc_scalable_vector(count = "4")]
-LL + #[rustc_scalable_vector]
-   |
-LL - #[rustc_scalable_vector(count = "4")]
-LL + #[rustc_scalable_vector(count)]
-   |
-
-error: element count in `rustc_scalable_vector` is too large: `65536`
-  --> $DIR/scalable-vector-count.rs:15:1
-   |
-LL | #[rustc_scalable_vector(65536)]
-   | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-   |
-   = note: the value may not exceed `u16::MAX`
-
-error: aborting due to 4 previous errors
-
-Some errors have detailed explanations: E0539, E0805.
-For more information about an error, try `rustc --explain E0539`.
-"#;
-    assert_eq!(ui("scalable-vector-count.rs", "2015", source), stderr);
+    let fixture = format!("//- /scalable-vector-count.rs crate:other:main edition:2015 cfg:target_arch=aarch64\n{source}");
+    assert_reports(
+        &ui_fixture_as(Mode::Other, &fixture, &Options::default()),
+        &[
+            error(3, &["`rustc_scalable_vector`"]),
+            error(7, &["`rustc_scalable_vector`"]),
+            error(11, &["`rustc_scalable_vector`"]),
+            error(15, &["`65536`", "`rustc_scalable_vector`"]),
+        ],
+    );
 }

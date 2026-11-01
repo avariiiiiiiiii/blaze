@@ -419,7 +419,7 @@ impl SyntaxNode {
         // alloc: the elided nodes' numbers, once per copy
         let numbers: Vec<u32> = numbers.collect();
         // alloc: the copy's tree, shared by its cursors as every tree is
-        SyntaxNode::new_flat_root(Arc::new(tree.subtree_without(at, &numbers)))
+        SyntaxNode::new_flat_root(Arc::new(tree.subtree_without(at, &numbers, None)))
     }
 
     /// The root of a new tree, the one this node is in but with this node's children (and

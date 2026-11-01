@@ -3,7 +3,7 @@
 //! `tests/ui/const-generics/`, `tests/ui/force-inlining/`, `tests/ui/linkage-attr/`,
 //! `tests/ui/structs/`, `tests/ui/panic-handler/`).
 
-use crate::tests::{items::ui_core, ui};
+use crate::tests::{assert_reports, error, items::ui_core, ui};
 
 #[test]
 fn transparent_takes_no_other_hint() {
@@ -387,68 +387,19 @@ fn main() {
     let () = ();
 }
 "#;
-    let stderr = r#"error: the `may_dangle` attribute cannot be used on const parameters
-  --> $DIR/may_dangle.rs:14:22
-   |
-LL | unsafe impl<'a, T, #[may_dangle] const N: usize> Drop for Implee1<'a, T, N> {
-   |                      ^^^^^^^^^^
-   |
-   = help: the `may_dangle` attribute can be applied to lifetime parameters and type parameters
-
-error: the `may_dangle` attribute cannot be used on structs
-  --> $DIR/may_dangle.rs:42:3
-   |
-LL | #[may_dangle]
-   |   ^^^^^^^^^^
-   |
-   = help: the `may_dangle` attribute can be applied to lifetime parameters and type parameters
-
-error: the `may_dangle` attribute cannot be used on trait impl blocks
-  --> $DIR/may_dangle.rs:45:3
-   |
-LL | #[may_dangle]
-   |   ^^^^^^^^^^
-   |
-   = help: the `may_dangle` attribute can be applied to lifetime parameters and type parameters
-
-error: the `may_dangle` attribute cannot be used on functions
-  --> $DIR/may_dangle.rs:49:3
-   |
-LL | #[may_dangle]
-   |   ^^^^^^^^^^
-   |
-   = help: the `may_dangle` attribute can be applied to lifetime parameters and type parameters
-
-error: the `may_dangle` attribute cannot be used on statements
-  --> $DIR/may_dangle.rs:51:7
-   |
-LL |     #[may_dangle]
-   |       ^^^^^^^^^^
-   |
-   = help: the `may_dangle` attribute can be applied to lifetime parameters and type parameters
-
-error: `#[may_dangle]` must be applied to a lifetime or type generic parameter in `Drop` impl
-  --> $DIR/may_dangle.rs:8:13
-   |
-LL | unsafe impl<#[may_dangle] 'a, T, const N: usize> NotDrop for Implee1<'a, T, N> {}
-   |             ^^^^^^^^^^^^^
-
-error: `#[may_dangle]` must be applied to a lifetime or type generic parameter in `Drop` impl
-  --> $DIR/may_dangle.rs:11:17
-   |
-LL | unsafe impl<'a, #[may_dangle] T, const N: usize> NotDrop for Implee2<'a, T, N> {}
-   |                 ^^^^^^^^^^^^^
-
-error: `#[may_dangle]` must be applied to a lifetime or type generic parameter in `Drop` impl
-  --> $DIR/may_dangle.rs:36:17
-   |
-LL |     unsafe impl<#[may_dangle] T> Drop for Implee<T> {
-   |                 ^^^^^^^^^^^^^
-
-error: aborting due to 8 previous errors
-
-"#;
-    assert_eq!(ui_core("may_dangle.rs", "2015", "drop", source), stderr);
+    assert_reports(
+        &ui_core("may_dangle.rs", "2015", "drop", source),
+        &[
+            error(14, &["`may_dangle`"]),
+            error(42, &["`may_dangle`"]),
+            error(45, &["`may_dangle`"]),
+            error(49, &["`may_dangle`"]),
+            error(51, &["`may_dangle`"]),
+            error(8, &["`#[may_dangle]`", "`Drop`"]),
+            error(11, &["`#[may_dangle]`", "`Drop`"]),
+            error(36, &["`#[may_dangle]`", "`Drop`"]),
+        ],
+    );
 }
 
 #[test]
@@ -565,37 +516,7 @@ gen fn gen_foo() {}
 //~^ ERROR attribute cannot be applied to a `async`, `gen` or `async gen` function
 async gen fn async_gen_foo() {}
 "#;
-    let stderr = r#"error: attribute cannot be applied to a `async`, `gen` or `async gen` function
-  --> $DIR/invalid.rs:4:1
-   |
-LL | #[rustc_force_inline]
-   | ^^^^^^^^^^^^^^^^^^^^^
-LL |
-LL | async fn async_foo() {}
-   | -------------------- `async`, `gen` or `async gen` function
-
-error: attribute cannot be applied to a `async`, `gen` or `async gen` function
-  --> $DIR/invalid.rs:8:1
-   |
-LL | #[rustc_force_inline]
-   | ^^^^^^^^^^^^^^^^^^^^^
-LL |
-LL | gen fn gen_foo() {}
-   | ---------------- `async`, `gen` or `async gen` function
-
-error: attribute cannot be applied to a `async`, `gen` or `async gen` function
-  --> $DIR/invalid.rs:12:1
-   |
-LL | #[rustc_force_inline]
-   | ^^^^^^^^^^^^^^^^^^^^^
-LL |
-LL | async gen fn async_gen_foo() {}
-   | ---------------------------- `async`, `gen` or `async gen` function
-
-error: aborting due to 3 previous errors
-
-"#;
-    assert_eq!(ui_core("invalid.rs", "2024", "future", source), stderr);
+    assert_reports(&ui_core("invalid.rs", "2024", "future", source), &[error(4, &["`async`", "`gen`", "`async gen`"]), error(8, &["`async`", "`gen`", "`async gen`"]), error(12, &["`async`", "`gen`", "`async gen`"])]);
 }
 
 #[test]

@@ -119,12 +119,14 @@ struct SimFile {
     /// file, lost (in part) by a crash.
     ops: Vec<Op>,
     mode: u32,
+    /// A symbolic link, its bytes its target.
+    link: bool,
 }
 
 impl Default for SimFile {
     fn default() -> SimFile {
         // alloc: none, two empty vectors.
-        SimFile { durable: Vec::new(), ops: Vec::new(), mode: 0o644 }
+        SimFile { durable: Vec::new(), ops: Vec::new(), mode: 0o644, link: false }
     }
 }
 
@@ -459,20 +461,89 @@ impl Sim {
         self.changed(file);
     }
 
+    /// `file` made a symbolic link to `target`, durably, by something outside the state
+    /// machine (a checkout): watches of it hear of it.
+    pub fn symlink(&mut self, file: &FileName, target: &str) {
+        // alloc: the world changed by the test, not an op.
+        *file_mut(&mut self.files, file) = SimFile { mode: 0o777, link: true, ..SimFile::whole(target.into()) };
+        self.changed(file);
+    }
+
     /// `to` made with `from`'s contents and mode, durably: the simulation does not model
     /// shared blocks or a link's shared inode.
     fn copy(&mut self, from: &FileName, to: &FileName) {
-        let mode = self.files[from].mode;
+        let SimFile { mode, link, .. } = self.files[from];
         let bytes = self.contents(from);
-        *file_mut(&mut self.files, to) = SimFile { mode, ..SimFile::whole(bytes) };
+        *file_mut(&mut self.files, to) = SimFile { mode, link, ..SimFile::whole(bytes) };
         self.changed(to);
     }
 
+    /// Where the symbolic link `file` leads, followed as the system opens a file (`None` when
+    /// `file` is no link): an error when it ends at a directory, outside the simulated root or
+    /// in a loop. Only the last name is followed; a link among a path's directories is not
+    /// modelled.
+    fn followed(&self, file: &FileName) -> Result<Option<FileName>, IoError> {
+        if !self.files.get(file).is_some_and(|it| it.link) {
+            return Ok(None);
+        }
+        // clone: the name of the file a read ends at.
+        let mut at = file.clone();
+        for _ in 0..40 {
+            let Some(sim) = self.files.get(&at).filter(|it| it.link) else {
+                if !self.files.contains_key(&at) && self.files.keys().any(|it| it.is_under(&at)) {
+                    // alloc: an error's message.
+                    return Err(IoError(format!("{file}: Is a directory (os error 21)")));
+                }
+                return Ok(Some(at));
+            };
+            let target = String::from_utf8_lossy(&sim.contents()).into_owned();
+            // alloc: the name a link leads to.
+            let mut parts: Vec<&str> = at.as_str().rsplit_once('/').map_or(vec![], |(dir, _)| dir.split('/').collect());
+            for part in target.split('/') {
+                match part {
+                    "" if parts.is_empty() && target.starts_with('/') => {
+                        // alloc: an error's message.
+                        return Err(IoError(format!("{file}: a link out of the simulated root")));
+                    }
+                    "" | "." => {}
+                    ".." => {
+                        if parts.pop().is_none() {
+                            // alloc: an error's message.
+                            return Err(IoError(format!("{file}: a link out of the simulated root")));
+                        }
+                    }
+                    part => parts.push(part),
+                }
+            }
+            let Some(next) = FileName::new(&parts.join("/")) else {
+                // alloc: an error's message.
+                return Err(IoError(format!("{file}: a link to the simulated root")));
+            };
+            at = next;
+        }
+        // alloc: an error's message.
+        Err(IoError(format!("{file}: Too many levels of symbolic links (os error 40)")))
+    }
+
+    /// [`Effect::ReadLink`] of `file`.
+    fn read_link(&self, file: &FileName) -> Done {
+        match self.files.get(file) {
+            Some(sim) if sim.link => Done::Read(sim.contents()),
+            // alloc: an error's message.
+            Some(_) => Done::Failed(IoError(format!("{file}: Invalid argument (os error 22)"))),
+            // alloc: an error's message.
+            None => Done::Failed(IoError(format!("{file}: No such file or directory (os error 2)"))),
+        }
+    }
+
     /// The bytes `at..at + len` of the file, or fewer at its end: none of a file not there.
-    fn read(&mut self, file: &FileName, at: u64, len: usize) -> Vec<u8> {
+    /// A symbolic link is followed.
+    fn read(&mut self, file: &FileName, at: u64, len: usize) -> Result<Vec<u8>, IoError> {
+        let followed = self.followed(file)?;
+        let file = followed.as_ref().unwrap_or(file);
         let Some(sim) = self.files.get(file) else {
             // alloc: none, an empty read.
-            return Vec::new();
+            return Ok(Vec::new());
         };
         let bytes: &[u8] = match sim.ops.is_empty() {
             true => &sim.durable,
@@ -487,7 +558,7 @@ impl Sim {
         };
         let at = usize::try_from(at).unwrap_or(usize::MAX).min(bytes.len());
         // alloc: the read's payload, which the completion carries.
-        bytes[at..at.saturating_add(len).min(bytes.len())].to_vec()
+        Ok(bytes[at..at.saturating_add(len).min(bytes.len())].to_vec())
     }
 
     /// The files under `dir` and the directories they imply, as a disk would list them. As for
@@ -753,8 +824,9 @@ impl Sim {
             return self.fail(tag);
         }
         let done = match effect {
-            Effect::ReadAll { file, .. } => Done::Read(self.read(&file, 0, usize::MAX)),
-            Effect::Read { file, at, len, .. } => Done::Read(self.read(&file, at, len)),
+            Effect::ReadAll { file, .. } => self.read(&file, 0, usize::MAX).map_or_else(Done::Failed, Done::Read),
+            Effect::Read { file, at, len, .. } => self.read(&file, at, len).map_or_else(Done::Failed, Done::Read),
+            Effect::ReadLink { file, .. } => self.read_link(&file),
             Effect::Append { file, bytes, .. } => {
                 file_mut(&mut self.files, &file).ops.push(Op::Append(bytes));
                 self.changed(&file);
@@ -1280,7 +1352,7 @@ mod tests {
                 assert_eq!(sim.files[&file].len(), whole.len() as u64, "seed {seed}");
                 let (at, len) = (sim.rng.below(25), sim.rng.below(25) as usize);
                 let from = (at as usize).min(whole.len());
-                assert_eq!(sim.read(&file, at, len), whole[from..(from + len).min(whole.len())], "seed {seed}");
+                assert_eq!(sim.read(&file, at, len).unwrap(), whole[from..(from + len).min(whole.len())], "seed {seed}");
             }
         }
     }

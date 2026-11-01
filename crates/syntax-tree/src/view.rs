@@ -508,6 +508,17 @@ impl<'t, L: Language> Node<'t, L> {
     /// `clone_subtree_without`. They must be in the tree this node's children are in (its
     /// part's, for a lazy node).
     pub fn subtree_without(self, elided: &[Node<'t, L>]) -> FlatTree {
+        self.subtree_without_in(elided, None)
+    }
+
+    /// [`Self::subtree_without`] with every elided node replaced by an empty node of
+    /// `placeholder`, whatever its own kind: a copy that an edit turning an elided node into one
+    /// of another kind leaves the same.
+    pub fn subtree_without_as(self, elided: &[Node<'t, L>], placeholder: L::Kind) -> FlatTree {
+        self.subtree_without_in(elided, Some(L::kind_to_raw(placeholder)))
+    }
+
+    fn subtree_without_in(self, elided: &[Node<'t, L>], placeholder: Option<SyntaxKind>) -> FlatTree {
         if elided.is_empty() {
             return self.subtree();
         }
@@ -524,7 +535,7 @@ impl<'t, L: Language> Node<'t, L> {
         });
         // alloc: the elided nodes' numbers, once per copy
         let numbers: Vec<u32> = numbers.collect();
-        place.tree.subtree_without(at, &numbers)
+        place.tree.subtree_without(at, &numbers, placeholder)
     }
 }
 

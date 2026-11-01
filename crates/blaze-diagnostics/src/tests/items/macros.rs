@@ -1,7 +1,7 @@
 //! rustc's UI tests of macros: calls of macros that do not exist, `compile_error!`,
 //! `macro_rules!` definitions rustc refuses, and expansions that do not parse.
 
-use crate::tests::{ui, ui_builtins};
+use crate::tests::{assert_reports, error, ui, ui_builtins};
 
 #[test]
 fn an_undefined_macro_suggests_the_similar_one() {
@@ -20,24 +20,7 @@ fn main() {
     kl!();
 }
 "#;
-    let stderr = r#"error: cannot find macro `k` in this scope
-  --> $DIR/macro_undefined.rs:11:5
-   |
-LL |     macro_rules! kl {
-   |     --------------- similarly named macro `kl` defined here
-...
-LL |     k!();
-   |     ^
-   |
-help: a macro with a similar name exists
-   |
-LL |     kl!();
-   |      +
-
-error: aborting due to 1 previous error
-
-"#;
-    assert_eq!(ui("macro_undefined.rs", "2015", source), stderr);
+    assert_reports(&ui("macro_undefined.rs", "2015", source), &[error(11, &["`k`"])]);
 }
 
 #[test]
@@ -50,16 +33,7 @@ fn main() {
     //~^ ERROR cannot find macro `iamnotanextensionthatexists` in this scope
 }
 "#;
-    let stderr = r#"error: cannot find macro `iamnotanextensionthatexists` in this scope
-  --> $DIR/nonexistent-macro.rs:4:5
-   |
-LL |     iamnotanextensionthatexists!("");
-   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^
-
-error: aborting due to 1 previous error
-
-"#;
-    assert_eq!(ui("nonexistent-macro.rs", "2015", source), stderr);
+    assert_reports(&ui("nonexistent-macro.rs", "2015", source), &[error(4, &["`iamnotanextensionthatexists`"])]);
 }
 
 #[test]
@@ -69,16 +43,7 @@ fn compile_error_is_an_error_at_the_call() {
     compile_error!("a very descriptive error message"); //~ ERROR: a very descriptive error message
 }
 "#;
-    let stderr = r#"error: a very descriptive error message
-  --> $DIR/compile_error_macro.rs:2:5
-   |
-LL |     compile_error!("a very descriptive error message");
-   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-
-error: aborting due to 1 previous error
-
-"#;
-    assert_eq!(ui_builtins("compile_error_macro.rs", "2015", source), stderr);
+    assert_reports(&ui_builtins("compile_error_macro.rs", "2015", source), &[error(2, &["a very descriptive error message"])]);
 }
 
 #[test]
@@ -237,14 +202,5 @@ fn main() {
     x!(!); //~ ERROR macro expansion ends with an incomplete expression: expected expression
 }
 "#;
-    let stderr = r#"error: macro expansion ends with an incomplete expression: expected expression
-  --> $DIR/issue-68092-unicode-ident-after-incomplete-expr.rs:8:9
-   |
-LL |     x!(!);
-   |         ^ expected expression
-
-error: aborting due to 1 previous error
-
-"#;
-    assert_eq!(ui("issue-68092-unicode-ident-after-incomplete-expr.rs", "2015", source), stderr);
+    assert_reports(&ui("issue-68092-unicode-ident-after-incomplete-expr.rs", "2015", source), &[error(8, &[])]);
 }

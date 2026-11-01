@@ -867,7 +867,6 @@ mod tests {
             counted: false,
             mir_inline: false,
             pgo: blaze_codegen::settings::Pgo::None,
-            policy: ContentId::default(),
             sanitize: blaze_codegen::settings::Sanitize::default(),
         }
     }

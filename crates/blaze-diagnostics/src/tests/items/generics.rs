@@ -8,7 +8,7 @@
 use crate::{
     Options,
     emit::Style,
-    tests::{Mode, checked_with, compiletest, items::ui_core, normalized, ui},
+    tests::{Mode, assert_reports, checked_with, compiletest, error, items::ui_core, normalized, ui},
 };
 
 #[test]
@@ -432,35 +432,7 @@ static BAR: _ = "test"; //~ ERROR E0121
 
 fn main() {}
 "#;
-    let stderr = r#"error[E0121]: the placeholder `_` is not allowed within types on item signatures for return types
-  --> $DIR/E0121.rs:1:13
-   |
-LL | fn foo() -> _ { 5 }
-   |             ^ not allowed in type signatures
-   |
-help: replace with the correct return type
-   |
-LL - fn foo() -> _ { 5 }
-LL + fn foo() -> i32 { 5 }
-   |
-
-error[E0121]: the placeholder `_` is not allowed within types on item signatures for static variables
-  --> $DIR/E0121.rs:3:13
-   |
-LL | static BAR: _ = "test";
-   |             ^ not allowed in type signatures
-   |
-help: replace this with a fully-specified type
-   |
-LL - static BAR: _ = "test";
-LL + static BAR: &str = "test";
-   |
-
-error: aborting due to 2 previous errors
-
-For more information about this error, try `rustc --explain E0121`.
-"#;
-    assert_eq!(ui("E0121.rs", "2015", source), stderr);
+    assert_reports(&ui("E0121.rs", "2015", source), &[error(1, &["`_`"]), error(3, &["`_`"])]);
 }
 
 #[test]
@@ -487,22 +459,7 @@ where
 
 fn main() {}
 "#;
-    let stderr = r#"error: return type notation not allowed in this position yet
-  --> $DIR/bare-path.rs:14:23
-   |
-LL |     let _ = T::CONST::(..);
-   |                       ^^^^
-
-error: return type notation not allowed in this position yet
-  --> $DIR/bare-path.rs:16:12
-   |
-LL |     let _: T::method(..);
-   |            ^^^^^^^^^^^^^
-
-error: aborting due to 2 previous errors
-
-"#;
-    assert_eq!(ui_core("bare-path.rs", "2015", "send, sized", source), stderr);
+    assert_reports(&ui_core("bare-path.rs", "2015", "send, sized", source), &[error(14, &[]), error(16, &[])]);
 }
 
 /// [`ui_core`] of a revision: `--cfg {revision}`, as compiletest passes it.

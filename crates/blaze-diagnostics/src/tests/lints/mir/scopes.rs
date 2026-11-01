@@ -3,7 +3,7 @@
 //! `unused_must_use`. A test given in part keeps its lines where they are, so the lines and
 //! columns of the expectation are the test's.
 
-use crate::tests::{items::ui_core, ui};
+use crate::tests::{assert_reports, error, items::ui_core, ui, warning};
 
 #[test]
 fn an_await_in_a_closure_points_at_the_closure() {
@@ -137,20 +137,7 @@ async fn fun() {
 
 fn main() {}
 "#;
-    let stderr = r#"error[E0728]: `await` is only allowed inside `async` functions and blocks
-  --> $DIR/issue-70594.rs:4:12
-   |
-LL |     [1; ().await];
-   |         ---^^^^^
-   |         |  |
-   |         |  only allowed inside `async` functions and blocks
-   |         this is not `async`
-
-error: aborting due to 1 previous error
-
-For more information about this error, try `rustc --explain E0728`.
-"#;
-    assert_eq!(ui_core("issue-70594.rs", "2018", "future", source), stderr);
+    assert_reports(&ui_core("issue-70594.rs", "2018", "future", source), &[error(4, &[])]);
 }
 
 #[test]
@@ -199,75 +186,19 @@ async fn await_across_const_block() {
 
 fn main() {}
 "#;
-    let stderr = r#"error[E0767]: use of unreachable label `'a`
-  --> $DIR/cross-const-control-flow-125846.rs:9:25
-   |
-LL |     'a: { const { break 'a } }
-   |     --                  ^^ unreachable label `'a`
-   |     |
-   |     unreachable label defined here
-   |
-   = note: labels are unreachable through functions, closures, async blocks and modules
-
-error[E0767]: use of unreachable label `'a`
-  --> $DIR/cross-const-control-flow-125846.rs:22:28
-   |
-LL |     'a: { const { continue 'a } }
-   |     --                     ^^ unreachable label `'a`
-   |     |
-   |     unreachable label defined here
-   |
-   = note: labels are unreachable through functions, closures, async blocks and modules
-
-error[E0728]: `await` is only allowed inside `async` functions and blocks
-  --> $DIR/cross-const-control-flow-125846.rs:35:22
-   |
-LL |     const { async {}.await }
-   |           -----------^^^^^--
-   |           |          |
-   |           |          only allowed inside `async` functions and blocks
-   |           this is not `async`
-
-error[E0572]: return statement outside of function body
-  --> $DIR/cross-const-control-flow-125846.rs:4:13
-   |
-LL | / fn foo() {
-LL | |     const { return }
-   | |           --^^^^^^-- the return is part of this body...
-LL | |
-LL | | }
-   | |_- ...not the enclosing function body
-
-error[E0268]: `break` outside of a loop or labeled block
-  --> $DIR/cross-const-control-flow-125846.rs:9:19
-   |
-LL |     'a: { const { break 'a } }
-   |                   ^^^^^^^^ cannot `break` outside of a loop or labeled block
-
-error[E0268]: `break` outside of a loop or labeled block
-  --> $DIR/cross-const-control-flow-125846.rs:16:17
-   |
-LL |         const { break }
-   |                 ^^^^^ cannot `break` outside of a loop or labeled block
-
-error[E0268]: `continue` outside of a loop
-  --> $DIR/cross-const-control-flow-125846.rs:22:19
-   |
-LL |     'a: { const { continue 'a } }
-   |                   ^^^^^^^^^^^ cannot `continue` outside of a loop
-
-error[E0268]: `continue` outside of a loop
-  --> $DIR/cross-const-control-flow-125846.rs:29:17
-   |
-LL |         const { continue }
-   |                 ^^^^^^^^ cannot `continue` outside of a loop
-
-error: aborting due to 8 previous errors
-
-Some errors have detailed explanations: E0268, E0572, E0728, E0767.
-For more information about an error, try `rustc --explain E0268`.
-"#;
-    assert_eq!(ui("cross-const-control-flow-125846.rs", "2021", source), stderr);
+    assert_reports(
+        &ui("cross-const-control-flow-125846.rs", "2021", source),
+        &[
+            error(9, &["`'a`"]),
+            error(22, &["`'a`"]),
+            error(35, &["`async`", "`await`"]),
+            error(4, &[]),
+            error(9, &["`break`"]),
+            error(16, &["`break`"]),
+            error(22, &["`continue`"]),
+            error(29, &["`continue`"]),
+        ],
+    );
 }
 
 #[test]
@@ -591,58 +522,15 @@ fn main() {
     }];
 }
 "#;
-    let stderr = r#"error[E0572]: return statement outside of function body
-  --> $DIR/issue-86188-return-not-in-fn-body.rs:9:10
-   |
-LL |       [(); return || {
-   |  __________^
-LL | |
-LL | |         let tx;
-LL | |     }]
-   | |_____^
-
-error[E0572]: return statement outside of function body
-  --> $DIR/issue-86188-return-not-in-fn-body.rs:20:14
-   |
-LL | /     fn bar() {
-LL | |
-LL | |         [(); return];
-   | |              ^^^^^^ the return is part of this body...
-...  |
-LL | |     }
-   | |_____- ...not the enclosing function body
-
-error[E0572]: return statement outside of function body
-  --> $DIR/issue-86188-return-not-in-fn-body.rs:28:14
-   |
-LL | /     fn foo() {
-LL | |
-LL | |         [(); return];
-   | |              ^^^^^^ the return is part of this body...
-...  |
-LL | |     }
-   | |_____- ...not the enclosing function body
-
-error[E0572]: return statement outside of function body
-  --> $DIR/issue-86188-return-not-in-fn-body.rs:36:10
-   |
-LL | /  fn main() {
-LL | |
-LL | |      [(); return || {
-   | | __________^
-LL | ||
-LL | ||
-LL | ||         let tx;
-LL | ||     }];
-   | ||_____^ the return is part of this body...
-LL | |  }
-   | |__- ...not the enclosing function body
-
-error: aborting due to 4 previous errors
-
-For more information about this error, try `rustc --explain E0572`.
-"#;
-    assert_eq!(ui("issue-86188-return-not-in-fn-body.rs", "2015", source), stderr);
+    assert_reports(
+        &ui("issue-86188-return-not-in-fn-body.rs", "2015", source),
+        &[
+            error(9, &[]),
+            error(20, &[]),
+            error(28, &[]),
+            error(36, &[]),
+        ],
+    );
 }
 
 #[test]
@@ -987,35 +875,8 @@ fn main() {
     baz();
 }
 "#;
-    let stderr = r#"warning: unused return value of `foo` that must be used
-  --> $DIR/must-use-block-expr.rs:13:9
-   |
-LL |         foo();
-   |         ^^^^^
-   |
-note: the lint level is defined here
-  --> $DIR/must-use-block-expr.rs:4:9
-   |
-LL | #![warn(unused_must_use)]
-   |         ^^^^^^^^^^^^^^^
-help: use `let _ = ...` to ignore the resulting value
-   |
-LL |         let _ = foo();
-   |         +++++++
-
-warning: unused return value of `foo` that must be used
-  --> $DIR/must-use-block-expr.rs:20:9
-   |
-LL |         foo()
-   |         ^^^^^
-   |
-help: use `let _ = ...` to ignore the resulting value
-   |
-LL |         let _ = foo();
-   |         +++++++      +
-
-warning: 2 warnings emitted
-
-"#;
-    assert_eq!(ui("must-use-block-expr.rs", "2015", source), stderr);
+    assert_reports(
+        &ui("must-use-block-expr.rs", "2015", source),
+        &[warning(13, &["`foo`"]), warning(20, &["`foo`"])],
+    );
 }

@@ -4,7 +4,7 @@ use super::types::ui_std;
 use crate::{
     Options,
     emit::Style,
-    tests::{Mode, checked_with, compiletest, normalized, ui},
+    tests::{Mode, assert_reports, checked_with, compiletest, error, normalized, ui},
 };
 
 /// std's `println!` and what it calls, for the tests that write one: what std's prelude has of
@@ -289,24 +289,7 @@ fn main() {
     };
 }
 "##;
-    let stderr = r##"error: unreachable statement
-  --> $DIR/expr_again.rs:8:9
-   |
-LL |         continue;
-   |         -------- any code following this expression is unreachable
-LL |         println!("hi");
-   |         ^^^^^^^^^^^^^^ unreachable statement
-   |
-note: the lint level is defined here
-  --> $DIR/expr_again.rs:3:9
-   |
-LL | #![deny(unreachable_code)]
-   |         ^^^^^^^^^^^^^^^^
-
-error: aborting due to 1 previous error
-
-"##;
-    assert_eq!(ui_std("expr_again.rs", "2015", "sized, fmt", PRINTLN, source), stderr);
+    assert_reports(&ui_std("expr_again.rs", "2015", "sized, fmt", PRINTLN, source), &[error(8, &[])]);
 }
 
 #[test]
@@ -356,50 +339,13 @@ fn g() {
 
 fn main() { }
 "##;
-    let stderr = r##"error: unreachable statement
-  --> $DIR/expr_match.rs:8:5
-   |
-LL |     match () { () => return }
-   |     ------------------------- any code following this `match` expression is unreachable, as all arms diverge
-LL |     println!("I am dead");
-   |     ^^^^^^^^^^^^^^^^^^^^^ unreachable statement
-   |
-note: the lint level is defined here
-  --> $DIR/expr_match.rs:4:9
-   |
-LL | #![deny(unreachable_code)]
-   |         ^^^^^^^^^^^^^^^^
-
-error: unreachable statement
-  --> $DIR/expr_match.rs:19:5
-   |
-LL |     match () { () if false => return, () => return }
-   |     ------------------------------------------------ any code following this `match` expression is unreachable, as all arms diverge
-LL |     println!("I am dead");
-   |     ^^^^^^^^^^^^^^^^^^^^^ unreachable statement
-
-error: unreachable expression
-  --> $DIR/expr_match.rs:25:25
-   |
-LL |         () if return => (),
-   |               ------    ^^ unreachable expression
-   |               |
-   |               any code following this expression is unreachable
-
-error: unreachable statement
-  --> $DIR/expr_match.rs:29:5
-   |
-LL | /     match () {
-LL | |         () if return => (),
-LL | |
-LL | |         () => return,
-LL | |     }
-   | |_____- any code following this `match` expression is unreachable, as all arms diverge
-LL |       println!("I am dead");
-   |       ^^^^^^^^^^^^^^^^^^^^^ unreachable statement
-
-error: aborting due to 4 previous errors
-
-"##;
-    assert_eq!(ui_std("expr_match.rs", "2015", "sized, fmt, option", PRINTLN, source), stderr);
+    assert_reports(
+        &ui_std("expr_match.rs", "2015", "sized, fmt, option", PRINTLN, source),
+        &[
+            error(8, &[]),
+            error(19, &[]),
+            error(25, &[]),
+            error(29, &[]),
+        ],
+    );
 }

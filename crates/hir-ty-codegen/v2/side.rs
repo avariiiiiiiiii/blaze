@@ -2,28 +2,33 @@
 //! named locals and where they are while it runs, and the code the MIR optimizer inlined
 //! into it and where that was called. Kept in the store under
 //! [`blaze_codegen::CompiledFunction::side`], in postcard, versioned by [`VERSION`].
+//!
+//! A local is told by its binding's index in the store of the body it is written in, never by
+//! its name: the table is a function of the code its key names, which renaming a local keeps,
+//! and whatever writes the local's debug record reads its name from the database then, as the
+//! link reads positions from the span tables.
 
 use std::borrow::Cow;
 
 use blaze_format::SpanRef;
 use blaze_ids::ContentId;
 use blaze_mem::Frame;
-use intern::Symbol;
 use serde::Serializer;
 use serde_derive::{Deserialize, Serialize};
 
 use crate::debuginfo::{LineRow, SlotPlaces, VariablePlace};
 
 /// The encoding's version: a change to what is below is a new one.
-pub(crate) const VERSION: u32 = 3;
+pub(crate) const VERSION: u32 = 4;
 
-const SIDE_DOMAIN: &str = "blaze v2 side 3";
+const SIDE_DOMAIN: &str = "blaze v2 side 4";
 
 /// A named local of a function, as its IR was built: in a stack slot, or at an address the
-/// slot holds. 64 bytes; its name is the body's interned one, a pointer to it.
+/// slot holds. 60 bytes.
 #[derive(Clone, PartialEq, Eq, Hash, Debug)]
 pub(crate) struct Variable {
-    pub(crate) name: Symbol,
+    /// Its binding, by index in the store of the body it is written in.
+    pub(crate) binding: u32,
     pub(crate) param: bool,
     /// Its type by content ([`super::Hashes::ty`]).
     pub(crate) ty: ContentId,
@@ -75,8 +80,8 @@ pub(crate) enum SpanScope {
 
 const _: () = assert!(size_of::<SpanScope>() == 8);
 
-/// The table as written, borrowing what it tells of, and as read, borrowing the names from
-/// the stored bytes.
+/// The table as written, borrowing what it tells of, and as read, borrowing the frame base
+/// from the stored bytes.
 #[derive(Serialize, Deserialize, PartialEq, Eq, Debug)]
 pub(crate) struct Side<'a> {
     pub(crate) version: u32,
@@ -84,8 +89,7 @@ pub(crate) struct Side<'a> {
     #[serde(borrow)]
     pub(crate) frame_base: Cow<'a, [u8]>,
     pub(crate) scopes: Vec<Scope>,
-    #[serde(borrow)]
-    pub(crate) variables: Vec<Told<'a>>,
+    pub(crate) variables: Vec<Told>,
     pub(crate) inlined: Vec<Inlined>,
 }
 
@@ -109,8 +113,9 @@ pub(crate) struct Scope {
 }
 
 #[derive(Serialize, Deserialize, PartialEq, Eq, Debug)]
-pub(crate) struct Told<'a> {
-    pub(crate) name: &'a str,
+pub(crate) struct Told {
+    /// As [`Variable::binding`].
+    pub(crate) binding: u32,
     pub(crate) param: bool,
     pub(crate) ty: ContentId,
     pub(crate) place: Place,
@@ -160,7 +165,7 @@ struct WrittenInlined<'f> {
 /// [`Told`] as written: its place borrowed from the function's slots unless it is a pointee's.
 #[derive(Serialize)]
 struct WrittenTold<'a> {
-    name: &'a str,
+    binding: u32,
     param: bool,
     ty: ContentId,
     place: WrittenPlace<'a>,
@@ -208,7 +213,7 @@ pub(crate) fn encode(
             }
         };
         Some(WrittenTold {
-            name: variable.name.as_str(),
+            binding: variable.binding,
             param: variable.param,
             ty: variable.ty,
             place,
@@ -335,7 +340,7 @@ fn extend<'f, T>(
     Ok(())
 }
 
-/// The table in `bytes`, its names borrowed from them.
+/// The table in `bytes`, its frame base borrowed from them.
 pub(crate) fn decode(bytes: &[u8]) -> Result<Side<'_>, String> {
     // alloc: the error's message
     let side: Side<'_> = postcard::from_bytes(bytes).map_err(|e| e.to_string())?;
@@ -357,15 +362,15 @@ mod tests {
             slots: vec![(0, VariablePlace::Frame(-16)), (2, VariablePlace::Frame(8))],
         };
         let ty = ContentId::of("test", b"u32");
-        let variable = |name: &str, slot, pointer| Variable {
-            name: Symbol::intern(name),
+        let variable = |binding, slot, pointer| Variable {
+            binding,
             param: false,
             ty,
             slot,
             pointer,
             scope: None,
         };
-        let variables = [variable("a", 0, None), variable("gone", 1, None), variable("b", 2, Some(4))];
+        let variables = [variable(7, 0, None), variable(8, 1, None), variable(3, 2, Some(4))];
         let encoded = || {
             blaze_mem::frame::task(blaze_mem::Tag::Codegen, |frame| {
                 encode(&variables, &Scopes::default(), &slots, &[], 16, frame)
@@ -373,8 +378,8 @@ mod tests {
         };
         let (bytes, id) = encoded().expect("encoded").expect("variables");
         let side = decode(&bytes).expect("decoded");
-        let names: Vec<_> = side.variables.iter().map(|it| it.name).collect();
-        assert_eq!(names, ["a", "b"]);
+        let bindings: Vec<_> = side.variables.iter().map(|it| it.binding).collect();
+        assert_eq!(bindings, [7, 3], "the slot of binding 8 holds nothing");
         assert_eq!(side.variables[0].place, Place::Frame(-16));
         assert!(matches!(side.variables[1].place, Place::Ranges(_)));
         assert_eq!(encoded().expect("encoded").expect("variables").1, id);
@@ -454,15 +459,15 @@ mod tests {
             ],
         };
         let ty = ContentId::of("test", b"u32");
-        let variable = |name: &str, slot, scope| Variable {
-            name: Symbol::intern(name),
+        let variable = |binding, slot, scope| Variable {
+            binding,
             param: false,
             ty,
             slot,
             pointer: None,
             scope,
         };
-        let variables = [variable("a", 0, None), variable("b", 2, Some(1))];
+        let variables = [variable(0, 0, None), variable(1, 2, Some(1))];
         let scopes = Scopes {
             parents: vec![None, Some(0)],
             of_span: vec![SpanScope::Outside, SpanScope::In(0), SpanScope::In(1)],

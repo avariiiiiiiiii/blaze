@@ -445,3 +445,44 @@ fn a_view_copies_into_a_builder() {
         assert_eq!(copy_root.text(), root.text());
     }
 }
+
+/// An item whose body, a node of `body` with `words` in it, is elided: an edit that turns
+/// the body from one kind into another (a literal into a binary expression) leaves the copy
+/// with one placeholder kind the same, and changes the copy that keeps each node's kind.
+#[test]
+fn an_elided_body_of_another_kind_leaves_the_copy_with_one_placeholder_the_same() {
+    const LITERAL: SyntaxKind = SyntaxKind(20);
+    const BINARY: SyntaxKind = SyntaxKind(21);
+    const PLACEHOLDER: SyntaxKind = SyntaxKind(22);
+    fn item(body: SyntaxKind, words: &[&str]) -> FlatTree {
+        let mut builder = FlatTreeBuilder::new();
+        builder.start_node(ROOT);
+        builder.start_node(GROUP);
+        builder.token(WORD, "k");
+        builder.token(SPACE, " ");
+        builder.start_node(body);
+        for (i, word) in words.iter().enumerate() {
+            if i > 0 {
+                builder.token(SPACE, " ");
+            }
+            builder.token(WORD, word);
+        }
+        builder.finish_node();
+        builder.token(CLOSE, ";");
+        builder.finish_node();
+        builder.finish_node();
+        builder.finish()
+    }
+    let copies = |tree: &FlatTree| {
+        let group = View::root(tree).first_child().expect("the item");
+        let body = group.children().next().expect("the body");
+        (group.subtree_without_as(&[body], PLACEHOLDER), group.subtree_without(&[body]))
+    };
+    let (literal, binary) = (item(LITERAL, &["2"]), item(BINARY, &["2", "*", "2"]));
+    let ((literal_as, literal_own), (binary_as, binary_own)) = (copies(&literal), copies(&binary));
+    assert_eq!(literal_as, binary_as, "one placeholder kind: the copies are the same");
+    assert_eq!(View::root(&literal_as).to_string(), "k ;");
+    let placeholder = View::root(&literal_as).children().next().expect("the placeholder");
+    assert_eq!((placeholder.kind(), placeholder.text_range().is_empty()), (PLACEHOLDER, true));
+    assert_ne!(literal_own, binary_own, "each node's kind kept: the copies differ by it");
+}

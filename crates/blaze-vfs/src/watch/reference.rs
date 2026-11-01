@@ -677,14 +677,14 @@ impl Watcher {
                 match from {
                     Some(from) => batch.slots[at].look = Some(Look::Moved(from)),
                     // alloc: per changed path, beside its read and hash.
-                    None => reads.push((at, slot.file.clone())),
+                    None => reads.push((at, slot.file.clone(), stamp.is_link())),
                 }
             }
             batch.open += lists.len() as u32;
         }
-        for (at, file) in reads {
+        for (at, file, link) in reads {
             let tag = self.tag(Pending::Read(number, at));
-            effects.push(Effect::ReadAll { file, tag });
+            effects.push(if link { Effect::ReadLink { file, tag } } else { Effect::ReadAll { file, tag } });
         }
         for dir in lists {
             // clone: per directory whose stamp moved.
@@ -739,7 +739,7 @@ impl Watcher {
                     } else {
                         slot.stamp = Some(now);
                         // alloc: per changed path, beside its read and hash.
-                        asks.push((Some(at), slot.file.clone()));
+                        asks.push((Some((at, now.is_link())), slot.file.clone()));
                     }
                 }
                 batch.went(disk, &vfs.tree, head, below);
@@ -764,7 +764,7 @@ impl Watcher {
                     Some(Look::Moved(from))
                 } else {
                     // alloc: per changed path, beside its read and hash.
-                    asks.push((Some(at), file.clone()));
+                    asks.push((Some((at, stamp.is_link())), file.clone()));
                     None
                 };
                 batch.slots.push(Slot { path, file, was, saved: None, stamp: Some(stamp), look });
@@ -772,9 +772,9 @@ impl Watcher {
         }
         for (at, file) in asks {
             match at {
-                Some(at) => {
+                Some((at, link)) => {
                     let tag = self.tag(Pending::Read(number, at));
-                    effects.push(Effect::ReadAll { file, tag });
+                    effects.push(if link { Effect::ReadLink { file, tag } } else { Effect::ReadAll { file, tag } });
                 }
                 None => {
                     // clone: per new directory.
@@ -864,12 +864,16 @@ impl Watcher {
                 }
                 Look::File(bytes) => {
                     room(tree, base, &slot.path, &mut deletes);
-                    let mode = entry.filter(|_| is_file).map_or(Mode::Regular, |it| it.1);
+                    let had = entry.filter(|_| is_file).map(|it| it.1);
+                    let mode = if slot.stamp.is_some_and(|it| it.is_link()) {
+                        Mode::Symlink
+                    } else {
+                        had.filter(|it| *it != Mode::Symlink).unwrap_or(Mode::Regular)
+                    };
                     // Compared in place, not hashed: the commit hashes what it writes, once. A
                     // blob of the image that fails its check compares unequal, so it is replaced.
-                    let same = node
-                        .filter(|_| is_file)
-                        .is_some_and(|it| matches!(tree.bytes(it), Ok(Some(have)) if *have == *bytes));
+                    let same = had == Some(mode)
+                        && node.is_some_and(|it| matches!(tree.bytes(it), Ok(Some(have)) if *have == *bytes));
                     if !same {
                         // alloc: per changed path, beside its read and hash.
                         writes.push((slot.path.clone(), bytes, mode));

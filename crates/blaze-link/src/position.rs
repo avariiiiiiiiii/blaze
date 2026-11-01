@@ -168,13 +168,13 @@ pub(crate) const FILE_NAME_DOMAIN: &str = "blaze v2 link file name 1";
 /// `core::panic::Location<'static>` as blaze lays it out (rustc's field order by alignment):
 /// the file name's pointer and length (`NonNull<str>`), then `line` and `col` as `u32`s.
 /// codegen reads `line!()` at [`LINE`], `column!()` at [`COLUMN`] and `file!()`'s `&str` at 0.
-pub(crate) const LOCATION_SIZE: u64 = 24;
-pub(crate) const LOCATION_ALIGN: u64 = 8;
+pub const LOCATION_SIZE: u64 = 24;
+pub const LOCATION_ALIGN: u64 = 8;
 pub const LINE: i64 = 16;
 pub const COLUMN: i64 = 20;
 
 /// A `Location` record's bytes, its pointer left for a relocation to the file name.
-pub(crate) fn location(name_len: usize, position: Position) -> [u8; LOCATION_SIZE as usize] {
+pub fn location(name_len: usize, position: Position) -> [u8; LOCATION_SIZE as usize] {
     let mut record = [0; LOCATION_SIZE as usize];
     record[8..16].copy_from_slice(&(name_len as u64).to_le_bytes());
     record[16..20].copy_from_slice(&position.line.to_le_bytes());
@@ -184,7 +184,7 @@ pub(crate) fn location(name_len: usize, position: Position) -> [u8; LOCATION_SIZ
 
 /// The bytes of a file name a `Location` points at: NUL-terminated, as
 /// `Location::file_as_c_str` reads one byte past the length.
-pub(crate) fn file_name(name: &str) -> Vec<u8> {
+pub fn file_name(name: &str) -> Vec<u8> {
     let mut bytes = Vec::with_capacity(name.len() + 1);
     bytes.extend_from_slice(name.as_bytes());
     bytes.push(0);

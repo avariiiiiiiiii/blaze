@@ -12,7 +12,7 @@
 use crate::{
     Options,
     emit::Style,
-    tests::{Mode, checked, checked_with, compiletest, normalized, ui},
+    tests::{Mode, assert_reports, checked, checked_with, compiletest, error, normalized, ui},
 };
 
 /// [`ui`] of a fixture of several files or crates, or with minicore: each file named
@@ -750,63 +750,16 @@ fn main() {
     Struct { a, .. }; //~ ERROR base expression required after `..`
 }
 "#;
-    assert_eq!(ui("struct_destructure_fail.rs", "2015", source), r#"error: expected identifier, found reserved identifier `_`
-  --> $DIR/struct_destructure_fail.rs:11:17
-   |
-LL |     Struct { a, _ } = Struct { a: 1, b: 2 };
-   |     ------      ^ expected identifier, found reserved identifier
-   |     |
-   |     while parsing this struct
-
-error: functional record updates are not allowed in destructuring assignments
-  --> $DIR/struct_destructure_fail.rs:13:19
-   |
-LL |     Struct { a, ..d } = Struct { a: 1, b: 2 };
-   |                   ^ help: consider removing the trailing pattern
-
-error[E0026]: struct `Struct` does not have a field named `c`
-  --> $DIR/struct_destructure_fail.rs:10:20
-   |
-LL |     Struct { a, b, c } = Struct { a: 0, b: 1 };
-   |                    ^ struct `Struct` does not have this field
-
-error[E0027]: pattern does not mention field `b`
-  --> $DIR/struct_destructure_fail.rs:11:5
-   |
-LL |     Struct { a, _ } = Struct { a: 1, b: 2 };
-   |     ^^^^^^^^^^^^^^^ missing field `b`
-   |
-help: include the missing field in the pattern
-   |
-LL -     Struct { a, _ } = Struct { a: 1, b: 2 };
-LL +     Struct { a, b } = Struct { a: 1, b: 2 };
-   |
-help: if you don't care about this missing field, you can explicitly ignore it
-   |
-LL |     Struct { a, b: _ } = Struct { a: 1, b: 2 };
-   |                 ++
-help: or always ignore missing fields here
-   |
-LL -     Struct { a, _ } = Struct { a: 1, b: 2 };
-LL +     Struct { a, .. } = Struct { a: 1, b: 2 };
-   |
-
-error[E0797]: base expression required after `..`
-  --> $DIR/struct_destructure_fail.rs:15:19
-   |
-LL |     Struct { a, .. };
-   |                   ^
-   |
-help: add a base expression here
-   |
-LL |     Struct { a, ../* expr */ };
-   |                   ++++++++++
-
-error: aborting due to 5 previous errors
-
-Some errors have detailed explanations: E0026, E0027, E0797.
-For more information about an error, try `rustc --explain E0026`.
-"#);
+    assert_reports(
+        &ui("struct_destructure_fail.rs", "2015", source),
+        &[
+            error(11, &[]),
+            error(13, &[]),
+            error(10, &["`Struct`", "`c`"]),
+            error(11, &["`b`"]),
+            error(15, &["`..`"]),
+        ],
+    );
 }
 
 #[test]
@@ -852,18 +805,7 @@ fn main() {
     //~^ ERROR field `a` bound multiple times in the pattern
 }
 "#;
-    assert_eq!(ui("E0025.rs", "2015", source), r#"error[E0025]: field `a` bound multiple times in the pattern
-  --> $DIR/E0025.rs:8:21
-   |
-LL |     let Foo { a: x, a: y, b: 0 } = x;
-   |               ----  ^^^^ multiple uses of `a` in pattern
-   |               |
-   |               first use of `a`
-
-error: aborting due to 1 previous error
-
-For more information about this error, try `rustc --explain E0025`.
-"#);
+    assert_reports(&ui("E0025.rs", "2015", source), &[error(8, &["`a`"])]);
 }
 
 #[test]
@@ -1110,16 +1052,7 @@ fn a_field_of_a_primitive() {
     let _ = x.foo; //~ ERROR E0610
 }
 "#;
-    assert_eq!(ui("E0610.rs", "2015", source), r#"error[E0610]: `{integer}` is a primitive type and therefore doesn't have fields
-  --> $DIR/E0610.rs:3:15
-   |
-LL |     let _ = x.foo;
-   |               ^^^
-
-error: aborting due to 1 previous error
-
-For more information about this error, try `rustc --explain E0610`.
-"#);
+    assert_reports(&ui("E0610.rs", "2015", source), &[error(3, &[])]);
 }
 
 #[test]
@@ -1391,60 +1324,22 @@ fn a_value_a_format_string_captures() {
          pub mod fmt {{ pub fn format(_: ::core::fmt::Arguments<'_>) {{}} }}\n\
          //- /format-args-capture-missing-variables.rs crate:other:main edition:2015 deps:std\n{source}"
     );
-    assert_eq!(ui_fixture(&fixture), r#"error: named argument never used
-  --> $DIR/format-args-capture-missing-variables.rs:8:51
-   |
-LL |     format!("{valuea} {valueb}", valuea=5, valuec=7);
-   |             -------------------                   ^ named argument never used
-   |             |
-   |             formatting specifier missing
-
-error[E0425]: cannot find value `foo` in this scope
-  --> $DIR/format-args-capture-missing-variables.rs:2:18
-   |
-LL |     format!("{} {foo} {} {bar} {}", 1, 2, 3);
-   |                  ^^^ not found in this scope
-
-error[E0425]: cannot find value `bar` in this scope
-  --> $DIR/format-args-capture-missing-variables.rs:2:27
-   |
-LL |     format!("{} {foo} {} {bar} {}", 1, 2, 3);
-   |                           ^^^ not found in this scope
-
-error[E0425]: cannot find value `foo` in this scope
-  --> $DIR/format-args-capture-missing-variables.rs:6:15
-   |
-LL |     format!("{foo}");
-   |               ^^^ not found in this scope
-
-error[E0425]: cannot find value `valueb` in this scope
-  --> $DIR/format-args-capture-missing-variables.rs:8:24
-   |
-LL |     format!("{valuea} {valueb}", valuea=5, valuec=7);
-   |                        ^^^^^^ not found in this scope
-
-error[E0425]: cannot find value `foo` in this scope
-  --> $DIR/format-args-capture-missing-variables.rs:14:10
-   |
-LL |         {foo}
-   |          ^^^ not found in this scope
-
-error[E0425]: cannot find value `foo` in this scope
-  --> $DIR/format-args-capture-missing-variables.rs:19:14
-   |
-LL |     panic!("{foo} {bar}", bar=1);
-   |              ^^^ not found in this scope
-
-error: aborting due to 7 previous errors
-
-For more information about this error, try `rustc --explain E0425`.
-"#);
+    assert_reports(
+        &ui_fixture(&fixture),
+        &[
+            error(8, &[]),
+            error(2, &["`foo`"]),
+            error(2, &["`bar`"]),
+            error(6, &["`foo`"]),
+            error(8, &["`valueb`"]),
+            error(14, &["`foo`"]),
+            error(19, &["`foo`"]),
+        ],
+    );
 }
 
-const E0063_ONLY: [&str; 3] = [
+const E0063_ONLY: [&str; 1] = [
     "E0063: missing field `dir` in initializer of `WorkerConfig`",
-    "aborting due to 1 previous error",
-    "For more information about this error, try `rustc --explain E0063`.",
 ];
 
 /// #1522: the case it was found in, a literal inside another in a closure of a
@@ -1453,6 +1348,7 @@ const E0063_ONLY: [&str; 3] = [
 fn a_missing_field_in_a_closure_of_a_test_module() {
     let checked = checked(
         r#"
+//- minicore: fn
 //- /lib.rs crate:main cfg:test
 pub struct WorkerConfig { pub jobs: u32, pub dir: u32 }
 pub enum Ahead { Config { config: WorkerConfig } }

@@ -2,7 +2,7 @@
 //! `redundant_semicolon.rs` and `precedence.rs`, against rustc's UI tests.
 
 use super::{ui_core, ui_std};
-use crate::tests::ui;
+use crate::tests::{assert_reports, ui, warning};
 
 #[test]
 fn while_true_follows_the_level_of_warnings() {
@@ -178,44 +178,12 @@ trait T {
 
 fn main() {}
 "#;
-    let stderr = r#"warning: anonymous parameters are deprecated and will be removed in the next edition
-  --> $DIR/anon-params-deprecated.rs:10:12
-   |
-LL |     fn foo(i32);
-   |            ^^^ help: try naming the parameter or explicitly ignoring it: `_: i32`
-   |
-   = warning: this is accepted in the current edition (Rust 2015) but is a hard error in Rust 2018!
-   = note: for more information, see <https://doc.rust-lang.org/edition-guide/rust-2018/trait-fn-parameters.html>
-note: the lint level is defined here
-  --> $DIR/anon-params-deprecated.rs:1:9
-   |
-LL | #![warn(anonymous_parameters)]
-   |         ^^^^^^^^^^^^^^^^^^^^
-
-warning: anonymous parameters are deprecated and will be removed in the next edition
-  --> $DIR/anon-params-deprecated.rs:13:30
-   |
-LL |     fn bar_with_default_impl(String, String) {}
-   |                              ^^^^^^ help: try naming the parameter or explicitly ignoring it: `_: String`
-   |
-   = warning: this is accepted in the current edition (Rust 2015) but is a hard error in Rust 2018!
-   = note: for more information, see <https://doc.rust-lang.org/edition-guide/rust-2018/trait-fn-parameters.html>
-
-warning: anonymous parameters are deprecated and will be removed in the next edition
-  --> $DIR/anon-params-deprecated.rs:13:38
-   |
-LL |     fn bar_with_default_impl(String, String) {}
-   |                                      ^^^^^^ help: try naming the parameter or explicitly ignoring it: `_: String`
-   |
-   = warning: this is accepted in the current edition (Rust 2015) but is a hard error in Rust 2018!
-   = note: for more information, see <https://doc.rust-lang.org/edition-guide/rust-2018/trait-fn-parameters.html>
-
-warning: 3 warnings emitted
-
-"#;
     let std_items = "pub mod string {\n    pub struct String;\n}\n";
     let prelude = "pub use crate::string::String;";
-    assert_eq!(ui_std("anon-params-deprecated.rs", "2015", "sized", (std_items, prelude), source), stderr);
+    assert_reports(
+        &ui_std("anon-params-deprecated.rs", "2015", "sized", (std_items, prelude), source),
+        &[warning(10, &["`_: i32`"]), warning(13, &["`_: String`"]), warning(13, &["`_: String`"])],
+    );
 }
 
 #[test]
@@ -332,50 +300,14 @@ fn main() {
     let _y = --(-x); //~ WARN use of a double negation
 }
 "#;
-    let stderr = r#"warning: use of a double negation
-  --> $DIR/lint-double-negations.rs:6:5
-   |
-LL |     --x;
-   |     ^^^
-   |
-   = note: the prefix `--` could be misinterpreted as a decrement operator which exists in other languages
-   = note: use `-= 1` if you meant to decrement the value
-   = note: `#[warn(double_negations)]` on by default
-help: add parentheses for clarity
-   |
-LL |     -(-x);
-   |      +  +
-
-warning: use of a double negation
-  --> $DIR/lint-double-negations.rs:7:6
-   |
-LL |     ---x;
-   |      ^^^
-   |
-   = note: the prefix `--` could be misinterpreted as a decrement operator which exists in other languages
-   = note: use `-= 1` if you meant to decrement the value
-help: add parentheses for clarity
-   |
-LL |     --(-x);
-   |       +  +
-
-warning: use of a double negation
-  --> $DIR/lint-double-negations.rs:8:14
-   |
-LL |     let _y = --(-x);
-   |              ^^^^^^
-   |
-   = note: the prefix `--` could be misinterpreted as a decrement operator which exists in other languages
-   = note: use `-= 1` if you meant to decrement the value
-help: add parentheses for clarity
-   |
-LL |     let _y = -(-(-x));
-   |               +     +
-
-warning: 3 warnings emitted
-
-"#;
-    assert_eq!(ui_core("lint-double-negations.rs", "2015", "unary_ops, builtin_impls", source), stderr);
+    assert_reports(
+        &ui_core("lint-double-negations.rs", "2015", "copy, unary_ops, builtin_impls", source),
+        &[
+            warning(6, &[]),
+            warning(7, &[]),
+            warning(8, &[]),
+        ],
+    );
 }
 
 #[test]

@@ -132,6 +132,11 @@ pub mod fmt {
     }
 }
 
+#[unstable(
+    feature = "panic_internals",
+    reason = "internal details of the implementation of the `panic!` and related macros",
+    issue = "none"
+)]
 pub mod panicking {
     use crate::fmt;
 

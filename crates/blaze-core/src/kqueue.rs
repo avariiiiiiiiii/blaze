@@ -445,6 +445,7 @@ impl Kqueue {
         match effect {
             effect @ (Effect::ReadAll { .. }
             | Effect::Read { .. }
+            | Effect::ReadLink { .. }
             | Effect::Append { .. }
             | Effect::Sync { .. }
             | Effect::Truncate { .. }

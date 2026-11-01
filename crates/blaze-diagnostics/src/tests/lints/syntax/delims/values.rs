@@ -4,7 +4,7 @@
 use super::ui_core;
 use crate::{
     Options,
-    tests::{ui, ui_run_pass},
+    tests::{assert_reports, error, ui, ui_run_pass},
 };
 
 #[test]
@@ -112,39 +112,10 @@ fn main() {
 fn unary(_: ()) {}
 fn routine() {}
 "#;
-    let expected = r#"error: unnecessary parentheses around function argument
-  --> $DIR/unused_parens_follow_ident.rs:12:16
-   |
-LL |     wrap!(unary(routine()));
-   |                ^         ^
-   |
-note: the lint level is defined here
-  --> $DIR/unused_parens_follow_ident.rs:3:9
-   |
-LL | #![deny(unused_parens)]
-   |         ^^^^^^^^^^^^^
-help: remove these parentheses
-   |
-LL -     wrap!(unary(routine()));
-LL +     wrap!(unary routine());
-   |
-
-error: unnecessary parentheses around function argument
-  --> $DIR/unused_parens_follow_ident.rs:13:17
-   |
-LL |     wrap!(unary (routine()));
-   |                 ^         ^
-   |
-help: remove these parentheses
-   |
-LL -     wrap!(unary (routine()));
-LL +     wrap!(unary routine());
-   |
-
-error: aborting due to 2 previous errors
-
-"#;
-    assert_eq!(ui("unused_parens_follow_ident.rs", "2015", source), expected);
+    assert_reports(
+        &ui("unused_parens_follow_ident.rs", "2015", source),
+        &[error(12, &[]), error(13, &[])],
+    );
 }
 
 #[test]
@@ -159,39 +130,10 @@ fn main() {
     for _ in (1..match () { () => 2 }) {} //~ERROR
 }
 "#;
-    let expected = r#"error: unnecessary parentheses around `for` iterator expression
-  --> $DIR/issue-90807-unused-paren-error.rs:7:14
-   |
-LL |     for _ in (1..loop { break 2 }) {}
-   |              ^                   ^
-   |
-note: the lint level is defined here
-  --> $DIR/issue-90807-unused-paren-error.rs:4:9
-   |
-LL | #![deny(unused_parens)]
-   |         ^^^^^^^^^^^^^
-help: remove these parentheses
-   |
-LL -     for _ in (1..loop { break 2 }) {}
-LL +     for _ in 1..loop { break 2 } {}
-   |
-
-error: unnecessary parentheses around `for` iterator expression
-  --> $DIR/issue-90807-unused-paren-error.rs:8:14
-   |
-LL |     for _ in (1..match () { () => 2 }) {}
-   |              ^                       ^
-   |
-help: remove these parentheses
-   |
-LL -     for _ in (1..match () { () => 2 }) {}
-LL +     for _ in 1..match () { () => 2 } {}
-   |
-
-error: aborting due to 2 previous errors
-
-"#;
-    assert_eq!(ui("issue-90807-unused-paren-error.rs", "2015", source), expected);
+    assert_reports(
+        &ui_core("issue-90807-unused-paren-error.rs", "2015", "iterator, range", source),
+        &[error(7, &["`for`"]), error(8, &["`for`"])],
+    );
 }
 
 #[test]
@@ -205,7 +147,7 @@ fn main() {
     for _ in (1..{ 2 }) {}
 }
 "#;
-    assert_eq!(ui("issue-90807-unused-paren.rs", "2015", source), "");
+    assert_reports(&ui_core("issue-90807-unused-paren.rs", "2015", "iterator, range", source), &[]);
 }
 
 #[test]
@@ -422,9 +364,10 @@ fn foo() {
 
 fn main() {}
 "#;
-    assert_eq!(
-        ui_core("unused-parens-labeled-break-issue-143256.rs", "2015", "default, ord, builtin_impls", source),
-        ""
+    assert_reports(
+        &ui_core("unused-parens-labeled-break-issue-143256.rs", "2015", "default, ord, builtin_impls", source),
+        &[
+        ],
     );
 }
 

@@ -395,6 +395,8 @@ Status: open (waits on the callers above)
 
 > held (requests, pass 25): `crates/cfg` is the coordinator's, so requests applies it, but only once its `needs` are in: 15 `parse_from_ast` callers remain outside `crates/cfg`, `ide*` and `hir-ide` (`rg` as above).
 
+> applied (requests, 2026-10-31 16:50): every caller had moved to `parse_from_view` (`rg -n parse_from_ast crates --type rust` found only `crates/cfg`), so `CfgExpr::parse_from_ast` is deleted, its successor's doc reworded, and `cfg/src/tests.rs`'s `cfgs` drops the handle comparison and its imports, all as written. `ra.py diag crates/cfg`: 0 errors. Not built.
+
 ## frontend-fast-const-deps: hir-ide's tests of dependencies' constants (2026-10-29)
 
 `crates/hir-ide/src/tests/consteval/deps.rs` (frontend-fast-const-deps's, written) evaluates a

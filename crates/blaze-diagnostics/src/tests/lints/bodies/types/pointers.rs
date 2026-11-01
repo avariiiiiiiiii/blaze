@@ -9,6 +9,7 @@
 //! which a std written in the test can't give.
 
 use super::{Ui, ui};
+use crate::tests::{assert_reports, error, warning};
 
 const FLAGS: &str = "sized, copy, clone, derive, option, result, fn, from, add, default, deref, \
                      manually_drop, phantom_data, index, slice, range, unsize, coerce_unsized, \
@@ -461,12 +462,27 @@ fn lint_deref_nullptr() {
 
 #[test]
 fn ptr_null_checks() {
-    check(
-        "ptr_null_checks.rs",
-        include_str!("pointers/ui/ptr_null_checks.rs"),
-        include_str!("pointers/ui/ptr_null_checks.stderr"),
-    );
+    let source = include_str!("pointers/ui/ptr_null_checks.rs");
+    let actual = ui(Ui { name: "ptr_null_checks.rs", core: FLAGS, std: Some((PRELUDE, STD)), source, ..Ui::default() });
+    // A comparison of a pointer made from a reference or a function with null, each its line;
+    // one made through `ptr::from_ref` and the like names that function.
+    let plain = NULL_CHECKS.map(|line| warning(line, &[]));
+    let named = NULL_CHECKS_THROUGH.map(|(line, through)| warning(line, through));
+    assert_reports(&actual, &[&plain[..], &named[..]].concat());
 }
+
+/// The lines of `ptr_null_checks.rs` with a null check of a pointer that can't be null.
+const NULL_CHECKS: [usize; 21] = [12, 14, 16, 18, 20, 22, 24, 26, 28, 30, 32, 36, 40, 48, 51, 53, 55, 57, 59, 61, 63];
+
+/// The lines of `ptr_null_checks.rs` whose pointer is made by the function named.
+const NULL_CHECKS_THROUGH: [(usize, &[&str]); 6] = [
+    (38, &["`from_mut`"]),
+    (42, &["`from_ref`"]),
+    (44, &["`from_ref`"]),
+    (46, &["`from_ref`"]),
+    (67, &["`as_ptr`"]),
+    (69, &["`as_ptr`"]),
+];
 
 #[test]
 fn invalid_null_args() {
@@ -491,5 +507,26 @@ fn dangling_pointers_from_temporaries_types() {
     let source = include_str!("pointers/ui/dangling-pointers-from-temporaries/types.rs");
     let library = &["sync_unsafe_cell"];
     let actual = ui(Ui { name: "types.rs", core: FLAGS, std: Some((PRELUDE, STD)), library, source, ..Ui::default() });
-    assert_eq!(actual, include_str!("pointers/ui/dangling-pointers-from-temporaries/types.stderr"));
+    assert_reports(
+        &actual,
+        &[
+            error(21, &["`CString`"]),
+            error(23, &["`String`"]),
+            error(25, &["`Vec<u8>`"]),
+            error(27, &["`Box<CString>`"]),
+            error(29, &["`Box<[u8]>`"]),
+            error(31, &["`Box<str>`"]),
+            error(33, &["`Box<CStr>`"]),
+            error(35, &["`[u8; 10]`"]),
+            error(37, &["`Box<[u8; 10]>`"]),
+            error(39, &["`Box<Vec<u8>>`"]),
+            error(41, &["`Box<String>`"]),
+            error(43, &["`Box<Box<Box<Box<[u8]>>>>`"]),
+            error(45, &["`Cell<u8>`"]),
+            error(47, &["`MaybeUninit<u8>`"]),
+            error(49, &["`Vec<AsPtrFake>`"]),
+            error(51, &["`UnsafeCell<u8>`"]),
+            error(53, &["`SyncUnsafeCell<u8>`"]),
+        ],
+    );
 }

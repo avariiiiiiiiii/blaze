@@ -65,7 +65,7 @@ use blaze_mem::Frame;
 use rustc_hash::FxHashMap;
 
 pub use output::{Debug, DevRun, Format, Live, Native, NativeKind, Output, OutputKind, Platform};
-pub use position::{COLUMN, LINE, Position, SpanTable};
+pub use position::{COLUMN, LINE, LOCATION_ALIGN, LOCATION_SIZE, Position, SpanTable, file_name, location};
 pub use lazy::{LazyPlacer, Slots};
 pub use premap::{NoOutside, Outside};
 

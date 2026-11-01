@@ -5,7 +5,7 @@
 //! declarations check gives.
 
 use super::ui_std;
-use crate::tests::ui;
+use crate::tests::{assert_reports, error, ui, warning};
 
 const PARSE_ERRORS: &str = r#"//@ check-fail
 //@ run-rustfix
@@ -461,30 +461,7 @@ fn main() {
     let x = foo!({ 3 });
 }
 "#;
-    let stderr = r#"error: this labeled break expression is easy to confuse with an unlabeled break with a labeled value expression
-  --> $DIR/issue-87812.rs:6:13
-   |
-LL |             break '_l $f;
-   |             ^^^^^^^^^^^^
-...
-LL |     let x = foo!({ 3 });
-   |             ----------- in this macro invocation
-   |
-note: the lint level is defined here
-  --> $DIR/issue-87812.rs:1:9
-   |
-LL | #![deny(break_with_label_and_loop)]
-   |         ^^^^^^^^^^^^^^^^^^^^^^^^^
-   = note: this error originates in the macro `foo` (in Nightly builds, run with -Z macro-backtrace for more info)
-help: wrap this expression in parentheses
-   |
-LL |             break '_l ($f);
-   |                       +  +
-
-error: aborting due to 1 previous error
-
-"#;
-    assert_eq!(ui("issue-87812.rs", "2015", source), stderr);
+    assert_reports(&ui("issue-87812.rs", "2015", source), &[error(6, &[])]);
 }
 
 #[test]
@@ -548,55 +525,14 @@ pub fn main() {
     };
 }
 "#;
-    let stderr = r#"error: parentheses are required around this expression to avoid confusion with a labeled break expression
-  --> $DIR/lifetime_starts_expressions.rs:8:18
-   |
-LL |     loop { break 'label: loop { break 'label 42; }; }
-   |                  ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-   |
-help: wrap the expression in parentheses
-   |
-LL |     loop { break ('label: loop { break 'label 42; }); }
-   |                  +                                 +
-
-error: parentheses are required around this expression to avoid confusion with a labeled break expression
-  --> $DIR/lifetime_starts_expressions.rs:33:15
-   |
-LL |           break 'inner_loop: loop {
-   |  _______________^
-LL | |
-LL | |
-LL | |             break 'inner_loop 1;
-LL | |         };
-   | |_________^
-   |
-help: wrap the expression in parentheses
-   |
-LL ~         break ('inner_loop: loop {
-LL |
-LL |
-LL |             break 'inner_loop 1;
-LL ~         });
-   |
-
-warning: this labeled break expression is easy to confuse with an unlabeled break with a labeled value expression
-  --> $DIR/lifetime_starts_expressions.rs:15:9
-   |
-LL | /         break 'label
-LL | |
-LL | |             loop { break 42; };
-   | |______________________________^
-   |
-   = note: `#[warn(break_with_label_and_loop)]` on by default
-help: wrap this expression in parentheses
-   |
-LL |             (loop { break 42; });
-   |             +                  +
-
-error: aborting due to 2 previous errors; 1 warning emitted
-
-"#;
-    assert_eq!(ui("lifetime_starts_expressions.rs", "2015", source), stderr);
+    assert_reports(
+        &ui("lifetime_starts_expressions.rs", "2015", source),
+        &[
+            error(8, &[]),
+            error(33, &[]),
+            warning(15, &[]),
+        ],
+    );
 }
 
 #[test]

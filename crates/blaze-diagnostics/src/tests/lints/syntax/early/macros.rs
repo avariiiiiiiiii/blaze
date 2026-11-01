@@ -6,7 +6,7 @@ mod matchers;
 use crate::{
     Options,
     emit::Style,
-    tests::{Mode, library_features, ui, ui_core_as},
+    tests::{Mode, assert_reports, error, library_features, ui, ui_core_as, warning},
 };
 
 /// [`crate::tests::ui_as`] of a fixture of several files: a UI test, its auxiliary crates
@@ -518,7 +518,7 @@ LL | 10
 error: aborting due to 1 previous error
 
 "#;
-    assert_eq!(ui_fixture(Mode::Other, fixture, &Options::default()), expected);
+    assert_reports(&ui_fixture(Mode::Other, fixture, &Options::default()), &[error(4, &[])]);
 }
 
 #[test]
@@ -584,7 +584,7 @@ LL | #[warn(incomplete_include)]
 warning: 2 warnings emitted
 
 "#;
-    assert_eq!(ui_fixture(Mode::Other, fixture, &Options::default()), expected);
+    assert_reports(&ui_fixture(Mode::Other, fixture, &Options::default()), &[warning(5, &[]), warning(4, &[])]);
 }
 
 #[test]
@@ -706,29 +706,13 @@ struct S2;
 
 fn main() {}
 "#;
-    let expected = r#"warning: duplicated attribute
-  --> $DIR/duplicated-attributes.rs:12:1
-   |
-LL | #[test]
-   | ^^^^^^^
-   |
-   = note: `#[warn(duplicate_macro_attributes)]` on by default
-
-warning: duplicated attribute
-  --> $DIR/duplicated-attributes.rs:29:1
-   |
-LL | #[bench]
-   | ^^^^^^^^
-
-warning: duplicated attribute
-  --> $DIR/duplicated-attributes.rs:34:1
-   |
-LL | #[cfg_eval]
-   | ^^^^^^^^^^^
-
-warning: 3 warnings emitted
-
-"#;
     let fixture = format!("{TEST_CRATES}{}{source}", library_features(&["cfg_eval"]));
-    assert_eq!(ui_fixture(Mode::Other, &fixture, &Options::default()), expected);
+    assert_reports(
+        &ui_fixture(Mode::Other, &fixture, &Options::default()),
+        &[
+            warning(12, &[]),
+            warning(29, &[]),
+            warning(34, &[]),
+        ],
+    );
 }

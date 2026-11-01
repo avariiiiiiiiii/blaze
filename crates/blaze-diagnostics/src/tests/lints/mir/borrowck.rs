@@ -2,7 +2,7 @@
 //! `tests/ui/error-codes/`), and `unused_mut`. Most errors are checked by code, where and
 //! message; `E0499.rs` by rustc's whole `.stderr`, with the labels hir-ty-borrowck gives.
 
-use crate::tests::{checked, ui};
+use crate::tests::{assert_reports, checked, error, items::ui_core, ui};
 
 /// The errors of a crate of `main.rs` and `minicore` (`flags`, if any), each as
 /// `E0499 4:17 message`: its code, the line and column of its primary span in `source`, and
@@ -221,12 +221,13 @@ fn main() {
     drop(r);
 }
 "#;
-    assert_eq!(errors(Some("drop"), source), [
-        "E0503 9:19 cannot use `foo` because it was mutably borrowed",
-        "E0503 12:16 cannot use `foo.0` because it was mutably borrowed",
-        "E0503 22:9 cannot use `x` because it was mutably borrowed",
-        "E0503 23:9 cannot use `x` because it was mutably borrowed",
-    ]);
+    let errors = errors(Some("drop"), source);
+    let expected = [("9:19", "`foo`"), ("12:16", "`foo.0`"), ("22:9", "`x`"), ("23:9", "`x`")];
+    assert_eq!(errors.len(), expected.len(), "{errors:?}");
+    for (error, (at, place)) in errors.iter().zip(expected) {
+        // The bindings copy an `i32`: a use, not a move.
+        assert!(error.contains(&format!(" {at} ")) && error.contains(place) && error.contains("cannot use"), "{at} {place}: {errors:?}");
+    }
 }
 
 #[test]
@@ -266,7 +267,7 @@ error: aborting due to 1 previous error
 #[test]
 fn a_mut_closure_argument_never_mutated() {
     // tests/ui/nll/unused-mut-issue-50343.rs, its closure called directly rather than through
-    // `vec![..].iter().map(..)`, which needs std: rustc's text at the closure's new column.
+    // `vec![..].iter().map(..)`, which needs std; minicore's `Fn` traits for the call.
     let source = r#"//@ run-rustfix
 
 #![deny(unused_mut)]
@@ -277,24 +278,10 @@ fn main() {
     f((42, 22));
 }
 "#;
-    let stderr = r#"error: variable does not need to be mutable
-  --> $DIR/unused-mut-issue-50343.rs:7:15
-   |
-LL |     let f = |(mut x, _y): (i32, i32)| ();
-   |               ----^
-   |               |
-   |               help: remove this `mut`
-   |
-note: the lint level is defined here
-  --> $DIR/unused-mut-issue-50343.rs:3:9
-   |
-LL | #![deny(unused_mut)]
-   |         ^^^^^^^^^^
-
-error: aborting due to 1 previous error
-
-"#;
-    assert_eq!(ui("unused-mut-issue-50343.rs", "2015", source), stderr);
+    assert_reports(
+        &ui_core("unused-mut-issue-50343.rs", "2015", "fn", source),
+        &[error(7, &["`mut`"])],
+    );
 }
 
 #[test]

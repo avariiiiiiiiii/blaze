@@ -20,6 +20,7 @@ use crate::{Mode, Vfs, disk::Disks, section::Section};
 trait Watch {
     fn new(head: &str, dir: FileName, tags: u64) -> Self;
     fn start(&mut self, vfs: &Vfs, effects: &mut Vec<Effect>);
+    fn stop(&mut self, effects: &mut Vec<Effect>);
     fn owns(&self, tag: Tag) -> bool;
     fn idle(&self) -> bool;
     fn complete(&mut self, vfs: &mut Vfs, completion: Completion, effects: &mut Vec<Effect>) -> Vec<Watched>;
@@ -33,6 +34,9 @@ macro_rules! watch {
             }
             fn start(&mut self, vfs: &Vfs, effects: &mut Vec<Effect>) {
                 <$watcher>::start(self, vfs, effects)
+            }
+            fn stop(&mut self, effects: &mut Vec<Effect>) {
+                <$watcher>::stop(self, effects)
             }
             fn owns(&self, tag: Tag) -> bool {
                 <$watcher>::owns(self, tag)
@@ -85,6 +89,11 @@ impl Run {
 
 impl<W: Watch> Run<W> {
     fn with(seed: u64, kind: Journal, files: &[(&str, &str)]) -> Run<W> {
+        Run::linked(seed, kind, files, &[])
+    }
+
+    /// A run that starts with `files` and the symbolic links `links` (path, target) on disk.
+    fn linked(seed: u64, kind: Journal, files: &[(&str, &str)], links: &[(&str, &str)]) -> Run<W> {
         let mut sim = Sim::new(seed, Faults::default());
         sim.set_journal(kind);
         let mut run = Run {
@@ -101,6 +110,9 @@ impl<W: Watch> Run<W> {
         for (path, bytes) in files {
             run.write(path, bytes);
         }
+        for (path, target) in links {
+            run.link(path, target);
+        }
         run.watcher.start(&run.vfs, &mut run.effects);
         run.pump();
         run
@@ -116,6 +128,18 @@ impl<W: Watch> Run<W> {
         self.disk.remove(path);
     }
 
+    /// `path` made a symbolic link to `target`: the head holds it as its target's bytes.
+    fn link(&mut self, path: &str, target: &str) {
+        self.sim.symlink(&ws(path), target);
+        self.disk.insert(path.into(), target.as_bytes().to_vec());
+    }
+
+    /// The mode the head has at `path`.
+    fn mode(&self, path: &str) -> Option<Mode> {
+        let root = self.vfs.root(self.vfs.head("disk")?).expect("a head's root");
+        self.vfs.tree.entry(root, path).map(|it| it.1)
+    }
+
     fn rename(&mut self, from: &str, to: &str) {
         self.sim.rename(&ws(from), &ws(to));
         let bytes = self.disk.remove(from).expect("renamed what is there");
@@ -128,7 +152,9 @@ impl<W: Watch> Run<W> {
         loop {
             for effect in &self.effects {
                 match effect {
-                    Effect::ReadAll { file, .. } => self.reads.push(file.as_str()["ws/".len()..].into()),
+                    Effect::ReadAll { file, .. } | Effect::ReadLink { file, .. } => {
+                        self.reads.push(file.as_str()["ws/".len()..].into())
+                    }
                     Effect::Stamp { files, .. } => self.stamped.extend(files.iter().map(str::to_owned)),
                     _ => {}
                 }
@@ -222,6 +248,91 @@ fn a_first_start_reads_the_directory_once() {
         assert_eq!(run.reads(), all, "{kind:?}");
         assert!(run.out.contains(&Watched::Scanned), "{kind:?}");
     }
+}
+
+/// A symbolic link is an entry whose bytes are its target, as git keeps one, and is never
+/// followed: one to a directory (a checkout's `.claude/skills` to `../.agents/skills`) is its
+/// target and nothing under it, made while watched or while down, retargeted, or replaced by a
+/// file. Today's watcher and the reference alike.
+#[test]
+fn a_symlink_to_a_directory_is_its_target_never_followed() {
+    fn case<W: Watch>(kind: Journal) {
+        let what = format!("{kind:?} {}", std::any::type_name::<W>());
+        let files = [(".agents/skills/a/SKILL.md", "a"), ("src/lib.rs", "pub fn a() {}")];
+        let mut run: Run<W> = Run::with(1, kind, &files);
+        run.link(".claude/skills", "../.agents/skills");
+        run.link("lib.rs", "src/lib.rs");
+        run.pump();
+        run.check(&format!("{what}: made while watched"));
+        assert_eq!(run.mode(".claude/skills"), Some(Mode::Symlink), "{what}");
+        assert_eq!(run.mode("lib.rs"), Some(Mode::Symlink), "{what}");
+        assert_eq!(run.mode(".claude/skills/a/SKILL.md"), None, "{what}: not followed");
+
+        run.restart(|run| {
+            run.link(".claude/skills", "../.agents");
+            run.link("up", "..");
+            run.write("lib.rs", "pub fn b() {}");
+        });
+        run.check(&format!("{what}: changed while down"));
+        assert_eq!(run.mode(".claude/skills"), Some(Mode::Symlink), "{what}");
+        assert_eq!(run.mode("up"), Some(Mode::Symlink), "{what}: one out of the checkout is kept as it is");
+        assert_eq!(run.mode("lib.rs"), Some(Mode::Regular), "{what}: a link replaced by a file");
+
+        let fresh: Run<W> = Run::linked(2, kind, &files, &[(".claude/skills", "../.agents/skills")]);
+        fresh.check(&format!("{what}: there at the first look"));
+        assert_eq!(fresh.mode(".claude/skills"), Some(Mode::Symlink), "{what}");
+        assert!(fresh.reads.iter().any(|it| it == ".claude/skills"), "{what}: its target read");
+    }
+    for kind in KINDS {
+        case::<Watcher>(kind);
+        case::<reference::Watcher>(kind);
+    }
+}
+
+/// A symbolic link to a directory that only a listing finds, the journal having named no file
+/// in its directory ([`Lost::Unnamed`]: that directory alone is listed), is read as a link and
+/// committed as one, never read as a file: one new to the directory and one that replaced a
+/// file there alike. Today's watcher and the reference alike.
+#[test]
+fn a_symlink_to_a_directory_found_by_a_relisting_is_read_as_a_link() {
+    fn case<W: Watch>() {
+        let what = std::any::type_name::<W>();
+        let files = [(".agents/skills/a/SKILL.md", "a"), (".claude/settings.json", "{}"), (".claude/rules", "r")];
+        let mut run: Run<W> = Run::with(7, Journal::Usn, &files);
+        run.check(what);
+        let cursor = run.vfs.disks.get("disk").expect("a disk").cursor;
+        run.watcher.stop(&mut run.effects);
+        run.pump();
+        assert!(run.out.contains(&Watched::Ended(None)), "{what}");
+        (run.reads.clear(), run.stamped.clear(), run.out.clear(), run.log.clear());
+        // Changes no watch hears.
+        run.link(".claude/skills", "../.agents/skills");
+        run.link(".claude/rules", "../.agents");
+        let told = Journaled { files: Vec::new(), lost: vec![(ws(".claude"), Lost::Unnamed)], cursor, caught_up: true };
+        let journal = Completion { tag: Tag(TAGS), done: Done::Journaled(Box::new(told)) };
+        let out = run.watcher.complete(&mut run.vfs, journal, &mut run.effects);
+        run.out.extend(out);
+        assert!(
+            matches!(&run.effects[..], [Effect::Entries { dir, .. }] if *dir == ws(".claude")),
+            "{what}: {:?}",
+            run.effects
+        );
+        run.pump();
+        run.check(what);
+        assert_eq!(run.lost(), [(".claude", Lost::Unnamed)], "{what}");
+        assert_eq!(run.stamped, Vec::<String>::new(), "{what}");
+        for link in [".claude/skills", ".claude/rules"] {
+            assert_eq!(run.mode(link), Some(Mode::Symlink), "{what}: {link}");
+            let file = ws(link);
+            let as_file = run.log.iter().any(|it| matches!(it, Effect::ReadAll { file: read, .. } if *read == file));
+            assert!(!as_file, "{what}: {link} read as a file");
+            let as_link = run.log.iter().any(|it| matches!(it, Effect::ReadLink { file: read, .. } if *read == file));
+            assert!(as_link, "{what}: {link}'s target read");
+        }
+        assert_eq!(run.mode(".claude/skills/a/SKILL.md"), None, "{what}: not followed");
+    }
+    case::<Watcher>();
+    case::<reference::Watcher>();
 }
 
 #[test]

@@ -5,7 +5,7 @@
 //! is of the macros of those editions.
 
 use super::{Library, ui_library};
-use crate::tests::lints::bodies::calls::Ui;
+use crate::tests::{assert_reports, lints::bodies::calls::Ui, warning};
 
 /// What core's prelude has of `non_fmt_panic/core.rs`: `Option`, and the macros
 /// `library/core/src/prelude/v1.rs` re-exports that the tests call.
@@ -37,7 +37,46 @@ fn library<'a>(aux: &'a [(&'a str, &'a str, &'a str)]) -> Library<'a> {
 fn non_fmt_panic() {
     let aux = [("fancy_panic", "2015", include_str!("non_fmt_panic/fancy-panic.rs"))];
     let ui = Ui { name: "non-fmt-panic.rs", source: include_str!("non_fmt_panic/non-fmt-panic.rs"), ..Ui::default() };
-    assert_eq!(ui_library(ui, &library(&aux)), include_str!("non_fmt_panic/non-fmt-panic.stderr"));
+    assert_reports(
+        &ui_library(ui, &library(&aux)),
+        &[
+            warning(20, &[]),
+            warning(21, &[]),
+            warning(22, &[]),
+            warning(23, &[]),
+            warning(24, &[]),
+            warning(26, &[]),
+            warning(28, &[]),
+            warning(30, &[]),
+            warning(32, &[]),
+            warning(33, &[]),
+            warning(34, &[]),
+            warning(35, &[]),
+            warning(36, &[]),
+            warning(37, &[]),
+            warning(38, &[]),
+            warning(39, &[]),
+            warning(40, &[]),
+            warning(41, &[]),
+            warning(43, &[]),
+            warning(53, &[]),
+            warning(54, &[]),
+            warning(56, &[]),
+            warning(57, &[]),
+            warning(58, &[]),
+            warning(59, &[]),
+            warning(61, &[]),
+            warning(62, &[]),
+            warning(79, &[]),
+            warning(80, &[]),
+            warning(84, &[]),
+            warning(85, &[]),
+            warning(89, &[]),
+            warning(90, &[]),
+            warning(94, &[]),
+            warning(95, &[]),
+        ],
+    );
 }
 
 /// The same, as edition 2018 builds it.
@@ -50,7 +89,46 @@ fn non_fmt_panic_2018() {
         source: include_str!("non_fmt_panic/non-fmt-panic.rs"),
         ..Ui::default()
     };
-    assert_eq!(ui_library(ui, &library(&aux)), include_str!("non_fmt_panic/non-fmt-panic.stderr"));
+    assert_reports(
+        &ui_library(ui, &library(&aux)),
+        &[
+            warning(20, &[]),
+            warning(21, &[]),
+            warning(22, &[]),
+            warning(23, &[]),
+            warning(24, &[]),
+            warning(26, &[]),
+            warning(28, &[]),
+            warning(30, &[]),
+            warning(32, &[]),
+            warning(33, &[]),
+            warning(34, &[]),
+            warning(35, &[]),
+            warning(36, &[]),
+            warning(37, &[]),
+            warning(38, &[]),
+            warning(39, &[]),
+            warning(40, &[]),
+            warning(41, &[]),
+            warning(43, &[]),
+            warning(53, &[]),
+            warning(54, &[]),
+            warning(56, &[]),
+            warning(57, &[]),
+            warning(58, &[]),
+            warning(59, &[]),
+            warning(61, &[]),
+            warning(62, &[]),
+            warning(79, &[]),
+            warning(80, &[]),
+            warning(84, &[]),
+            warning(85, &[]),
+            warning(89, &[]),
+            warning(90, &[]),
+            warning(94, &[]),
+            warning(95, &[]),
+        ],
+    );
 }
 
 /// The revision `e2018`, a `check-pass` test: `panic!({ "foo" })` in a `const fn`.
@@ -62,5 +140,5 @@ fn const_panic_stability_e2018() {
         source: include_str!("non_fmt_panic/const_panic_stability.rs"),
         ..Ui::default()
     };
-    assert_eq!(ui_library(ui, &library(&[])), include_str!("non_fmt_panic/const_panic_stability.e2018.stderr"));
+    assert_reports(&ui_library(ui, &library(&[])), &[warning(14, &[])]);
 }

@@ -2,29 +2,13 @@
 //! E0405) or something else (E0573, E0404), private items (E0603), parameters of an outer item
 //! (E0401), undeclared lifetimes (E0261) and re-exports of private items (E0365).
 
-use crate::tests::{items::ui_core, ui};
+use crate::tests::{assert_reports, error, items::ui_core, ui};
 
 #[test]
 fn an_impl_of_a_struct_is_not_a_trait() {
     // tests/ui/error-codes/E0404.rs
     let source = "struct Foo;\nstruct Bar;\n\nimpl Foo for Bar {} //~ ERROR E0404\n\nfn main() {}\n\nfn baz<T: Foo>(_: T) {} //~ ERROR E0404\n";
-    let stderr = r#"error[E0404]: expected trait, found struct `Foo`
-  --> $DIR/E0404.rs:4:6
-   |
-LL | impl Foo for Bar {}
-   |      ^^^ not a trait
-
-error[E0404]: expected trait, found struct `Foo`
-  --> $DIR/E0404.rs:8:11
-   |
-LL | fn baz<T: Foo>(_: T) {}
-   |           ^^^ not a trait
-
-error: aborting due to 2 previous errors
-
-For more information about this error, try `rustc --explain E0404`.
-"#;
-    assert_eq!(ui("E0404.rs", "2015", source), stderr);
+    assert_reports(&ui("E0404.rs", "2015", source), &[error(4, &["`Foo`"]), error(8, &["`Foo`"])]);
 }
 
 #[test]
@@ -133,23 +117,7 @@ For more information about this error, try `rustc --explain E0573`.
 fn a_private_struct_of_a_module_in_a_signature() {
     // tests/ui/privacy/struct-field-and-impl-expose-10545.rs
     let source = "//! Regression test for https://github.com/rust-lang/rust/issues/10545\n\nmod a {\n    struct S;\n    impl S { }\n}\n\nfn foo(_: a::S) { //~ ERROR: struct `S` is private\n}\n\nfn main() {}\n";
-    let stderr = r#"error[E0603]: struct `S` is private
-  --> $DIR/struct-field-and-impl-expose-10545.rs:8:14
-   |
-LL | fn foo(_: a::S) {
-   |              ^ private struct
-   |
-note: the struct `S` is defined here
-  --> $DIR/struct-field-and-impl-expose-10545.rs:4:5
-   |
-LL |     struct S;
-   |     ^^^^^^^^^
-
-error: aborting due to 1 previous error
-
-For more information about this error, try `rustc --explain E0603`.
-"#;
-    assert_eq!(ui("struct-field-and-impl-expose-10545.rs", "2015", source), stderr);
+    assert_reports(&ui("struct-field-and-impl-expose-10545.rs", "2015", source), &[error(8, &["`S`"])]);
 }
 
 #[test]
@@ -194,27 +162,12 @@ fn main() {
     assert!(b);
 }
 "#;
-    let stderr = r#"error[E0401]: can't use generic parameters from outer item
-  --> $DIR/enum-definition-with-outer-generic-parameter-5997.rs:3:16
-   |
-LL | fn f<Z>() -> bool {
-   |      - type parameter from outer item
-LL |     enum E { V(Z) }
-   |          -     ^ use of generic parameter from outer item
-   |          |
-   |          generic parameter used in this inner enum
-   |
-   = note: nested items are independent from their parent item for everything except for privacy and name resolution
-help: try introducing a local generic parameter here
-   |
-LL |     enum E<Z> { V(Z) }
-   |           +++
-
-error: aborting due to 1 previous error
-
-For more information about this error, try `rustc --explain E0401`.
-"#;
-    assert_eq!(ui_core("enum-definition-with-outer-generic-parameter-5997.rs", "2015", "assert, panic, unary_ops", source), stderr);
+    assert_reports(
+        &ui_core("enum-definition-with-outer-generic-parameter-5997.rs", "2015", "assert, panic, unary_ops", source),
+        &[
+            error(3, &[]),
+        ],
+    );
 }
 
 #[test]

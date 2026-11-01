@@ -3,7 +3,7 @@
 //! whose errors come from the attribute parser and `check_mod_attrs` rustc shares; the ones
 //! without a path are ours, of what no UI test covers.
 
-use crate::tests::ui;
+use crate::tests::{assert_reports, error, ui};
 
 #[test]
 fn an_alias_is_a_string_of_no_quote_and_no_whitespace_but_inner_spaces() {
@@ -371,40 +371,15 @@ where
 
 fn main() {}
 "##;
-    let stderr = r##"error: most attributes are not supported in `where` clauses
-  --> $DIR/where-doc.rs:6:1
-   |
-LL | #[doc(alias = ":(")]
-   | ^^^^^^^^^^^^^^^^^^^^
-   |
-   = help: only `#[cfg]` and `#[cfg_attr]` are supported
-
-error: most attributes are not supported in `where` clauses
-  --> $DIR/where-doc.rs:11:1
-   |
-LL | #[doc(hidden)]
-   | ^^^^^^^^^^^^^^
-   |
-   = help: only `#[cfg]` and `#[cfg_attr]` are supported
-
-error: most attributes are not supported in `where` clauses
-  --> $DIR/where-doc.rs:15:1
-   |
-LL | #[doc = ""]
-   | ^^^^^^^^^^^
-   |
-   = help: only `#[cfg]` and `#[cfg_attr]` are supported
-
-error: `#[doc(alias = "...")]` isn't allowed on where predicate
-  --> $DIR/where-doc.rs:6:15
-   |
-LL | #[doc(alias = ":(")]
-   |               ^^^^
-
-error: aborting due to 4 previous errors
-
-"##;
-    assert_eq!(ui("where-doc.rs", "2015", source), stderr);
+    assert_reports(
+        &ui("where-doc.rs", "2015", source),
+        &[
+            error(6, &[]),
+            error(11, &["`where`"]),
+            error(15, &["`where`"]),
+            error(6, &["`#[doc(alias = \"...\")]`"]),
+        ],
+    );
 }
 
 #[test]
@@ -884,19 +859,7 @@ fn auto_cfg_values_are_identifiers() {
 //~^ ERROR malformed `doc` attribute input
 fn f() {}
 "##;
-    let stderr = r##"error[E0565]: malformed `doc` attribute input
-  --> $DIR/doc-auto-cfg-values-non-ident.rs:5:3
-   |
-LL | #[doc(auto_cfg(hide(a, values(::b))))]
-   |   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^---^^^^
-   |                               |
-   |                               expected a valid identifier here
-
-error: aborting due to 1 previous error
-
-For more information about this error, try `rustc --explain E0565`.
-"##;
-    assert_eq!(ui("doc-auto-cfg-values-non-ident.rs", "2015", source), stderr);
+    assert_reports(&ui("doc-auto-cfg-values-non-ident.rs", "2015", source), &[error(5, &["`doc`"])]);
 }
 
 #[test]

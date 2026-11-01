@@ -2,7 +2,7 @@
 //! `tests/ui/missing/`, `tests/ui/entry-point/`, `tests/ui/extern/`,
 //! `tests/ui/conditional-compilation/`).
 
-use crate::tests::items::ui_bin;
+use crate::tests::{assert_reports, error, items::ui_bin};
 
 #[test]
 fn a_binary_without_main_points_at_the_end_of_its_root_file() {
@@ -96,17 +96,17 @@ For more information about this error, try `rustc --explain E0601`.
 fn a_crate_configured_out_has_no_main() {
     // tests/ui/conditional-compilation/cfg-in-crate-1.rs
     let source = "#![cfg(false)] //~ ERROR `main` function not found in crate `cfg_in_crate_1`\n";
-    let stderr = r#"error[E0601]: `main` function not found in crate `cfg_in_crate_1`
-  --> $DIR/cfg-in-crate-1.rs:1:15
-   |
-LL | #![cfg(false)]
-   |               ^ consider adding a `main` function to `$DIR/cfg-in-crate-1.rs`
-
-error: aborting due to 1 previous error
-
-For more information about this error, try `rustc --explain E0601`.
-"#;
-    assert_eq!(ui_bin("cfg-in-crate-1.rs", "cfg_in_crate_1", "2015", source), stderr);
+    // A crate configured out drops the fixture's `no_core` too: it takes `std`'s prelude.
+    let fixture = format!(
+        "//- /std.rs crate:std edition:2015 library\npub mod prelude {{ pub mod rust_2015 {{}} }}\n\
+         //- /cfg-in-crate-1.rs crate:bin:cfg_in_crate_1 edition:2015 deps:std\n{source}"
+    );
+    assert_reports(
+        &super::ui_fixture(&fixture),
+        &[
+            error(1, &["`cfg_in_crate_1`", "`main`"]),
+        ],
+    );
 }
 
 #[test]

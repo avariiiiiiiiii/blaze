@@ -283,11 +283,21 @@ impl<'a> Os<'a> {
             }
             ItemContainerId::ImplId(_) | ItemContainerId::TraitId(_) => return None,
         };
-        let target = match &func.krate(db).workspace_data(db).target {
+        Some(Shim { call, target: Os::target_of(db, func.krate(db)) })
+    }
+
+    /// The shim of the external function `symbol` called by code of `krate`, when one is
+    /// claimed: [`Os::claims`] of an `extern` block's function, for code compiled with its
+    /// externals named by symbol (the compiled tier's).
+    pub(crate) fn claims_extern(db: &Db, krate: base_db::Crate, symbol: &str) -> Option<Shim> {
+        Some(Shim { call: Call::of_extern(symbol)?, target: Os::target_of(db, krate) })
+    }
+
+    fn target_of(db: &Db, krate: base_db::Crate) -> Option<Target> {
+        match &krate.workspace_data(db).target {
             Ok(data) => Target::of_tuple(data.tuple.as_str()),
             Err(_) => None,
-        };
-        Some(Shim { call, target })
+        }
     }
 
     /// Runs `shim` with the argument bytes `args`, writing its result to `ret` (zeroed, the

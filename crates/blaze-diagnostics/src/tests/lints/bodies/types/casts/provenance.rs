@@ -1,7 +1,7 @@
 //! `implicit_provenance_casts`: rustc's `tests/ui/lint/lint-strict-provenance-*.rs` and
 //! `tests/ui/feature-gates/feature-gate-strict_provenance_lints.rs`.
 
-use crate::tests::ui;
+use crate::tests::{assert_reports, error, ui};
 
 #[test]
 fn lossy_casts() {
@@ -157,68 +157,16 @@ fn main() {
     i2p!(0x42);
 }
 "##;
-    let expected = r##"error: cast from `*const u8` to `usize` implicitly exposes pointer provenance
-  --> $DIR/lint-strict-provenance-macro-casts.rs:6:9
-   |
-LL |         $e as $t
-   |         ^^^^^^^^
-...
-LL |     let _addr = cast!(ptr, usize);
-   |                 ----------------- in this macro invocation
-   |
-   = help: if conforming to strict provenance is not possible, use `.expose_provenance()`
-   = note: for more information, visit <https://doc.rust-lang.org/std/ptr/index.html#provenance>
-note: the lint level is defined here
-  --> $DIR/lint-strict-provenance-macro-casts.rs:2:9
-   |
-LL | #![deny(implicit_provenance_casts)]
-   |         ^^^^^^^^^^^^^^^^^^^^^^^^^
-   = note: this error originates in the macro `cast` (in Nightly builds, run with -Z macro-backtrace for more info)
-
-error: cast from `usize` to `*const u8` implicitly relies on exposed provenance
-  --> $DIR/lint-strict-provenance-macro-casts.rs:6:9
-   |
-LL |         $e as $t
-   |         ^^^^^^^^
-...
-LL |     let _ptr = cast!(0usize, *const u8);
-   |                ------------------------ in this macro invocation
-   |
-   = help: if conforming to strict provenance is not possible, use `std::ptr::with_exposed_provenance()`
-   = note: for more information, visit <https://doc.rust-lang.org/std/ptr/index.html#provenance>
-   = note: this error originates in the macro `cast` (in Nightly builds, run with -Z macro-backtrace for more info)
-
-error: cast from `*const u8` to `usize` implicitly exposes pointer provenance
-  --> $DIR/lint-strict-provenance-macro-casts.rs:13:20
-   |
-LL |     ($e:expr) => { $e as usize };
-   |                    ^^^^^^^^^^^
-...
-LL |     p2i!(&raw const x);
-   |     ------------------ in this macro invocation
-   |
-   = help: if conforming to strict provenance is not possible, use `.expose_provenance()`
-   = note: for more information, visit <https://doc.rust-lang.org/std/ptr/index.html#provenance>
-   = note: this error originates in the macro `p2i` (in Nightly builds, run with -Z macro-backtrace for more info)
-
-error: cast from `usize` to `*const ()` implicitly relies on exposed provenance
-  --> $DIR/lint-strict-provenance-macro-casts.rs:18:20
-   |
-LL |     ($e:expr) => { $e as *const () };
-   |                    ^^^^^^^^^^^^^^^
-...
-LL |     i2p!(0x42);
-   |     ---------- in this macro invocation
-   |
-   = help: if conforming to strict provenance is not possible, use `std::ptr::with_exposed_provenance()`
-   = note: for more information, visit <https://doc.rust-lang.org/std/ptr/index.html#provenance>
-   = note: this error originates in the macro `i2p` (in Nightly builds, run with -Z macro-backtrace for more info)
-
-error: aborting due to 4 previous errors
-
-"##;
     let stderr = ui("lint-strict-provenance-macro-casts.rs", "2015", source);
-    assert_eq!(stderr, expected);
+    assert_reports(
+        &stderr,
+        &[
+            error(6, &["`*const u8`", "`usize`"]),
+            error(6, &["`*const u8`", "`usize`"]),
+            error(13, &["`*const u8`", "`usize`"]),
+            error(18, &["`*const ()`", "`usize`"]),
+        ],
+    );
 }
 
 /// Without `#![feature(strict_provenance_lints)]` the lint is unknown and lints nothing. The

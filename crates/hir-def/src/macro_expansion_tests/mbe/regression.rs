@@ -1106,7 +1106,7 @@ fn main() {
 macro_rules! concat_bytes {}
 
 fn main() {
-    let x = /* error: unexpected token */b"";
+    let x = /* error: cannot concatenate numeric literals */b"";
 }
 
 "#]],

@@ -11,7 +11,8 @@ Design: [item-hash.md](../../design/item-hash.md) sections 3.3, 3.7, 12 and 13.
 
 | key | made in | holds | stale after a rename or move? |
 |---|---|---|---|
-| a body's code (`Hashes::code`) | `hir_ty_share::code::with_spans`, through `v2/hashes.rs` | the items lane's code hash, **the names of its bindings** (`NAMES_DOMAIN`), and each span by (table, index) | no: a local's rename is a new key, so it reruns MIR codegen (the cost 00957 removes); positions are by index, never by value |
+| a body's code (`Hashes::code`) | `hir_ty_share::code::with_spans`, through `v2/hashes.rs` | the items lane's code hash, **the names of its bindings** (`NAMES_DOMAIN`, until queue 01386 drops it), and each span by (table, index) | no: a local's rename is a new key, so it reruns MIR codegen (the cost 00957 removes); positions are by index, never by value |
+| a function's side table (`CompiledFunction::side`) | `v2/side.rs` `encode` | each named local by its binding's index in its store, its type, slot and scope: no name since 01351 (version 4) | no |
 | an instance's arguments (`Described::args`) | `v2/frontend.rs` `args_of`, `shared_args` | each type by `hir_ty_share::identity`, which holds each item's `ItemKey` (crate, parent, name) | no: a renamed or moved type is another instance |
 | a generic's share key | `hir_ty_share::walk` | `type_name`/`type_id` arguments by full identity (`Class::Identity`), transitively through callees | no |
 | a const's code, a static's data | `blaze_items` form `const_value`, `v2/statics.rs` `value_id` | the evaluated value | no (00043) |
@@ -36,17 +37,19 @@ given to the link), its symbol (`symbol_of`), each `Target::Position` and line r
 link from the span tables `link_inputs` encodes), and file names (`ItemHashes::file_name`).
 
 So no key misses a name or position today; what 00957 asks is that the binding names leave
-the code key, which needs them out of the template first.
+the code key. Since 01351 no template holds one, and queue 01386 takes them out of the key.
 
 ## The split (00957, 01008, 01004)
 
 - **Binding names as data, as positions already are.** A template's side record
-  (`v2/side.rs` `Variable::name`) holds the local's binding by its index in its owner's
-  store, never its name, and the debug record the link (or the daemon, 01004) writes reads the
-  name from the current database by (owner, binding), as `v2/linked.rs` reads positions. Then
-  `hir_ty_share::code::with_spans` drops `NAMES_DOMAIN`, and a local's rename reruns no MIR
-  codegen. Owners: `v2/side.rs` and `v2/backend.rs` `named` (lane speed), `hir-ty-share`
-  `code.rs` (queued), the debug record writer (01004).
+  (`v2/side.rs` `Variable::binding`, done in 01351) holds the local's binding by its index in
+  its owner's store, never its name, and the debug record the link (or the daemon, 01004 and
+  queue 01354) writes reads the name from the current database by (owner, binding), as
+  `v2/linked.rs` reads positions. Which locals are told (`v2/backend.rs` `named` leaves out
+  those lowering names `<..>`) follows from the code, as no written name starts with `<`.
+  Then `hir_ty_share::code::with_spans` drops `NAMES_DOMAIN` (queue 01386), and a local's
+  rename reruns no MIR codegen. A coroutine's identity holds its code, so it then keeps a
+  local's rename too: no cached output spells a coroutine's locals.
 - **A debug record is keyed by (code hash, presentation of every item it spells).** The body's
   own `blaze_item_hash::presentation` and the presentation of each item it names (callees,
   argument types, impl self types: 01008). Built after the edit, never waited on (01004).
@@ -56,8 +59,15 @@ the code key, which needs them out of the template first.
 
 ## Locations as data (01003)
 
-v2 already holds no location value in code: `Location`s, `#[track_caller]` callers'
-locations and `file!()` are `Target::Position` relocations into records the link fills from
-the span tables. What remains is `line!()` and `column!()`, which `hir-expand` expands to a
-literal in the body, so a move changes the code hash; item-hash-mir's location slots (design
-section 3.3) remove that in the front end.
+v2 holds no location value in code: `Location`s, `#[track_caller]` callers' locations and
+`file!()` are `Target::Position` relocations into records the link fills from the span
+tables. Since 01352 `line!()` is one too where the code runs: MIR lowering
+(`hir-ty-mir` `lower.rs` `lower_line`) reads it as `Location::caller().line` at the literal,
+in a function that is neither `#[track_caller]` (where `Location::caller` is the caller's) nor
+`const`, outside `const { .. }` blocks and borrows rustc may promote, which are values. The
+`Location` a call there gets is where the literal is written, as rustc's `line!()` is (both are
+the expansion's cause), so the program prints what a fresh build prints. Elsewhere the line
+stays a literal in the MIR and so in the code hash, which is correct and only rebuilds more.
+
+`column!()` stays a literal: a `Location`'s column is rustc's display width, `column!()`'s
+counts chars, so the record cannot give it; and a move above a body changes no column.

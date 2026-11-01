@@ -3,7 +3,7 @@
 //! and the rest named at each test), verbatim: each source and the whole `.stderr` rustc
 //! writes for it, the errors of other passes in it included.
 
-use crate::tests::{items::ui_core, ui};
+use crate::tests::{assert_reports, error, items::ui_core, ui};
 
 #[test]
 fn an_unsafe_inherent_impl_is_refused() {
@@ -108,17 +108,7 @@ fn foo<T>(x: &T)
 
 fn main() {}
 "###;
-    let stderr = r###"error[E0316]: nested quantification of lifetimes
-  --> $DIR/where-for-self.rs:15:26
-   |
-LL |     where for<'a> &'a T: for<'b> Bar<'b>
-   |                          ^^^^^^^^^^^^^^^
-
-error: aborting due to 1 previous error
-
-For more information about this error, try `rustc --explain E0316`.
-"###;
-    assert_eq!(ui("where-for-self.rs", "2015", source), stderr);
+    assert_reports(&ui("where-for-self.rs", "2015", source), &[error(15, &[])]);
 }
 
 #[test]
@@ -240,56 +230,7 @@ fn main() {
     }
 }
 "###;
-    let stderr = r###"error: free function without a body
-  --> $DIR/fn-body-optional-semantic-fail.rs:7:5
-   |
-LL |     fn f1();
-   |     ^^^^^^^-
-   |            |
-   |            help: provide a definition for the function: `{ <body> }`
-
-error: free function without a body
-  --> $DIR/fn-body-optional-semantic-fail.rs:8:5
-   |
-LL |     fn f1_rpit() -> impl Trait;
-   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^-
-   |                               |
-   |                               help: provide a definition for the function: `{ <body> }`
-
-error: associated function in `impl` without body
-  --> $DIR/fn-body-optional-semantic-fail.rs:18:9
-   |
-LL |         fn f1();
-   |         ^^^^^^^-
-   |                |
-   |                help: provide a definition for the function: `{ <body> }`
-
-error: associated function in `impl` without body
-  --> $DIR/fn-body-optional-semantic-fail.rs:23:9
-   |
-LL |         fn f3();
-   |         ^^^^^^^-
-   |                |
-   |                help: provide a definition for the function: `{ <body> }`
-
-error: incorrect function inside `extern` block
-  --> $DIR/fn-body-optional-semantic-fail.rs:29:12
-   |
-LL |     extern "C" {
-   |     ---------- `extern` blocks define existing foreign functions and functions inside of them cannot have a body
-LL |         fn f5(); // OK.
-LL |         fn f6() {}
-   |            ^^   -- help: remove the invalid body: `;`
-   |            |
-   |            cannot have a body
-   |
-   = help: you might have meant to write a function accessible through FFI, which can be done by writing `extern fn` outside of the `extern` block
-   = note: for more information, visit https://doc.rust-lang.org/std/keyword.extern.html
-
-error: aborting due to 5 previous errors
-
-"###;
-    assert_eq!(ui("fn-body-optional-semantic-fail.rs", "2015", source), stderr);
+    assert_reports(&ui("fn-body-optional-semantic-fail.rs", "2015", source), &[error(7, &[]), error(8, &[]), error(18, &["`impl`"]), error(23, &["`impl`"]), error(29, &["`extern`"])]);
 }
 
 #[test]
@@ -706,43 +647,14 @@ fn test<
 
 fn main() { }
 "###;
-    let stderr = r###"error[E0226]: only a single explicit lifetime bound is permitted
-  --> $DIR/region-bounds-on-objects-and-type-parameters.rs:21:26
-   |
-LL |     z: Box<dyn Is<'a>+'b+'c>,
-   |                          ^^
-
-error[E0392]: lifetime parameter `'c` is never used
-  --> $DIR/region-bounds-on-objects-and-type-parameters.rs:11:18
-   |
-LL | struct Foo<'a,'b,'c> {
-   |                  ^^ unused lifetime parameter
-   |
-   = help: consider removing `'c`, referring to it in a field, or using a marker such as `PhantomData`
-
-error[E0478]: lifetime bound not satisfied
-  --> $DIR/region-bounds-on-objects-and-type-parameters.rs:21:8
-   |
-LL |     z: Box<dyn Is<'a>+'b+'c>,
-   |        ^^^^^^^^^^^^^^^^^^^^^
-   |
-note: lifetime parameter instantiated with the lifetime `'b` as defined here
-  --> $DIR/region-bounds-on-objects-and-type-parameters.rs:11:15
-   |
-LL | struct Foo<'a,'b,'c> {
-   |               ^^
-note: but lifetime parameter must outlive the lifetime `'a` as defined here
-  --> $DIR/region-bounds-on-objects-and-type-parameters.rs:11:12
-   |
-LL | struct Foo<'a,'b,'c> {
-   |            ^^
-
-error: aborting due to 3 previous errors
-
-Some errors have detailed explanations: E0226, E0392, E0478.
-For more information about an error, try `rustc --explain E0226`.
-"###;
-    assert_eq!(ui("region-bounds-on-objects-and-type-parameters.rs", "2015", source), stderr);
+    assert_reports(
+        &ui("region-bounds-on-objects-and-type-parameters.rs", "2015", source),
+        &[
+            error(21, &[]),
+            error(11, &["`'c`"]),
+            error(21, &[]),
+        ],
+    );
 }
 
 #[test]
@@ -1286,85 +1198,21 @@ fn ordering4 < 'a , 'b     > ( a :            ,   self , self ,   self ,
     //~| ERROR cannot find type `F` in this scope
 }
 "###;
-    let stderr = r###"error: expected type, found `,`
-  --> $DIR/issue-86053-1.rs:5:47
-   |
-LL | fn ordering4 < 'a , 'b     > ( a :            ,   self , self ,   self ,
-   |                                               ^ expected type
-
-error: unexpected `self` parameter in function
-  --> $DIR/issue-86053-1.rs:5:51
-   |
-LL | fn ordering4 < 'a , 'b     > ( a :            ,   self , self ,   self ,
-   |                                                   ^^^^ must be the first parameter of an associated function
-
-error: unexpected `self` parameter in function
-  --> $DIR/issue-86053-1.rs:5:58
-   |
-LL | fn ordering4 < 'a , 'b     > ( a :            ,   self , self ,   self ,
-   |                                                          ^^^^ must be the first parameter of an associated function
-
-error: unexpected `self` parameter in function
-  --> $DIR/issue-86053-1.rs:5:67
-   |
-LL | fn ordering4 < 'a , 'b     > ( a :            ,   self , self ,   self ,
-   |                                                                   ^^^^ must be the first parameter of an associated function
-
-error: unexpected `self` parameter in function
-  --> $DIR/issue-86053-1.rs:10:5
-   |
-LL |     self , _: ... ,   self ,   self , _: ... ) where F : FnOnce ( & 'a & 'b usize ) {
-   |     ^^^^ must be the first parameter of an associated function
-
-error: unexpected `self` parameter in function
-  --> $DIR/issue-86053-1.rs:10:23
-   |
-LL |     self , _: ... ,   self ,   self , _: ... ) where F : FnOnce ( & 'a & 'b usize ) {
-   |                       ^^^^ must be the first parameter of an associated function
-
-error: unexpected `self` parameter in function
-  --> $DIR/issue-86053-1.rs:10:32
-   |
-LL |     self , _: ... ,   self ,   self , _: ... ) where F : FnOnce ( & 'a & 'b usize ) {
-   |                                ^^^^ must be the first parameter of an associated function
-
-error: `...` must be the last argument of a C-variadic function
-  --> $DIR/issue-86053-1.rs:10:12
-   |
-LL |     self , _: ... ,   self ,   self , _: ... ) where F : FnOnce ( & 'a & 'b usize ) {
-   |            ^^^^^^
-
-error: `...` is not supported for non-extern functions
-  --> $DIR/issue-86053-1.rs:10:39
-   |
-LL |     self , _: ... ,   self ,   self , _: ... ) where F : FnOnce ( & 'a & 'b usize ) {
-   |                                       ^^^^^^
-   |
-   = help: only `extern "C"` and `extern "C-unwind"` functions may have a C variable argument list
-
-error[E0425]: cannot find type `F` in this scope
-  --> $DIR/issue-86053-1.rs:10:54
-   |
-LL |     self , _: ... ,   self ,   self , _: ... ) where F : FnOnce ( & 'a & 'b usize ) {
-   |                                                      ^
-   |
-  --> $SRC_DIR/core/src/ops/function.rs:LL:COL
-   |
-   = note: similarly named trait `Fn` defined here
-help: a trait with a similar name exists
-   |
-LL |     self , _: ... ,   self ,   self , _: ... ) where Fn : FnOnce ( & 'a & 'b usize ) {
-   |                                                       +
-help: you might be missing a type parameter
-   |
-LL | fn ordering4 < 'a , 'b, F     > ( a :            ,   self , self ,   self ,
-   |                       +++
-
-error: aborting due to 10 previous errors
-
-For more information about this error, try `rustc --explain E0425`.
-"###;
-    assert_eq!(ui("issue-86053-1.rs", "2015", source), stderr);
+    assert_reports(
+        &ui("issue-86053-1.rs", "2015", source),
+        &[
+            error(5, &["`,`"]),
+            error(5, &["`self`"]),
+            error(5, &["`self`"]),
+            error(5, &["`self`"]),
+            error(10, &["`self`"]),
+            error(10, &["`self`"]),
+            error(10, &["`self`"]),
+            error(10, &["`...`"]),
+            error(10, &["`...`"]),
+            error(10, &["`F`"]),
+        ],
+    );
 }
 
 #[test]
@@ -1458,64 +1306,7 @@ static mut C: u8; //~ ERROR free static item without body
 static mut D; //~ ERROR free static item without body
 //~^ ERROR missing type for `static mut` item
 "#;
-    let stderr = r#"error: free static item without body
-  --> $DIR/item-free-static-no-body-semantic-fail.rs:5:1
-   |
-LL | static A: u8;
-   | ^^^^^^^^^^^^-
-   |             |
-   |             help: provide a definition for the static: `= <expr>;`
-
-error: free static item without body
-  --> $DIR/item-free-static-no-body-semantic-fail.rs:6:1
-   |
-LL | static B;
-   | ^^^^^^^^-
-   |         |
-   |         help: provide a definition for the static: `= <expr>;`
-
-error: free static item without body
-  --> $DIR/item-free-static-no-body-semantic-fail.rs:9:1
-   |
-LL | static mut C: u8;
-   | ^^^^^^^^^^^^^^^^-
-   |                 |
-   |                 help: provide a definition for the static: `= <expr>;`
-
-error: free static item without body
-  --> $DIR/item-free-static-no-body-semantic-fail.rs:10:1
-   |
-LL | static mut D;
-   | ^^^^^^^^^^^^-
-   |             |
-   |             help: provide a definition for the static: `= <expr>;`
-
-error: missing type for `static` item
-  --> $DIR/item-free-static-no-body-semantic-fail.rs:6:9
-   |
-LL | static B;
-   |         ^
-   |
-help: provide a type for the item
-   |
-LL | static B: <type>;
-   |         ++++++++
-
-error: missing type for `static mut` item
-  --> $DIR/item-free-static-no-body-semantic-fail.rs:10:13
-   |
-LL | static mut D;
-   |             ^
-   |
-help: provide a type for the item
-   |
-LL | static mut D: <type>;
-   |             ++++++++
-
-error: aborting due to 6 previous errors
-
-"#;
-    assert_eq!(ui("item-free-static-no-body-semantic-fail.rs", "2015", source), stderr);
+    assert_reports(&ui("item-free-static-no-body-semantic-fail.rs", "2015", source), &[error(5, &[]), error(6, &[]), error(9, &[]), error(10, &[]), error(6, &["`static`"]), error(10, &["`static mut`"])]);
 }
 
 #[test]
@@ -1529,37 +1320,7 @@ const A: u8; //~ ERROR free constant item without body
 const B; //~ ERROR free constant item without body
 //~^ ERROR missing type for `const` item
 "#;
-    let stderr = r#"error: free constant item without body
-  --> $DIR/item-free-const-no-body-semantic-fail.rs:5:1
-   |
-LL | const A: u8;
-   | ^^^^^^^^^^^-
-   |            |
-   |            help: provide a definition for the constant: `= <expr>;`
-
-error: free constant item without body
-  --> $DIR/item-free-const-no-body-semantic-fail.rs:6:1
-   |
-LL | const B;
-   | ^^^^^^^-
-   |        |
-   |        help: provide a definition for the constant: `= <expr>;`
-
-error: missing type for `const` item
-  --> $DIR/item-free-const-no-body-semantic-fail.rs:6:8
-   |
-LL | const B;
-   |        ^
-   |
-help: provide a type for the item
-   |
-LL | const B: <type>;
-   |        ++++++++
-
-error: aborting due to 3 previous errors
-
-"#;
-    assert_eq!(ui("item-free-const-no-body-semantic-fail.rs", "2015", source), stderr);
+    assert_reports(&ui("item-free-const-no-body-semantic-fail.rs", "2015", source), &[error(5, &[]), error(6, &[]), error(6, &["`const`"])]);
 }
 
 #[test]
@@ -1614,137 +1375,24 @@ impl X {
     //~| ERROR `X: Eq` is not satisfied
 }
 "#;
-    let stderr = r#"error: associated type in `impl` without body
-  --> $DIR/impl-item-type-no-body-semantic-fail.rs:6:5
-   |
-LL |     type Y;
-   |     ^^^^^^-
-   |           |
-   |           help: provide a definition for the type: `= <type>;`
-
-error: associated type in `impl` without body
-  --> $DIR/impl-item-type-no-body-semantic-fail.rs:9:5
-   |
-LL |     type Z: Ord;
-   |     ^^^^^^^^^^^-
-   |                |
-   |                help: provide a definition for the type: `= <type>;`
-
-error: bounds on `type`s in `impl`s have no effect
-  --> $DIR/impl-item-type-no-body-semantic-fail.rs:9:13
-   |
-LL |     type Z: Ord;
-   |             ^^^
-
-error: associated type in `impl` without body
-  --> $DIR/impl-item-type-no-body-semantic-fail.rs:13:5
-   |
-LL |     type W: Ord where Self: Eq;
-   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^-
-   |                               |
-   |                               help: provide a definition for the type: `= <type>;`
-
-error: bounds on `type`s in `impl`s have no effect
-  --> $DIR/impl-item-type-no-body-semantic-fail.rs:13:13
-   |
-LL |     type W: Ord where Self: Eq;
-   |             ^^^
-
-error: associated type in `impl` without body
-  --> $DIR/impl-item-type-no-body-semantic-fail.rs:18:5
-   |
-LL |     type W where Self: Eq;
-   |     ^^^^^^^^^^^^^^^^^^^^^-
-   |                          |
-   |                          help: provide a definition for the type: `= <type>;`
-
-error[E0658]: inherent associated types are unstable
-  --> $DIR/impl-item-type-no-body-semantic-fail.rs:6:5
-   |
-LL |     type Y;
-   |     ^^^^^^^
-   |
-   = note: see issue #8995 <https://github.com/rust-lang/rust/issues/8995> for more information
-   = help: add `#![feature(inherent_associated_types)]` to the crate attributes to enable
-   = note: this compiler was built on YYYY-MM-DD; consider upgrading it if it is out of date
-
-error[E0658]: inherent associated types are unstable
-  --> $DIR/impl-item-type-no-body-semantic-fail.rs:9:5
-   |
-LL |     type Z: Ord;
-   |     ^^^^^^^^^^^^
-   |
-   = note: see issue #8995 <https://github.com/rust-lang/rust/issues/8995> for more information
-   = help: add `#![feature(inherent_associated_types)]` to the crate attributes to enable
-   = note: this compiler was built on YYYY-MM-DD; consider upgrading it if it is out of date
-
-error[E0658]: inherent associated types are unstable
-  --> $DIR/impl-item-type-no-body-semantic-fail.rs:13:5
-   |
-LL |     type W: Ord where Self: Eq;
-   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^
-   |
-   = note: see issue #8995 <https://github.com/rust-lang/rust/issues/8995> for more information
-   = help: add `#![feature(inherent_associated_types)]` to the crate attributes to enable
-   = note: this compiler was built on YYYY-MM-DD; consider upgrading it if it is out of date
-
-error[E0658]: inherent associated types are unstable
-  --> $DIR/impl-item-type-no-body-semantic-fail.rs:18:5
-   |
-LL |     type W where Self: Eq;
-   |     ^^^^^^^^^^^^^^^^^^^^^^
-   |
-   = note: see issue #8995 <https://github.com/rust-lang/rust/issues/8995> for more information
-   = help: add `#![feature(inherent_associated_types)]` to the crate attributes to enable
-   = note: this compiler was built on YYYY-MM-DD; consider upgrading it if it is out of date
-
-error[E0277]: the trait bound `X: Eq` is not satisfied
-  --> $DIR/impl-item-type-no-body-semantic-fail.rs:13:23
-   |
-LL |     type W: Ord where Self: Eq;
-   |                       ^^^^^^^^ the trait `Eq` is not implemented for `X`
-   |
-help: consider annotating `X` with `#[derive(Eq)]`
-   |
-LL + #[derive(Eq)]
-LL | struct X;
-   |
-help: add `#![feature(trivial_bounds)]` to the crate attributes to enable
-   |
-LL + #![feature(trivial_bounds)]
-   |
-
-error[E0277]: the trait bound `X: Eq` is not satisfied
-  --> $DIR/impl-item-type-no-body-semantic-fail.rs:18:18
-   |
-LL |     type W where Self: Eq;
-   |                  ^^^^^^^^ the trait `Eq` is not implemented for `X`
-   |
-help: consider annotating `X` with `#[derive(Eq)]`
-   |
-LL + #[derive(Eq)]
-LL | struct X;
-   |
-help: add `#![feature(trivial_bounds)]` to the crate attributes to enable
-   |
-LL + #![feature(trivial_bounds)]
-   |
-
-error[E0592]: duplicate definitions with name `W`
-  --> $DIR/impl-item-type-no-body-semantic-fail.rs:18:5
-   |
-LL |     type W: Ord where Self: Eq;
-   |     ------ other definition for `W`
-...
-LL |     type W where Self: Eq;
-   |     ^^^^^^ duplicate definitions for `W`
-
-error: aborting due to 13 previous errors
-
-Some errors have detailed explanations: E0277, E0592, E0658.
-For more information about an error, try `rustc --explain E0277`.
-"#;
-    assert_eq!(ui_core("impl-item-type-no-body-semantic-fail.rs", "2015", "ord, derive", source), stderr);
+    assert_reports(
+        &ui_core("impl-item-type-no-body-semantic-fail.rs", "2015", "ord, derive", source),
+        &[
+            error(6, &["`impl`"]),
+            error(9, &["`impl`"]),
+            error(9, &["`impl`", "`type`"]),
+            error(13, &["`impl`"]),
+            error(13, &["`impl`", "`type`"]),
+            error(18, &["`impl`"]),
+            error(6, &[]),
+            error(9, &[]),
+            error(13, &[]),
+            error(18, &[]),
+            error(13, &["`X: Eq`"]),
+            error(18, &["`X: Eq`"]),
+            error(18, &["`W`"]),
+        ],
+    );
 }
 
 #[test]

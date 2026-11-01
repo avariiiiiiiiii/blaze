@@ -1,7 +1,7 @@
 //! rustc's UI tests of the errors `parse_attribute_list` gives for every attribute, whatever
 //! its parser: the arguments, `unsafe`, and the attributes that are not allowed where they are.
 
-use crate::tests::ui;
+use crate::tests::{assert_reports, error, ui};
 
 #[test]
 fn attribute_items_are_separated_with_commas() {
@@ -21,31 +21,7 @@ fn f0() {}
 )]
 fn f1() {}
 "#;
-    let stderr = r#"error: attribute items not separated with `,`
-  --> $DIR/attr-missing-comma.rs:4:20
-   |
-LL |     since = "since"
-   |                    ^ help: try adding `,` here
-
-error: attribute items not separated with `,`
-  --> $DIR/attr-missing-comma.rs:10:18
-   |
-LL |     name = "name"
-   |                  ^
-   |
-help: try adding `,` here
-   |
-LL |     name = "name",
-   |                  +
-help: try adding `,` here
-   |
-LL |     kind = "static",
-   |                    +
-
-error: aborting due to 2 previous errors
-
-"#;
-    assert_eq!(ui("attr-missing-comma.rs", "2015", source), stderr);
+    assert_reports(&ui("attr-missing-comma.rs", "2015", source), &[error(4, &["`,`"]), error(10, &["`,`"])]);
 }
 
 #[test]

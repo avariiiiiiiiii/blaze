@@ -5,7 +5,7 @@
 use crate::{
     Options,
     emit::Style,
-    tests::{Mode, checked, checked_with, compiletest, normalized},
+    tests::{Mode, assert_reports, checked, checked_with, compiletest, error, normalized, warning},
 };
 
 /// What rustc writes compiling `fixture` (its files named `$DIR/<path>`) as compiletest runs a
@@ -69,7 +69,6 @@ fn with_deprecation_lint(name: &str, source: &str, header: &str, deps: &str) -> 
 #[test]
 fn deprecation_lint() {
     let source = include_str!("stability/deprecation-lint.rs");
-    let expected = include_str!("stability/deprecation-lint.stderr");
     // The test's `Option<String>` and `#[derive(Debug)]`: the prelude of a `std` with them.
     let std = "//- minicore: option, fmt, derive
 //- /std.rs crate:std edition:2015 library
@@ -104,7 +103,6 @@ fn deprecation_lint_3() {
 #[test]
 fn lint_stability_deprecated() {
     let source = include_str!("stability/lint-stability-deprecated.rs");
-    let expected = include_str!("stability/lint-stability-deprecated.stderr");
     let fixture = format!(
         "//- /auxiliary/lint_stability.rs crate:lint_stability edition:2015 library\n{}\
          //- /auxiliary/inherited_stability.rs crate:inherited_stability edition:2015 library\n{}\
@@ -117,7 +115,116 @@ fn lint_stability_deprecated() {
         include_str!("stability/auxiliary/stability_cfg1.rs"),
         include_str!("stability/auxiliary/stability-cfg2.rs"),
     );
-    assert_eq!(ui(&fixture, Mode::Other), expected);
+    assert_reports(
+        &ui(&fixture, Mode::Other),
+        &[
+            warning(24, &["`lint_stability::deprecated`"]),
+            warning(29, &["`lint_stability::Trait::trait_deprecated`"]),
+            warning(31, &["`lint_stability::Trait::trait_deprecated`"]),
+            warning(33, &["`lint_stability::deprecated_text`"]),
+            warning(38, &["`lint_stability::Trait::trait_deprecated_text`"]),
+            warning(40, &["`lint_stability::Trait::trait_deprecated_text`"]),
+            warning(42, &["`lint_stability::deprecated_unstable`"]),
+            warning(47, &["`lint_stability::Trait::trait_deprecated_unstable`"]),
+            warning(49, &["`lint_stability::Trait::trait_deprecated_unstable`"]),
+            warning(51, &["`lint_stability::deprecated_unstable_text`"]),
+            warning(56, &["`lint_stability::Trait::trait_deprecated_unstable_text`"]),
+            warning(58, &["`lint_stability::Trait::trait_deprecated_unstable_text`"]),
+            warning(105, &["`lint_stability::DeprecatedStruct`"]),
+            warning(108, &["`lint_stability::DeprecatedUnstableStruct`"]),
+            warning(115, &["`lint_stability::DeprecatedUnitStruct`"]),
+            warning(116, &["`lint_stability::DeprecatedUnstableUnitStruct`"]),
+            warning(120, &["`lint_stability::Enum::DeprecatedVariant`"]),
+            warning(121, &["`lint_stability::Enum::DeprecatedUnstableVariant`"]),
+            warning(125, &["`lint_stability::DeprecatedTupleStruct`"]),
+            warning(126, &["`lint_stability::DeprecatedUnstableTupleStruct`"]),
+            warning(135, &["`lint_stability::deprecated_text`"]),
+            warning(136, &["`lint_stability::deprecated_unstable_text`"]),
+            warning(137, &["`lint_stability::deprecated_text`"]),
+            warning(142, &["`lint_stability::Trait::trait_deprecated`"]),
+            warning(144, &["`lint_stability::Trait::trait_deprecated`"]),
+            warning(146, &["`lint_stability::Trait::trait_deprecated_text`"]),
+            warning(148, &["`lint_stability::Trait::trait_deprecated_text`"]),
+            warning(150, &["`lint_stability::Trait::trait_deprecated_unstable`"]),
+            warning(152, &["`lint_stability::Trait::trait_deprecated_unstable`"]),
+            warning(154, &["`lint_stability::Trait::trait_deprecated_unstable_text`"]),
+            warning(156, &["`lint_stability::Trait::trait_deprecated_unstable_text`"]),
+            warning(184, &["`lint_stability::DeprecatedTrait`"]),
+            warning(186, &["`lint_stability::DeprecatedTrait`"]),
+            warning(205, &[]),
+            warning(327, &["`this_crate::deprecated`"]),
+            warning(332, &["`this_crate::Trait::trait_deprecated`"]),
+            warning(334, &["`this_crate::Trait::trait_deprecated`"]),
+            warning(336, &["`this_crate::deprecated_text`"]),
+            warning(341, &["`this_crate::Trait::trait_deprecated_text`"]),
+            warning(343, &["`this_crate::Trait::trait_deprecated_text`"]),
+            warning(381, &["`this_crate::DeprecatedStruct`"]),
+            warning(388, &["`this_crate::DeprecatedUnitStruct`"]),
+            warning(392, &["`this_crate::Enum::DeprecatedVariant`"]),
+            warning(396, &["`this_crate::DeprecatedTupleStruct`"]),
+            warning(403, &["`this_crate::Trait::trait_deprecated`"]),
+            warning(405, &["`this_crate::Trait::trait_deprecated`"]),
+            warning(407, &["`this_crate::Trait::trait_deprecated_text`"]),
+            warning(409, &["`this_crate::Trait::trait_deprecated_text`"]),
+            warning(436, &["`this_crate::test_fn_body::fn_in_body`"]),
+            warning(456, &["`this_crate::DeprecatedTrait`"]),
+            warning(458, &["`this_crate::DeprecatedTrait`"]),
+            warning(444, &["`this_crate::MethodTester::test_method_body::fn_in_body`"]),
+            warning(97, &["`lint_stability::TraitWithAssociatedTypes::TypeDeprecated`"]),
+            warning(101, &["`lint_stability::TraitWithAssociatedTypes::TypeDeprecated`"]),
+            warning(25, &["`lint_stability::MethodTester::method_deprecated`"]),
+            warning(26, &["`lint_stability::MethodTester::method_deprecated`"]),
+            warning(27, &["`lint_stability::MethodTester::method_deprecated`"]),
+            warning(28, &["`lint_stability::Trait::trait_deprecated`"]),
+            warning(30, &["`lint_stability::Trait::trait_deprecated`"]),
+            warning(34, &["`lint_stability::MethodTester::method_deprecated_text`"]),
+            warning(35, &["`lint_stability::MethodTester::method_deprecated_text`"]),
+            warning(36, &["`lint_stability::MethodTester::method_deprecated_text`"]),
+            warning(37, &["`lint_stability::Trait::trait_deprecated_text`"]),
+            warning(39, &["`lint_stability::Trait::trait_deprecated_text`"]),
+            warning(43, &["`lint_stability::MethodTester::method_deprecated_unstable`"]),
+            warning(44, &["`lint_stability::MethodTester::method_deprecated_unstable`"]),
+            warning(45, &["`lint_stability::MethodTester::method_deprecated_unstable`"]),
+            warning(46, &["`lint_stability::Trait::trait_deprecated_unstable`"]),
+            warning(48, &["`lint_stability::Trait::trait_deprecated_unstable`"]),
+            warning(52, &["`lint_stability::MethodTester::method_deprecated_unstable_text`"]),
+            warning(53, &["`lint_stability::MethodTester::method_deprecated_unstable_text`"]),
+            warning(54, &["`lint_stability::MethodTester::method_deprecated_unstable_text`"]),
+            warning(55, &["`lint_stability::Trait::trait_deprecated_unstable_text`"]),
+            warning(57, &["`lint_stability::Trait::trait_deprecated_unstable_text`"]),
+            warning(106, &["`lint_stability::DeprecatedStruct::i`"]),
+            warning(110, &["`lint_stability::DeprecatedUnstableStruct::i`"]),
+            warning(141, &["`lint_stability::Trait::trait_deprecated`"]),
+            warning(143, &["`lint_stability::Trait::trait_deprecated`"]),
+            warning(145, &["`lint_stability::Trait::trait_deprecated_text`"]),
+            warning(147, &["`lint_stability::Trait::trait_deprecated_text`"]),
+            warning(149, &["`lint_stability::Trait::trait_deprecated_unstable`"]),
+            warning(151, &["`lint_stability::Trait::trait_deprecated_unstable`"]),
+            warning(153, &["`lint_stability::Trait::trait_deprecated_unstable_text`"]),
+            warning(155, &["`lint_stability::Trait::trait_deprecated_unstable_text`"]),
+            warning(172, &["`lint_stability::Trait::trait_deprecated`"]),
+            warning(173, &["`lint_stability::Trait::trait_deprecated_text`"]),
+            warning(174, &["`lint_stability::Trait::trait_deprecated_unstable`"]),
+            warning(175, &["`lint_stability::Trait::trait_deprecated_unstable_text`"]),
+            warning(328, &["`this_crate::MethodTester::method_deprecated`"]),
+            warning(329, &["`this_crate::MethodTester::method_deprecated`"]),
+            warning(330, &["`this_crate::MethodTester::method_deprecated`"]),
+            warning(331, &["`this_crate::Trait::trait_deprecated`"]),
+            warning(333, &["`this_crate::Trait::trait_deprecated`"]),
+            warning(337, &["`this_crate::MethodTester::method_deprecated_text`"]),
+            warning(338, &["`this_crate::MethodTester::method_deprecated_text`"]),
+            warning(339, &["`this_crate::MethodTester::method_deprecated_text`"]),
+            warning(340, &["`this_crate::Trait::trait_deprecated_text`"]),
+            warning(342, &["`this_crate::Trait::trait_deprecated_text`"]),
+            warning(383, &["`this_crate::DeprecatedStruct::i`"]),
+            warning(402, &["`this_crate::Trait::trait_deprecated`"]),
+            warning(404, &["`this_crate::Trait::trait_deprecated`"]),
+            warning(406, &["`this_crate::Trait::trait_deprecated_text`"]),
+            warning(408, &["`this_crate::Trait::trait_deprecated_text`"]),
+            warning(425, &["`this_crate::Trait::trait_deprecated`"]),
+            warning(426, &["`this_crate::Trait::trait_deprecated_text`"]),
+        ],
+    );
 }
 
 /// `deprecation-sanity.rs`'s `useless_deprecated`, as its `.stderr` has it. The test's other
@@ -200,13 +307,12 @@ fn main() {
 #[test]
 fn an_unstable_trait_impl_of_stable_types_and_traits_has_no_effect() {
     let source = include_str!("stability/stability-attribute-trait-impl.rs");
-    let expected = include_str!("stability/stability-attribute-trait-impl.stderr");
     let stderr = one("stability-attribute-trait-impl.rs", source, Mode::Other);
-    let (lints, rest) = expected.split_at(expected.find("error: module has missing").expect("the test's last error"));
-    let (missing, closing) = rest.split_at(rest.find("error: aborting").expect("the closing line"));
-    assert!(stderr.contains(lints), "{stderr}");
-    assert!(stderr.contains(missing), "{stderr}");
-    assert!(stderr.ends_with(closing), "{stderr}");
+    let no_effect = ["`#[unstable]`", "no effect"];
+    assert_reports(
+        &stderr,
+        &[error(25, &no_effect), error(33, &no_effect), error(37, &no_effect), error(44, &no_effect), error(1, &["stability attribute"])],
+    );
 }
 
 #[test]

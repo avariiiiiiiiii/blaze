@@ -6,6 +6,7 @@
 //! of std they use written as `library/` writes them.
 
 use super::{Ui, ui};
+use crate::tests::{assert_reports, error};
 
 fn check(name: &str, core: &str, std: &str, source: &str, stderr: &str) {
     let actual = ui(Ui { name, core, std: Some(("", std)), source, ..Ui::default() });
@@ -1191,7 +1192,62 @@ fn invalid_value() {
     let source = include_str!("values/ui/invalid_value.rs");
     let library = &["pattern_type_macro"];
     let actual = ui(Ui { name: "invalid_value.rs", core: "sized, option, result, send, non_null, non_zero, pat, manually_drop, fn", std: Some(("", UNINIT)), library, source, ..Ui::default() });
-    assert_eq!(actual, include_str!("values/ui/invalid_value.stderr"));
+    assert_reports(
+        &actual,
+        &[
+            error(50, &["`&T`"]),
+            error(51, &["`&T`"]),
+            error(53, &["`Wrap<&T>`"]),
+            error(54, &["`Wrap<&T>`"]),
+            error(61, &["`!`"]),
+            error(62, &["`!`"]),
+            error(64, &["`(i32, !)`"]),
+            error(65, &["`(i32, !)`"]),
+            error(67, &["`Void`"]),
+            error(68, &["`Void`"]),
+            error(70, &["`&i32`"]),
+            error(71, &["`&i32`"]),
+            error(73, &["`Ref`"]),
+            error(74, &["`Ref`"]),
+            error(76, &["`fn()`"]),
+            error(77, &["`fn()`"]),
+            error(79, &["`Wrap<fn()>`"]),
+            error(80, &["`Wrap<fn()>`"]),
+            error(82, &["`WrapEnum<fn()>`"]),
+            error(83, &["`WrapEnum<fn()>`"]),
+            error(85, &["`Wrap<(RefPair, i32)>`"]),
+            error(86, &["`Wrap<(RefPair, i32)>`"]),
+            error(88, &["`NonNull<i32>`"]),
+            error(89, &["`NonNull<i32>`"]),
+            error(91, &["`(NonZero<u32>, i32)`"]),
+            error(92, &["`(NonZero<u32>, i32)`"]),
+            error(94, &["`*const dyn Send`"]),
+            error(95, &["`*const dyn Send`"]),
+            error(97, &["`[fn(); 2]`"]),
+            error(98, &["`[fn(); 2]`"]),
+            error(100, &["`TwoUninhabited`"]),
+            error(101, &["`TwoUninhabited`"]),
+            error(103, &["`OneFruitNonZero`"]),
+            error(104, &["`OneFruitNonZero`"]),
+            error(108, &["`bool`"]),
+            error(111, &["`Wrap<char>`"]),
+            error(114, &["`NonBig`"]),
+            error(117, &["`Fruit`"]),
+            error(120, &["`[bool; 2]`"]),
+            error(123, &["`i32`"]),
+            error(126, &["`f32`"]),
+            error(129, &["`*const ()`"]),
+            error(132, &["`*const [()]`"]),
+            error(135, &["`WrapAroundRange`"]),
+            error(140, &["`Result<i32, i32>`"]),
+            error(148, &["`&i32`"]),
+            error(149, &["`&[i32]`"]),
+            error(150, &["`NonZero<u32>`"]),
+            error(153, &["`NonNull<i32>`"]),
+            error(154, &["`NonNull<i32>`"]),
+            error(155, &["`bool`"]),
+        ],
+    );
 }
 
 #[test]

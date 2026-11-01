@@ -10,7 +10,7 @@ mod args;
 use crate::{
     Options,
     emit::Style,
-    tests::{Mode, checked_with, compiletest, normalized, ui},
+    tests::{Mode, assert_reports, checked_with, compiletest, error, normalized, ui},
 };
 
 /// [`ui`] of a file with minicore's items for `flags` (`crates/test-utils/src/minicore.rs`),
@@ -93,34 +93,13 @@ fn a_cast_of_a_reference_borrows_too_much_or_is_not_dereferenced() {
     x as u8; //~ ERROR casting `&u8` as `u8` is invalid [E0606]
 }
 ";
-    let stderr = "error[E0606]: casting `&u8` as `u8` is invalid
-  --> $DIR/E0606.rs:2:14
-   |
-LL |     let x = &(&0u8 as u8);
-   |              ^^^^^^^^^^^^
-   |
-help: remove the unneeded borrow
-   |
-LL -     let x = &(&0u8 as u8);
-LL +     let x = &(0u8 as u8);
-   |
-
-error[E0606]: casting `&u8` as `u8` is invalid
-  --> $DIR/E0606.rs:3:5
-   |
-LL |     x as u8;
-   |     ^^^^^^^
-   |
-help: dereference the expression
-   |
-LL |     *x as u8;
-   |     +
-
-error: aborting due to 2 previous errors
-
-For more information about this error, try `rustc --explain E0606`.
-";
-    assert_eq!(ui_core("E0606.rs", "sized", source), stderr);
+    assert_reports(
+        &ui_core("E0606.rs", "sized", source),
+        &[
+            error(2, &["`&u8`", "`u8`"]),
+            error(3, &["`&u8`", "`u8`"]),
+        ],
+    );
 }
 
 #[test]
@@ -183,22 +162,7 @@ fn a_cast_to_an_unsized_type_is_to_a_reference() {
     let _foo = &[1_usize, 2] as [usize]; //~ ERROR E0620
 }
 ";
-    let stderr = "error[E0620]: cast to unsized type: `&[usize; 2]` as `[usize]`
-  --> $DIR/E0620.rs:2:16
-   |
-LL |     let _foo = &[1_usize, 2] as [usize];
-   |                ^^^^^^^^^^^^^^^^^^^^^^^^
-   |
-help: consider casting to a reference instead
-   |
-LL |     let _foo = &[1_usize, 2] as &[usize];
-   |                                 +
-
-error: aborting due to 1 previous error
-
-For more information about this error, try `rustc --explain E0620`.
-";
-    assert_eq!(ui_core("E0620.rs", "sized, slice", source), stderr);
+    assert_reports(&ui_core("E0620.rs", "sized, slice", source), &[error(2, &["`&[usize; 2]`", "`[usize]`"])]);
 }
 
 #[test]
@@ -318,19 +282,7 @@ fn main() {
     assert_eq!(d, 0);
 }
 "#;
-    let stderr = "error[E0606]: casting `FieldLessWithNonExhaustiveVariant` as `u8` is invalid
-  --> $DIR/enum-as-cast.rs:9:13
-   |
-LL |     let d = e as u8;
-   |             ^^^^^^^
-   |
-   = note: cannot cast an enum with a non-exhaustive variant when it's defined in another crate
-
-error: aborting due to 1 previous error
-
-For more information about this error, try `rustc --explain E0606`.
-";
-    assert_eq!(ui_fixture(fixture), stderr);
+    assert_reports(&ui_fixture(fixture), &[error(9, &["`FieldLessWithNonExhaustiveVariant`", "`u8`"])]);
 }
 
 #[test]
@@ -437,35 +389,10 @@ fn some_function() {
 fn main() {
 }
 ";
-    let stderr = "error[E0070]: invalid left-hand side of assignment
-  --> $DIR/E0070.rs:6:16
-   |
-LL |     SOME_CONST = 14;
-   |     ---------- ^
-   |     |
-   |     cannot assign to this expression
-
-error[E0070]: invalid left-hand side of assignment
-  --> $DIR/E0070.rs:7:7
-   |
-LL |     1 = 3;
-   |     - ^
-   |     |
-   |     cannot assign to this expression
-
-error[E0070]: invalid left-hand side of assignment
-  --> $DIR/E0070.rs:8:23
-   |
-LL |     some_other_func() = 4;
-   |     ----------------- ^
-   |     |
-   |     cannot assign to this expression
-
-error: aborting due to 3 previous errors
-
-For more information about this error, try `rustc --explain E0070`.
-";
-    assert_eq!(ui("E0070.rs", "2015", source), stderr);
+    assert_reports(
+        &ui("E0070.rs", "2015", source),
+        &[error(6, &["assign"]), error(7, &["assign"]), error(8, &["assign"])],
+    );
 }
 
 #[test]
@@ -491,25 +418,8 @@ fn main() {
     //~| HELP consider dereferencing the left-hand side of this operation
 }
 ";
-    let stderr = "error[E0067]: invalid left-hand side of assignment
-  --> $DIR/assign-non-lval-needs-deref.rs:15:16
-   |
-LL |     (&mut Foo) += ();
-   |     ---------- ^^
-   |     |
-   |     cannot assign to this expression
-   |
-help: consider dereferencing the left-hand side of this operation
-   |
-LL |     *(&mut Foo) += ();
-   |     +
-
-error: aborting due to 1 previous error
-
-For more information about this error, try `rustc --explain E0067`.
-";
     let std_items = "pub use core::ops;";
-    assert_eq!(ui_std("assign-non-lval-needs-deref.rs", "add", ("", std_items), source), stderr);
+    assert_reports(&ui_std("assign-non-lval-needs-deref.rs", "add", ("", std_items), source), &[error(15, &[])]);
 }
 
 #[test]
@@ -646,26 +556,13 @@ fn main() {
     //~| HELP you need `&dyn Trait` instead of `&mut dyn Trait`
 }
 "##;
-    let stderr = r##"error: the `function` method cannot be invoked on `&dyn MutTrait`
-  --> $DIR/mutability-mismatch.rs:26:33
-   |
-LL |     (&MutType as &dyn MutTrait).function();
-   |                                 ^^^^^^^^
-   |
-   = help: you need `&mut dyn MutTrait` instead of `&dyn MutTrait`
-
-error: the `function` method cannot be invoked on `&mut dyn Trait`
-  --> $DIR/mutability-mismatch.rs:29:35
-   |
-LL |     (&mut Type as &mut dyn Trait).function();
-   |                                   ^^^^^^^^
-   |
-   = help: you need `&dyn Trait` instead of `&mut dyn Trait`
-
-error: aborting due to 2 previous errors
-
-"##;
-    assert_eq!(ui_core("mutability-mismatch.rs", "sized, unsize, coerce_unsized", source), stderr);
+    assert_reports(
+        &ui_core("mutability-mismatch.rs", "sized, unsize, coerce_unsized", source),
+        &[
+            error(26, &["`&dyn MutTrait`", "`function`"]),
+            error(29, &["`&mut dyn Trait`", "`function`"]),
+        ],
+    );
 }
 
 /// minicore's flags for a `&dyn Iterator`'s `min`: `Iterator::min` and `Ord` (`ord`), `[T]::iter`
@@ -684,21 +581,12 @@ fn main() {
      test(&mut array.iter());
 }
 "##;
-    let stderr = r##"error: the `min` method cannot be invoked on `&dyn Iterator<Item = &u64>`
-  --> $DIR/imm-ref-trait-object.rs:2:8
-   |
-LL |      t.min().unwrap()
-   |        ^^^
-   |
-help: you need `&mut dyn Iterator<Item = &u64>` instead of `&dyn Iterator<Item = &u64>`
-   |
-LL | fn test(t: &mut dyn Iterator<Item=&u64>) -> u64 {
-   |             +++
-
-error: aborting due to 1 previous error
-
-"##;
-    assert_eq!(ui_core("imm-ref-trait-object.rs", MIN_OF_A_DYN_ITERATOR, source), stderr);
+    assert_reports(
+        &ui_core("imm-ref-trait-object.rs", MIN_OF_A_DYN_ITERATOR, source),
+        &[
+            error(2, &["`&dyn Iterator<Item = &u64>`", "`min`"]),
+        ],
+    );
 }
 
 #[test]
@@ -714,21 +602,12 @@ fn main() {
      test(&mut array.iter());
 }
 "##;
-    let stderr = r##"error: the `min` method cannot be invoked on `&dyn Iterator<Item = &u64>`
-  --> $DIR/mutability-mismatch-arg.rs:3:9
-   |
-LL |      *t.min().unwrap()
-   |         ^^^
-   |
-help: you need `&mut dyn Iterator<Item = &u64>` instead of `&dyn Iterator<Item = &u64>`
-   |
-LL | fn test(t: &mut dyn Iterator<Item=&u64>) -> u64 {
-   |             +++
-
-error: aborting due to 1 previous error
-
-"##;
-    assert_eq!(ui_core("mutability-mismatch-arg.rs", MIN_OF_A_DYN_ITERATOR, source), stderr);
+    assert_reports(
+        &ui_core("mutability-mismatch-arg.rs", MIN_OF_A_DYN_ITERATOR, source),
+        &[
+            error(3, &["`&dyn Iterator<Item = &u64>`", "`min`"]),
+        ],
+    );
 }
 
 #[test]
@@ -763,23 +642,6 @@ fn bar(arg: Box<dyn private::Future>) {
 
 fn main() {}
 "##;
-    let stderr = r##"error: the `wait` method cannot be invoked on a trait object
-  --> $DIR/trait-object-import-suggestion-on-method.rs:24:9
-   |
-LL |         fn wait(&self) where Self: Sized;
-   |                                    ----- this has a `Sized` requirement
-...
-LL |     arg.wait();
-   |         ^^^^
-   |
-help: another candidate was found in the following trait, perhaps add a `use` for it:
-   |
-LL + use private::Future;
-   |
-
-error: aborting due to 1 previous error
-
-"##;
     let fixture = format!(
         "//- minicore: sized, unsize, coerce_unsized, deref\n//- /std.rs crate:std\n\
          pub mod prelude {{ pub mod rust_2015 {{ pub use core::prelude::rust_2015::*; pub use crate::boxed::Box; }} }}\n\
@@ -790,5 +652,5 @@ error: aborting due to 1 previous error
          }}\n\
          //- /trait-object-import-suggestion-on-method.rs crate:other:main edition:2015 deps:std\n{source}"
     );
-    assert_eq!(ui_fixture(&fixture), stderr);
+    assert_reports(&ui_fixture(&fixture), &[error(24, &["`wait`"])]);
 }

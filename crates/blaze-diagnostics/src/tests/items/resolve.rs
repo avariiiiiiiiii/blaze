@@ -5,7 +5,7 @@
 use crate::{
     Options,
     emit::Style,
-    tests::{Mode, checked_with, compiletest, normalized, ui},
+    tests::{Mode, assert_reports, checked_with, compiletest, error, normalized, ui},
 };
 
 #[test]
@@ -142,35 +142,15 @@ pub fn main() {
     m::bar(); //~ ERROR cannot find function `bar` in module `m`
 }
 "##;
-    let stderr = r##"error[E0425]: cannot find function `foo` in module `m`
-  --> $DIR/namespaced-enum-glob-import-no-impls.rs:22:8
-   |
-LL |     m::foo();
-   |        ^^^ not found in `m`
-
-error[E0425]: cannot find function `bar` in module `m`
-  --> $DIR/namespaced-enum-glob-import-no-impls.rs:24:8
-   |
-LL |     m::bar();
-   |        ^^^ not found in `m`
-
-error[E0425]: cannot find function `foo` in this scope
-  --> $DIR/namespaced-enum-glob-import-no-impls.rs:21:5
-   |
-LL |     foo();
-   |     ^^^ not found in this scope
-
-error[E0425]: cannot find function `bar` in this scope
-  --> $DIR/namespaced-enum-glob-import-no-impls.rs:23:5
-   |
-LL |     bar();
-   |     ^^^ not found in this scope
-
-error: aborting due to 4 previous errors
-
-For more information about this error, try `rustc --explain E0425`.
-"##;
-    assert_eq!(ui("namespaced-enum-glob-import-no-impls.rs", "2015", source), stderr);
+    assert_reports(
+        &ui("namespaced-enum-glob-import-no-impls.rs", "2015", source),
+        &[
+            error(22, &["`foo`", "`m`"]),
+            error(24, &["`bar`", "`m`"]),
+            error(21, &["`foo`"]),
+            error(23, &["`bar`"]),
+        ],
+    );
 }
 
 #[test]
@@ -208,6 +188,11 @@ For more information about this error, try `rustc --explain E0433`.
 
 /// A `std` with the one item the test reads beside minicore's: `HashMap`, with `Default`.
 const STD_HASH_MAP: &str = "//- /std.rs crate:std
+pub mod prelude {
+    pub mod rust_2018 {
+        pub use core::prelude::rust_2018::*;
+    }
+}
 pub mod collections {
     pub struct HashMap<K, V>(K, V);
     impl<K, V> core::default::Default for HashMap<K, V> {
@@ -288,72 +273,12 @@ use Glob::*; //~ ERROR `use` associated items of traits is unstable
 
 fn main() {}
 "#;
-    let stderr = r#"error[E0658]: `use` associated items of traits is unstable
-  --> $DIR/feature-gate-import-trait-associated-functions.rs:4:9
-   |
-LL | use A::{DEFAULT, new};
-   |         ^^^^^^^
-   |
-   = note: see issue #134691 <https://github.com/rust-lang/rust/issues/134691> for more information
-   = help: add `#![feature(import_trait_associated_functions)]` to the crate attributes to enable
-   = note: this compiler was built on YYYY-MM-DD; consider upgrading it if it is out of date
-
-error[E0658]: `use` associated items of traits is unstable
-  --> $DIR/feature-gate-import-trait-associated-functions.rs:4:18
-   |
-LL | use A::{DEFAULT, new};
-   |                  ^^^
-   |
-   = note: see issue #134691 <https://github.com/rust-lang/rust/issues/134691> for more information
-   = help: add `#![feature(import_trait_associated_functions)]` to the crate attributes to enable
-   = note: this compiler was built on YYYY-MM-DD; consider upgrading it if it is out of date
-
-error[E0658]: `use` associated items of traits is unstable
-  --> $DIR/feature-gate-import-trait-associated-functions.rs:7:5
-   |
-LL | use Default::default;
-   |     ^^^^^^^^^^^^^^^^
-   |
-   = note: see issue #134691 <https://github.com/rust-lang/rust/issues/134691> for more information
-   = help: add `#![feature(import_trait_associated_functions)]` to the crate attributes to enable
-   = note: this compiler was built on YYYY-MM-DD; consider upgrading it if it is out of date
-
-error[E0658]: `use` associated items of traits is unstable
-  --> $DIR/feature-gate-import-trait-associated-functions.rs:27:26
-   |
-LL |     use super::A::{self, DEFAULT, new};
-   |                          ^^^^^^^
-   |
-   = note: see issue #134691 <https://github.com/rust-lang/rust/issues/134691> for more information
-   = help: add `#![feature(import_trait_associated_functions)]` to the crate attributes to enable
-   = note: this compiler was built on YYYY-MM-DD; consider upgrading it if it is out of date
-
-error[E0658]: `use` associated items of traits is unstable
-  --> $DIR/feature-gate-import-trait-associated-functions.rs:27:35
-   |
-LL |     use super::A::{self, DEFAULT, new};
-   |                                   ^^^
-   |
-   = note: see issue #134691 <https://github.com/rust-lang/rust/issues/134691> for more information
-   = help: add `#![feature(import_trait_associated_functions)]` to the crate attributes to enable
-   = note: this compiler was built on YYYY-MM-DD; consider upgrading it if it is out of date
-
-error[E0658]: `use` associated items of traits is unstable
-  --> $DIR/feature-gate-import-trait-associated-functions.rs:64:5
-   |
-LL | use Glob::*;
-   |     ^^^^^^^
-   |
-   = note: see issue #134691 <https://github.com/rust-lang/rust/issues/134691> for more information
-   = help: add `#![feature(import_trait_associated_functions)]` to the crate attributes to enable
-   = note: this compiler was built on YYYY-MM-DD; consider upgrading it if it is out of date
-
-error: aborting due to 6 previous errors
-
-For more information about this error, try `rustc --explain E0658`.
-"#;
     let name = "feature-gate-import-trait-associated-functions.rs";
-    let fixture = format!("//- minicore: default, option\n{STD_HASH_MAP}//- /{name} crate:other:main edition:2018 deps:std\n{source}");
+    let fixture = format!("//- minicore: sized, default, option\n{STD_HASH_MAP}//- /{name} crate:other:main edition:2018 deps:std\n{source}");
     let checked = checked_with(&fixture, "$DIR/", &compiletest(Mode::Other, &Options::default()));
-    assert_eq!(normalized(&checked.stderr_with(Style { ui_testing: true, ..Style::default() })), stderr);
+    let unstable = |line| error(line, &["`use` associated items of traits"]);
+    assert_reports(
+        &normalized(&checked.stderr_with(Style { ui_testing: true, ..Style::default() })),
+        &[unstable(4), unstable(4), unstable(7), unstable(27), unstable(27), unstable(64)],
+    );
 }

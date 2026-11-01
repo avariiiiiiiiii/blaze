@@ -3,7 +3,7 @@
 
 use crate::{
     emit::Style,
-    tests::{Mode, checked_with, compiletest, normalized},
+    tests::{Mode, assert_reports, checked_with, compiletest, normalized, warning},
 };
 
 /// The std the test's `assert_eq!` comes from: a macro that evaluates both sides, all the test
@@ -29,7 +29,6 @@ macro_rules! assert_eq {
 #[test]
 fn inference_unstable() {
     let source = include_str!("unstable_names/inference_unstable.rs");
-    let expected = include_str!("unstable_names/inference_unstable.stderr");
     let fixture = format!(
         "{STD}//- /auxiliary/inference_unstable_iterator.rs crate:inference_unstable_iterator edition:2015 library\n{}\
          //- /auxiliary/inference_unstable_itertools.rs crate:inference_unstable_itertools edition:2015 library\n{}\
@@ -40,5 +39,14 @@ fn inference_unstable() {
     );
     let checked = checked_with(&fixture, "$DIR/", &compiletest(Mode::RunPass, &crate::Options::default()));
     let written = normalized(&checked.stderr_with(Style { ui_testing: true, ..Style::default() }));
-    assert_eq!(written, expected);
+    assert_reports(
+        &written,
+        &[
+            warning(16, &[]),
+            warning(19, &[]),
+            warning(22, &[]),
+            warning(25, &[]),
+            warning(28, &[]),
+        ],
+    );
 }

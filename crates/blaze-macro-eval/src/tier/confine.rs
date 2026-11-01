@@ -554,7 +554,7 @@ fn checked(
 
 /// The table signature of `sig`: its parameters, returns, purposes, extensions and calling
 /// convention, as Cranelift prints them.
-fn intern(signatures: &mut Signatures, sig: &ir::Signature) -> Sig {
+pub(crate) fn intern(signatures: &mut Signatures, sig: &ir::Signature) -> Sig {
     // alloc: once per signature met, per function compiled: its interning key
     let text = sig.to_string();
     signatures.intern(text.as_bytes())

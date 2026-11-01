@@ -57,6 +57,7 @@ pub(crate) struct Server {
     /// What the lexer and printer write into, kept for the next request.
     text: String,
     lexed: Vec<String>,
+    warned: Vec<String>,
 }
 
 fn freed() -> Stop {
@@ -186,6 +187,7 @@ impl Server {
             emitted: Vec::new(), // alloc: once per expansion, as above
             text: String::new(), // alloc: once per expansion, as above
             lexed: Vec::new(), // alloc: once per expansion, as above
+            warned: Vec::new(), // alloc: once per expansion, as above
         };
         for site in sites {
             server.span_handle(site);
@@ -496,7 +498,7 @@ impl Server {
                 let text = r.str()?;
                 let call_site = self.sites[1];
                 self.lexed.clear();
-                let lexed = lex::literal(text, call_site, self.edition, self.forced_keywords, &mut self.lexed);
+                let lexed = lex::literal(text, call_site, self.edition, self.forced_keywords, &mut self.lexed, &mut self.warned);
                 self.lexed_errors();
                 w.ok(true);
                 match lexed {
@@ -550,7 +552,7 @@ impl Server {
                 let text = r.str()?;
                 let call_site = self.sites[1];
                 self.lexed.clear();
-                let lexed = lex::stream(text, call_site, self.edition, self.forced_keywords, &mut self.lexed);
+                let lexed = lex::stream(text, call_site, self.edition, self.forced_keywords, &mut self.lexed, &mut self.warned);
                 self.lexed_errors();
                 w.ok(true);
                 match lexed {
@@ -845,10 +847,13 @@ impl Server {
         Ok(())
     }
 
-    /// The lexer's errors rustc would have reported to its session: errors of the expansion.
+    /// The lexer's errors, errors of the expansion, and its lints, warnings of it.
     fn lexed_errors(&mut self) {
         for text in self.lexed.drain(..) {
             self.emitted.push(Emitted { error: true, text });
+        }
+        for text in self.warned.drain(..) {
+            self.emitted.push(Emitted { error: false, text });
         }
     }
 }

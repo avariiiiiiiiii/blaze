@@ -9,7 +9,9 @@
 //! what `print` glues back as rustc's printer sees it.
 //!
 //! Errors rustc emits to its session go to `emitted` and the call still answers `Ok`, as
-//! rustc's does; the `Err` is what the client sees.
+//! rustc's does; the `Err` is what the client sees. The lints rustc's lexer buffers go to
+//! `warned`: a warning naming the macro, never an error, so a dependency's build doesn't stop
+//! on text its macro made.
 
 mod cook;
 mod unicode;
@@ -23,7 +25,7 @@ use crate::print::Op;
 use crate::stream::{DelimSpan, Delimiter, DocKind, LitKind, Spacing, Stream, Tree};
 use cook::{Fatal, Kind, Lexer, Token};
 
-/// The lints rustc's lexer buffers, deny by default.
+/// The lints rustc's lexer buffers.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(super) enum Lint {
     TextDirectionCodepointInComment,
@@ -44,12 +46,11 @@ impl Emitted {
         Emitted { errors: std::mem::take(emitted), ..Emitted::default() }
     }
 
-    /// Gives the errors back, with what rustc reports after expansion: the buffered lints at
-    /// their default level and, unless the calling crate enables `forced_keywords`
-    /// (`enabled`), the feature gate of each forced keyword.
-    fn finish(self, enabled: bool, emitted: &mut Vec<String>) {
+    /// Gives the errors back, with the feature gate of each forced keyword unless the calling
+    /// crate enables `forced_keywords` (`enabled`), and the buffered lints to `warned`.
+    fn finish(self, enabled: bool, emitted: &mut Vec<String>, warned: &mut Vec<String>) {
         *emitted = self.errors;
-        emitted.extend(self.lints.into_iter().map(|(_, message)| message));
+        warned.extend(self.lints.into_iter().map(|(_, message)| message));
         let gated = if enabled { 0 } else { self.forced_keywords };
         for _ in 0..gated {
             emitted.push("forced keywords are experimental".to_owned()); // alloc: error path
@@ -58,13 +59,14 @@ impl Emitted {
 }
 
 /// `ts_from_str`: `text` as a stream, every token at `span`, lexed in `edition`, for a crate
-/// that enables `forced_keywords` or not. Errors rustc emits go to `emitted`.
+/// that enables `forced_keywords` or not. Errors go to `emitted`, lints to `warned`.
 pub(crate) fn stream(
     text: &str,
     span: Span,
     edition: Edition,
     forced_keywords: bool,
     emitted: &mut Vec<String>,
+    warned: &mut Vec<String>,
 ) -> Result<Stream, String> {
     let source = normalize(text);
     let mut src: &str = &source;
@@ -73,7 +75,7 @@ pub(crate) fn stream(
     }
     let mut out = Emitted::taking(emitted);
     let (read, _) = Reader::new(src, span, edition, &mut out).read();
-    out.finish(forced_keywords, emitted);
+    out.finish(forced_keywords, emitted, warned);
     match read {
         Ok(trees) => Ok(Stream::of(trees)),
         Err(Stop::Fatal) => Err("failed to parse to tokenstream".to_owned()), // alloc: error path
@@ -89,11 +91,12 @@ pub(crate) fn literal(
     edition: Edition,
     forced_keywords: bool,
     emitted: &mut Vec<String>,
+    warned: &mut Vec<String>,
 ) -> Result<Tree, String> {
     let source = normalize(text);
     let mut out = Emitted::taking(emitted);
     let (read, firsts) = Reader::new(&source, span, edition, &mut out).read();
-    out.finish(forced_keywords, emitted);
+    out.finish(forced_keywords, emitted, warned);
     match read {
         Ok(_) => {}
         Err(Stop::Fatal) => return Err("failed to parse to literal".to_owned()), // alloc: error path

@@ -67,6 +67,7 @@ use crate::{
 use super::{
     MirLowerError, MirOwner, OperandKind, Place,
     framed::{self, FrameMap, FrameSet},
+    location,
 };
 
 mod as_place;
@@ -246,6 +247,12 @@ struct MirLowerCtx<'a, 'f, 'db> {
     super_let: Option<usize>,
     /// How many `const { .. }` blocks deep the expression being lowered is.
     inline_consts: u32,
+    /// The `line!()` literals read where the code runs ([`location::slots_lines`]); `None`
+    /// where each is its value.
+    line_slots: Option<&'db rustc_hash::FxHashSet<ExprId>>,
+    /// How many shared borrows rustc may promote the expression being lowered is inside of: a
+    /// promoted constant is a value, so a `line!()` in one stays a literal.
+    promotable_borrows: u32,
     /// The expressions that end their own temporaries: the body, and from the 2024 edition the
     /// tail of a block. The operands of such an expression are in one scope with its
     /// temporaries, where those of any other expression are in a scope inside it.
@@ -465,6 +472,13 @@ impl<'a, 'f, 'db> MirLowerCtx<'a, 'f, 'db> {
             extended_blocks: framed::map_in(frame),
             super_let: None,
             inline_consts: 0,
+            line_slots: match owner {
+                InferBodyId::DefWithBodyId(def) if location::slots_lines(db, owner) => {
+                    Some(location::line_literals(db, def))
+                }
+                _ => None,
+            },
+            promotable_borrows: 0,
             ends_temporaries: framed::set_in(frame),
             drop_temps: framed::set_in(frame),
             undeclared: framed::set_in(frame),
@@ -619,6 +633,7 @@ impl<'a, 'f, 'db> MirLowerCtx<'a, 'f, 'db> {
     ) -> Result<'db, Option<(Operand, BasicBlockId)>> {
         if !self.has_adjustments(expr_id)
             && let Expr::Literal(l) = self.store.expr(expr_id)
+            && !self.is_line_slot(expr_id)
         {
             let ty = self.expr_ty_without_adjust(expr_id);
             let mut operand = self.lower_literal_to_operand(ty, l)?;
@@ -739,11 +754,6 @@ impl<'a, 'f, 'db> MirLowerCtx<'a, 'f, 'db> {
         bk: BorrowKind,
     ) -> Result<'db, Option<BasicBlockId>> {
         let locals = self.local_count();
-        let Some((p, current)) =
-            self.lower_expr_as_place_with_adjust(current, expr_id, true, rest)?
-        else {
-            return Ok(None);
-        };
         // `CONST.len()` borrows a promoted constant just as `(&CONST).len()` does, and
         // `[][..]` mutably an empty array just as `&mut []` does (rustc's `validate_ref`).
         let promotable_kind = match bk {
@@ -753,6 +763,12 @@ impl<'a, 'f, 'db> MirLowerCtx<'a, 'f, 'db> {
             } => self.is_empty_array(expr_id),
             BorrowKind::Shallow
             | BorrowKind::Mut { kind: super::MutBorrowKind::ClosureCapture } => false,
+        };
+        self.promotable_borrows += u32::from(promotable_kind);
+        let lowered = self.lower_expr_as_place_with_adjust(current, expr_id, true, rest);
+        self.promotable_borrows -= u32::from(promotable_kind);
+        let Some((p, current)) = lowered? else {
+            return Ok(None);
         };
         if promotable_kind
             && rest.is_empty()
@@ -1838,7 +1854,11 @@ impl<'a, 'f, 'db> MirLowerCtx<'a, 'f, 'db> {
             }
             Expr::Ref { expr, rawness: _, mutability } => {
                 let locals = self.local_count();
-                let Some((p, current)) = self.lower_expr_as_place(current, expr, true)? else {
+                let promotable = mutability.is_shared() || self.is_empty_array(expr);
+                self.promotable_borrows += u32::from(promotable);
+                let lowered = self.lower_expr_as_place(current, expr, true);
+                self.promotable_borrows -= u32::from(promotable);
+                let Some((p, current)) = lowered? else {
                     return Ok(None);
                 };
                 // A mutable borrow is promoted only of an empty array, as rustc's `&mut []`.
@@ -2321,6 +2341,7 @@ impl<'a, 'f, 'db> MirLowerCtx<'a, 'f, 'db> {
                     }
                 }
             },
+            Expr::Literal(_) if self.is_line_slot(expr_id) => self.lower_line(expr_id, place, current),
             Expr::Literal(l) => {
                 let ty = self.expr_ty_without_adjust(expr_id);
                 let mut op = self.lower_literal_to_operand(ty, l)?;
@@ -2331,6 +2352,58 @@ impl<'a, 'f, 'db> MirLowerCtx<'a, 'f, 'db> {
             Expr::Underscore => Ok(Some(current)),
             Expr::IncludeBytes => not_supported!("include_bytes!()"),
         }
+    }
+
+    /// Whether `expr_id` is a `line!()` literal that [`Self::lower_line`] reads where the code
+    /// runs: not in a `const { .. }` block or a borrow rustc may promote, which are values.
+    fn is_line_slot(&self, expr_id: ExprId) -> bool {
+        self.inline_consts == 0
+            && self.promotable_borrows == 0
+            && self.line_slots.is_some_and(|it| it.contains(&expr_id))
+    }
+
+    /// `line!()` where the code runs: the `line` of the `Location` of the literal, which
+    /// `Location::caller()` called there gives in a function that is not `#[track_caller]`.
+    /// The MIR holds no line, so a move above the body changes none of it.
+    fn lower_line(
+        &mut self,
+        expr_id: ExprId,
+        place: Place<'db>,
+        current: BasicBlockId,
+    ) -> Result<'db, Option<BasicBlockId>> {
+        let span = MirSpan::from(expr_id);
+        let interner = self.interner();
+        let location = self.lang_items().PanicLocation.ok_or(MirLowerError::LangItemNotFound)?;
+        let caller =
+            location::location_caller(self.db, location).ok_or(MirLowerError::LangItemNotFound)?;
+        let line = VariantId::StructId(location)
+            .fields(self.db)
+            .field(&Name::new_root("line"))
+            .ok_or(MirLowerError::LangItemNotFound)?;
+        let statik = self.types.regions.statik;
+        let location_ty = Ty::new_adt(
+            interner,
+            AdtId::StructId(location),
+            GenericArgs::new_from_slice(&[statik.into()]),
+        );
+        let reference = Ty::new_ref(interner, statik, location_ty, Mutability::Not);
+        let func = Operand::const_zst(Ty::new_fn_def(
+            interner,
+            CallableDefId::FunctionId(caller).into(),
+            GenericArgs::new_from_slice(&[statik.into()]),
+        ));
+        let temp = self.temp(reference, current, span)?;
+        // alloc: the call's arguments, none
+        let Some(current) = self.lower_call(func, Box::new([]), temp.into(), current, false, span)?
+        else {
+            return Ok(None);
+        };
+        let read = Place::from(temp)
+            .project(ProjectionElem::Deref)
+            .project(ProjectionElem::Field(FieldIndex::from(line)));
+        let read = Operand { kind: OperandKind::Copy(read.store()), span: Some(span) };
+        self.push_assignment(current, place, read.into(), span);
+        Ok(Some(current))
     }
 
     /// The field `offset_of!` names, of a value at address 0.
@@ -5271,6 +5344,8 @@ pub fn promoted_mir_body_query<'db>(
     check_expansions(db, def)?;
     frame::task(Tag::Mir, |frame| {
         let mut ctx = MirLowerCtx::new(db, def, store, infer, frame);
+        // A promoted constant is a value: its `line!()` is the literal.
+        ctx.line_slots = None;
         // The value itself, before what borrowing or indexing it adjusts it to.
         let ty = ctx.expr_ty_without_adjust(expr).store();
         ctx.alloc_local(Local { ty });

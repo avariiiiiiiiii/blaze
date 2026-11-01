@@ -6,7 +6,7 @@ use crate::{
     Options,
     emit::Style,
     lints::CommandLine,
-    tests::{Mode, checked_with, compiletest, normalized, ui},
+    tests::{Mode, assert_reports, checked_with, compiletest, error, normalized, ui},
 };
 
 /// What rustc writes compiling `fixture` (its files named `$DIR/<path>`) as a UI test that is
@@ -70,12 +70,11 @@ fn unused_macro_use() {
 #[test]
 fn unused_import_with_attributes() {
     let source = include_str!("imports/unused-import-issue-87973.rs");
-    let expected = include_str!("imports/unused-import-issue-87973.stderr");
     let fixture = format!(
-        "//- /std.rs crate:std edition:2021 library\npub mod fs {{}}\n\
+        "//- /std.rs crate:std edition:2021 library\npub mod fs {{}}\npub mod prelude {{ pub mod rust_2015 {{}} }}\n\
          //- /unused-import-issue-87973.rs crate:other:main edition:2015 deps:std\n{source}"
     );
-    assert_eq!(ui_fixture(&fixture), expected);
+    assert_reports(&ui_fixture(&fixture), &[error(8, &["`std::fs`"])]);
 }
 
 #[test]

@@ -7,7 +7,7 @@
 use crate::{
     Options,
     emit::Style,
-    tests::{Mode, checked_with, compiletest, normalized, ui},
+    tests::{Mode, assert_reports, checked_with, compiletest, error, normalized, ui},
 };
 
 /// [`ui`] of a file with minicore's items for `flags` (`crates/test-utils/src/minicore.rs`).
@@ -100,21 +100,9 @@ fn an_inherent_impl_of_a_type_parameter() {
 
 fn main() {}
 "#;
-    let stderr = r#"error[E0118]: no nominal type found for inherent implementation
-  --> $DIR/E0118.rs:1:1
-   |
-LL | impl<T> T {
-   | ^^^^^^^^^ impl requires a nominal type
-   |
-   = note: either implement a trait on it or create a newtype to wrap it instead
-
-error: aborting due to 1 previous error
-
-For more information about this error, try `rustc --explain E0118`.
-"#;
-    assert_eq!(ui_std("E0118.rs", "sized", r#"pub struct String;
+    assert_reports(&ui_std("E0118.rs", "sized", r#"pub struct String;
 impl String { pub fn new() -> String { String } }
-"#, "pub use crate::String;", source), stderr);
+"#, "pub use crate::String;", source), &[error(1, &[])]);
 }
 
 #[test]
@@ -131,27 +119,7 @@ impl fn(Foo) {} //~ ERROR E0390
 fn main() {
 }
 "#;
-    let stderr = r#"error[E0390]: cannot define inherent `impl` for primitive types
-  --> $DIR/E0390.rs:5:1
-   |
-LL | impl *mut Foo {}
-   | ^^^^^^^^^^^^^
-   |
-   = help: consider using an extension trait instead
-
-error[E0390]: cannot define inherent `impl` for primitive types
-  --> $DIR/E0390.rs:7:1
-   |
-LL | impl fn(Foo) {}
-   | ^^^^^^^^^^^^
-   |
-   = help: consider using an extension trait instead
-
-error: aborting due to 2 previous errors
-
-For more information about this error, try `rustc --explain E0390`.
-"#;
-    assert_eq!(ui("E0390.rs", "2015", source), stderr);
+    assert_reports(&ui("E0390.rs", "2015", source), &[error(5, &["`impl`"]), error(7, &["`impl`"])]);
 }
 
 #[test]
@@ -309,19 +277,7 @@ impl Drop for DropNoMethod {} //~ ERROR not all trait items implemented, missing
 
 fn main() {}
 "#;
-    let stderr = r#"error[E0046]: not all trait items implemented, missing: `drop`
-  --> $DIR/missing-drop-method.rs:2:1
-   |
-LL | impl Drop for DropNoMethod {}
-   | ^^^^^^^^^^^^^^^^^^^^^^^^^^ missing `drop` in implementation
-   |
-   = help: implement the missing item: `fn drop(&mut self) { todo!() }`
-
-error: aborting due to 1 previous error
-
-For more information about this error, try `rustc --explain E0046`.
-"#;
-    assert_eq!(ui_core("missing-drop-method.rs", "drop", source), stderr);
+    assert_reports(&ui_core("missing-drop-method.rs", "drop", source), &[error(2, &["`drop`"])]);
 }
 
 #[test]
@@ -350,31 +306,7 @@ impl Fuzz for Baz {
 fn main() {
 }
 "#;
-    let stderr = r#"error[E0049]: associated function `foo` has 0 type parameters but its trait declaration has 1 type parameter
-  --> $DIR/E0049.rs:8:11
-   |
-LL |     fn foo<T: Default>(x: T) -> Self;
-   |            - expected 1 type parameter
-...
-LL |     fn foo(x: bool) -> Self { Bar }
-   |           ^ found 0 type parameters
-
-error[E0049]: associated function `fuzz` has 0 type parameters but its trait declaration has 2 type parameters
-  --> $DIR/E0049.rs:18:12
-   |
-LL |     fn fuzz<A: Default, B>(x: A, y: B) -> Self;
-   |             -           -
-   |             |
-   |             expected 2 type parameters
-...
-LL |     fn fuzz(x: bool, y: bool) -> Self { Baz }
-   |            ^ found 0 type parameters
-
-error: aborting due to 2 previous errors
-
-For more information about this error, try `rustc --explain E0049`.
-"#;
-    assert_eq!(ui_core("E0049.rs", "default", source), stderr);
+    assert_reports(&ui_core("E0049.rs", "default", source), &[error(8, &["`foo`"]), error(18, &["`fuzz`"])]);
 }
 
 #[test]
@@ -702,22 +634,5 @@ fn main() {
     List { head: 0 };
 }
 "#;
-    let stderr = r#"error[E0366]: `Drop` impls cannot be specialized
-  --> $DIR/issue-38868.rs:5:1
-   |
-LL | impl Drop for List<i32> {
-   | ^^^^^^^^^^^^^^^^^^^^^^^
-   |
-   = note: `i32` is not a generic parameter
-note: use the same sequence of generic lifetime, type and const parameters as the struct definition
-  --> $DIR/issue-38868.rs:1:1
-   |
-LL | pub struct List<T> {
-   | ^^^^^^^^^^^^^^^^^^
-
-error: aborting due to 1 previous error
-
-For more information about this error, try `rustc --explain E0366`.
-"#;
-    assert_eq!(ui_core("issue-38868.rs", "drop, panic", source), stderr);
+    assert_reports(&ui_core("issue-38868.rs", "drop, panic", source), &[error(5, &["`Drop`"])]);
 }

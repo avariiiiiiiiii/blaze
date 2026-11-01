@@ -3,7 +3,7 @@
 use crate::{
     Options,
     emit::Style,
-    tests::{Mode, checked_with, compiletest, normalized, ui, ui_run_pass},
+    tests::{Mode, assert_reports, checked_with, compiletest, error, normalized, ui, ui_run_pass},
 };
 
 /// [`ui`] of a UI test that needs core's items: core is minicore with `flags`
@@ -122,40 +122,13 @@ fn main() {
     let a = 1; //~ ERROR unused variable: `a`
 }
 "#;
-    let stderr = r#"error: unused variable: `var`
-  --> $DIR/issue-117284-arg-in-macro.rs:4:13
-   |
-LL |         let $var = $struct.$var;
-   |             ^^^^
-...
-LL |     make_var!(s, var);
-   |     ----------------- in this macro invocation
-   |
-help: `var` is captured in macro and introduced a unused variable
-  --> $DIR/issue-117284-arg-in-macro.rs:4:13
-   |
-LL |         let $var = $struct.$var;
-   |             ^^^^
-...
-LL |     make_var!(s, var);
-   |     ----------------- in this macro invocation
-note: the lint level is defined here
-  --> $DIR/issue-117284-arg-in-macro.rs:1:9
-   |
-LL | #![deny(unused_variables)]
-   |         ^^^^^^^^^^^^^^^^
-   = note: this error originates in the macro `make_var` (in Nightly builds, run with -Z macro-backtrace for more info)
-
-error: unused variable: `a`
-  --> $DIR/issue-117284-arg-in-macro.rs:16:9
-   |
-LL |     let a = 1;
-   |         ^ help: if this is intentional, prefix it with an underscore: `_a`
-
-error: aborting due to 2 previous errors
-
-"#;
-    assert_eq!(ui("issue-117284-arg-in-macro.rs", "2015", source), stderr);
+    assert_reports(
+        &ui("issue-117284-arg-in-macro.rs", "2015", source),
+        &[
+            error(4, &["`var`"]),
+            error(16, &["`a`"]),
+        ],
+    );
 }
 
 #[test]

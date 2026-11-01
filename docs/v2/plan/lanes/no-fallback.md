@@ -61,7 +61,8 @@ reaches the client as `blaze_api::Worked::links` (SCHEMA 16), and blaze-ui and t
 it as `link: <path> (<how>)`. `harness/bench.py` fails an edit that was not spliced, or that
 printed no link line, before timing it. Codegen no longer hands a function LLVM refuses to
 Cranelift (`CodegenError::LlvmRefused`). Visibility, the prelude and const and struct paths
-report rustc's errors instead of guessing.
+stop with a typed error naming what and where instead of guessing (AGENTS.md rule 5: the error
+is judged by whether it helps, not by matching rustc's text or code).
 
 Open: request 01195 (the coordinator's blaze-wasm `project()` after the no-std-uses-core
 fallback went), 01239 (format: pattern-type range ends), 01164 (harness/v2 engine.py and

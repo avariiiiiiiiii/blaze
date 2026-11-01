@@ -20,6 +20,7 @@ mod conflicts;
 mod discriminants;
 mod fields;
 mod generics;
+mod packed;
 mod recursive;
 mod unused;
 
@@ -51,6 +52,7 @@ pub(crate) fn check(cx: &Cx<'_, '_>, scopes: &[hir::Module]) -> Vec<Found> {
         if let hir::Adt::Enum(it) = adt {
             found.extend(discriminants::check(cx, it));
         }
+        found.extend(packed::check(cx, adt));
         found.extend(unused::check(cx, adt));
         found.extend(infinite.check(cx, adt));
     }

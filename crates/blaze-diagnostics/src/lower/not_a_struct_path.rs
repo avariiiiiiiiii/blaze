@@ -43,7 +43,7 @@ use crate::{
     cx::Cx,
     lints::code_fact,
     lower::{
-        Found, Phase, ambiguous_assoc_type,
+        Found, Phase, ambiguous_assoc_type, invalid_lhs_of_assignment,
         unresolved_ident::{Ns, PathSource, def_descr, def_span},
     },
     model::Diag,
@@ -54,6 +54,15 @@ pub(crate) fn lower(cx: &Cx<'_, '_>, d: &hir::NotAStructPath<'_>) -> Vec<Found> 
     let file = d.node.file_id;
     let node = cx.node_view(d.node);
     let ptr = InFile::new(file, d.node.value.syntax_node_ptr());
+    // rustc's `extract_tuple_struct_path`/`extract_unit_struct_path`: in a destructuring
+    // assignment, a call or path that resolves to no constructor is an expression, not a
+    // pattern, so the assignment's left-hand side is not a place.
+    if matches!(d.found, StructPathFound::Def(_))
+        && matches!(node.value, Either::Left(ast::Expr::CallExpr(_) | ast::Expr::PathExpr(_)))
+    {
+        let lhs = hir::InvalidLhsOfAssignment { lhs: d.node, assign: d.node, op: None };
+        return invalid_lhs_of_assignment::lower(cx, &lhs);
+    }
     let Some(path) = path_of(node.value) else {
         return refused(cx, ptr, "hir found it in a node that is not a struct literal or a pattern");
     };
@@ -199,6 +208,11 @@ pub(crate) fn lower(cx: &Cx<'_, '_>, d: &hir::NotAStructPath<'_>) -> Vec<Found> 
 fn path_of<'t>(node: Either<ast::Expr<'t>, ast::Pat<'t>>) -> Option<ast::Path<'t>> {
     match node {
         Either::Left(ast::Expr::RecordExpr(it)) => it.path(),
+        Either::Left(ast::Expr::CallExpr(it)) => match it.expr()? {
+            ast::Expr::PathExpr(it) => it.path(),
+            _ => None,
+        },
+        Either::Left(ast::Expr::PathExpr(it)) => it.path(),
         Either::Right(ast::Pat::PathPat(it)) => it.path(),
         Either::Right(ast::Pat::TupleStructPat(it)) => it.path(),
         Either::Right(ast::Pat::RecordPat(it)) => it.path(),

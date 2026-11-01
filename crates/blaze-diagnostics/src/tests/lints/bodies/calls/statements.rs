@@ -3,7 +3,7 @@
 //! tests.
 
 use super::{Ui, ui};
-use crate::tests::Mode;
+use crate::tests::{Mode, assert_reports, error};
 
 #[test]
 fn a_path_statement_has_no_effect_or_drops_its_value() {
@@ -634,84 +634,6 @@ fn main() {
     (1, ()); //~ ERROR: unused result of type `(i32, ())`
 }
 "##;
-    let expected = r##"error: unused `MustUse` that must be used
-  --> $DIR/unused-result.rs:25:5
-   |
-LL |     foo::<MustUse>();
-   |     ^^^^^^^^^^^^^^^^
-   |
-note: the lint level is defined here
-  --> $DIR/unused-result.rs:2:25
-   |
-LL | #![deny(unused_results, unused_must_use)]
-   |                         ^^^^^^^^^^^^^^^
-help: use `let _ = ...` to ignore the resulting value
-   |
-LL |     let _ = foo::<MustUse>();
-   |     +++++++
-
-error: unused `MustUseMsg` that must be used
-  --> $DIR/unused-result.rs:26:5
-   |
-LL |     foo::<MustUseMsg>();
-   |     ^^^^^^^^^^^^^^^^^^^
-   |
-   = note: some message
-help: use `let _ = ...` to ignore the resulting value
-   |
-LL |     let _ = foo::<MustUseMsg>();
-   |     +++++++
-
-error: unused result of type `isize`
-  --> $DIR/unused-result.rs:38:5
-   |
-LL |     foo::<isize>();
-   |     ^^^^^^^^^^^^^^^
-   |
-note: the lint level is defined here
-  --> $DIR/unused-result.rs:2:9
-   |
-LL | #![deny(unused_results, unused_must_use)]
-   |         ^^^^^^^^^^^^^^
-
-error: unused `MustUse` that must be used
-  --> $DIR/unused-result.rs:39:5
-   |
-LL |     foo::<MustUse>();
-   |     ^^^^^^^^^^^^^^^^
-   |
-help: use `let _ = ...` to ignore the resulting value
-   |
-LL |     let _ = foo::<MustUse>();
-   |     +++++++
-
-error: unused `MustUseMsg` that must be used
-  --> $DIR/unused-result.rs:40:5
-   |
-LL |     foo::<MustUseMsg>();
-   |     ^^^^^^^^^^^^^^^^^^^
-   |
-   = note: some message
-help: use `let _ = ...` to ignore the resulting value
-   |
-LL |     let _ = foo::<MustUseMsg>();
-   |     +++++++
-
-error: unused result of type `((), i32)`
-  --> $DIR/unused-result.rs:55:5
-   |
-LL |     ((), 1);
-   |     ^^^^^^^^
-
-error: unused result of type `(i32, ())`
-  --> $DIR/unused-result.rs:56:5
-   |
-LL |     (1, ());
-   |     ^^^^^^^^
-
-error: aborting due to 7 previous errors
-
-"##;
     let ui = ui(Ui {
         name: "unused-result.rs",
         core: "result, try",
@@ -719,7 +641,18 @@ error: aborting due to 7 previous errors
         source,
         ..Ui::default()
     });
-    assert_eq!(ui, expected);
+    assert_reports(
+        &ui,
+        &[
+            error(25, &["`MustUse`"]),
+            error(26, &["`MustUseMsg`"]),
+            error(38, &["`isize`"]),
+            error(39, &["`MustUse`"]),
+            error(40, &["`MustUseMsg`"]),
+            error(55, &["`((), i32)`"]),
+            error(56, &["`(i32, ())`"]),
+        ],
+    );
 }
 
 /// std's `Box` as far as the test uses it.

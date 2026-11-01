@@ -649,13 +649,15 @@ fn named(
 ) -> Result<(Vec<side::Variable>, side::Scopes), String> {
     let body = Body::of(db, owner);
     let mut told: Vec<&fragment::Variable, &Frame> = Vec::with_capacity_in(variables.len(), frame);
+    // Only the names lowering makes start with `<`, never one written, so which locals are
+    // told follows from the code and the side table needs no name in its key.
     told.extend(variables.iter().filter(|it| !body[it.binding].name.as_str().starts_with('<')));
     let (scopes, of_binding) = scoped(db, owner, &told, spans, frame);
     // alloc: the named locals, kept in the prepared function
     let mut named = Vec::with_capacity(told.len());
     for variable in told.iter().copied() {
         named.push(side::Variable {
-            name: *body[variable.binding].name.symbol(),
+            binding: variable.binding.into_raw().into_u32(),
             param: variable.param,
             ty: hashes.ty(db, evaluated(db, Some(krate), variable.ty.as_ref())?)?,
             slot: variable.slot,

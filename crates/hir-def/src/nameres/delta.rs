@@ -204,7 +204,9 @@ fn maintain_crate(
             Some(last)
         }
     };
-    if cutoff.is_none() && delta.direct.is_empty() && moved.is_empty() {
+    // An edit of the root's `#![...]` alone wakes no group, and changes the crate data.
+    let attrs_changed = cs.data_of.as_ref() != Some(queries::crate_data(db, krate));
+    if cutoff.is_none() && delta.direct.is_empty() && moved.is_empty() && !attrs_changed {
         let out = touched_only(db, krate, &cs, &delta);
         state.crates.insert(krate, cs);
         return out;

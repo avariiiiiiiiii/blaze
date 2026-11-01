@@ -7,7 +7,7 @@
 use crate::{
     Options,
     emit::Style,
-    tests::{Mode, checked_with, compiletest, normalized},
+    tests::{Mode, assert_reports, checked_with, compiletest, error, normalized},
 };
 
 /// `crate::tests::ui` of a crate rustc is run on alone, with no `--crate-type` (its
@@ -116,113 +116,25 @@ static A: S = S(0);
 
 fn main() {}
 "##;
-    let expected = r##"error[E0566]: conflicting representation hints
-  --> $DIR/conflicting-repr-hints.rs:13:8
-   |
-LL | #[repr(C, u64)]
-   |        ^  ^^^
-   |
-   = warning: this was previously accepted by the compiler but is being phased out; it will become a hard error in a future release!
-   = note: for more information, see issue #68585 <https://github.com/rust-lang/rust/issues/68585>
-   = note: `#[deny(conflicting_repr_hints)]` (part of `#[deny(future_incompatible)]`) on by default
-
-error[E0566]: conflicting representation hints
-  --> $DIR/conflicting-repr-hints.rs:19:8
-   |
-LL | #[repr(u32, u64)]
-   |        ^^^  ^^^
-   |
-   = warning: this was previously accepted by the compiler but is being phased out; it will become a hard error in a future release!
-   = note: for more information, see issue #68585 <https://github.com/rust-lang/rust/issues/68585>
-
-error[E0587]: type has conflicting packed and align representation hints
-  --> $DIR/conflicting-repr-hints.rs:29:1
-   |
-LL | struct F(i32);
-   | ^^^^^^^^
-
-error[E0587]: type has conflicting packed and align representation hints
-  --> $DIR/conflicting-repr-hints.rs:33:1
-   |
-LL | struct G(i32);
-   | ^^^^^^^^
-
-error[E0587]: type has conflicting packed and align representation hints
-  --> $DIR/conflicting-repr-hints.rs:37:1
-   |
-LL | struct H(i32);
-   | ^^^^^^^^
-
-error[E0634]: type has conflicting packed representation hints
-  --> $DIR/conflicting-repr-hints.rs:40:1
-   |
-LL | struct I(i32);
-   | ^^^^^^^^
-
-error[E0634]: type has conflicting packed representation hints
-  --> $DIR/conflicting-repr-hints.rs:44:1
-   |
-LL | struct J(i32);
-   | ^^^^^^^^
-
-error[E0587]: type has conflicting packed and align representation hints
-  --> $DIR/conflicting-repr-hints.rs:50:1
-   |
-LL | union X {
-   | ^^^^^^^
-
-error[E0587]: type has conflicting packed and align representation hints
-  --> $DIR/conflicting-repr-hints.rs:57:1
-   |
-LL | union Y {
-   | ^^^^^^^
-
-error[E0587]: type has conflicting packed and align representation hints
-  --> $DIR/conflicting-repr-hints.rs:64:1
-   |
-LL | union Z {
-   | ^^^^^^^
-
-error[E0587]: type has conflicting packed and align representation hints
-  --> $DIR/conflicting-repr-hints.rs:70:1
-   |
-LL | pub struct S(u16);
-   | ^^^^^^^^^^^^
-
-error[E0587]: type has conflicting packed and align representation hints
-  --> $DIR/conflicting-repr-hints.rs:73:1
-   |
-LL | pub union U {
-   | ^^^^^^^^^^^
-
-error: aborting due to 12 previous errors
-
-Some errors have detailed explanations: E0566, E0587, E0634.
-For more information about an error, try `rustc --explain E0566`.
-Future incompatibility report: Future breakage diagnostic:
-error[E0566]: conflicting representation hints
-  --> $DIR/conflicting-repr-hints.rs:13:8
-   |
-LL | #[repr(C, u64)]
-   |        ^  ^^^
-   |
-   = warning: this was previously accepted by the compiler but is being phased out; it will become a hard error in a future release!
-   = note: for more information, see issue #68585 <https://github.com/rust-lang/rust/issues/68585>
-   = note: `#[deny(conflicting_repr_hints)]` (part of `#[deny(future_incompatible)]`) on by default
-
-Future breakage diagnostic:
-error[E0566]: conflicting representation hints
-  --> $DIR/conflicting-repr-hints.rs:19:8
-   |
-LL | #[repr(u32, u64)]
-   |        ^^^  ^^^
-   |
-   = warning: this was previously accepted by the compiler but is being phased out; it will become a hard error in a future release!
-   = note: for more information, see issue #68585 <https://github.com/rust-lang/rust/issues/68585>
-   = note: `#[deny(conflicting_repr_hints)]` (part of `#[deny(future_incompatible)]`) on by default
-
-"##;
-    assert_eq!(ui("conflicting-repr-hints.rs", "2015", source), expected);
+    assert_reports(
+        &ui("conflicting-repr-hints.rs", "2015", source),
+        &[
+            error(13, &[]),
+            error(19, &[]),
+            error(29, &[]),
+            error(33, &[]),
+            error(37, &[]),
+            error(40, &[]),
+            error(44, &[]),
+            error(50, &[]),
+            error(57, &[]),
+            error(64, &[]),
+            error(70, &[]),
+            error(73, &[]),
+            error(13, &[]),
+            error(19, &[]),
+        ],
+    );
 }
 
 /// `tests/ui/lint/unused/unused-attr-repr-packed-c-order.rs`: `C` with `packed`, in either
@@ -495,79 +407,19 @@ pub unsafe fn foo() {}
 
 fn main() {}
 "##;
-    let expected = r##"error: unused attribute
-  --> $DIR/empty-attributes.rs:2:1
-   |
-LL | #![allow()]
-   | ^^^^^^^^^^^ help: remove this attribute
-   |
-   = note: attribute `allow` with an empty list has no effect
-note: the lint level is defined here
-  --> $DIR/empty-attributes.rs:1:9
-   |
-LL | #![deny(unused_attributes)]
-   |         ^^^^^^^^^^^^^^^^^
-
-error: unused attribute
-  --> $DIR/empty-attributes.rs:3:1
-   |
-LL | #![expect()]
-   | ^^^^^^^^^^^^ help: remove this attribute
-   |
-   = note: attribute `expect` with an empty list has no effect
-
-error: unused attribute
-  --> $DIR/empty-attributes.rs:4:1
-   |
-LL | #![warn()]
-   | ^^^^^^^^^^ help: remove this attribute
-   |
-   = note: attribute `warn` with an empty list has no effect
-
-error: unused attribute
-  --> $DIR/empty-attributes.rs:5:1
-   |
-LL | #![deny()]
-   | ^^^^^^^^^^ help: remove this attribute
-   |
-   = note: attribute `deny` with an empty list has no effect
-
-error: unused attribute
-  --> $DIR/empty-attributes.rs:6:1
-   |
-LL | #![forbid()]
-   | ^^^^^^^^^^^^ help: remove this attribute
-   |
-   = note: attribute `forbid` with an empty list has no effect
-
-error: unused attribute
-  --> $DIR/empty-attributes.rs:7:1
-   |
-LL | #![feature()]
-   | ^^^^^^^^^^^^^ help: remove this attribute
-   |
-   = note: using `feature` with an empty list has no effect
-
-error: unused attribute
-  --> $DIR/empty-attributes.rs:9:1
-   |
-LL | #[repr()]
-   | ^^^^^^^^^ help: remove this attribute
-   |
-   = note: using `repr` with an empty list has no effect
-
-error: unused attribute
-  --> $DIR/empty-attributes.rs:12:1
-   |
-LL | #[target_feature()]
-   | ^^^^^^^^^^^^^^^^^^^ help: remove this attribute
-   |
-   = note: using `target_feature` with an empty list has no effect
-
-error: aborting due to 8 previous errors
-
-"##;
-    assert_eq!(ui("empty-attributes.rs", "2015", source), expected);
+    assert_reports(
+        &ui("empty-attributes.rs", "2015", source),
+        &[
+            error(2, &[]),
+            error(3, &[]),
+            error(4, &[]),
+            error(5, &[]),
+            error(6, &[]),
+            error(7, &[]),
+            error(9, &[]),
+            error(12, &[]),
+        ],
+    );
 }
 
 /// `tests/ui/lint/linker-warning.rs`: the function's lint before the crate's.

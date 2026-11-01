@@ -182,23 +182,42 @@ pub const C: u32 = 1;
 pub fn reads() -> u32 { C }
 "#;
 
-/// A constant's code is its value where it has one for every use, so the data a body makes
-/// of it is keyed by the value, never by how the constant is written.
+/// A body reading a constant that has one value for every use is keyed by that value: a new
+/// value rebuilds the reader, another way of writing the same value rebuilds nothing.
 #[test]
-fn a_constant_s_code_is_its_value() {
+fn a_body_reading_a_constant_is_keyed_by_its_value() {
     let (mut db, file) = fixture("sized", VALUED);
-    let konst = |db: &TestDB| {
-        let konst = hir_def::test_items::constant(db, fixture::test_crate(db), "C");
-        hashes().code(db, Body::Item(konst.into())).unwrap_or_else(|e| panic!("the code of `C`: {e}"))
-    };
-    let (before, reads) = (konst(&db), code(&db, "reads"));
+    let reads = code(&db, "reads");
 
     db.set_file_text(file, &VALUED.replace("= 1", "= 2 - 1"));
-    assert_eq!(konst(&db), before, "one value, however written");
+    assert_eq!(code(&db, "reads"), reads, "one value, however written");
 
     db.set_file_text(file, &VALUED.replace("= 1", "= 2"));
-    assert_ne!(konst(&db), before);
     assert_ne!(code(&db, "reads"), reads, "a body reading it reads its value");
+}
+
+const LINED: &str = r#"
+#[rustc_builtin_macro]
+macro_rules! line {() => {}}
+pub fn here() -> u32 { line!() }
+#[track_caller]
+pub fn tracked() -> u32 { line!() }
+pub fn borrowed() -> &'static u32 { &line!() }
+"#;
+
+/// A function reads its `line!()` from the `Location` the link fills, so moving it keeps its
+/// code. Where the line is in the code, a `#[track_caller]` function's (its `Location` is its
+/// caller's) or a borrow promoted to a constant, the move is new code.
+#[test]
+fn moving_a_function_that_reads_its_line_keeps_its_code() {
+    let (mut db, file) = fixture("panic_location", LINED);
+    let names = ["here", "tracked", "borrowed"];
+    let before = names.map(|it| code(&db, it));
+    db.set_file_text(file, &format!("\n{LINED}"));
+    let after = names.map(|it| code(&db, it));
+    assert_eq!(after[0], before[0], "the line is read where the code runs");
+    assert_ne!(after[1], before[1], "a `#[track_caller]` function's line is its value");
+    assert_ne!(after[2], before[2], "a promoted line is its value");
 }
 
 #[test]

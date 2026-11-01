@@ -2,7 +2,7 @@
 //! `tests/ui/statics/` that give it.
 
 use super::{Ui, ui};
-use crate::tests::Mode;
+use crate::tests::{Mode, assert_reports, error, warning};
 
 #[test]
 fn static_mut_shared_parens() {
@@ -230,157 +230,6 @@ macro_rules! format {
 
 const STATIC_MUT_REFS_FLAGS: &str = "add, builtin_impls, coerce_unsized, fmt, index, slice, unsize";
 
-/// `static-mut-refs.e2021.stderr`.
-const STATIC_MUT_REFS_E2021: &str = r##"warning: creating a shared reference to mutable static
-  --> $DIR/static-mut-refs.rs:38:18
-   |
-LL |         let _y = &X;
-   |                  ^^ shared reference to mutable static
-   |
-   = note: shared references to mutable statics are dangerous; it's undefined behavior if the static is mutated or if a mutable reference is created for it while the shared reference lives
-   = note: for more information, see <https://doc.rust-lang.org/edition-guide/rust-2024/static-mut-references.html>
-   = note: `#[warn(static_mut_refs)]` (part of `#[warn(rust_2024_compatibility)]`) on by default
-help: use `&raw const` instead to create a raw pointer
-   |
-LL |         let _y = &raw const X;
-   |                   +++++++++
-
-warning: creating a mutable reference to mutable static
-  --> $DIR/static-mut-refs.rs:42:18
-   |
-LL |         let _y = &mut X;
-   |                  ^^^^^^ mutable reference to mutable static
-   |
-   = note: mutable references to mutable statics are dangerous; it's undefined behavior if any other pointer to the static is used or if any other reference is created for the static while the mutable reference lives
-   = note: for more information, see <https://doc.rust-lang.org/edition-guide/rust-2024/static-mut-references.html>
-help: use `&raw mut` instead to create a raw pointer
-   |
-LL |         let _y = &raw mut X;
-   |                   +++
-
-warning: creating a shared reference to mutable static
-  --> $DIR/static-mut-refs.rs:50:22
-   |
-LL |         let ref _a = X;
-   |                      ^ shared reference to mutable static
-   |
-   = note: shared references to mutable statics are dangerous; it's undefined behavior if the static is mutated or if a mutable reference is created for it while the shared reference lives
-   = help: use a type that relies on "interior mutability" instead; to read more on this, visit <https://doc.rust-lang.org/reference/interior-mutability.html>
-   = note: for more information, see <https://doc.rust-lang.org/edition-guide/rust-2024/static-mut-references.html>
-
-warning: creating a shared reference to mutable static
-  --> $DIR/static-mut-refs.rs:54:25
-   |
-LL |         let (_b, _c) = (&X, &Y);
-   |                         ^^ shared reference to mutable static
-   |
-   = note: shared references to mutable statics are dangerous; it's undefined behavior if the static is mutated or if a mutable reference is created for it while the shared reference lives
-   = note: for more information, see <https://doc.rust-lang.org/edition-guide/rust-2024/static-mut-references.html>
-help: use `&raw const` instead to create a raw pointer
-   |
-LL |         let (_b, _c) = (&raw const X, &Y);
-   |                          +++++++++
-
-warning: creating a shared reference to mutable static
-  --> $DIR/static-mut-refs.rs:54:29
-   |
-LL |         let (_b, _c) = (&X, &Y);
-   |                             ^^ shared reference to mutable static
-   |
-   = note: shared references to mutable statics are dangerous; it's undefined behavior if the static is mutated or if a mutable reference is created for it while the shared reference lives
-   = note: for more information, see <https://doc.rust-lang.org/edition-guide/rust-2024/static-mut-references.html>
-help: use `&raw const` instead to create a raw pointer
-   |
-LL |         let (_b, _c) = (&X, &raw const Y);
-   |                              +++++++++
-
-warning: creating a shared reference to mutable static
-  --> $DIR/static-mut-refs.rs:60:13
-   |
-LL |         foo(&X);
-   |             ^^ shared reference to mutable static
-   |
-   = note: shared references to mutable statics are dangerous; it's undefined behavior if the static is mutated or if a mutable reference is created for it while the shared reference lives
-   = note: for more information, see <https://doc.rust-lang.org/edition-guide/rust-2024/static-mut-references.html>
-help: use `&raw const` instead to create a raw pointer
-   |
-LL |         foo(&raw const X);
-   |              +++++++++
-
-warning: creating a shared reference to mutable static
-  --> $DIR/static-mut-refs.rs:66:17
-   |
-LL |         let _ = Z.len();
-   |                 ^^^^^^^ shared reference to mutable static
-   |
-   = note: shared references to mutable statics are dangerous; it's undefined behavior if the static is mutated or if a mutable reference is created for it while the shared reference lives
-   = help: use a type that relies on "interior mutability" instead; to read more on this, visit <https://doc.rust-lang.org/reference/interior-mutability.html>
-   = note: for more information, see <https://doc.rust-lang.org/edition-guide/rust-2024/static-mut-references.html>
-
-warning: creating a shared reference to mutable static
-  --> $DIR/static-mut-refs.rs:72:33
-   |
-LL |         let _ = format!("{:?}", Z);
-   |                                 ^ shared reference to mutable static
-   |
-   = note: shared references to mutable statics are dangerous; it's undefined behavior if the static is mutated or if a mutable reference is created for it while the shared reference lives
-   = help: use a type that relies on "interior mutability" instead; to read more on this, visit <https://doc.rust-lang.org/reference/interior-mutability.html>
-   = note: for more information, see <https://doc.rust-lang.org/edition-guide/rust-2024/static-mut-references.html>
-
-warning: creating a shared reference to mutable static
-  --> $DIR/static-mut-refs.rs:76:18
-   |
-LL |         let _v = &A.value;
-   |                  ^^^^^^^^ shared reference to mutable static
-   |
-   = note: shared references to mutable statics are dangerous; it's undefined behavior if the static is mutated or if a mutable reference is created for it while the shared reference lives
-   = note: for more information, see <https://doc.rust-lang.org/edition-guide/rust-2024/static-mut-references.html>
-help: use `&raw const` instead to create a raw pointer
-   |
-LL |         let _v = &raw const A.value;
-   |                   +++++++++
-
-warning: creating a shared reference to mutable static
-  --> $DIR/static-mut-refs.rs:80:18
-   |
-LL |         let _s = &A.s.value;
-   |                  ^^^^^^^^^^ shared reference to mutable static
-   |
-   = note: shared references to mutable statics are dangerous; it's undefined behavior if the static is mutated or if a mutable reference is created for it while the shared reference lives
-   = note: for more information, see <https://doc.rust-lang.org/edition-guide/rust-2024/static-mut-references.html>
-help: use `&raw const` instead to create a raw pointer
-   |
-LL |         let _s = &raw const A.s.value;
-   |                   +++++++++
-
-warning: creating a shared reference to mutable static
-  --> $DIR/static-mut-refs.rs:84:22
-   |
-LL |         let ref _v = A.value;
-   |                      ^^^^^^^ shared reference to mutable static
-   |
-   = note: shared references to mutable statics are dangerous; it's undefined behavior if the static is mutated or if a mutable reference is created for it while the shared reference lives
-   = help: use a type that relies on "interior mutability" instead; to read more on this, visit <https://doc.rust-lang.org/reference/interior-mutability.html>
-   = note: for more information, see <https://doc.rust-lang.org/edition-guide/rust-2024/static-mut-references.html>
-
-warning: creating a mutable reference to mutable static
-  --> $DIR/static-mut-refs.rs:14:14
-   |
-LL |         &mut ($x.0)
-   |              ^^^^^^ mutable reference to mutable static
-...
-LL |         let _x = bar!(FOO);
-   |                  --------- in this macro invocation
-   |
-   = note: mutable references to mutable statics are dangerous; it's undefined behavior if any other pointer to the static is used or if any other reference is created for the static while the mutable reference lives
-   = help: use a type that relies on "interior mutability" instead; to read more on this, visit <https://doc.rust-lang.org/reference/interior-mutability.html>
-   = note: for more information, see <https://doc.rust-lang.org/edition-guide/rust-2024/static-mut-references.html>
-   = note: this warning originates in the macro `bar` (in Nightly builds, run with -Z macro-backtrace for more info)
-
-warning: 12 warnings emitted
-
-"##;
-
 #[test]
 fn static_mut_refs_e2021() {
     let stderr = ui(Ui {
@@ -388,35 +237,58 @@ fn static_mut_refs_e2021() {
         edition: "2021",
         mode: Mode::RunPass,
         core: STATIC_MUT_REFS_FLAGS,
-        std: Some(("", FORMAT_STD)),
+        std: Some(("pub use crate::format;", FORMAT_STD)),
         source: STATIC_MUT_REFS,
         ..Ui::default()
     });
-    assert_eq!(stderr, STATIC_MUT_REFS_E2021);
+    assert_reports(
+        &stderr,
+        &[
+            warning(38, &[]),
+            warning(42, &[]),
+            warning(50, &[]),
+            warning(54, &[]),
+            warning(54, &[]),
+            warning(60, &[]),
+            warning(66, &[]),
+            warning(72, &[]),
+            warning(76, &[]),
+            warning(80, &[]),
+            warning(84, &[]),
+            warning(14, &[]),
+        ],
+    );
 }
 
-/// `static-mut-refs.e2024.stderr`: the e2021 revision's at `deny`, which is all it differs in
-/// (`diff static-mut-refs.e2021.stderr static-mut-refs.e2024.stderr`). Only the e2021 revision
-/// is `run-pass`.
+/// The e2024 revision: the e2021 revision's references, each an error, `static_mut_refs` being
+/// `deny` in edition 2024. Only the e2021 revision is `run-pass`.
 #[test]
 fn static_mut_refs_e2024() {
-    let expected = STATIC_MUT_REFS_E2021
-        .replace("warning: creating", "error: creating")
-        .replace(
-            "`#[warn(static_mut_refs)]` (part of `#[warn(rust_2024_compatibility)]`)",
-            "`#[deny(static_mut_refs)]` (part of `#[deny(rust_2024_compatibility)]`)",
-        )
-        .replace("this warning originates", "this error originates")
-        .replace("warning: 12 warnings emitted", "error: aborting due to 12 previous errors");
     let stderr = ui(Ui {
         name: "static-mut-refs.rs",
         edition: "2024",
         core: STATIC_MUT_REFS_FLAGS,
-        std: Some(("", FORMAT_STD)),
+        std: Some(("pub use crate::format;", FORMAT_STD)),
         source: STATIC_MUT_REFS,
         ..Ui::default()
     });
-    assert_eq!(stderr, expected);
+    assert_reports(
+        &stderr,
+        &[
+            error(38, &[]),
+            error(42, &[]),
+            error(50, &[]),
+            error(54, &[]),
+            error(54, &[]),
+            error(60, &[]),
+            error(66, &[]),
+            error(72, &[]),
+            error(76, &[]),
+            error(80, &[]),
+            error(84, &[]),
+            error(14, &[]),
+        ],
+    );
 }
 
 /// What of std the interior mutability tests use: `std::sync::Mutex`, as std writes it, its

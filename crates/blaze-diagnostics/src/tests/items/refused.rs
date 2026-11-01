@@ -2,7 +2,7 @@
 //! fresh variable, `pub`, `extern "C"`, no prelude) is each rustc's error, by its code and
 //! message.
 
-use crate::tests::checked;
+use crate::tests::{assert_reports, checked, error, items::ui_core};
 
 /// The crate `source`, of edition `edition` over minicore's `sized`, gives an error whose
 /// `code: message` starts with `wanted`.
@@ -81,16 +81,10 @@ fn type_lowering_errors_are_rustcs() {
 
 #[test]
 fn a_struct_path_to_something_else() {
-    refused(
-        "2021",
-        "fn g() {}\nfn main() { let _ = g {}; }\n",
-        "E0574: expected struct, variant or union type, found function `g`",
-    );
-    refused(
-        "2021",
-        "enum E { A }\nfn main() { let _ = E::C {}; }\n",
-        "E0599: no variant named `C` found for enum `E`",
-    );
+    let to_a_function = ui_core("main.rs", "2021", "sized", "fn g() {}\nfn main() { let _ = g {}; }\n");
+    assert_reports(&to_a_function, &[error(2, &["`g`", "struct"])]);
+    let to_no_variant = ui_core("main.rs", "2021", "sized", "enum E { A }\nfn main() { let _ = E::C {}; }\n");
+    assert_reports(&to_no_variant, &[error(2, &["`C`", "`E`"])]);
 }
 
 #[test]

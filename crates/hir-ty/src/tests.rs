@@ -18,6 +18,7 @@ mod lowering_errors;
 mod method_resolutions;
 mod probe_errors;
 mod qualifier_resolutions;
+mod query_span_names;
 mod ref_mut_bindings;
 mod sizedness;
 mod struct_paths;

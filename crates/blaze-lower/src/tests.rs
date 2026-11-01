@@ -354,6 +354,8 @@ fn editions_kinds_and_origins_are_cargos() {
     assert_eq!(extra.version.as_deref(), Some("0.1.0"));
     assert_eq!(extra.display_name.as_ref().map(|it| it.canonical_name().as_str().to_owned()).as_deref(), Some("b"));
     assert_eq!(krate(&built, LIB).workspace_data(db).const_eval.steps, 5000);
+    // The workspace's budget is its own crates': std's are evaluated as in every workspace.
+    assert_eq!(krate(&built, CORE).workspace_data(db).const_eval, base_db::ConstEvalBudget::default());
 }
 
 #[test]

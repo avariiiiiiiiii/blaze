@@ -970,6 +970,30 @@ pub(crate) fn cloned(id: u64) {
     }
 }
 
+/// The span `id`, still open, was given values after it was made: those of the schema's
+/// fields replace the ones it began with. A value given after the span closed is not kept.
+pub(crate) fn recorded(id: u64, values: &tracing::span::Record<'_>) {
+    if id == UNRECORDED {
+        return;
+    }
+    let Some(ring) = by_number(ring_of(id)) else { return };
+    let Some(opened) = ring.opened(id) else { return };
+    let wanted = SITES[usize::from(opened.site) - 1].get().map_or(0, |it| it.fields);
+    if wanted == 0 {
+        return;
+    }
+    let mut fields = Fields {
+        wanted,
+        krate: (opened.of >> 32) as Sym,
+        function: opened.of as Sym,
+        unit: opened.unit as Sym,
+    };
+    values.record(&mut fields);
+    let slot = &ring.open[slot_of(id)];
+    slot.of.store(u64::from(fields.krate) << 32 | u64::from(fields.function), Ordering::Relaxed);
+    slot.unit.store(u64::from(fields.unit), Ordering::Relaxed);
+}
+
 /// The site of the open span `id`.
 pub(crate) fn site_of(id: u64) -> Option<u16> {
     if id == UNRECORDED {
@@ -1571,6 +1595,42 @@ mod tests {
         read.clear();
         self::read(&mut cursor, &mut read);
         assert!(read.spans.iter().all(|it| it.thread != tid), "a cursor takes a row once");
+    }
+
+    #[test]
+    fn a_span_given_its_crate_and_function_after_it_began_has_them_in_its_row() {
+        crate::install();
+        let thread = std::thread::spawn(|| {
+            let span = tracing::info_span!(
+                target: "blaze",
+                "flight named late",
+                krate = tracing::field::Empty,
+                function = tracing::field::Empty,
+                unit = 5
+            );
+            span.record("krate", "shapes");
+            span.record("function", "shapes::area::of_square");
+            drop(span.entered());
+            let unnamed = tracing::info_span!(target: "blaze", "flight never named", function = tracing::field::Empty);
+            drop(unnamed);
+            crate::sampler::os_tid() as u32
+        });
+        let mut cursor = Cursor::default();
+        let mut read = Read::default();
+        let tid = thread.join().unwrap();
+        self::read(&mut cursor, &mut read);
+        let row = |name: &str| {
+            read.spans
+                .iter()
+                .find(|it| it.thread == tid && meta(it.site).map(|it| it.name()) == Some(name))
+                .unwrap_or_else(|| panic!("`{name}` is a row"))
+        };
+        let named = row("flight named late");
+        assert_eq!(
+            (self::name(named.krate), self::name(named.function), self::name(named.unit)),
+            (Some("shapes"), Some("shapes::area::of_square"), Some("5"))
+        );
+        assert_eq!(row("flight never named").function, 0);
     }
 
     #[test]

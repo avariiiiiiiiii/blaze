@@ -157,7 +157,7 @@ pub(crate) fn infer_body_in<'db>(
     lowering_mode: LoweringMode,
     frame: &Frame,
 ) -> InferenceResult<'db> {
-    let _p = tracing::info_span!("infer_query").entered();
+    let _p = hir_def::body_span!(db, def, "infer_query").entered();
     let resolver = def.resolver(db);
     let body = Body::of(db, def);
     let mut ctx = InferenceContext::new(
@@ -232,8 +232,17 @@ fn infer_anon_const_query<'db>(
     def: AnonConstId<'db>,
 ) -> InferenceResult<'db> {
     blaze_mem::frame::current(|frame| {
-        let _p = tracing::info_span!("infer_anon_const_query").entered();
         let loc = def.loc(db);
+        let _p = hir_def::span_names::of_anon_const(
+            db,
+            loc.owner,
+            tracing::info_span!(
+                "infer_anon_const_query",
+                krate = tracing::field::Empty,
+                function = tracing::field::Empty
+            ),
+        )
+        .entered();
         let store_owner = loc.owner;
         let store = ExpressionStore::of(db, store_owner);
 

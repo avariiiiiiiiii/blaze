@@ -154,7 +154,8 @@ pub struct World<'a, S: Steps> {
 pub struct Setup {
     /// Where an agent's build of a root no checkout has is placed: `<state>/views`.
     pub views: String,
-    /// Where the standard library's builds are placed, every workspace's: `<state>/std`.
+    /// Where the standard library's builds are placed, every workspace's and every daemon's of
+    /// this blaze build: [`super::Options::std`].
     pub std: String,
     /// The triple of the machine the daemon runs on.
     pub host: String,
@@ -2434,11 +2435,16 @@ impl<S: Steps> Jobs<S> {
                 }
             }
             Own::Write { job: id, path } | Own::Mode { job: id, path, .. } => {
+                let failed = match &done {
+                    Done::Failed(error) => {
+                        let name = &self.paths.names[path as usize];
+                        // alloc: an error, once
+                        Some(ApiError::new(format!("writing {name}: {error}"), Some(name.to_string())))
+                    }
+                    _ => None,
+                };
                 let Some(job) = self.end_placing(id, path) else { return };
-                if let Done::Failed(error) = done {
-                    let name = &self.paths.names[path as usize];
-                    // alloc: an error, once
-                    let error = ApiError::new(format!("writing {name}: {error}"), Some(name.to_string()));
+                if let Some(error) = failed {
                     job.over.get_or_insert((false, Some(error)));
                 } else if let Own::Mode { key, .. } = own {
                     self.record(w, id, path, key, true);
@@ -2916,7 +2922,7 @@ fn waits_for_program<S: Steps>(job: &Job<S>, node: NodeId) -> bool {
         return false;
     }
     let Stage::Units(build) = &job.stage else { return false };
-    let Some(compile) = build.unit(node).and_then(|run| super::unit::script::compile_of(&build.outputs.units, run)) else {
+    let Some(compile) = build.unit(node).and_then(|run| super::unit::compile_of(&build.outputs.units, run)) else {
         return false;
     };
     build.outputs.of(compile).iter().any(|path| job.busy.contains_key(path))

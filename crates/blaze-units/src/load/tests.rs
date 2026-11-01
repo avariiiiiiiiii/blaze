@@ -18,7 +18,7 @@ pub(crate) const HOST: &str = "x86_64-unknown-linux-gnu";
 pub(crate) const WS: &str = "/home/u/ws";
 pub(crate) const COMMIT: &str = "16d1ffac17ad8b739e32483ac2e65fe7e1804977";
 /// [`crate::query::BuildConfig::std`]: outside every workspace.
-pub(crate) const STD: &str = "/home/u/.cache/blaze/v2/std";
+pub(crate) const STD: &str = "/home/u/.cache/blaze/std/0b";
 const CRATES_IO: &str = "registry+https://github.com/rust-lang/crates.io-index";
 const CRATES_IO_SRC: &str = "/home/u/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f";
 const CRATES_IO_INDEX: &str = "/home/u/.cargo/registry/index/index.crates.io-1949cf8c6b5b557f";

@@ -67,6 +67,14 @@ outermost first. `?` marks a nullable column.
 | frame_grow_copies | u64? | blocks its thread's task frames moved to grow them while it was open; null when not counted or closed on another thread |
 | frame_copied_bytes | u64? | bytes those moves copied |
 
+A query span on a body names it: `infer_query`, `infer_anon_const_query`, `mir_body_query`,
+`body_query`, `body_relative_query` and `body_with_source_map_query` carry the body's crate in
+`crate` and its path in `function`. The path is `crate::module::item`, with `{block}` for a block,
+the trait or `<impl Type>` it is in, `Enum::Variant` for a discriminant, and `::{const}` for an
+anonymous const in a body. `hir_def::body_span!` writes them, and only while a subscriber records
+the span. The recorder interns each string, so a row holds a number, and also takes values
+recorded after the span began.
+
 A `Vec` in a frame grows in place while it is the frame's last block. Once something is
 allocated after it, it moves when it grows, copied whole. blaze-mem counts those moves per
 frame in two `Cell`s, on the slow path only. The frame reports them at task end

@@ -37,6 +37,7 @@ pub mod expr_store;
 pub mod hir;
 pub mod item_hash;
 pub mod resolver;
+pub mod span_names;
 pub mod upvars;
 
 pub mod nameres;

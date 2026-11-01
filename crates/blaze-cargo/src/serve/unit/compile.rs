@@ -92,7 +92,7 @@ struct RecordRef<'a> {
     made: &'a Made,
 }
 
-const RECORD: &str = "blaze v2 cargo unit record 3";
+const RECORD: &str = "blaze v2 cargo unit record 4";
 const OUTPUT: &str = "blaze v2 cargo output 1";
 /// A span table's anchor and content, as a test's selection holds it.
 const SPANS: &str = "blaze v2 cargo test spans 1";
@@ -199,7 +199,7 @@ fn work_out_key(job: &Job, unit: usize, identity: ContentId) -> Result<Key, ApiE
     // The unit, its plan and its run environment, each encoded into one buffer kept per
     // thread and hashed from it: no buffer allocated per unit once the first has grown it.
     SCRATCH.with_borrow_mut(|scratch| -> Result<(), ApiError> {
-        hash_cbor(&mut hasher, scratch, u, "unit", unit)?;
+        hash_cbor(&mut hasher, scratch, &KeyedUnit::of(job, u)?, "unit", unit)?;
         hash_cbor(&mut hasher, scratch, plan, "plan", unit)?;
         hash_cbor(&mut hasher, scratch, &runs.env, "run environment", unit)
     })?;
@@ -270,6 +270,68 @@ pub(crate) fn reached_only(job: &Job, unit: &Unit) -> Result<bool, ApiError> {
 /// nor at a path.
 pub(crate) fn capped(is_std: bool, is_member: bool, source: Option<&str>) -> bool {
     is_std || !(is_member || local(source))
+}
+
+/// A unit as its record's key hashes it: each dependency by what it is, never by its index
+/// in the graph, which another workspace's graph (or this one's after a dependency is added)
+/// gives another number. What a dependency is made from is in the identity.
+#[derive(Serialize)]
+pub(crate) struct KeyedUnit<'a> {
+    pkg_id: &'a str,
+    target: &'a blaze_units::schema::Target,
+    profile: &'a blaze_units::schema::Profile,
+    platform: &'a Option<String>,
+    mode: blaze_units::schema::Mode,
+    features: &'a [String],
+    is_std: bool,
+    dependencies: Vec<KeyedDep<'a>>,
+}
+
+#[derive(Serialize)]
+struct KeyedDep<'a> {
+    pkg_id: &'a str,
+    target: &'a str,
+    mode: blaze_units::schema::Mode,
+    platform: &'a Option<String>,
+    extern_crate_name: &'a str,
+    public: Option<bool>,
+    noprelude: Option<bool>,
+    nounused: Option<bool>,
+}
+
+impl<'a> KeyedUnit<'a> {
+    fn of(job: &'a Job, u: &'a Unit) -> Result<KeyedUnit<'a>, ApiError> {
+        KeyedUnit::among(u, |at| job.unit(at))
+    }
+
+    /// `u` of a graph whose unit `at` is `unit_at(at)`.
+    pub(crate) fn among(u: &'a Unit, unit_at: impl Fn(usize) -> Result<&'a Unit, ApiError>) -> Result<KeyedUnit<'a>, ApiError> {
+        // alloc: once per unit's key, a dependency each
+        let mut dependencies = Vec::with_capacity(u.dependencies.len());
+        for dep in &u.dependencies {
+            let on = unit_at(dep.index)?;
+            dependencies.push(KeyedDep {
+                pkg_id: &on.pkg_id,
+                target: &on.target.name,
+                mode: on.mode,
+                platform: &on.platform,
+                extern_crate_name: &dep.extern_crate_name,
+                public: dep.public,
+                noprelude: dep.noprelude,
+                nounused: dep.nounused,
+            });
+        }
+        Ok(KeyedUnit {
+            pkg_id: &u.pkg_id,
+            target: &u.target,
+            profile: &u.profile,
+            platform: &u.platform,
+            mode: u.mode,
+            features: &u.features,
+            is_std: u.is_std,
+            dependencies,
+        })
+    }
 }
 
 fn hash_cbor<T: Serialize + ?Sized>(

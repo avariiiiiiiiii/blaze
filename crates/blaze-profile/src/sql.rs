@@ -427,6 +427,13 @@ mod tests {
             assert!(batches.iter().all(|it| it.num_columns() > 0 && it.column(0).len() == it.num_rows()));
         }
 
+        for view in views::VIEWS.iter().filter(|it| it.args.iter().all(|arg| arg.default.is_some())) {
+            // alloc: a query, once a view
+            let sql = format!("SELECT count(*) AS n FROM {}", view.name);
+            run(&Query { duckdb: &duckdb, history: &dir, sql: &sql })
+                .unwrap_or_else(|error| panic!("`FROM {}` reads the view as a table: {error}", view.name));
+        }
+
         let error = run(&Query { duckdb: &duckdb, history: &dir, sql: "SELECT no_such_column FROM spans" }).unwrap_err();
         match &error {
             SqlError::Duckdb { message, script, .. } => {

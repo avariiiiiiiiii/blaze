@@ -196,3 +196,61 @@ FROM fiber_stacks
 WHERE build_id = $build
 ORDER BY high_water DESC
 LIMIT $limit
+
+-- name: utilization_per_second
+-- says: the standard utilization query: each second of a build, how many threads were busy (inside an outermost span) and the span names they were busy in, by seconds of thread time, those over 10 ms
+WITH bounds AS (
+    SELECT started_ns AS t0, started_ns + dur_ns AS t1
+    FROM builds
+    WHERE build_id = $build
+), outer_spans AS (
+    SELECT name, greatest(start_ns, t0) AS start_ns, least(start_ns + dur_ns, t1) AS end_ns, t0
+    FROM spans, bounds
+    WHERE depth = 0 AND start_ns < t1 AND start_ns + dur_ns > t0
+), seconds AS (
+    SELECT unnest(range(0, cast((t1 - t0) / 1e9 AS BIGINT) + 1)) AS second
+    FROM bounds
+), by_name AS (
+    SELECT
+        second,
+        name,
+        sum(least(end_ns, t0 + (second + 1) * 1000000000) - greatest(start_ns, t0 + second * 1000000000)) AS ns
+    FROM seconds
+    JOIN outer_spans ON start_ns < t0 + (second + 1) * 1000000000 AND end_ns > t0 + second * 1000000000
+    GROUP BY second, name
+)
+SELECT
+    seconds.second,
+    round(coalesce(sum(ns), 0) / 1e9, 2) AS busy_threads,
+    string_agg(name || ' ' || round(ns / 1e9, 2), ', ' ORDER BY ns DESC) FILTER (WHERE ns >= 10000000) AS busy_in
+FROM seconds
+LEFT JOIN by_name USING (second)
+GROUP BY seconds.second
+ORDER BY seconds.second
+
+-- name: uncovered_time
+-- says: how much of a build's wall time no thread was inside any span: what its profile cannot account for, which should stay under 5%
+WITH bounds AS (
+    SELECT started_ns AS t0, started_ns + dur_ns AS t1
+    FROM builds
+    WHERE build_id = $build
+), outer_spans AS (
+    SELECT greatest(start_ns, t0) AS start_ns, least(start_ns + dur_ns, t1) AS end_ns
+    FROM spans, bounds
+    WHERE depth = 0 AND start_ns < t1 AND start_ns + dur_ns > t0
+    UNION ALL
+    SELECT t1, t1 FROM bounds
+), swept AS (
+    SELECT
+        start_ns,
+        coalesce(
+            max(end_ns) OVER (ORDER BY start_ns, end_ns ROWS BETWEEN UNBOUNDED PRECEDING AND 1 PRECEDING),
+            (SELECT t0 FROM bounds)
+        ) AS covered_to
+    FROM outer_spans
+)
+SELECT
+    round(any_value(t1 - t0) / 1e9, 2) AS wall_s,
+    round(sum(greatest(start_ns - covered_to, 0)) / 1e9, 2) AS uncovered_s,
+    round(100 * sum(greatest(start_ns - covered_to, 0)) / any_value(t1 - t0), 1) AS uncovered_pct
+FROM swept, bounds

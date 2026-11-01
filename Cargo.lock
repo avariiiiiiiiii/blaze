@@ -2527,6 +2527,7 @@ dependencies = [
  "blaze-alloc-count",
  "blaze-dbsp",
  "blaze-format",
+ "blaze-graph",
  "blaze-ids",
  "blaze-mem",
  "blaze-phf",

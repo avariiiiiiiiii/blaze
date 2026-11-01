@@ -245,17 +245,24 @@ fn carry_scopes() {
     });
 }
 
+// Each access to `RELOCATION` or `ANONYMOUS` is a call of its own, never inlined: a job that
+// waits between two may resume on another thread, and an inlined access may reuse the address
+// of the first thread's slot (docs/v2/plan/lanes/may-suspend.md).
+
 /// The index of an id written in a [`relocating`] scope, `None` outside one.
+#[inline(never)]
 fn relocated(kind: Kind, bits: u64) -> Option<u32> {
     RELOCATION.with(|slot| slot.borrow_mut().as_mut().map(|table| table.index(kind, bits)))
 }
 
 /// Whether ids are read through a table: `Some` of what `index` names in it, `Some(None)`
 /// when it names nothing of `kind`, `None` outside a [`relocating`] scope.
+#[inline(never)]
 fn unrelocated(kind: Kind, index: u32) -> Option<Option<u64>> {
     RELOCATION.with(|slot| slot.borrow().as_ref().map(|table| table.get(kind, index)))
 }
 
+#[inline(never)]
 fn in_scope() -> bool {
     RELOCATION.with(|slot| slot.borrow().is_some())
 }
@@ -286,11 +293,13 @@ pub(crate) fn anonymous<T>(it: &mut Anonymous, f: impl FnOnce() -> T) -> T {
 }
 
 /// Whether names of bindings and labels are written empty.
+#[inline(never)]
 pub(crate) fn names_blank() -> bool {
     ANONYMOUS.with(|slot| slot.borrow().is_some())
 }
 
 /// How many leading segments of the store's path `at` are written empty.
+#[inline(never)]
 pub(crate) fn blank_segments(at: usize) -> usize {
     ANONYMOUS.with(|slot| {
         slot.borrow().as_ref().map_or(0, |it| it.blank.get(at).map_or(0, |&n| usize::from(n)))
@@ -299,6 +308,7 @@ pub(crate) fn blank_segments(at: usize) -> usize {
 
 /// The index of the lifetime `name` among the [`Anonymous::lifetimes`] of the scope this thread
 /// is in: `None` outside one, or for a name none of them has.
+#[inline(never)]
 pub(crate) fn lifetime_index(name: &Name) -> Option<u32> {
     ANONYMOUS.with(|slot| {
         let slot = slot.borrow();
@@ -308,6 +318,7 @@ pub(crate) fn lifetime_index(name: &Name) -> Option<u32> {
 }
 
 /// `f` of the [`Anonymous::slots`] of the scope this thread is in, empty outside one.
+#[inline(never)]
 pub(crate) fn with_slots<T>(f: impl FnOnce(&[u32]) -> T) -> T {
     ANONYMOUS.with(|slot| f(slot.borrow().as_ref().map_or(&[][..], |it| &it.slots[..])))
 }
@@ -1432,5 +1443,93 @@ mod tests {
     fn relocating_scopes_do_not_nest() {
         let (mut outer, mut inner) = (Relocation::new(), Relocation::new());
         relocating(&mut outer, || relocating(&mut inner, || ()));
+    }
+
+    /// On a pool of one worker, two jobs (as two derives expanding for items of their own)
+    /// each enter a relocation and an anonymous scope of their own and park in them, the first
+    /// on one key and the second on another; the keys end in the other order, so they resume
+    /// on the one thread swapped. Each reads its own scopes after its wait, and the jobs after
+    /// them none.
+    #[test]
+    fn jobs_in_scopes_of_their_own_resume_on_one_thread_in_swapped_order_in_their_own() {
+        use std::sync::{
+            Arc, Mutex,
+            atomic::{AtomicUsize, Ordering},
+            mpsc,
+        };
+
+        use blaze_graph::{Key, pool::Pool, pump::Flights, topology::Topology};
+
+        fn scopes_here() -> (Option<Option<u64>>, usize) {
+            (unrelocated(Kind::Struct, 0), blank_segments(0))
+        }
+
+        let pool = Pool::new(&Topology::flat(1), false).unwrap();
+        let flights = Arc::new(Flights::<u32>::new());
+        let run = |what: &'static str, f: Box<dyn FnOnce() + Send>| {
+            let (tx, rx) = mpsc::channel::<Result<(), String>>();
+            pool.submit(None, f, move |it| _ = tx.send(it.map_err(|_| format!("{what} panicked"))));
+            rx.recv().unwrap().unwrap();
+        };
+        for round in 0..20u32 {
+            let [first, second] = [2 * round, 2 * round + 1].map(|at| {
+                let mut bytes = [0u8; 32];
+                bytes[..4].copy_from_slice(&at.to_le_bytes());
+                bytes[4] = 2;
+                Key(bytes)
+            });
+            let (tx, rx) = mpsc::channel::<Result<u32, String>>();
+            let waiting = Arc::new(AtomicUsize::new(0));
+            let order = Arc::new(Mutex::new(Vec::new()));
+            let parked = |count: usize| {
+                while waiting.load(Ordering::SeqCst) < count {
+                    std::thread::yield_now();
+                }
+                run("the probe", Box::new(|| assert_eq!(scopes_here(), (None, 0), "a job came on in another's scopes")));
+            };
+            let job = |mine: u32, on: Key| {
+                let (flights, waiting, order, tx) = (flights.clone(), waiting.clone(), order.clone(), tx.clone());
+                pool.submit(
+                    None,
+                    move || {
+                        let own = (Some(Some(u64::from(mine) + 100)), mine as usize + 1);
+                        let mut table = Relocation::of(vec![(Kind::Struct, own.0.unwrap().unwrap())]);
+                        let mut blank = Anonymous { blank: vec![own.1 as u16], ..Anonymous::default() };
+                        relocating(&mut table, || {
+                            anonymous(&mut blank, || {
+                                assert_eq!(scopes_here(), own, "a job came on in another's scopes");
+                                waiting.fetch_add(1, Ordering::SeqCst);
+                                assert_eq!(flights.get_or_run(on, || panic!("the test holds the key")), Ok(round));
+                                assert_eq!(scopes_here(), own, "a job resumed in another's scopes");
+                            })
+                        });
+                        assert_eq!(scopes_here(), (None, 0), "a job kept scopes it left");
+                        order.lock().unwrap().push(mine);
+                        mine
+                    },
+                    move |it| _ = tx.send(it.map_err(|_| format!("job {mine} of round {round} panicked"))),
+                );
+            };
+            let held = flights.get_or_run(first, || {
+                job(0, first);
+                parked(1);
+                let held = flights.get_or_run(second, || {
+                    job(1, second);
+                    parked(2);
+                    Ok(round)
+                });
+                assert_eq!(held, Ok(round));
+                while order.lock().unwrap().is_empty() {
+                    std::thread::yield_now();
+                }
+                Ok(round)
+            });
+            assert_eq!(held, Ok(round));
+            let mut ended = [rx.recv().unwrap(), rx.recv().unwrap()];
+            ended.sort();
+            assert_eq!(ended, [Ok(0), Ok(1)]);
+            assert_eq!(*order.lock().unwrap(), [1, 0], "the jobs did not resume in the swapped order");
+            run("a later job", Box::new(|| assert_eq!(scopes_here(), (None, 0), "a job came on in its worker's scopes")));
+        }
     }
 }

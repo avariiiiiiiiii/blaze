@@ -193,6 +193,15 @@ impl<'db> SourceToDefCtx<'db, '_> {
         &self.cache.file_to_def_cache[&file]
     }
 
+    /// The first module of `file` in `krate`, whether or not `krate` is `within`.
+    pub(super) fn file_to_def_in(&mut self, krate: Crate, file: FileId) -> Option<ModuleId> {
+        let db = self.db;
+        if let Some(&module) = self.file_to_def(file).iter().find(|it| it.krate(db) == krate) {
+            return Some(module);
+        }
+        self.modules_in(std::iter::once(krate), file).first().copied()
+    }
+
     fn modules_in(
         &mut self,
         crates: impl Iterator<Item = Crate>,

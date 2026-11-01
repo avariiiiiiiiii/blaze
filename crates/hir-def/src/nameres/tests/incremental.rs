@@ -288,6 +288,7 @@ fn f() { foo }
                 "file_item_tree_query",
                 "HirFileId::ast_id_map",
                 "real_span_map",
+                "deferred_item_shape",
                 "MacroCallId::macro_arg",
                 "EditionedFileId::parse_errors",
                 "MacroCallId::parse_macro_expansion",
@@ -393,6 +394,7 @@ pub struct S {}
                 "MacroCallId::macro_arg",
                 "AstId::decl_macro_expander",
                 "MacroCallId::macro_arg",
+                "deferred_item_shape",
                 "MacroCallId::macro_arg",
                 "EditionedFileId::parse_errors",
             ]

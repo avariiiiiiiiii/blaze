@@ -317,7 +317,7 @@ fn resolve_one<'db, 'f, S: Sink<'db>, A: Allocator + Clone>(
                 return Resolved::Yes;
             }
         }
-        MacroOpKind::Attr { ast_id: file_ast_id, mod_item, attr_id, attr, tree } => {
+        MacroOpKind::Attr { ast_id: file_ast_id, mod_item, attr_id, attr, tree, .. } => {
             let &AstIdWithPath { ast_id, ref path } = file_ast_id;
             let file_id = ast_id.file_id;
             let recollect_without = |sink: &mut S, side: &mut SideTables<A>, added: &mut FrameVec<'f, MacroOp>| {
@@ -688,7 +688,7 @@ pub(crate) fn reseed_at<'db, 'f, S: Sink<'db>, A: Allocator + Clone>(
     let at = index as usize;
     let directive = &pending[at];
     let &MacroOp { module, depth, container, .. } = directive;
-    let MacroOpKind::Attr { ast_id, attr_id, attr, mod_item, tree } = &directive.kind else {
+    let MacroOpKind::Attr { ast_id, attr_id, attr, mod_item, tree, .. } = &directive.kind else {
         panic!("nameres facts: the reseed of {module:?} names directive {at}, which is not an attribute")
     };
     let (mod_item, tree, attr_id) = (*mod_item, *tree, *attr_id);

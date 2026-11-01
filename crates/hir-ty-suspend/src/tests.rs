@@ -119,7 +119,7 @@ impl Drop for Plain {
 #[track_caller]
 fn check(x: &str, test: impl FnOnce(&Db, &Found)) {
     // alloc: a test's fixture text
-    let db = fixture::db(&format!("{ENGINE}{x}")).into_db();
+    let db = &fixture::db(&format!("{ENGINE}{x}")).into_db();
     hir_ty::attach_db(db, || test(db, suspend_check(db, crate_named(db, "x"))));
 }
 
@@ -195,8 +195,7 @@ fn the_same_guard_dropped_before_the_call_is_accepted() {
 use engine::Db;
 
 pub fn released(db: &Db) -> u32 {
-    let mut guard = engine::lock();
-    guard.push(1);
+    let guard = engine::lock();
     engine::release(guard);
     db.variance(1)
 }
@@ -211,6 +210,30 @@ pub fn scoped(db: &Db) -> u32 {
 "#,
         |_, found| {
             nothing(found);
+        },
+    );
+}
+
+/// rustc's coroutine transform keeps a local's storage once it was borrowed, until its scope
+/// ends, even after it is moved out: the check holds it the same way.
+#[test]
+fn a_guard_borrowed_then_moved_away_is_held_until_its_scope_ends() {
+    check(
+        r#"
+//- /x.rs crate:x deps:engine
+use engine::Db;
+
+pub fn borrowed_then_released(db: &Db) -> u32 {
+    let mut guard = engine::lock();
+    guard.push(1);
+    engine::release(guard);
+    db.variance(1)
+}
+"#,
+        |db, found| {
+            let held = one_held(found);
+            assert_eq!(owner_name(db, held), "borrowed_then_released");
+            assert_eq!(binding_name(db, held), "guard");
         },
     );
 }
@@ -480,6 +503,7 @@ pub fn f() -> u32 {
 "#,
     )
     .into_db();
+    let db = &db;
     hir_ty::attach_db(db, || {
         let krate = crate_named(db, "x");
         assert!(roots(db, krate).is_empty(), "no root without `corosensei`");

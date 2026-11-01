@@ -219,12 +219,11 @@ pub(crate) fn outside<T>(f: impl FnOnce() -> T) -> T {
 
     impl Drop for Restore {
         fn drop(&mut self) {
-            let table = self.0.take();
-            TABLE.with(|slot| *slot.borrow_mut() = table);
+            replace_table(self.0.take());
         }
     }
 
-    match TABLE.with(|slot| slot.borrow_mut().take()) {
+    match replace_table(None) {
         None => f(),
         Some(table) => {
             let _restore = Restore(Some(table));
@@ -233,15 +232,25 @@ pub(crate) fn outside<T>(f: impl FnOnce() -> T) -> T {
     }
 }
 
+// Each access to `TABLE` is a call of its own, never inlined: a job that waits between two may
+// resume on another thread, and an inlined access may reuse the address of the first thread's
+// slot (docs/v2/plan/lanes/may-suspend.md).
+
+#[inline(never)]
+fn replace_table(table: Option<Table>) -> Option<Table> {
+    TABLE.with(|slot| std::mem::replace(&mut *slot.borrow_mut(), table))
+}
+
 /// Whether this thread is in a [`relocating`] scope: a reader puts back in this database's
 /// order what the writer's ids ordered.
+#[inline(never)]
 pub(crate) fn in_scope() -> bool {
     TABLE.with(|slot| slot.borrow().is_some())
 }
 
 /// The bits written for `id`: its index in the scope's table plus one, or its own bits
 /// outside a scope.
-#[inline]
+#[inline(never)]
 pub(crate) fn id_bits<T: Relocate>(id: T) -> u64 {
     let id = id.as_id();
     TABLE.with(|slot| match slot.borrow_mut().as_mut() {
@@ -257,7 +266,7 @@ pub(crate) fn id_bits<T: Relocate>(id: T) -> u64 {
 
 /// The id `bits` name, as [`id_bits`] wrote them: `None` for 0, and in a scope for an index
 /// the table has no id of `T`'s kind at.
-#[inline]
+#[inline(never)]
 pub(crate) fn id_of<T: Relocate>(bits: u64) -> Option<T> {
     if bits as u32 == 0 {
         return None;

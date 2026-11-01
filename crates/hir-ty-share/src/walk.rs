@@ -34,7 +34,7 @@ use std::hash::Hash as _;
 
 use base_db::Db;
 use blaze_ids::{ContentId, Hasher};
-use blaze_items::{ItemId, closure_code, code_hash, coroutine_code, interface_hash, item_key};
+use blaze_items::{ItemId, closure_code, code_hash, coroutine_code, interface_hash, item_key, key};
 use either::Either;
 use hir_def::{
     CallableDefId, FunctionId, HasModule, ItemContainerId, Lookup, hir::ExprId,
@@ -1012,6 +1012,11 @@ impl<'a, 'db> Walk<'a, 'db> {
         if let Some(func) = func {
             let item = ItemId::Function(func);
             h.id(&item_key(db, item).0).id(&interface_hash(db, item).map_err(identity::unhashable(db))?.0);
+        }
+        // Which closure, as its parent's arguments are all a closure of a body with no
+        // generics has: two closures of one signature are two callees.
+        if let ShareDef::Closure(id) = def {
+            h.id(&key::closure_key(db, InternedClosureId::from_id(id)).0);
         }
         let generic = args.iter().any(|arg| !matches!(arg.kind(), GenericArgKind::Lifetime(_)));
         if !generic {

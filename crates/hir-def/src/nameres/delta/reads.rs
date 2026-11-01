@@ -27,8 +27,26 @@ thread_local! {
     static READS: RefCell<Vec<Read>> = const { RefCell::new(Vec::new()) }; // alloc: empty, grown once per thread and kept
 }
 
+// Each access to `ON`, `READER` or `READS` is in a function of its own, never inlined: a run
+// that waits between two may resume on another thread, and an inlined access may reuse the
+// address of the first thread's slot (docs/v2/plan/lanes/may-suspend.md).
+
+/// The name a glob of an enum is noted reading in the enum's module, `(module, Some(it))`:
+/// no binding has it, so a glob of the module (`(module, None)`) is not woken with the
+/// enum's globs, and only a write touching an enum there wakes them (`delta::enum_glob_wakes`).
+pub(crate) fn enum_glob() -> Name {
+    Name::new_symbol_root(intern::Symbol::intern("{enum glob}"))
+}
+
+/// The name an import of a trait's items (`use Trait::item`, `use Trait::*`) is noted reading
+/// in the trait's module, as [`enum_glob`] for an enum's variants: an item is no binding of the
+/// module, and a write touching the trait wakes them (`delta::enum_glob_wakes`).
+pub(crate) fn trait_import() -> Name {
+    Name::new_symbol_root(intern::Symbol::intern("{trait import}"))
+}
+
 /// Notes a read of `module` (of `name` in it, or of the module whole).
-#[inline]
+#[inline(never)]
 pub(crate) fn note(module: ModuleId, name: Option<Name>) {
     if ON.get() {
         let reader = READER.get();
@@ -38,7 +56,7 @@ pub(crate) fn note(module: ModuleId, name: Option<Name>) {
 }
 
 /// Whether a run is capturing on this thread: a published scope notes its reads only then.
-#[inline]
+#[inline(never)]
 pub(crate) fn on() -> bool {
     ON.get()
 }
@@ -51,15 +69,20 @@ pub(crate) struct Reading {
 
 impl Drop for Reading {
     fn drop(&mut self) {
-        READER.set(self.before);
+        replace_reader(self.before);
     }
+}
+
+#[inline(never)]
+fn replace_reader(reader: Option<ModuleId>) -> Option<ModuleId> {
+    READER.replace(reader)
 }
 
 /// Reads from now until the guard drops are `module`'s.
 #[inline]
 pub(crate) fn reading(module: ModuleId) -> Reading {
     carry_capture();
-    Reading { before: READER.replace(Some(module)) }
+    Reading { before: replace_reader(Some(module)) }
 }
 
 /// Carries [`ON`], [`READER`] and [`READS`] with each job on a fiber across its waits
@@ -85,25 +108,61 @@ fn carry_capture() {
 }
 
 /// Runs `f`, then moves what it read to the end of `into` (with repeats; the caller sorts).
-/// A panic in `f` leaves capturing off and the list empty.
+/// A panic in `f` leaves capturing off and the list empty. A run that starts on a thread where
+/// another captures (one crate's job that a wait of another crate's pumped onto its stack)
+/// captures into a list of its own, and the other's capture is back when it ends.
 pub(super) fn capture<R>(into: &mut Vec<Read>, f: impl FnOnce() -> R) -> R {
-    struct Off;
-    impl Drop for Off {
+    struct Restore(Option<Outer>);
+    impl Drop for Restore {
         fn drop(&mut self) {
-            ON.set(false);
-            READER.set(None);
-            READS.with_borrow_mut(|it| it.clear());
+            restore_capture(self.0.take());
         }
     }
     carry_capture();
-    assert!(!ON.get(), "nameres delta: a maintainer run inside another");
+    let restore = Restore(start_capture());
+    let out = f();
+    end_capture(into);
+    drop(restore);
+    out
+}
+
+/// The capture a nested run put aside.
+struct Outer {
+    reader: Option<ModuleId>,
+    reads: Vec<Read>,
+}
+
+#[inline(never)]
+fn start_capture() -> Option<Outer> {
+    let outer = ON.get().then(|| Outer {
+        reader: READER.get(),
+        // alloc: none, the outer run's list moved aside with its capacity
+        reads: READS.with_borrow_mut(std::mem::take),
+    });
     READS.with_borrow_mut(|it| it.clear());
     READER.set(None);
     ON.set(true);
-    let off = Off;
-    let out = f();
+    outer
+}
+
+#[inline(never)]
+fn end_capture(into: &mut Vec<Read>) {
     ON.set(false);
     READS.with_borrow_mut(|it| into.append(it));
-    drop(off);
-    out
+}
+
+#[inline(never)]
+fn restore_capture(outer: Option<Outer>) {
+    READS.with_borrow_mut(|it| it.clear());
+    match outer {
+        Some(Outer { reader, reads }) => {
+            READS.set(reads);
+            READER.set(reader);
+            ON.set(true);
+        }
+        None => {
+            ON.set(false);
+            READER.set(None);
+        }
+    }
 }

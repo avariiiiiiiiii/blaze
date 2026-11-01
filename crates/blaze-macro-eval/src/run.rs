@@ -145,28 +145,33 @@ struct Host<'r, 'e> {
 }
 
 /// The evaluator's memory as a shim reaches it.
-struct Memory<'a, 'db>(&'a mut Evaluator<'db>);
+struct Memory<'a, 'db> {
+    db: &'a Db,
+    eval: &'a mut Evaluator<'db>,
+}
 
-fn stop_of(error: MirEvalError<'_>) -> Stop {
+/// `error` as the expansion's error. Its types print through the attached database, so it is
+/// rendered with `db` attached: the caller may run outside any attach (the daemon's loop).
+pub(crate) fn stop_of(db: &Db, error: MirEvalError<'_>) -> Stop {
     // alloc: error path
-    Stop(format!("stopped in the evaluator: {error:?}"))
+    hir_ty::attach_db(db, || Stop(format!("stopped in the evaluator: {error:?}")))
 }
 
 impl Guest for Memory<'_, '_> {
     fn read(&self, addr: u64, len: usize) -> Result<&[u8], Stop> {
-        self.0.read_bytes(addr, len).map_err(stop_of)
+        self.eval.read_bytes(addr, len).map_err(|e| stop_of(self.db, e))
     }
 
     fn write(&mut self, addr: u64, bytes: &[u8]) -> Result<(), Stop> {
-        self.0.write_bytes(addr, bytes).map_err(stop_of)
+        self.eval.write_bytes(addr, bytes).map_err(|e| stop_of(self.db, e))
     }
 
     fn set_errno(&mut self, code: i32) -> Result<(), Stop> {
-        self.0.set_errno(code).map_err(stop_of)
+        self.eval.set_errno(code).map_err(|e| stop_of(self.db, e))
     }
 
     fn alloc(&mut self, bytes: &[u8], align: usize) -> Result<u64, Stop> {
-        self.0.alloc_bytes(bytes, align).map_err(stop_of)
+        self.eval.alloc_bytes(bytes, align).map_err(|e| stop_of(self.db, e))
     }
 }
 
@@ -187,16 +192,16 @@ fn set_word(bytes: &mut [u8], word: usize, n: usize, value: u64) {
 
 /// The buffer `buffer` (its five words' bytes) made to hold `bytes` and nothing else: grown
 /// by its own `reserve` when it is too small, as the client's `extend_from_slice` grows it.
-fn fill(eval: &mut Evaluator<'_>, buffer: &mut Vec<u8>, word: usize, bytes: &[u8]) -> Result<(), Stop> {
+fn fill(db: &Db, eval: &mut Evaluator<'_>, buffer: &mut Vec<u8>, word: usize, bytes: &[u8]) -> Result<(), Stop> {
     set_word(buffer, word, 1, 0);
     if (word_at(buffer, word, 2)? as usize) < bytes.len() {
         let reserve = buffer[3 * word..4 * word].to_vec(); // alloc: a growth, once per buffer too small
         let additional = (bytes.len() as u64).to_le_bytes();
-        *buffer = eval.call_pointer(&reserve, &[buffer, &additional[..word]]).map_err(stop_of)?;
+        *buffer = eval.call_pointer(&reserve, &[buffer, &additional[..word]]).map_err(|e| stop_of(db, e))?;
     }
     let data = word_at(buffer, word, 0)?;
     if !bytes.is_empty() {
-        eval.write_bytes(data, bytes).map_err(stop_of)?;
+        eval.write_bytes(data, bytes).map_err(|e| stop_of(db, e))?;
     }
     set_word(buffer, word, 1, bytes.len() as u64);
     Ok(())
@@ -216,13 +221,13 @@ impl<'r, 'e> Host<'r, 'e> {
             let word = state.word;
             let (data, len) = (word_at(buffer, word, 0)?, word_at(buffer, word, 1)?);
             let len = usize::try_from(len).map_err(|_| Stop("sent a request longer than memory".to_owned()))?; // alloc: error path
-            let request = eval.read_bytes(data, len).map_err(stop_of)?;
+            let request = eval.read_bytes(data, len).map_err(|e| stop_of(self.db, e))?;
             let mut reply = std::mem::take(&mut state.reply);
             let answered = state.server.dispatch(self.db, request, &mut reply);
             (word, reply, answered)
         };
         let mut buffer = buffer.to_vec(); // alloc: the five words of the reply's buffer
-        let filled = answered.and_then(|()| fill(eval, &mut buffer, word, &reply));
+        let filled = answered.and_then(|()| fill(self.db, eval, &mut buffer, word, &reply));
         reply.clear();
         self.state.borrow_mut().reply = reply;
         filled?;
@@ -263,7 +268,7 @@ impl<'db, 'r: 'db, 'e: 'db> Foreign<'db> for Host<'r, 'e> {
             let mut state = self.state.borrow_mut();
             let state = &mut *state;
             match state.shims.get(&func) {
-                Some(&shim) => state.os.call(shim, &mut Memory(eval), args, ret).map(|answer| match answer {
+                Some(&shim) => state.os.call(shim, &mut Memory { db: self.db, eval }, args, ret).map(|answer| match answer {
                     Answer::Answered => Claimed::Answered,
                     Answer::Evaluator => Claimed::Declined,
                 }),
@@ -322,7 +327,7 @@ fn evaluate(
         word: 8,
     });
     // The evaluator's error borrows the state; made a `Stop` before the state is taken back.
-    let output = on_evaluator(db, bridge, &state, preset, expansions).map_err(stop_of);
+    let output = on_evaluator(db, bridge, &state, preset, expansions).map_err(|e| stop_of(db, e));
     let state = state.into_inner();
     let (output, statics) = match (output, state.stop) {
         (Ok(it), _) => it,
@@ -400,7 +405,7 @@ fn on_evaluator<'db>(
             state.word = word;
             state.server.input(expansion.inputs, &mut input);
         }
-        if let Err(stop) = fill(&mut eval, &mut buffer, word, &input) {
+        if let Err(stop) = fill(db, &mut eval, &mut buffer, word, &input) {
             state.borrow_mut().stop.get_or_insert(stop);
             return Err(MirEvalError::MachineStop);
         }
@@ -460,3 +465,6 @@ pub(crate) fn functions(db: &Db, krate: Crate) -> Vec<(Symbol, hir_expand::proc_
     }
     out
 }
+
+#[cfg(test)]
+mod tests;

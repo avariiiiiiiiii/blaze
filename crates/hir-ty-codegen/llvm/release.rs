@@ -612,6 +612,7 @@ pub(crate) fn compile(
     profiled: Option<&str>,
     features: Features,
 ) -> Result<(Code, Covered, Option<Counted>), Unhandled> {
+    let _span = tracing::info_span!(target: "blaze", "llvm compile").entered();
     let tally = Tally::global();
     // Where a parameter is the only way to its memory, as `compiled` wraps it.
     let wrapped = optimization.pipeline().is_some()

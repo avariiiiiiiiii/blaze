@@ -164,7 +164,7 @@ fn linked(db: &Db, krate: Crate) -> Result<Vec<NativeLib>, String> {
 /// Every span table `built` names, encoded: of each body and function declaration of its
 /// items whose anchor its code names. An anchor of no table found is an error naming it.
 fn span_tables(db: &Db, hashes: &HashSource, built: &Built) -> Result<Vec<(ContentId, Vec<u8>)>, String> {
-    tables(db, hashes, &built.items, named_anchors(built))
+    tables(db, hashes, &built.items, named_anchors(built), &built.debug_names)
 }
 
 /// The span tables of `items` that `named` lists, encoded as the linker's `SpanTable::decode`
@@ -177,22 +177,33 @@ pub fn span_tables_of(
     named: impl IntoIterator<Item = ContentId>,
 ) -> Result<Vec<(ContentId, Vec<u8>)>, String> {
     // alloc: per call, the anchors asked for
-    tables(db, hashes, items, named.into_iter().map(|it| (it, NamedBy::Caller)).collect())
+    tables(db, hashes, items, named.into_iter().map(|it| (it, NamedBy::Caller)).collect(), &[])
 }
 
+/// The span tables of `items` that `named` lists; `debug_names` gives an error the name of
+/// a function that names an anchor of none.
 fn tables(
     db: &Db,
     hashes: &HashSource,
     items: &[ItemKey],
     mut named: FxHashMap<ContentId, NamedBy>,
+    debug_names: &[(InstanceKey, String)],
 ) -> Result<Vec<(ContentId, Vec<u8>)>, String> {
     let mut names: FxHashMap<base_db::FileId, String> = FxHashMap::default();
     // alloc: per link, a table the code names each
     let mut spans = Vec::with_capacity(named.len());
     let mut owners: FxHashSet<DefWithBodyId> = FxHashSet::default();
     let mut declared: FxHashSet<FunctionId> = FxHashSet::default();
+    // An `asm!` function's and the allocator shim's items are of no crate of the database.
+    let mut unresolved: Option<(usize, ItemKey)> = None;
     for &item in items {
-        let owner = match blaze_items::resolve(db, item) {
+        let resolved = blaze_items::resolve(db, item);
+        if resolved.is_none() {
+            let (count, least) = unresolved.get_or_insert((0, item));
+            *count += 1;
+            *least = (*least).min(item);
+        }
+        let owner = match resolved {
             Some(Resolved::Item(ItemId::Function(func))) => {
                 declared.insert(func);
                 DefWithBodyId::FunctionId(func)
@@ -229,11 +240,27 @@ fn tables(
         }
     }
     if let Some((anchor, by)) = named.iter().min_by_key(|it| *it.0) {
+        let name = match by {
+            NamedBy::Function { key, .. } => debug_names.iter().find(|it| it.0 == *key).map(|it| it.1.as_str()),
+            NamedBy::Static(_) | NamedBy::Caller => None,
+        };
+        // alloc: an error
+        let name = name.map_or_else(String::new, |it| format!(" `{it}`"));
+        let unresolved = match unresolved {
+            // alloc: an error
+            Some((count, least)) => format!(
+                "; {count} of the build's {} items resolve to no item of the database, among them \
+                 {least:?}",
+                items.len()
+            ),
+            None => String::new(),
+        };
         // alloc: an error
         return Err(format!(
-            "{} span tables named by the code are of no body or declaration of the build's \
-             items, among them {anchor:?}, named by {by}",
-            named.len()
+            "{} span tables named by the code are of no body or declaration of the build's {} \
+             items, among them {anchor:?}, named by {by}{name}{unresolved}",
+            named.len(),
+            items.len()
         ));
     }
     spans.sort_unstable_by_key(|it| it.0);
@@ -251,10 +278,12 @@ fn named_anchors(built: &Built) -> FxHashMap<ContentId, NamedBy> {
     }
     let mut named: FxHashMap<ContentId, NamedBy> = FxHashMap::default();
     for function in &built.functions {
-        let data = function.data.iter().flat_map(|it| named_in(it.relocs.targets()));
-        let lines = function.lines.iter().map(|it| it.span.anchor);
-        for anchor in named_in(function.relocs.targets()).chain(data).chain(lines) {
-            named.entry(anchor).or_insert(NamedBy::Function(function.key));
+        let by = |what: &'static str| move |anchor: ContentId| (anchor, NamedBy::Function { key: function.key, what });
+        let code = named_in(function.relocs.targets()).map(by("a position in"));
+        let data = function.data.iter().flat_map(|it| named_in(it.relocs.targets())).map(by("the data of"));
+        let lines = function.lines.iter().map(|it| it.span.anchor).map(by("a line row of"));
+        for (anchor, by) in code.chain(data).chain(lines) {
+            named.entry(anchor).or_insert(by);
         }
     }
     for static_ in &built.statics {
@@ -273,7 +302,8 @@ fn named_anchors(built: &Built) -> FxHashMap<ContentId, NamedBy> {
 /// What names an anchor first, for an error.
 #[derive(Clone, Copy, Debug)]
 enum NamedBy {
-    Function(InstanceKey),
+    /// `what` says where in the function: its code, its data or its line rows.
+    Function { key: InstanceKey, what: &'static str },
     Static(ItemKey),
     /// The caller of [`span_tables_of`], which named it.
     Caller,
@@ -282,7 +312,7 @@ enum NamedBy {
 impl std::fmt::Display for NamedBy {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            NamedBy::Function(key) => write!(f, "the function {key:?}"),
+            NamedBy::Function { key, what } => write!(f, "{what} the function {key:?}"),
             NamedBy::Static(item) => write!(f, "the static {item:?}"),
             NamedBy::Caller => f.write_str("the caller"),
         }

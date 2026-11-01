@@ -278,6 +278,9 @@ pub(crate) fn topological(units: &Units, whats: &[String], after: &[Vec<usize>])
 
 /// `unit`'s dependency on `on` (whose crate is `krate`) by the name its code calls it: in the
 /// extern prelude unless cargo passes it `noprelude` (build-std's standard library crates).
+/// A proc macro's `proc_macro` is in it: cargo passes a proc-macro target `--extern
+/// proc_macro` beside build-std's `noprelude` one, and rustc puts a crate in the extern prelude
+/// when any `--extern` naming it is not `noprelude`.
 pub(crate) fn dependency(
     unit: &Unit,
     on: &Unit,
@@ -288,7 +291,8 @@ pub(crate) fn dependency(
     let name = CrateName::new(&dep.extern_crate_name).map_err(|_| {
         LowerError::at(format!("`{}` is not a crate's name", dep.extern_crate_name), what)
     })?;
-    let prelude = !dep.noprelude.unwrap_or(false);
+    let prelude = !dep.noprelude.unwrap_or(false)
+        || (unit.target.is_proc_macro() && dep.extern_crate_name == "proc_macro");
     Ok(BuiltDependency::with_prelude(name, krate, prelude, on.is_std && !unit.is_std))
 }
 

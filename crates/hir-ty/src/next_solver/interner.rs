@@ -1595,7 +1595,7 @@ impl<'db> Interner for DbInterner<'db> {
         self,
         def_id: Self::FunctionId,
     ) -> EarlyBinder<Self, rustc_type_ir::Binder<Self, rustc_type_ir::FnSig<Self>>> {
-        self.db().callable_item_signature(def_id.0)
+        crate::lower::solver_fn_sig(self.db(), def_id.0)
     }
 
     fn coroutine_movability(self, def_id: Self::CoroutineId) -> rustc_ast_ir::Movability {
@@ -3078,13 +3078,13 @@ mod tls_db {
                 #[inline]
                 fn drop(&mut self) {
                     if self.set {
-                        GLOBAL_DB.with(|it| it.database.set(None));
+                        replace_attached(None);
                     }
                 }
             }
 
             let new_db = NonNull::from(db);
-            let set = GLOBAL_DB.with(|it| match it.database.get() {
+            let set = match attached() {
                 Some(current_db) => {
                     if !std::ptr::addr_eq(current_db.as_ptr(), new_db.as_ptr()) {
                         panic!(
@@ -3095,10 +3095,10 @@ mod tls_db {
                     false
                 }
                 None => {
-                    it.database.set(Some(new_db));
+                    replace_attached(Some(new_db));
                     true
                 }
-            });
+            };
             let _guard = DbGuard { set };
             op()
         }
@@ -3113,19 +3113,17 @@ mod tls_db {
             impl Drop for DbGuard {
                 #[inline]
                 fn drop(&mut self) {
-                    GLOBAL_DB.with(|it| it.database.set(self.prev));
+                    replace_attached(self.prev);
                 }
             }
 
-            let _guard = DbGuard { prev: GLOBAL_DB.with(|it| it.database.replace(Some(NonNull::from(db)))) };
+            let _guard = DbGuard { prev: replace_attached(Some(NonNull::from(db))) };
             op()
         }
 
         #[inline]
         fn with<R>(op: impl FnOnce(&Db) -> R) -> R {
-            let db = GLOBAL_DB
-                .with(|it| it.database.get())
-                .expect("Tried to use attached db, but no db is attached");
+            let db = attached().expect("Tried to use attached db, but no db is attached");
 
             // SAFETY: `database` holds a pointer only while the `DbGuard` that set it is alive,
             // which borrows the database for that long and puts back the pointer before it on
@@ -3137,6 +3135,22 @@ mod tls_db {
 
     thread_local! {
         static GLOBAL_DB: Attached = const { Attached { database: Cell::new(None) } };
+    }
+
+    // Every access to `GLOBAL_DB` is one of these two, never inlined: a job that waits between
+    // two of them may resume on another thread, and an inlined access may reuse the address of
+    // the first thread's slot (docs/v2/plan/lanes/may-suspend.md).
+
+    /// The database attached on this thread.
+    #[inline(never)]
+    fn attached() -> Option<NonNull<Db>> {
+        GLOBAL_DB.with(|it| it.database.get())
+    }
+
+    /// Attaches `db` on this thread: the one attached before.
+    #[inline(never)]
+    fn replace_attached(db: Option<NonNull<Db>>) -> Option<NonNull<Db>> {
+        GLOBAL_DB.with(|it| it.database.replace(db))
     }
 
     /// Moves the switching job's attached database off this thread: a job that attached one
@@ -3151,10 +3165,8 @@ mod tls_db {
 
     /// Puts back what [`take_attached`] took, on a thread with no database attached.
     fn put_attached(taken: usize) {
-        GLOBAL_DB.with(|it| {
-            assert!(it.database.get().is_none(), "a job's database put back on a thread with one attached");
-            it.database.set(NonNull::new(std::ptr::with_exposed_provenance_mut(taken)));
-        });
+        assert!(attached().is_none(), "a job's database put back on a thread with one attached");
+        replace_attached(NonNull::new(std::ptr::with_exposed_provenance_mut(taken)));
     }
 
     /// Carries the attached database with each job on a fiber ([`blaze_query::carry`]), from
@@ -3194,7 +3206,7 @@ mod tls_db {
         use hir_expand::fixture;
 
         fn attached_here() -> Option<usize> {
-            super::GLOBAL_DB.with(|it| it.database.get()).map(|it| it.as_ptr().addr())
+            super::attached().map(|it| it.as_ptr().addr())
         }
 
         /// Two jobs on a pool of two workers each attach a database of their own (one with
@@ -3261,6 +3273,93 @@ mod tls_db {
             }
         }
 
+        /// On a pool of one worker, whose own slot a job that ended left holding a database, two
+        /// jobs each attach a database of their own (one with `attach_db`, one with
+        /// `attach_db_allow_change`) and park, the first on one key and the second on another;
+        /// the keys end in the other order, so they resume on the one thread swapped. Each sees
+        /// its own after its wait, and the jobs after them none.
+        #[test]
+        fn jobs_with_databases_of_their_own_resume_on_one_thread_in_swapped_order() {
+            let dbs = [(), (), ()].map(|()| Arc::new(fixture::db("fn f() {}").into_db()));
+            let pool = Pool::new(&Topology::flat(1), false).unwrap();
+            let flights = Arc::new(Flights::<u32>::new());
+            let run = |what: &'static str, f: Box<dyn FnOnce() + Send>| {
+                let (tx, rx) = mpsc::channel::<Result<(), String>>();
+                pool.submit(None, f, move |it| _ = tx.send(it.map_err(|_| format!("{what} panicked"))));
+                rx.recv().unwrap().unwrap();
+            };
+            super::carry_attached();
+            {
+                let left = Arc::as_ptr(&dbs[2]).addr();
+                run("the job leaving its worker a database", Box::new(move || super::put_attached(left)));
+            }
+            for round in 0..20u32 {
+                let [first, second] = [2 * round, 2 * round + 1].map(|at| {
+                    let mut bytes = [0u8; 32];
+                    bytes[..4].copy_from_slice(&at.to_le_bytes());
+                    bytes[4] = 1;
+                    Key(bytes)
+                });
+                let (tx, rx) = mpsc::channel::<Result<u32, String>>();
+                let waiting = Arc::new(AtomicUsize::new(0));
+                let order = Arc::new(std::sync::Mutex::new(Vec::new()));
+                let parked = |count: usize| {
+                    while waiting.load(Ordering::SeqCst) < count {
+                        std::thread::yield_now();
+                    }
+                    run("the probe", Box::new(|| ()));
+                };
+                let job = |mine: u32, on: Key| {
+                    let (db, flights, waiting, order, tx) =
+                        (dbs[mine as usize].clone(), flights.clone(), waiting.clone(), order.clone(), tx.clone());
+                    pool.submit(
+                        None,
+                        move || {
+                            let own = Arc::as_ptr(&db).addr();
+                            let wait = || {
+                                assert_eq!(attached_here(), Some(own), "a job came on to another's database");
+                                waiting.fetch_add(1, Ordering::SeqCst);
+                                assert_eq!(flights.get_or_run(on, || panic!("the test holds the key")), Ok(round));
+                                assert_eq!(attached_here(), Some(own), "a job resumed with another's database");
+                            };
+                            if mine == 0 {
+                                super::attach_db(&db, wait);
+                            } else {
+                                super::attach_db_allow_change(&db, wait);
+                            }
+                            assert_eq!(attached_here(), None, "a job kept a database it detached");
+                            order.lock().unwrap().push(mine);
+                            mine
+                        },
+                        move |it| _ = tx.send(it.map_err(|_| format!("job {mine} of round {round} panicked"))),
+                    );
+                };
+                let held = flights.get_or_run(first, || {
+                    job(0, first);
+                    parked(1);
+                    let held = flights.get_or_run(second, || {
+                        job(1, second);
+                        parked(2);
+                        Ok(round)
+                    });
+                    assert_eq!(held, Ok(round));
+                    while order.lock().unwrap().len() < 1 {
+                        std::thread::yield_now();
+                    }
+                    Ok(round)
+                });
+                assert_eq!(held, Ok(round));
+                let mut ended = [rx.recv().unwrap(), rx.recv().unwrap()];
+                ended.sort();
+                assert_eq!(ended, [Ok(0), Ok(1)]);
+                assert_eq!(*order.lock().unwrap(), [1, 0], "the jobs did not resume in the swapped order");
+                run(
+                    "a later job",
+                    Box::new(|| assert_eq!(attached_here(), None, "a job came on to its worker's database")),
+                );
+            }
+        }
+
         /// A job that attached the database and switched out (its carried thread-locals taken,
         /// as the scheduler takes them when it parks the job) sees it again on the thread it
         /// resumes on, which had none; the thread it left has none meanwhile.
@@ -3271,7 +3370,7 @@ mod tls_db {
             super::attach_db(&db, || {
                 let taken = super::take_attached();
                 assert_eq!(taken, here);
-                assert!(super::GLOBAL_DB.with(|it| it.database.get().is_none()), "the thread it left has none");
+                assert!(super::attached().is_none(), "the thread it left has none");
                 let (seen, back) = std::thread::spawn(move || {
                     super::put_attached(taken);
                     let seen = super::with_attached_db(|it| std::ptr::from_ref(it).addr());

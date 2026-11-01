@@ -1933,19 +1933,23 @@ impl<'db> DefCollector<'db> {
             let ImporterEdge { importer, data: (glob_import_vis, glob), next } =
                 self.globs.edge(edge);
             edge = next;
-            // we know all resolutions have the same visibility (`vis`), so we
-            // just need to check that once
             if !vis.is_visible_from_def_map(self.db, &self.def_map, importer) {
                 continue;
             }
             let vis = glob_import_vis.min(self.db, vis, &self.def_map).unwrap_or(glob_import_vis);
-            self.update_recursive(
-                importer,
-                held..end,
-                vis,
-                Some(ImportOrExternCrate::Glob(glob)),
-                depth + 1,
-            );
+            // Each name is held at the narrower of the import's visibility and its own, so the
+            // importer takes only the names whose own visibility it sees, as a first glob does.
+            let from = self.held.len();
+            for at in held..end {
+                let (name, res) = self.held[at];
+                let res = res.filter_visibility(|it| it.is_visible_from_def_map(self.db, &self.def_map, importer));
+                if !res.is_none() {
+                    self.held.push((name, res));
+                }
+            }
+            let visible = from..self.held.len();
+            self.update_recursive(importer, visible, vis, Some(ImportOrExternCrate::Glob(glob)), depth + 1);
+            self.held.truncate(from);
         }
         self.held.truncate(held);
     }
@@ -1985,6 +1989,9 @@ impl<'db> DefCollector<'db> {
         // finds the same answer if nothing it reads changed.
         self.imports.wake_slot(module_id, *name, written_ns(&defs));
 
+        // A name is unresolved only where nothing resolved it, never where every namespace was
+        // handled below.
+        let unresolved = defs.is_none();
         let mut changed = false;
 
         if let Some(ImportOrExternCrate::Glob(glob)) = def_import_type {
@@ -2007,7 +2014,7 @@ impl<'db> DefCollector<'db> {
                     defs.types = None;
                     self.def_map.modules.building()[module_id]
                         .scope_mut()
-                        .update_visibility_types(name, def.vis);
+                        .rebind_glob_types(name, def, glob);
                 }
                 // When the source module's definition changed (e.g., due to an explicit import
                 // shadowing a glob), propagate the new definition to modules that glob-import from it.
@@ -2043,7 +2050,7 @@ impl<'db> DefCollector<'db> {
                     defs.values = None;
                     self.def_map.modules.building()[module_id]
                         .scope_mut()
-                        .update_visibility_values(name, def.vis);
+                        .rebind_glob_values(name, def, glob);
                 } else if def.def != prev_def.def
                     && prev_def.import.map(ImportOrExternCrate::from) == def_import_type
                 {
@@ -2072,7 +2079,7 @@ impl<'db> DefCollector<'db> {
                     defs.macros = None;
                     self.def_map.modules.building()[module_id]
                         .scope_mut()
-                        .update_visibility_macros(name, def.vis);
+                        .rebind_glob_macros(name, def, glob);
                 } else if def.def != prev_def.def && prev_def.import == def_import_type {
                     changed = true;
                     defs.macros = None;
@@ -2088,12 +2095,14 @@ impl<'db> DefCollector<'db> {
             }
         }
 
-        changed |= self.def_map.modules.building()[module_id].scope_mut().push_res_with_import(
-            &mut self.from_glob_import,
-            (module_id, *name),
-            defs,
-            def_import_type,
-        );
+        if unresolved || !defs.is_none() {
+            changed |= self.def_map.modules.building()[module_id].scope_mut().push_res_with_import(
+                &mut self.from_glob_import,
+                (module_id, *name),
+                defs,
+                def_import_type,
+            );
+        }
 
         changed
     }

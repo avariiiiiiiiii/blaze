@@ -677,7 +677,12 @@ impl DefMap {
                     // `use Trait::item`: an import reads a trait as rustc's module of its
                     // associated items. Whether the crate may (E0658) is the importer's to
                     // report. Items the trait's def map cannot list yet bind nothing, and the
-                    // importer reports `ItemsFromMacros`.
+                    // importer reports `ItemsFromMacros`. An item is no binding of the trait's
+                    // module: a write touching the trait wakes this read (`enum_glob_wakes`).
+                    crate::nameres::delta::reads::note(
+                        crate::Lookup::lookup(&trait_, db).container,
+                        Some(crate::nameres::delta::reads::trait_import()),
+                    );
                     let mut res = PerNs::none();
                     let listed = self.for_each_trait_item_for_import(db, trait_, q.collected, |name, item| {
                         if name == *segment {

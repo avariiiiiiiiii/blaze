@@ -95,6 +95,7 @@ pub(crate) fn summarize(
     function: &mut Function,
     refs: &Refs,
 ) -> Result<(Summary, Export), CodegenError> {
+    let _span = tracing::info_span!(target: "blaze", "release summarize").entered();
     let optimization = optimization(unit, spec)?;
     let places = &function.places;
     let pending = match &function.code {
@@ -212,6 +213,7 @@ pub(crate) fn emit(
     refs: &Refs,
     imports: Option<(&Imports, &[Import<'_, Export>])>,
 ) -> Result<Emitted, CodegenError> {
+    let _span = tracing::info_span!(target: "blaze", "release emit").entered();
     let optimization = optimization(unit, spec)?;
     if function.places.refs as usize > refs.len() {
         return Err(failed(

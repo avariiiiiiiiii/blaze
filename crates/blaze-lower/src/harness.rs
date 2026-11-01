@@ -1,39 +1,37 @@
 //! A crate root as the compiler sees it, which is not the file on disk: the root's text with a
-//! module the compiler appends after it, a test crate's harness or a proc macro's list of its
-//! macros ([`Lowered::append_roots`]).
-//! What the module is, is the caller's: this crate writes it into the front end and keeps one
-//! root file one text for every crate that has it.
+//! module the compiler appends after it, a test crate's harness ([`Lowered::append_roots`]).
+//! What the module is, is the caller's: this crate writes it into the front end, into the root
+//! of the crate's own ([`base_db::Db::alias`] of the file on disk, which [`super::lower`] gives
+//! every crate whose root is appended to), so no other crate of that file reads it.
 
 use base_db::{Crate, FileText};
 use hir_expand::proc_macro::ProcMacros;
 use rustc_hash::FxHashSet;
-use blaze_query::db::Durability;
 
 use super::{ContentId, Db, LowerError, Lowered};
 
-/// What a crate's root file is to be: `text`, the file on disk with the module named `module`
-/// after it.
+/// What a crate's root is to be: the file on disk, then `after`, the module named `module`.
 #[derive(Debug)]
 pub struct Appended {
-    pub text: String,
+    pub after: String,
     pub module: &'static str,
 }
 
 impl Lowered {
-    /// The root file of the crate of each of `units` made what `wanted` says it is for that
-    /// crate (`None`: left as it is), with `Durability::LOW`, and the module it ends with set as
-    /// the root's appended module, so a root that `#![cfg]` takes away still has it. Both are
-    /// in the file's content ID, so the identity of every crate of that root follows. Returns
-    /// how many roots were written: none when each already is what is wanted.
+    /// The root of the crate of each of `units` made what `wanted` says it is for that crate
+    /// (`None`: left as it is): its own alias of the file on disk, which has the file's text
+    /// and then the module, with the module set as the root's appended module, so a root that
+    /// `#![cfg]` takes away still has it. Both are in the root's content ID, so the crate's
+    /// identity follows; the file on disk and every other crate of it are left as they are.
+    /// An edit of the file keeps the module after the new text until it is made again.
+    /// Returns how many roots were written: none when each already is what is wanted.
     ///
-    /// One root file is one text. Units whose crates share a root (a lib's test of two
-    /// targets, a check of tests beside a test) must want the same, or are refused naming
-    /// both: in one call, and across calls until the next [`Lowered::refresh`], so a root
-    /// made for one unit is never changed under it for another. A unit given again (once its
-    /// proc macros load, [`macros_loaded`]) may make its root again, and so may the others of
-    /// that root given with it. A crate of the same root that is not given here (the lib
-    /// beside its test) reads the appended module too, which the caller's module leaves out by
-    /// its own `#[cfg]`.
+    /// Units of one crate (a check of tests beside a test of the same cfg) must want the
+    /// same, or are refused naming both: in one call, and across calls until the next
+    /// [`Lowered::refresh`], so a root made for one unit is never changed under it for
+    /// another. A unit given again (once its proc macros load, [`macros_loaded`]) may make its
+    /// root again, and so may the others of that crate given with it. A crate whose root is
+    /// not an alias is refused.
     ///
     /// A write, as [`Lowered::ran`] is: call it before [`Lowered::identity`] of these units.
     pub fn append_roots(
@@ -50,27 +48,25 @@ impl Lowered {
             let Some(krate) = self.crates.krate(unit) else { continue };
             let Some(appended) = wanted(&self.db, unit, krate)? else { continue };
             let file = krate.data(&self.db).root_file_id;
-            let content = FileText::content_of(&appended.text, Some(appended.module));
+            let asked = FileText::content_of(&appended.after, Some(appended.module));
             match self.appended.get(&file) {
-                Some(&(_, was)) if was == content => continue,
+                Some(&(_, was)) if was == asked => continue,
                 Some(&(by, _)) if made.contains(&file) || !units.contains(&(by as u32)) => {
                     return Err(self.two_roots(by, unit, file));
                 }
                 _ => {}
             }
+            let before = self.db.file_text(file).content(&self.db);
+            self.db.set_alias_appended(file, Some((appended.module, &appended.after))).map_err(|error| {
+                let what = &self.crates.units[unit].what;
+                // alloc: the error's message
+                LowerError::at(format!("the root of {what} can't have a module appended: {error}"), what.clone())
+            })?;
             made.insert(file);
-            self.appended.insert(file, (unit, content));
-            let input = self.db.file_text(file);
-            if input.content(&self.db) == content {
-                continue;
+            self.appended.insert(file, (unit, asked));
+            if self.db.file_text(file).content(&self.db) != before {
+                written += 1;
             }
-            if input.appended_root_module(&self.db) != Some(appended.module) {
-                self.db.set_appended_root_module(file, Some(appended.module), Durability::LOW);
-            }
-            if **input.text(&self.db) != *appended.text {
-                self.db.set_file_text_with_durability(file, &appended.text, Durability::LOW);
-            }
-            written += 1;
         }
         if written > 0 {
             self.identities.clear();
@@ -85,8 +81,8 @@ impl Lowered {
         LowerError::at(
             // alloc: as `at`
             format!(
-                "{first} and {second} share the root file `{at}` and would each have it end with \
-                 another module (a test harness, a proc macro's list), which one file can't"
+                "{first} and {second} are one crate of the root file `{at}` and would each have its root end with \
+                 another test harness, which one root can't"
             ),
             at,
         )

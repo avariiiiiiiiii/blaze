@@ -3,7 +3,10 @@
 //! `infer_query` was for. They are written only while a subscriber records the span; the
 //! profiler interns them, so its rows hold a number for each.
 
+use std::fmt::Write as _;
+
 use base_db::{Crate, Db};
+use hir_expand::HirFileId;
 
 use crate::{
     DefWithBodyId, ExpressionStoreOwnerId, HasModule, ItemContainerId, Lookup, ModuleIdLt,
@@ -58,6 +61,22 @@ pub fn of_anon_const(db: &Db, owner: ExpressionStoreOwnerId, span: tracing::Span
     span
 }
 
+/// `span` named for the file `file` read as part of `krate`: the crate in `krate`, and in
+/// `function` the file's path (a macro file by its call, `{macro <id>}`), so the same file
+/// lowered for many crates reads as repeats of one key. The span declares `krate` and `function`.
+pub fn of_file(db: &Db, file: HirFileId, krate: Crate, span: tracing::Span) -> tracing::Span {
+    if !span.is_disabled() {
+        name(db, krate, &span, |text| match file {
+            HirFileId::FileId(it) => match db.path_for_file(it.file_id(db)) {
+                Some(path) => _ = write!(text, "{path}"),
+                None => _ = write!(text, "{{file {}}}", it.file_id(db).index()),
+            },
+            HirFileId::MacroFile(call) => _ = write!(text, "{{macro {call:?}}}"),
+        });
+    }
+    span
+}
+
 /// Writes `krate`'s name and the path `path` writes in `span`'s fields `krate` and `function`.
 /// The path's queries may name spans of their own, so each span has its own buffer.
 fn name(db: &Db, krate: Crate, span: &tracing::Span, path: impl FnOnce(&mut String)) {
@@ -68,7 +87,8 @@ fn name(db: &Db, krate: Crate, span: &tracing::Span, path: impl FnOnce(&mut Stri
     span.record("function", text.as_str());
 }
 
-fn crate_name(db: &Db, krate: Crate) -> &str {
+/// `krate`'s display name, `{crate}` for one with none: a span's `krate`.
+pub fn crate_name(db: &Db, krate: Crate) -> &str {
     match &krate.extra_data(db).display_name {
         Some(name) => name.crate_name().symbol().as_str(),
         None => "{crate}",

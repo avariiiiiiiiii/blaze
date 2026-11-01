@@ -185,22 +185,50 @@ impl<E> Clone for Import<'_, E> {
 impl<E> Copy for Import<'_, E> {}
 
 /// The references of a release compile: its own, then each imported function's, in
-/// [`Imports::imported`]'s order, each target once. The places of its template.
-pub fn release_refs(own: &Refs, imported: &[&Refs]) -> Vec<crate::Target> {
-    let mut seen: rustc_hash::FxHashSet<ContentId> =
-        rustc_hash::FxHashSet::with_capacity_and_hasher(own.len(), Default::default());
-    seen.extend(own.iter().map(crate::content::target_id));
+/// [`Imports::imported`]'s order, each target once. The places of its template. With them,
+/// the first place of each of its own references and then each import's, in that order:
+/// which of them are one target, which no key of the compile says (a key takes callees by
+/// their interface), and which decides how many places its template has and where each
+/// relocation points. [`laid_out`] keys the compile on it.
+pub fn release_refs(own: &Refs, imported: &[&Refs]) -> (Vec<crate::Target>, Vec<u32>) {
+    let total = own.len() + imported.iter().map(|it| it.len()).sum::<usize>();
+    let mut first: rustc_hash::FxHashMap<ContentId, u32> =
+        rustc_hash::FxHashMap::with_capacity_and_hasher(total, Default::default());
     // alloc: the release unit's references, kept by its job
     let mut refs = own.to_vec();
+    // alloc: the release unit's layout, hashed into its key and dropped
+    let mut places = Vec::with_capacity(total);
+    for (at, target) in own.iter().enumerate() {
+        places.push(*first.entry(crate::content::target_id(target)).or_insert(place(at)));
+    }
     for import in imported {
         for target in import.iter() {
-            if seen.insert(crate::content::target_id(target)) {
+            let at = *first.entry(crate::content::target_id(target)).or_insert_with(|| {
                 // clone: as `refs`, once per target an import adds
                 refs.push(target.clone());
-            }
+                place(refs.len() - 1)
+            });
+            places.push(at);
         }
     }
-    refs
+    (refs, places)
+}
+
+fn place(at: usize) -> u32 {
+    u32::try_from(at).expect("a compile refers to fewer than 2^32 things")
+}
+
+pub const LAID_OUT_DOMAIN: &str = "blaze v2 release laid out 1";
+
+/// What a release compile of `stored` is kept under, before its imports
+/// ([`Imports::blob_key`]): `stored` and the places of [`release_refs`].
+pub fn laid_out(stored: InstanceKey, places: &[u32]) -> InstanceKey {
+    let mut hasher = blaze_ids::Hasher::new(LAID_OUT_DOMAIN);
+    hasher.id(&stored.0).update(&(places.len() as u64).to_le_bytes());
+    for at in places {
+        hasher.update(&at.to_le_bytes());
+    }
+    InstanceKey(hasher.finish())
 }
 
 /// A backend, as a build runs it per function.

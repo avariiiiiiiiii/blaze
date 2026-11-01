@@ -1813,6 +1813,7 @@ impl<'db, 'f, S: Sink<'db>, A: Allocator + Clone> ModCollector<'_, 'db, 'f, S, A
                 mod_item.ast_id(self.item_tree),
                 ModPath::clone(&attr.path), // clone: the directive owns the attribute's path
             );
+            let shape = item_tree::deferred_item_shape(self.cx.db, ast_id.ast_id);
             self.sink.apply(DeclOp::Macro(MacroOp {
                 module: self.module_id,
                 depth: self.macro_depth + 1,
@@ -1823,6 +1824,7 @@ impl<'db, 'f, S: Sink<'db>, A: Allocator + Clone> ModCollector<'_, 'db, 'f, S, A
                     attr: attr.clone(),
                     mod_item,
                     tree: self.tree_id,
+                    shape,
                 },
                 container,
             }));

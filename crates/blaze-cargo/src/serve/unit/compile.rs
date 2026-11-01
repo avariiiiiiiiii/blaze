@@ -536,6 +536,15 @@ pub(crate) fn compile(
         // alloc: error path
         return Err(ApiError::new(format!("unit {unit} has no phases in the job"), None).into());
     };
+    let krate = job.units().graph.units.get(unit).map_or("", |it| it.target.name.as_str());
+    let _span = match phase {
+        Phase::Names => tracing::info_span!("unit names", krate),
+        Phase::Bodies => tracing::info_span!("unit bodies", krate),
+        Phase::Codegen => tracing::info_span!("unit codegen", krate),
+        Phase::Link => tracing::info_span!("unit link", krate),
+        Phase::Store => tracing::info_span!("unit store", krate),
+    }
+    .entered();
     match phase {
         Phase::Names => names(job, reader, unit, slot)?,
         Phase::Bodies => bodies(job, reader, unit, slot)?,
@@ -585,9 +594,12 @@ fn names(job: &Job, reader: &UnitReader, unit: usize, slot: &Mutex<Phases>) -> R
     let _ = hir_def::nameres::crate_def_map(db, krate);
     let inert = elided_unbuilt(job, unit)? || script::pure::unbuilt(job, reader, unit)?;
     let reached = reached_only(job, u)?;
-    // A library compiled only as a program reaches it has no code of its own to build.
-    let library_reached = reached && codegen::makes(u).is_ok_and(|it| it == Makes::Library);
-    let builds_code = !inert && !checks_only(job.input.goal, u) && !library_reached;
+    // A library compiled only as a program reaches it has no code of its own to build, and a
+    // proc macro's lib none that is loaded: its expanders run its MIR ([`macros`]).
+    let makes = codegen::makes(u);
+    let library_reached = reached && makes.as_ref().is_ok_and(|it| *it == Makes::Library);
+    let proc_macro = makes.is_ok_and(|it| it == Makes::Shared { proc_macro: true });
+    let builds_code = !inert && !checks_only(job.input.goal, u) && !library_reached && !proc_macro;
     let (checking, diags) = match blaze_diagnostics::cache::read(db, reader.checks(), krate, job.mounted.root()) {
         Some(Err(why)) => return Err(ApiError::new(why, Some(u.target.name.clone())).into()),
         // A dependency's check outcome from the store: no check runs, and codegen reads the
@@ -670,6 +682,12 @@ fn link(job: &Job, reader: &UnitReader, unit: usize, phases: &mut Phases, images
         // Moved, not copied: the store keeps them as they are.
         let built = std::mem::take(&mut parts.built.puts);
         making.puts.extend(built.into_iter().map(|it| Put { key: it.key, kind: it.kind, bytes: it.bytes }));
+    }
+    if let Some(Ok((_, Ok(Ok(parts))))) = &mut phases.generated
+        && !parts.built.memo_used.is_empty()
+    {
+        let used = std::mem::take(&mut parts.built.memo_used);
+        job.memo_used.lock().unwrap_or_else(PoisonError::into_inner).extend_from_slice(&used);
     }
     phases.linked = Some(Linked::Made(Box::new(making)));
     Ok(())

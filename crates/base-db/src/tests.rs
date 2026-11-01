@@ -575,6 +575,177 @@ fn a_content_id_that_is_not_its_bytes_is_refused() {
     assert_eq!(file_at(&db, &base, "src/lib.rs"), None);
 }
 
+/// [`VIEW`] set, and an alias of its `src/lib.rs`: (base, partition, lib, alias).
+fn aliased_view(db: &mut Db) -> (AbsPathBuf, FileSetConfig, FileId, FileId) {
+    let (base, partition) = checkout(db);
+    set_view(db, &base, &partition, VIEW).unwrap();
+    let lib = file_at(db, &base, "src/lib.rs").unwrap();
+    let alias = db.alias(lib).unwrap();
+    (base, partition, lib, alias)
+}
+
+#[test]
+fn an_alias_is_found_by_its_file_never_by_its_path() {
+    let mut db = Db::for_tests();
+    let (base, partition) = checkout(&mut db);
+    set_view(&mut db, &base, &partition, VIEW).unwrap();
+    let lib = file_at(&db, &base, "src/lib.rs").unwrap();
+    let a = file_at(&db, &base, "src/a.rs").unwrap();
+    let content = db.source_root(SourceRootId(0)).content(&db);
+    let alias = db.alias(lib).unwrap();
+    assert_ne!(alias, lib);
+
+    let root = db.source_root(SourceRootId(0)).source_root(&db);
+    let path = VfsPath::from(base.join("src/lib.rs"));
+    assert_eq!(root.path_for_file(&alias), Some(&path));
+    assert_eq!(root.file_for_path(&path), Some(&lib), "a path has one answer, the disk file");
+    assert!(!root.iter().any(|it| it == alias), "an alias is not among the root's files");
+    assert_eq!(root.aliases().collect::<Vec<_>>(), vec![(alias, lib)]);
+    let from_alias = AnchoredPath { anchor: alias, path: "a.rs" };
+    assert_eq!(root.resolve_path(from_alias), Some(a));
+    assert_eq!(db.resolve_path(from_alias), Some(a));
+    assert_eq!(file_at(&db, &base, "src/lib.rs"), Some(lib));
+    assert_eq!(db.source_root(SourceRootId(0)).content(&db), content, "the root's files are as they were");
+
+    assert_eq!(db.file_source_root(alias).source_root_id(&db), SourceRootId(0));
+    assert_eq!(&**db.file_text(alias).text(&db), "mod a;");
+    assert_eq!(db.file_text(alias).content(&db), db.file_text(lib).content(&db));
+    assert_eq!(db.files().aliases_of(lib).as_slice(), &[alias]);
+    assert_eq!(db.files().alias_of(alias), Some(lib));
+    assert_eq!(db.files().alias_of(lib), None);
+}
+
+#[test]
+fn a_view_set_again_keeps_every_alias() {
+    let mut db = Db::for_tests();
+    let (base, partition, lib, alias) = aliased_view(&mut db);
+    let path = VfsPath::from(base.join("src/lib.rs"));
+    // A view that adds a file rebuilds nothing of the alias, and one the same again writes nothing.
+    let more: &[(&str, &[u8])] =
+        &[("src/lib.rs", b"mod a;"), ("src/a.rs", b"fn f() {}"), ("README.md", b"hello"), ("src/b.rs", b"")];
+    for view in [VIEW, more, VIEW, VIEW] {
+        let change = set_view(&mut db, &base, &partition, view).unwrap();
+        assert!(!change.removed.contains(&alias), "{change:?}");
+        let root = db.source_root(SourceRootId(0)).source_root(&db);
+        assert_eq!(root.path_for_file(&alias), Some(&path));
+        assert_eq!(root.file_for_path(&path), Some(&lib));
+        assert_eq!(&**db.file_text(alias).text(&db), "mod a;");
+    }
+    let then = revision(&db);
+    assert_eq!(set_view(&mut db, &base, &partition, VIEW).unwrap(), ViewChange::default());
+    assert_eq!(revision(&db), then);
+}
+
+#[test]
+fn an_edit_of_a_root_reaches_every_alias_of_it() {
+    let mut db = Db::for_tests();
+    let (base, partition, lib, first) = aliased_view(&mut db);
+    let second = db.alias(lib).unwrap();
+    assert_eq!(db.files().aliases_of(lib).as_slice(), &[first, second]);
+    db.set_alias_appended(second, Some(("__harness", "\nmod __harness {}"))).unwrap();
+
+    let edited: &[(&str, &[u8])] =
+        &[("src/lib.rs", b"mod a; mod b;"), ("src/a.rs", b"fn f() {}"), ("README.md", b"hello")];
+    let change = set_view(&mut db, &base, &partition, edited).unwrap();
+    assert_eq!(change.set, vec![lib, first, second], "the aliases are written in the same change");
+    assert_eq!(&**db.file_text(first).text(&db), "mod a; mod b;");
+    assert_eq!(db.file_text(first).content(&db), FileText::content_of("mod a; mod b;", None));
+    let appended = "mod a; mod b;\nmod __harness {}";
+    assert_eq!(&**db.file_text(second).text(&db), appended, "its suffix is kept after the new text");
+    assert_eq!(db.file_text(second).appended_root_module(&db), Some("__harness"));
+    assert_eq!(db.file_text(second).content(&db), FileText::content_of(appended, Some("__harness")));
+    assert_eq!(&**db.file_text(lib).text(&db), "mod a; mod b;");
+    assert_eq!(db.file_text(lib).appended_root_module(&db), None);
+
+    db.set_file_text(lib, "mod c;");
+    assert_eq!(&**db.file_text(first).text(&db), "mod c;");
+    assert_eq!(&**db.file_text(second).text(&db), "mod c;\nmod __harness {}");
+    assert_eq!(db.file_text(second).appended_root_module(&db), Some("__harness"));
+}
+
+#[test]
+fn an_alias_owns_its_suffix() {
+    let mut db = Db::for_tests();
+    let (_, _, lib, alias) = aliased_view(&mut db);
+    let shared = db.file_text(lib).text(&db).as_ptr();
+    assert!(std::ptr::eq(db.file_text(alias).text(&db).as_ptr(), shared), "with no suffix it shares the bytes");
+
+    db.set_alias_appended(alias, Some(("__list", "\nmod __list {}"))).unwrap();
+    assert_eq!(&**db.file_text(alias).text(&db), "mod a;\nmod __list {}");
+    assert_eq!(db.file_text(alias).appended_root_module(&db), Some("__list"));
+    assert_eq!(&**db.file_text(lib).text(&db), "mod a;", "the file is as on disk");
+    let then = revision(&db);
+    db.set_alias_appended(alias, Some(("__list", "\nmod __list {}"))).unwrap();
+    assert_eq!(revision(&db), then, "the same suffix again writes nothing");
+
+    db.set_alias_appended(alias, None).unwrap();
+    assert_eq!(&**db.file_text(alias).text(&db), "mod a;");
+    assert_eq!(db.file_text(alias).appended_root_module(&db), None);
+    assert_eq!(db.file_text(alias).content(&db), db.file_text(lib).content(&db));
+    assert_eq!(db.set_alias_appended(lib, None), Err(crate::AliasError::NotAnAlias(lib)));
+}
+
+#[test]
+#[should_panic = "set_alias_appended"]
+fn an_aliass_module_is_set_with_its_suffix() {
+    let mut db = Db::for_tests();
+    let (_, _, _, alias) = aliased_view(&mut db);
+    db.set_appended_root_module(alias, Some("__harness"), Durability::LOW);
+}
+
+#[test]
+fn a_file_gone_takes_its_aliases_with_it() {
+    let mut db = Db::for_tests();
+    let (base, partition, lib, alias) = aliased_view(&mut db);
+    let change = set_view(&mut db, &base, &partition, &VIEW[1..]).unwrap();
+    let mut removed = vec![lib, alias];
+    removed.sort();
+    assert_eq!(change.removed, removed);
+    assert!(!db.has_file_text(alias));
+    let root = db.source_root(SourceRootId(0)).source_root(&db);
+    assert_eq!(root.path_for_file(&alias), None);
+    assert!(db.files().aliases_of(lib).is_empty());
+    assert_eq!(db.files().alias_of(alias), None);
+
+    // Back, the file has its ID and no alias: a new alias is a new file.
+    set_view(&mut db, &base, &partition, VIEW).unwrap();
+    assert_eq!(file_at(&db, &base, "src/lib.rs"), Some(lib));
+    assert!(db.files().aliases_of(lib).is_empty());
+    let again = db.alias(lib).unwrap();
+    assert_ne!(again, alias, "a gone alias's ID keeps its parked text, so it is not handed out again");
+}
+
+#[test]
+fn a_root_set_whole_keeps_its_aliases() {
+    let mut db = Db::for_tests();
+    let files = load(&mut db, 0, FILES);
+    let alias = db.alias(files[0]).unwrap();
+    // `load` again sets source root 0 to a set made from scratch.
+    load(&mut db, 0, FILES);
+    let root = db.source_root(SourceRootId(0)).source_root(&db);
+    assert_eq!(root.path_for_file(&alias), root.path_for_file(&files[0]));
+    assert_eq!(root.resolve_path(AnchoredPath { anchor: alias, path: "b.rs" }), Some(files[1]));
+    assert_eq!(db.files().aliases_of(files[0]).as_slice(), &[alias]);
+}
+
+#[test]
+fn an_alias_is_of_a_file_with_a_path() {
+    let mut db = Db::for_tests();
+    let (_, _, lib, alias) = aliased_view(&mut db);
+    assert_eq!(db.alias(alias), Err(crate::AliasError::OfAnAlias(alias)));
+    let nowhere = db.new_file_id().unwrap();
+    assert_eq!(db.alias(nowhere), Err(crate::AliasError::NotInASourceRoot(nowhere)));
+    assert_eq!(db.files().aliases_of(lib).as_slice(), &[alias]);
+}
+
+#[test]
+#[should_panic = "is an alias of"]
+fn an_aliass_text_is_its_files() {
+    let mut db = Db::for_tests();
+    let (_, _, _, alias) = aliased_view(&mut db);
+    db.set_file_text(alias, "fn other() {}");
+}
+
 #[test]
 fn a_table_finds_what_a_hash_map_does() {
     use crate::table::{Table, hash_of};

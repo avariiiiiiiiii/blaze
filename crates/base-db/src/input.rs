@@ -148,6 +148,16 @@ impl SourceRoot {
         self.file_set.remove(file)
     }
 
+    /// See [`FileSet::alias`].
+    pub(crate) fn alias_file(&mut self, alias: FileId, of: FileId) -> bool {
+        self.file_set.alias(alias, of)
+    }
+
+    /// See [`FileSet::aliases`].
+    pub fn aliases(&self) -> impl Iterator<Item = (FileId, FileId)> + '_ {
+        self.file_set.aliases()
+    }
+
     pub(crate) fn len(&self) -> usize {
         self.file_set.len()
     }

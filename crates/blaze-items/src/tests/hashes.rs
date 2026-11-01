@@ -439,6 +439,26 @@ fn f() -> &'static str { intrinsics::type_name::<T>() }
     assert_ne!(of(&db, "f").code, f.code, "`type_name` spells the name");
 }
 
+#[test]
+fn callers_of_two_intrinsics_of_one_signature_differ_in_code() {
+    let (db, _) = single(
+        r#"
+#![feature(intrinsics)]
+mod intrinsics {
+    #[rustc_intrinsic]
+    pub unsafe fn simd_lt<T, U>(x: T, y: T) -> U;
+    #[rustc_intrinsic]
+    pub unsafe fn simd_ge<T, U>(x: T, y: T) -> U;
+}
+fn lt(a: u64) -> u64 { unsafe { intrinsics::simd_lt(a, 0) } }
+fn ge(a: u64) -> u64 { unsafe { intrinsics::simd_ge(a, 0) } }
+"#,
+    );
+    let (lt, ge) = (of(&db, "intrinsics::simd_lt"), of(&db, "intrinsics::simd_ge"));
+    assert_ne!(lt.interface, ge.interface, "an intrinsic is what its name says");
+    assert_ne!(of(&db, "lt").code, of(&db, "ge").code);
+}
+
 fn closures(db: &TestDB, f: ItemId) -> Vec<InternedClosureId<'_>> {
     let ItemId::Function(func) = f else { panic!("{f:?} is no fn") };
     let owner = DefWithBodyId::from(func);

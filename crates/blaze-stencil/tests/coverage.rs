@@ -61,6 +61,9 @@ struct Input {
     projects: Vec<Project>,
     /// Where the table is written, besides stderr.
     out: Option<String>,
+    /// Print each function before it is lowered and surveyed: where a crash was.
+    #[serde(default)]
+    trace: bool,
 }
 
 #[derive(Deserialize)]
@@ -78,6 +81,18 @@ struct Project {
 #[test]
 #[ignore = "reads the projects' checkouts: run with --ignored and BLAZE_STENCIL_COVERAGE set"]
 fn every_function_of_the_projects_and_std_compiles_by_copy_and_patch() {
+    // The front end recurses as deep as the code it lowers: a test thread's stack is too small
+    // for every body of std and a workspace.
+    std::thread::Builder::new()
+        .name("coverage".to_owned())
+        .stack_size(1 << 30)
+        .spawn(coverage)
+        .expect("the coverage thread")
+        .join()
+        .unwrap_or_else(|panic| std::panic::resume_unwind(panic));
+}
+
+fn coverage() {
     let input = std::env::var("BLAZE_STENCIL_COVERAGE")
         .expect("BLAZE_STENCIL_COVERAGE names the projects: see the head of crates/blaze-stencil/tests/coverage.rs");
     let text = if input.trim_start().starts_with('{') {
@@ -89,6 +104,12 @@ fn every_function_of_the_projects_and_std_compiles_by_copy_and_patch() {
     let (policy, stencils) = policy().unwrap_or_else(|error| panic!("{error}"));
     let mut tally = Tally::default();
     let out = input.out.as_deref();
+    tally.notes.push(
+        "std is planned as shipped (opt-level 3, its MIR inlined) and compiled by copy-and-patch; \
+         \"a relocation at a reference of a body built in\" is a reference inside an inlined body, \
+         which should go once std is planned at opt-level 0 (codegen queue 01466)"
+            .to_owned(),
+    );
     for project in &input.projects {
         if project.unbuilt {
             tally.notes.push(format!("{}: lowered without its build scripts' runs", project.dir));
@@ -96,7 +117,7 @@ fn every_function_of_the_projects_and_std_compiles_by_copy_and_patch() {
         let (lowered, units) = lower(project).unwrap_or_else(|error| panic!("{error}"));
         let crates = crates(&units, &lowered);
         eprintln!("{}: {} crates to survey", project.dir, crates.len());
-        survey(lowered.db(), lowered.paths(), &crates, &policy, &stencils, &mut tally, out)
+        survey(lowered.db(), lowered.paths(), &crates, &policy, &stencils, &mut tally, out, input.trace)
             .unwrap_or_else(|error| panic!("{}: {error}", project.dir));
     }
     let table = tally.table();
@@ -116,6 +137,9 @@ struct Tally {
     refused: BTreeMap<String, Row>,
     /// What `lowered` refuses before there is IR (`asm!`, naked functions), by its kind.
     unlowered: BTreeMap<String, Row>,
+    /// Roots the front end can't reach from (a body that fails to lower), and crates whose
+    /// survey panicked, by the message: not the stencil library's, but not surveyed.
+    unreached: BTreeMap<String, Row>,
     /// Said above the table: what the run left out.
     notes: Vec<String>,
 }
@@ -139,7 +163,7 @@ impl Row {
 
 impl Tally {
     fn is_clean(&self) -> bool {
-        self.gaps.is_empty() && self.refused.is_empty() && self.unlowered.is_empty()
+        self.gaps.is_empty() && self.refused.is_empty() && self.unlowered.is_empty() && self.unreached.is_empty()
     }
 
     fn function(&mut self, name: &str, errors: &[blaze_stencil::Error]) {
@@ -157,7 +181,11 @@ impl Tally {
             }
         }
         for (key, count) in gaps {
-            self.gaps.entry(key).or_default().hit(count, name);
+            let row = self.gaps.entry(key).or_insert_with_key(|key| {
+                eprintln!("  gap: `{}` of {} in `{name}`", key.0, key.1);
+                Row::default()
+            });
+            row.hit(count, name);
         }
         for (key, count) in refused {
             self.refused.entry(key).or_default().hit(count, name);
@@ -167,13 +195,17 @@ impl Tally {
     fn unlowered(&mut self, name: &str, what: &str) {
         self.functions += 1;
         let kind = if what.contains("`asm!`") {
-            "a body with `asm!` statements"
+            "a body with `asm!` statements".to_owned()
         } else if what.contains("naked") {
-            "a naked function"
+            "a naked function".to_owned()
         } else {
-            what
+            message(what)
         };
-        self.unlowered.entry(kind.to_owned()).or_default().hit(1, name);
+        self.unlowered.entry(kind).or_default().hit(1, name);
+    }
+
+    fn unreached(&mut self, name: &str, what: &str) {
+        self.unreached.entry(message(what)).or_default().hit(1, name);
     }
 
     /// The report's table, most functions first.
@@ -205,8 +237,24 @@ impl Tally {
                 let _ = writeln!(out, "| {what} | {} | `{}` |", row.functions, row.example);
             }
         }
+        if !self.unreached.is_empty() {
+            let _ = writeln!(out, "\n| not reached (front end) | roots | e.g. |\n|---|---:|---|");
+            for (what, row) in sorted(&self.unreached) {
+                let _ = writeln!(out, "| {what} | {} | `{}` |", row.functions, row.example);
+            }
+        }
         out
     }
+}
+
+/// `what` without the instance a codegen error starts with (`HirInstance(..): `), so one
+/// refusal is one row, and with no `|` or newline to break the table.
+fn message(what: &str) -> String {
+    let what = match what.strip_prefix("HirInstance(") {
+        Some(_) => what.split_once("): ").map_or(what, |it| it.1),
+        None => what,
+    };
+    what.replace('|', "\\|").replace('\n', " ")
 }
 
 /// `rows`, most functions first, then most instructions.
@@ -232,6 +280,10 @@ fn policy() -> Result<(Policy, blaze_stencil::Target), String> {
     hir_ty_codegen::v2::select(&toolchain)?;
     toolchain.relocation = Relocation::Static;
     toolchain.stencils = Some(blaze_format::hex::encode(&library));
+    // Std's shipped layer is opt-level 3, which a plan refuses in a blaze without LLVM; every
+    // unit here is compiled by copy-and-patch whatever its level (`tier_spec`), so the plan
+    // is told of an LLVM it never reaches.
+    toolchain.llvm.get_or_insert_with(|| "none: the stencil survey compiles every unit by copy-and-patch".to_owned());
     let policy = Policy {
         toolchain,
         profile: Profile {
@@ -298,6 +350,7 @@ fn survey(
     stencils: &blaze_stencil::Target,
     tally: &mut Tally,
     out: Option<&str>,
+    trace: bool,
 ) -> Result<(), String> {
     let names = Arc::clone(paths);
     let hashes = ItemHashes::new(Box::new(move |file: FileId| {
@@ -311,44 +364,30 @@ fn survey(
     let mut seen: HashSet<InstanceKey> = HashSet::new();
     let started = Instant::now();
     for (n, (krate, origin, name)) in crates.iter().enumerate() {
-        let roots: Vec<(HirInstance, PlanOrigin)> =
-            frontend.every_function(*krate).into_iter().map(|it| (it, *origin)).collect();
-        let reached = Build::new(&backends, &frontend, policy, &memo).reach(&roots, &[]).map_err(|errors| {
-            let errors: Vec<_> = errors.iter().map(|error| error.what.as_str()).take(10).collect();
-            format!("`{name}`: {}", errors.join("; "))
-        })?;
         let (before, compiled) = (tally.functions, tally.compiled);
-        for ((instance, unit), refs) in reached.functions.iter().zip(&reached.refs) {
-            if !seen.insert(unit.instance.key()) {
-                continue;
+        eprintln!("[{}/{}] {name}: surveying", n + 1, crates.len());
+        let surveyed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            survey_crate(&frontend, &backends, &memo, policy, stencils, &requester, *krate, *origin, &mut seen, tally, trace)
+        }));
+        let (roots, reached) = match surveyed {
+            Ok(Ok(counts)) => counts,
+            Ok(Err(error)) => return Err(format!("`{name}`: {error}")),
+            Err(panic) => {
+                let what = panic
+                    .downcast_ref::<String>()
+                    .map(String::as_str)
+                    .or_else(|| panic.downcast_ref::<&str>().copied())
+                    .unwrap_or("a panic");
+                tally.unreached(name, &format!("the survey of the crate panicked: {what}"));
+                (0, 0)
             }
-            let described = frontend.describe(instance, &requester).map_err(|error| error.what)?;
-            let spec = tier_spec(
-                policy
-                    .choose(&described.origin, described.overflow_checks)
-                    .map_err(|why| format!("`{}`: {why}", described.name))?
-                    .first,
-            );
-            let unit = Unit {
-                instance: UnitInstance { settings: spec.settings(), ..unit.instance },
-                backend: Backend::Stencil,
-                ..unit.clone()
-            };
-            match lowered(&frontend, &unit, &spec, instance, refs) {
-                Ok(Lowering::Ir { func, .. }) => {
-                    let errors = blaze_stencil::survey(&func, stencils).map_err(|error| error.to_string())?;
-                    tally.function(&described.name, &errors);
-                }
-                Ok(Lowering::Asm(_) | Lowering::Allocator(_)) => {}
-                Err(error) => tally.unlowered(&described.name, &error.what),
-            }
-        }
+        };
         eprintln!(
             "[{}/{}] {name}: {} roots, {} reached, {} new, {} compile; {} gaps so far; {:.0?}",
             n + 1,
             crates.len(),
-            roots.len(),
-            reached.functions.len(),
+            roots,
+            reached,
             tally.functions - before,
             tally.compiled - compiled,
             tally.gaps.len(),
@@ -357,6 +396,84 @@ fn survey(
         write_out(out, &tally.table());
     }
     Ok(())
+}
+
+/// Surveys what `krate`'s functions reach and `seen` has not, into `tally`: how many roots and
+/// reached functions there were. A crate whose reach fails is reached a root at a time, each
+/// root that fails a row of [`Tally::unreached`].
+#[expect(clippy::too_many_arguments, reason = "the survey's state, passed down once a crate")]
+fn survey_crate(
+    frontend: &HirFrontend<'_>,
+    backends: &Backends,
+    memo: &Memo,
+    policy: &Policy,
+    stencils: &blaze_stencil::Target,
+    requester: &PlanOrigin,
+    krate: Crate,
+    origin: PlanOrigin,
+    seen: &mut HashSet<InstanceKey>,
+    tally: &mut Tally,
+    trace: bool,
+) -> Result<(usize, usize), String> {
+    let roots: Vec<(HirInstance, PlanOrigin)> = frontend.every_function(krate).into_iter().map(|it| (it, origin)).collect();
+    let build = Build::new(backends, frontend, policy, memo);
+    let reached = match build.reach(&roots, &[]) {
+        Ok(reached) => vec![reached],
+        Err(_) => {
+            let mut each = Vec::new();
+            for root in &roots {
+                match build.reach(std::slice::from_ref(root), &[]) {
+                    Ok(reached) => each.push(reached),
+                    Err(errors) => {
+                        let name = frontend.describe(&root.0, requester).map_or_else(|_| format!("{:?}", root.0), |it| it.name);
+                        let what = errors.first().map_or("no error given", |it| it.what.as_str());
+                        tally.unreached(&name, what);
+                    }
+                }
+            }
+            each
+        }
+    };
+    let mut count = 0;
+    for reached in &reached {
+        count += reached.functions.len();
+        for ((instance, unit), refs) in reached.functions.iter().zip(&reached.refs) {
+            if !seen.insert(unit.instance.key()) {
+                continue;
+            }
+            let described = match frontend.describe(instance, requester) {
+                Ok(described) => described,
+                Err(error) => {
+                    tally.unreached(&format!("{instance:?}"), &error.what);
+                    continue;
+                }
+            };
+            let spec = match policy.choose(&described.origin, described.overflow_checks) {
+                Ok(choice) => tier_spec(choice.first),
+                Err(why) => {
+                    tally.unreached(&described.name, &why.to_string());
+                    continue;
+                }
+            };
+            let unit = Unit {
+                instance: UnitInstance { settings: spec.settings(), ..unit.instance },
+                backend: Backend::Stencil,
+                ..unit.clone()
+            };
+            if trace {
+                eprintln!("  {}", described.name);
+            }
+            match lowered(frontend, &unit, &spec, instance, refs) {
+                Ok(Lowering::Ir { func, .. }) => {
+                    let errors = blaze_stencil::survey(&func, stencils).map_err(|error| error.to_string())?;
+                    tally.function(&described.name, &errors);
+                }
+                Ok(Lowering::Asm(_) | Lowering::Allocator(_)) => {}
+                Err(error) => tally.unlowered(&described.name, &error.what),
+            }
+        }
+    }
+    Ok((roots.len(), count))
 }
 
 fn write_out(out: Option<&str>, table: &str) {

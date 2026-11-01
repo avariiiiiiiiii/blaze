@@ -23,7 +23,7 @@ use crate::{
 };
 
 /// A dependency with closures, a coroutine closure, an `async fn`, an opaque type, constants in
-/// types and in blocks, a `dyn` type with auto traits, derives; `other` comes first in the
+/// types and in blocks, a `dyn` type with auto traits, derives; [`PAD`] comes first in the
 /// second database, so the dependency's ids there are not the first one's.
 const FIXTURE: &str = r#"
 //- minicore: sized, copy, clone, add, mul, fn, option, deref, async_fn, future, derive, eq, send, sync
@@ -92,16 +92,25 @@ fn written() -> Vec<u8> {
     encode(&db, dep, &|_| true).unwrap()
 }
 
-/// A second database, warmed with `other` first, and `dep` in it.
+/// A second database, [`FIXTURE`] with a crate `pad` before its own, and `dep` in it. Name
+/// resolution interns every crate's items as the database is made, in the crate graph's order,
+/// so only items made before `dep`'s can move its ids, not what is asked of the database
+/// afterwards.
 fn second() -> (Db, Crate) {
-    let db = db_of(FIXTURE);
-    let other = crate_named(&db, "other");
-    for def in crate_body_owners(&db, other) {
-        let _ = InferenceResult::of(&db, def);
-    }
+    let at = FIXTURE.find("//- /").expect("a fixture with a file");
+    let db = db_of(&format!("{}{PAD}{}", &FIXTURE[..at], &FIXTURE[at..]));
     let dep = crate_named(&db, "dep");
     (db, dep)
 }
+
+/// A crate of nothing the fixture's crates name, its functions interned before theirs.
+const PAD: &str = "//- /pad.rs crate:pad deps:core new_source_root:library
+pub fn p1() {}
+pub fn p2() {}
+pub fn p3() {}
+pub struct P;
+impl P { pub fn p4(&self) {} }
+";
 
 fn buf(bytes: &[u8]) -> ImageBuf {
     Arc::new(Aligned::copy_from(bytes))

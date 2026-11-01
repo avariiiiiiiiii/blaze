@@ -22,7 +22,7 @@ How blaze is now. Kept true: CI checks their links, paths and settings against t
 - [toolchain.md](toolchain.md): blaze's own pinned nightly: what it is, how it is fetched and checked, and the daily bump.
 - [usage.md](usage.md): Getting started: using blaze on a project, in short.
 - [v2/plan/lanes/filters/speed-of-light.md](v2/plan/lanes/filters/speed-of-light.md): Lane filters - where a definite no in front of a membership test skips real work in blaze v2, the one site that pays (trait impls read only from the crates that can name the trait and the type), its bound and bench, and the sites checked and left as they are.
-- [v2/plan/lanes/may-suspend/fiber-boundary.md](v2/plan/lanes/may-suspend/fiber-boundary.md): the blaze lint `blaze::fiber_boundary` (crates/blaze-lints/src/blaze/fiber.rs) rejects a path to `blaze_graph::sched::fiber`, corosensei or the fiber driver written outside `blaze_graph::sched`, so fibers stay the scheduler's alone; blaze's tree denies it from the workspace's `[lints.blaze]`.
+- [v2/plan/lanes/may-suspend/fiber-boundary.md](v2/plan/lanes/may-suspend/fiber-boundary.md): the blaze lint `blaze::fiber_boundary` (crates/blaze-lints/src/blaze/fiber.rs) rejects a path to `blaze_graph::sched::fiber`, corosensei or the fiber driver written outside `blaze_graph::sched`, so fibers stay the scheduler's alone; blaze's tree is to deny it from the workspace's `[workspace.metadata.blaze.lints]`.
 
 ## Plans
 

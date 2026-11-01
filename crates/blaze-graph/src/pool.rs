@@ -21,7 +21,9 @@
 //! On a machine of fast and slow groups, a job on its request's critical path
 //! ([`Pool::submit_critical`]) goes to its `near` group if that is fast, else to the least loaded
 //! fast group; stealing is unchanged, so a slow worker with nothing else still takes it. Where
-//! every group is fast a critical job is placed as any other. [`node`] names the NUMA node of
+//! every group is fast a critical job is placed as any other. A background job
+//! ([`Class::Background`], work ahead of demand) waits in its group's queue of its own, taken one
+//! at a time by a worker that found nothing else while no group has a job queued. [`node`] names the NUMA node of
 //! the calling worker, for memory it should keep local.
 //!
 //! Bound to its CPU, a worker is pinned to it on Linux (`sched_setaffinity`); on macOS, which
@@ -75,6 +77,11 @@ const BATCH: usize = 4;
 const LIFO_RUNS: u8 = 3;
 /// How many times a searching worker looks at every queue before it parks.
 const ROUNDS: u32 = 4;
+
+/// How long a pool sleeps, idle with jobs parked, before it asks the scheduler whether they
+/// are stalled ([`crate::sched::check_stall`]).
+#[cfg(not(blaze_check))]
+const STALL_AFTER: std::time::Duration = std::time::Duration::from_secs(2);
 
 /// What the queues hold: a pointer to a job's [`Header`], which says how to run it. 8 bytes,
 /// so a line of a deque's buffer holds eight jobs.
@@ -360,6 +367,46 @@ impl Inject {
         self.len.fetch_add(1, Ordering::SeqCst);
     }
 
+    /// The oldest job, taken.
+    fn pop(&self) -> Option<Job> {
+        if self.is_empty() {
+            return None;
+        }
+        let mut list = self.list.lock();
+        let head = NonNull::new(list.head)?;
+        // SAFETY: as in `push`: the head is a job of this list, under its lock.
+        list.head = unsafe { head.as_ref() }.next.load(Ordering::Relaxed);
+        if list.head.is_null() {
+            list.tail = ptr::null_mut();
+        }
+        self.len.fetch_sub(1, Ordering::SeqCst);
+        Some(Job(head))
+    }
+
+    /// Every job of `self`, oldest first, to the back of `to`, one lock at a time.
+    fn move_to(&self, to: &Inject) {
+        if self.is_empty() {
+            return;
+        }
+        let (head, tail, count) = {
+            let mut list = self.list.lock();
+            let taken = (list.head, list.tail);
+            list.head = ptr::null_mut();
+            list.tail = ptr::null_mut();
+            let count = self.len.swap(0, Ordering::SeqCst);
+            (taken.0, taken.1, count)
+        };
+        let Some(head) = NonNull::new(head) else { return };
+        let mut list = to.list.lock();
+        match NonNull::new(list.tail) {
+            // SAFETY: as in `push`: the tail is a job of `to`'s list, under its lock.
+            Some(old) => unsafe { old.as_ref() }.next.store(head.as_ptr(), Ordering::Relaxed),
+            None => list.head = head.as_ptr(),
+        }
+        list.tail = tail;
+        to.len.fetch_add(count, Ordering::SeqCst);
+    }
+
     /// Up to [`BATCH`] jobs, oldest first: the first to run now, the rest to `deque`.
     fn steal_into(&self, deque: &Worker<Job>) -> Option<Job> {
         if self.is_empty() {
@@ -393,6 +440,9 @@ impl Inject {
 #[repr(align(128))]
 struct Group {
     inject: Inject,
+    /// Its [`Class::Background`] jobs: taken one at a time, by a worker that found nothing
+    /// else, never into a deque, so no thief takes one as other work.
+    later: Inject,
     workers: Box<[u32]>,
     order: Box<[u32]>,
     fast: bool,
@@ -444,6 +494,19 @@ struct Shared {
     parked: AtomicUsize,
     #[cfg(test)]
     critical: AtomicUsize,
+}
+
+/// How soon a job is taken, by what waits on it.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
+pub enum Class {
+    /// Work ahead of demand: taken only by a worker that found no other job while none is
+    /// queued, never stolen as other work. It is background only until it starts: once it ran,
+    /// a wait parks and resumes it as a normal job, so a job that waits for a key it holds
+    /// never waits behind the queue.
+    Background,
+    Normal,
+    /// On its request's critical path ([`Pool::submit_critical`]).
+    Critical,
 }
 
 pub struct Pool {
@@ -539,6 +602,7 @@ impl Pool {
             .enumerate()
             .map(|(at, workers)| Group {
                 inject: Inject::new(),
+                later: Inject::new(),
                 fast: workers.iter().any(|&it| topology.cpus[it as usize].fast),
                 order: topology.steal_order(at as u32).into_boxed_slice(),
                 workers: workers.into_boxed_slice(),
@@ -563,7 +627,7 @@ impl Pool {
         });
         #[cfg(not(blaze_check))]
         shared.member.store(
-            crate::sched::join_pool(wake_parked, Arc::as_ptr(&shared).expose_provenance()),
+            crate::sched::join_pool(wake_parked, pool_idle, Arc::as_ptr(&shared).expose_provenance()),
             Ordering::Relaxed,
         );
         let (ready_tx, ready_rx) = crossbeam_channel::unbounded::<io::Result<()>>();
@@ -641,6 +705,18 @@ impl Pool {
         .flatten()
     }
 
+    /// Whether every worker sleeps with nothing queued: no job of the pool runs or is
+    /// runnable, though some may be parked on a wait ([`Pool::parked`]).
+    pub fn idle(&self) -> bool {
+        let shared = &*self.shared;
+        shared.idle.0.load(Ordering::SeqCst) / SLEEPING == shared.slots.len() as u64 && !shared.any_work()
+    }
+
+    /// How many of the pool's jobs are parked on a wait now.
+    pub fn parked(&self) -> usize {
+        self.shared.parked.load(Ordering::Acquire)
+    }
+
     /// Runs `run` on a worker near `group` (a group this pool does not have is no group), then
     /// `done` on the same thread with what came of it: its value, or its panic, caught. The
     /// pool goes on after a panic; a panic of `done` is kept and raised when the pool is
@@ -677,6 +753,28 @@ impl Pool {
         done: impl FnOnce(thread::Result<R>) + Send + 'static,
     ) {
         self.push_placed(near, true, Job::new(move || done(catch_unwind(AssertUnwindSafe(run)))));
+    }
+
+    /// As [`Pool::submit`], for a job of `class`: a critical one placed as
+    /// [`Pool::submit_critical`] places it, a background one queued apart ([`Class::Background`]).
+    pub fn submit_as<R: 'static>(
+        &self,
+        near: Option<u32>,
+        class: Class,
+        run: impl FnOnce() -> R + Send + 'static,
+        done: impl FnOnce(thread::Result<R>) + Send + 'static,
+    ) {
+        #[cfg(test)]
+        if class == Class::Critical {
+            self.shared.critical.fetch_add(1, Ordering::Relaxed);
+        }
+        self.shared.push_as(near, class, Job::new(move || done(catch_unwind(AssertUnwindSafe(run)))));
+    }
+
+    /// Every background job queued now becomes a normal one, behind those queued: what is
+    /// ahead of demand is wanted now (a write waits on the readers whose jobs they are).
+    pub fn promote_background(&self) {
+        self.shared.promote();
     }
 
     /// `job` near `near`, placed as [`Pool::submit_critical`] places a job when `critical`,
@@ -742,6 +840,7 @@ fn scope_in<'env, R>(shared: &Shared, f: impl FnOnce(&Scope<'env>) -> R) -> R {
     let pending = Pending {
         count: AtomicUsize::new(1),
         finished: AtomicBool::new(false),
+        background: AtomicBool::new(false),
         #[cfg(not(blaze_check))]
         counter: crate::sched::open_scope(),
         #[cfg(blaze_check)]
@@ -749,6 +848,9 @@ fn scope_in<'env, R>(shared: &Shared, f: impl FnOnce(&Scope<'env>) -> R) -> R {
     };
     let scope = Scope { shared: ptr::from_ref(shared), pending: &pending, _env: PhantomData };
     let result = catch_unwind(AssertUnwindSafe(|| f(&scope)));
+    if pending.background.load(Ordering::Relaxed) {
+        shared.promote();
+    }
     drop(Left(&raw const pending));
     #[cfg(not(blaze_check))]
     {
@@ -877,6 +979,8 @@ struct Pending {
     /// Set by whoever brought `count` to 0, as the last thing it does with `Pending`: the call
     /// returns only once it is.
     finished: AtomicBool,
+    /// A job of the scope was given as [`Class::Background`].
+    background: AtomicBool,
     /// The scope's counter in the scheduler, held until `count` is 0; the jobs of it that wait
     /// count towards it.
     #[cfg(not(blaze_check))]
@@ -923,6 +1027,24 @@ impl<'env> Scope<'env> {
         run: impl FnOnce() -> R + Send + 'env,
         done: impl FnOnce(thread::Result<R>) + Send + 'env,
     ) {
+        self.submit_as(near, Class::Normal, run, done);
+    }
+
+    /// As [`Scope::submit`], for a job of `class`: a normal one to this worker's LIFO slot as
+    /// there, a critical or background one queued as [`Pool::submit_as`] queues it. A scope
+    /// with a background job promotes the pool's ([`Pool::promote_background`]) once its call
+    /// waits on its jobs, so the call never waits behind the queue.
+    pub fn submit_as<R: 'env>(
+        &self,
+        near: Option<u32>,
+        class: Class,
+        run: impl FnOnce() -> R + Send + 'env,
+        done: impl FnOnce(thread::Result<R>) + Send + 'env,
+    ) {
+        if class == Class::Background {
+            // SAFETY: as below.
+            unsafe { &*self.pending }.background.store(true, Ordering::Relaxed);
+        }
         // SAFETY: `Pool::scope` keeps `Pending` until every job counted in it is done.
         unsafe { &*self.pending }.count.fetch_add(1, Ordering::Relaxed);
         let left = Left(self.pending);
@@ -944,8 +1066,13 @@ impl<'env> Scope<'env> {
         let job = unsafe { Job::erase(job) };
         // SAFETY: the pool outlives the call of `Pool::scope`, which borrows it.
         let shared = unsafe { &*self.shared };
-        if let Some(job) = push_next(shared, near, job) {
-            shared.push(near, job);
+        match class {
+            Class::Normal => {
+                if let Some(job) = push_next(shared, near, job) {
+                    shared.push(near, job);
+                }
+            }
+            Class::Critical | Class::Background => shared.push_as(near, class, job),
         }
     }
 }
@@ -1047,8 +1174,32 @@ impl Shared {
         }
     }
 
+    /// `job` of `class` near `near`: as [`Pool::submit_critical`] places a critical one, as
+    /// [`Pool::submit`] a normal one, and a background one to its group's [`Group::later`].
+    fn push_as(&self, near: Option<u32>, class: Class, job: Job) {
+        match class {
+            Class::Critical => self.push_to(self.place(near, true), job),
+            Class::Normal => self.push(near, job),
+            Class::Background => {
+                let group = self.place(near, false);
+                self.groups[group].later.push(job);
+                self.announce(group);
+            }
+        }
+    }
+
+    /// Every background job queued becomes a normal one, behind those queued.
+    fn promote(&self) {
+        for (at, group) in self.groups.iter().enumerate() {
+            if !group.later.is_empty() {
+                group.later.move_to(&group.inject);
+                self.announce(at);
+            }
+        }
+    }
+
     fn any_work(&self) -> bool {
-        self.groups.iter().any(|it| !it.inject.is_empty())
+        self.groups.iter().any(|it| !it.inject.is_empty() || !it.later.is_empty())
             || self
                 .slots
                 .iter()
@@ -1150,6 +1301,16 @@ impl Local {
         }
     }
 
+    /// A background job, nearest group first, for a worker that found no other while no group
+    /// has one queued.
+    fn later(&self) -> Option<Job> {
+        let shared = &*self.shared;
+        if !shared.groups.iter().all(|it| it.inject.is_empty()) {
+            return None;
+        }
+        shared.groups[self.group].order.iter().find_map(|&at| shared.groups[at as usize].later.pop())
+    }
+
     /// Whether this worker may search: while fewer than half the workers do.
     fn begin_search(&self) -> bool {
         let idle = &self.shared.idle.0;
@@ -1202,6 +1363,18 @@ impl Local {
         shared.idle.0.fetch_add(SLEEPING, Ordering::SeqCst);
         fence(Ordering::SeqCst);
         if !ended() && !shared.any_work() {
+            #[cfg(not(blaze_check))]
+            if shared.parked.load(Ordering::Acquire) != 0 && pool_idle(ptr::from_ref(shared).expose_provenance()) {
+                // The last to sleep with jobs parked: none of them wakes unless a job ends a
+                // wait, so after a while with none, the scheduler checks for a stall.
+                thread::park_timeout(STALL_AFTER);
+                if slot.sleeping.load(Ordering::SeqCst) && !ended() && !shared.any_work() {
+                    crate::sched::check_stall();
+                }
+            } else {
+                thread::park();
+            }
+            #[cfg(blaze_check)]
             thread::park();
         }
         if slot.sleeping.compare_exchange(true, false, Ordering::SeqCst, Ordering::Relaxed).is_ok() {
@@ -1247,6 +1420,15 @@ fn wake_parked(shared: usize, token: usize) {
     }
 }
 
+/// Whether every worker of the pool at `shared` (an exposed `Shared` address) sleeps with
+/// nothing queued: called under the scheduler's lock ([`crate::sched::check_stall`]).
+#[cfg(not(blaze_check))]
+fn pool_idle(shared: usize) -> bool {
+    // SAFETY: as in `wake_parked`: the pool leaves the scheduler before its `Shared` goes.
+    let shared = unsafe { &*ptr::with_exposed_provenance::<Shared>(shared) };
+    shared.idle.0.load(Ordering::SeqCst) / SLEEPING == shared.slots.len() as u64 && !shared.any_work()
+}
+
 fn work(local: &Local) {
     LOCAL.set(local);
     let shared = &*local.shared;
@@ -1274,6 +1456,10 @@ fn work(local: &Local) {
                 local.run(&mut runner, job);
                 continue;
             }
+        }
+        if let Some(job) = local.later() {
+            local.run(&mut runner, job);
+            continue;
         }
         if shared.stop.load(Ordering::SeqCst) {
             // Every job given before the stop is run, and every parked one resumed and run:
@@ -1347,7 +1533,7 @@ mod tests {
     use blaze_ids::rng::SplitMix64 as Rng;
     use crossbeam_channel::{bounded, unbounded};
 
-    use super::{Group, Header, Job, Pending, Placed, Pool, Slot, group, searching, sleeping};
+    use super::{Class, Group, Header, Job, Pending, Placed, Pool, Slot, group, searching, sleeping};
     use crate::{
         Cancelled, Key,
         pump::Flights,
@@ -1902,13 +2088,9 @@ mod tests {
         static LENT: std::cell::RefCell<Option<u32>> = const { std::cell::RefCell::new(None) };
     }
 
-    /// Two jobs each lend a value to a carried thread-local ([`stdx::lend`]), park on a key and
-    /// resume, often on each other's worker, while each worker holds a value of its own in the
-    /// slot (left by a job that ended without taking it back). A job always comes on to an
-    /// empty slot, finds its own value after the wait, and the jobs after them find it empty:
-    /// a job's carried values are swapped with its worker's, never put over them.
-    #[test]
-    fn jobs_holding_lends_resume_crosswise_on_workers_whose_slots_are_held() {
+    /// Carries [`LENT`] with each job, once for every test of it: carried twice, the second
+    /// carry's put of nothing finds the first's value on the thread.
+    fn carry_lent() {
         static CARRIED: std::sync::Once = std::sync::Once::new();
         CARRIED.call_once(|| {
             crate::sched::carry(crate::sched::Carried {
@@ -1916,6 +2098,16 @@ mod tests {
                 put: |it| stdx::lend::put_carried(&LENT, Option::is_none, it),
             });
         });
+    }
+
+    /// Two jobs each lend a value to a carried thread-local ([`stdx::lend`]), park on a key and
+    /// resume, often on each other's worker, while each worker holds a value of its own in the
+    /// slot (left by a job that ended without taking it back). A job always comes on to an
+    /// empty slot, finds its own value after the wait, and the jobs after them find it empty:
+    /// a job's carried values are swapped with its worker's, never put over them.
+    #[test]
+    fn jobs_holding_lends_resume_crosswise_on_workers_whose_slots_are_held() {
+        carry_lent();
         let pool = Pool::new(&Topology::flat(2), false).unwrap();
         let flights = Arc::new(Flights::<u32>::new());
         let mut crossed = 0;
@@ -1997,13 +2189,7 @@ mod tests {
     /// jobs the slot is the worker's, set aside while a job runs and given back as it goes off.
     #[test]
     fn jobs_holding_lends_resume_on_one_thread_in_swapped_order() {
-        static CARRIED: std::sync::Once = std::sync::Once::new();
-        CARRIED.call_once(|| {
-            crate::sched::carry(crate::sched::Carried {
-                take: || stdx::lend::take_carried(&LENT, Option::is_none),
-                put: |it| stdx::lend::put_carried(&LENT, Option::is_none, it),
-            });
-        });
+        carry_lent();
         let pool = Pool::new(&Topology::flat(1), false).unwrap();
         let flights = Arc::new(Flights::<u32>::new());
         for round in 0..20u32 {
@@ -2069,6 +2255,164 @@ mod tests {
             }
             assert_eq!(rx.recv_timeout(LONG).unwrap(), Ok(2));
         }
+    }
+
+    /// A job claims a key and then waits on a scope of its own that nothing will end; another
+    /// waits for the key, which nobody will finish. Once the pool is idle a while, each fails
+    /// with the stall, naming the key and who claimed it, rather than both waiting forever;
+    /// the pool goes on running jobs.
+    #[test]
+    fn a_job_waiting_on_a_key_nobody_will_finish_fails_naming_the_key() {
+        use crate::sched::{self, Wait};
+        let pool = Pool::new(&Topology::flat(2), false).unwrap();
+        let (tx, rx) = unbounded::<Result<(), String>>();
+        let at = key(7_000);
+        let claimed = Arc::new(AtomicUsize::new(0));
+        {
+            let (tx, claimed) = (tx.clone(), claimed.clone());
+            pool.submit(
+                None,
+                move || {
+                    assert!(sched::claim(at), "the key is new");
+                    claimed.store(1, Ordering::SeqCst);
+                    let never = sched::open_scope();
+                    let _ = sched::wait(Wait::Counter(never));
+                },
+                move |it| _ = tx.send(it.map_err(|it| message(&*it))),
+            );
+        }
+        until("the key to be claimed", || claimed.load(Ordering::SeqCst) == 1);
+        {
+            let tx = tx.clone();
+            pool.submit(
+                None,
+                move || {
+                    let _ = sched::wait(Wait::Key(at));
+                },
+                move |it| _ = tx.send(it.map_err(|it| message(&*it))),
+            );
+        }
+        let named: String = at.0.iter().map(|byte| format!("{byte:02x}")).collect();
+        for _ in 0..2 {
+            let failed = rx.recv_timeout(LONG).unwrap().expect_err("a stalled job fails");
+            assert!(failed.starts_with("stalled: "), "{failed}");
+            assert!(failed.contains(&format!("key {named}, claimed by job ")), "the stall names the key: {failed}");
+        }
+        let tx = tx.clone();
+        pool.submit(None, || (), move |it| _ = tx.send(it.map_err(|it| message(&*it))));
+        assert_eq!(rx.recv_timeout(LONG).unwrap(), Ok(()), "the pool ran no job after the stall");
+    }
+
+    /// On a pool of one worker, busy while a background job and then two normal ones are
+    /// given: the normal ones run first, then the background one.
+    #[test]
+    fn a_background_job_runs_after_the_normal_ones_queued_with_it() {
+        let pool = Pool::new(&Topology::flat(1), false).unwrap();
+        let (go_tx, go_rx) = bounded::<()>(0);
+        let (tx, rx) = unbounded::<&'static str>();
+        let started = Arc::new(AtomicUsize::new(0));
+        {
+            let started = started.clone();
+            pool.submit(
+                None,
+                move || {
+                    started.store(1, Ordering::SeqCst);
+                    go_rx.recv().unwrap();
+                },
+                |it| it.unwrap(),
+            );
+        }
+        until("the worker to be busy", || started.load(Ordering::SeqCst) == 1);
+        for (class, name) in [(Class::Background, "background"), (Class::Normal, "first"), (Class::Normal, "second")] {
+            let tx = tx.clone();
+            pool.submit_as(None, class, move || name, move |it| _ = tx.send(it.unwrap()));
+        }
+        go_tx.send(()).unwrap();
+        let ran: Vec<_> = (0..3).map(|_| rx.recv_timeout(LONG).unwrap()).collect();
+        assert_eq!(ran, ["first", "second", "background"]);
+    }
+
+    /// A scope's background job, on a pool of one worker that always has a normal job queued
+    /// (each gives the next): never taken as background, it runs once the scope's call waits
+    /// on it, promoted behind the queued one.
+    #[test]
+    fn a_scope_waiting_on_its_background_job_runs_it_ahead_of_normal_work() {
+        fn again(pool: Arc<Pool>, stop: Arc<AtomicUsize>) {
+            if stop.load(Ordering::SeqCst) == 0 {
+                let next = pool.clone();
+                pool.submit(None, move || again(next, stop), |it| it.unwrap());
+            }
+        }
+        let pool = Arc::new(Pool::new(&Topology::flat(1), false).unwrap());
+        let stop = Arc::new(AtomicUsize::new(0));
+        again(pool.clone(), stop.clone());
+        let ran = AtomicUsize::new(0);
+        pool.scope(|scope| {
+            scope.submit_as(None, Class::Background, || ran.store(1, Ordering::SeqCst), |it| it.unwrap());
+        });
+        assert_eq!(ran.load(Ordering::SeqCst), 1);
+        stop.store(1, Ordering::SeqCst);
+        until("the last of the chain to end", || Arc::strong_count(&pool) == 1);
+    }
+
+    /// A scope's job waits on a key a job outside it claimed, which waits forever: a stall. The
+    /// key's claimer and the scope's job fail with it; the scope's caller, waiting on its job,
+    /// is left until that job ended and returns as a scope does, never unwinding while a job
+    /// borrowing its frame runs.
+    #[test]
+    fn a_stall_inside_a_scope_fails_its_job_before_its_caller() {
+        use crate::sched::{self, Wait};
+        let pool = Arc::new(Pool::new(&Topology::flat(2), false).unwrap());
+        let (tx, rx) = unbounded::<Result<(), String>>();
+        let at = key(7_100);
+        let claimed = Arc::new(AtomicUsize::new(0));
+        {
+            let (tx, claimed) = (tx.clone(), claimed.clone());
+            pool.submit(
+                None,
+                move || {
+                    assert!(sched::claim(at), "the key is new");
+                    claimed.store(1, Ordering::SeqCst);
+                    let never = sched::open_scope();
+                    let _ = sched::wait(Wait::Counter(never));
+                },
+                move |it| _ = tx.send(it.map_err(|it| message(&*it))),
+            );
+        }
+        until("the key to be claimed", || claimed.load(Ordering::SeqCst) == 1);
+        let ended = Arc::new(AtomicUsize::new(0));
+        {
+            let (tx, ended) = (tx.clone(), ended.clone());
+            let scoped = pool.clone();
+            pool.submit(
+                None,
+                move || {
+                    let (job_tx, job_rx) = unbounded::<Result<(), String>>();
+                    let borrowed = &ended;
+                    scoped.scope(|scope| {
+                        scope.submit(
+                            None,
+                            move || {
+                                let _ = sched::wait(Wait::Key(at));
+                                borrowed.store(1, Ordering::SeqCst);
+                            },
+                            move |it| _ = job_tx.send(it.map_err(|it| message(&*it))),
+                        );
+                    });
+                    let failed = job_rx.try_recv().expect("the scope returned once its job ended").unwrap_err();
+                    assert!(failed.starts_with("stalled: "), "{failed}");
+                    assert_eq!(ended.load(Ordering::SeqCst), 0, "the scope's job failed at its wait");
+                },
+                move |it| _ = tx.send(it.map_err(|it| message(&*it))),
+            );
+        }
+        let mut got = [rx.recv_timeout(LONG).unwrap(), rx.recv_timeout(LONG).unwrap()];
+        got.sort();
+        assert!(got[0].is_ok(), "the scope's caller saw its job's stall: {got:?}");
+        assert!(got[1].as_ref().is_err_and(|it| it.starts_with("stalled: ")), "the key's claimer fails: {got:?}");
+        let tx = tx.clone();
+        pool.submit(None, || (), move |it| _ = tx.send(it.map_err(|it| message(&*it))));
+        assert_eq!(rx.recv_timeout(LONG).unwrap(), Ok(()), "the pool ran no job after the stall");
     }
 
     /// A scope's job given to a worker's LIFO slot is taken by another worker while the first
@@ -2490,6 +2834,7 @@ mod model {
             .collect();
         let group = Group {
             inject: Inject::new(),
+            later: Inject::new(),
             workers: (0..workers as u32).collect(),
             order: Topology::flat(workers).steal_order(0).into_boxed_slice(),
             fast: true,

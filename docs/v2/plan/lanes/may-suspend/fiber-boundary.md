@@ -1,6 +1,6 @@
 ---
 status: current
-summary: the blaze lint `blaze::fiber_boundary` (crates/blaze-lints/src/blaze/fiber.rs) rejects a path to `blaze_graph::sched::fiber`, corosensei or the fiber driver written outside `blaze_graph::sched`, so fibers stay the scheduler's alone; blaze's tree denies it from the workspace's `[lints.blaze]`.
+summary: the blaze lint `blaze::fiber_boundary` (crates/blaze-lints/src/blaze/fiber.rs) rejects a path to `blaze_graph::sched::fiber`, corosensei or the fiber driver written outside `blaze_graph::sched`, so fibers stay the scheduler's alone; blaze's tree is to deny it from the workspace's `[workspace.metadata.blaze.lints]`.
 date: 2026-10-31
 ---
 # `blaze::fiber_boundary`: fibers are the scheduler's alone
@@ -40,8 +40,10 @@ outside.
 ## How blaze's tree turns it on
 
 It is allow by default and in no group (`blaze::hot` doesn't include it). blaze's own workspace
-denies it with `fiber_boundary = "deny"` under `[workspace.lints.blaze]` in the root
-`Cargo.toml`, which every member's `[lints] workspace = true` picks up; the name is registered in
+is to deny it with `fiber_boundary = "deny"` under `[workspace.metadata.blaze.lints]` in the
+root `Cargo.toml`, which blaze gives every member as `--deny=blaze::fiber_boundary`; not under
+`[workspace.lints.blaze]`, which cargo hands rustc, which stops at the unknown tool `blaze`
+(E0602). The root has neither line yet; the name is registered in
 `crates/blaze-lint-defs/src/lints.rs`'s `BLAZE` table so `#[deny(blaze::fiber_boundary)]` is
 not an unknown lint. Both are coordinator requests from lane may-suspend-lint.
 

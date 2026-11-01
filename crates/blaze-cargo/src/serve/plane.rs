@@ -27,7 +27,7 @@ use blaze_graph::{
     admission::{Predict, Prediction, TaskKind},
     arena,
     machine::{NodeId, Outcome, Pool},
-    plane::{Key, NodeRef, Nodes},
+    plane::{Key, NodeRef, Nodes, Unsettled},
 };
 use blaze_ids::rng::SplitMix64 as Rng;
 use blaze_protocol::events::{Event, NodeState};
@@ -335,7 +335,7 @@ pub fn record_panics() {
 
 /// The panic `payload` caught, with where the hook saw the newest one of its message raised.
 // dyn: a panic payload, read once per panicked task
-fn panicked(payload: &(dyn std::any::Any + Send)) -> Panic {
+pub(crate) fn panicked(payload: &(dyn std::any::Any + Send)) -> Panic {
     let message = stdx::panic_text(payload).map(str::to_owned); // alloc: a panic, once
     let mut raised = RAISED.lock().unwrap_or_else(PoisonError::into_inner);
     let at = raised.iter().rposition(|(it, _)| *it == message).and_then(|place| raised.remove(place)).map(|(_, at)| at);
@@ -518,6 +518,11 @@ impl<W: Work, P: Predict> Plane<W, P> {
 
     pub fn stats(&self, request: RequestId) -> Option<RequestStats> {
         self.graph.stats(request)
+    }
+
+    /// Whether `request` is known and not finished: one [`Plane::cancel`] takes.
+    pub fn is_open(&self, request: RequestId) -> bool {
+        self.graph.is_open(request)
     }
 
     /// A batch of `count` nodes with consecutive ids no node of this plane has, its columns
@@ -794,6 +799,16 @@ impl<W: Work, P: Predict> Plane<W, P> {
     /// How many thread tasks run.
     pub fn running(&self) -> usize {
         self.runner.running()
+    }
+
+    /// How many loop tasks run ([`Happened::Run`], not yet [`Plane::ended`]).
+    pub fn loops_running(&self) -> usize {
+        self.loops.len()
+    }
+
+    /// Each node of an open request that has not settled, to `each`, in no order.
+    pub fn unsettled<'a>(&'a self, each: impl FnMut(Unsettled<'a>)) {
+        self.graph.unsettled(each);
     }
 
     /// One input, its outputs taken through `said`, which is reused by every step.

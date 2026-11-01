@@ -870,7 +870,7 @@ const I16_TO_I128: TySet = TySet::of(&[Ty::I16, Ty::I32, Ty::I64, Ty::I128]);
 const NARROWED: TySet = TySet::of(&[Ty::I8x16, Ty::I16x8, Ty::I32x4]);
 const WIDENED: TySet = TySet::of(&[Ty::I16x8, Ty::I32x4, Ty::I64x2]);
 const SAT_LANES: TySet = TySet::INT_VECTORS;
-const MUL_TYS: TySet = TySet::INTS_WIDE.union(WIDENED);
+const MUL_TYS: TySet = TySet::INTS_WIDE.union(TySet::INT_VECTORS);
 // Neither backend has a vector rule (x64's `pmulhw` and AArch64's `smull2` lower widening
 // multiplies, not `umulhi`/`smulhi`).
 const MULHI_TYS: TySet = TySet::INTS;
@@ -1255,6 +1255,8 @@ impl Shape {
                 !x64 || matches!(ty, Ty::I8x16 | Ty::I16x8)
             }
             Op::Fcopysign => !(x64 && ty.is_vector()),
+            // AArch64 multiplies lanes of 32 bits or fewer with `mul`; x64 has no `i8x16` rule.
+            Op::Imul => !(x64 && ty == Ty::I8x16),
             // x64 has no rule narrowing `i64x2` operands, and none for `uunarrow`.
             Op::Snarrow | Op::Unarrow | Op::SqmulRoundSat => !(x64 && ty == Ty::I32x4),
             Op::Uunarrow => !x64,

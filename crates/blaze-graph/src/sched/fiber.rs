@@ -251,6 +251,10 @@ pub(super) struct Global {
 pub(super) struct OwnIo {
     pub(super) wake: fn(usize, usize),
     pub(super) ctx: usize,
+    /// Of a pool: whether all its workers sleep with nothing queued (`idle(ctx)`), under the
+    /// scheduler's lock. A pool's job not yet in the graph runs only on a worker or waits in
+    /// a queue, so an idle pool has none.
+    pub(super) idle: Option<fn(usize) -> bool>,
 }
 
 struct Io {
@@ -910,6 +914,41 @@ pub(super) fn switched(world: &World, event: SwitchEvent, job: JobId, fiber: u32
     }
 }
 
+/// A worker going idle or waking, as the idle observer ([`observe_idle`]) is told it: on the
+/// worker's thread, with no lock held. With the switches, it puts each worker's every moment in
+/// one state: running a job, idle (with why), or the driver's own work between them.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct Idle {
+    pub core: CoreId,
+    pub reason: IdleReason,
+    /// `true` as the worker goes idle, `false` as it wakes.
+    pub began: bool,
+}
+
+/// Why a worker is idle.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum IdleReason {
+    /// Its core has nothing to run.
+    Nothing,
+    /// Nothing to run before the timer of a job waiting until this time (the driver's clock).
+    Until(u64),
+}
+
+static IDLE_OBSERVER: OnceLock<fn(Idle)> = OnceLock::new();
+
+/// Has `observer` told of every worker's idle stretches (the profiler's). Once a process; a
+/// second is refused.
+pub fn observe_idle(observer: fn(Idle)) -> Result<(), fn(Idle)> {
+    IDLE_OBSERVER.set(observer)
+}
+
+#[inline]
+fn idled(core: u32, reason: IdleReason, began: bool) {
+    if let Some(observer) = IDLE_OBSERVER.get() {
+        observer(Idle { core: CoreId(core), reason, began });
+    }
+}
+
 /// A region that must not wait (a lock held, a thread-local borrowed): a wait inside it
 /// panics, naming the job, instead of moving the region to another thread.
 pub struct NoWait(());
@@ -1185,7 +1224,10 @@ fn worker<W: Work>(shared: &Arc<Shared<W>>, me: u32) {
         }
         let deadline = st.world().next_deadline(member);
         drop(st);
+        let reason = deadline.map_or(IdleReason::Nothing, IdleReason::Until);
+        idled(me, reason, true);
         idle(shared, slot, deadline);
+        idled(me, reason, false);
         st = shared.lock();
         if deadline.is_some() {
             st.world().advance_clock(member, shared.now());

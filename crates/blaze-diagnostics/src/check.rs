@@ -51,8 +51,10 @@ pub fn check_crate(
     files: Files<'_>,
     options: &Options,
 ) -> Vec<Diag> {
-    let plan = Plan::new(db, &[krate], &hir::check::every_body);
-    frame::task(Tag::Diagnostics, |frame| run(db, krate, files, options, &plan, frame))
+    hir::attach_db(db, || {
+        let plan = Plan::new(db, &[krate], &hir::check::every_body);
+        frame::task(Tag::Diagnostics, |frame| run(db, krate, files, options, &plan, frame))
+    })
 }
 
 /// [`check_crate`], its bodies checked by `plan`, a plan of `krate` alone with every body: what
@@ -65,7 +67,7 @@ pub fn check_planned(
     files: Files<'_>,
     options: &Options,
 ) -> Vec<Diag> {
-    frame::task(Tag::Diagnostics, |frame| run(db, krate, files, options, plan, frame))
+    hir::attach_db(db, || frame::task(Tag::Diagnostics, |frame| run(db, krate, files, options, plan, frame)))
 }
 
 /// The check of `krate`, its tables in `frame`, its bodies by `plan`.
@@ -344,5 +346,38 @@ mod tests {
 
         let out = written(diags, &Options::default());
         assert_eq!(out.len(), 2, "no report, and the allowed one not written: {out:?}");
+    }
+
+    /// A pool job starts with no database attached, and an unimplemented trait's cause compares
+    /// `hir::Type`s, which read the attached one: the check attaches its own.
+    #[test]
+    fn a_check_planned_on_a_thread_with_no_db_attached_gives_its_diagnostics() {
+        let checked = crate::tests::checked(
+            "//- /main.rs crate:main\n\
+             trait Foo {\n    fn bar(&self);\n}\n\
+             fn some_func<T: Foo>(foo: T) {\n    foo.bar();\n}\n\
+             fn main() {\n    some_func(5i32);\n}\n",
+        );
+        assert!(
+            checked.diags.iter().any(|it| it.code.as_ref().is_some_and(|code| code.as_str() == "E0277")),
+            "the fixture's call is an E0277: {:?}",
+            checked.messages()
+        );
+        let db = &checked.db;
+        let krate = hir::attach_db(db, || hir::check::workspace_crates(db))
+            .into_iter()
+            .find(|it| hir::attach_db(db, || it.display_name(db).is_some_and(|name| name.to_string() == "main")))
+            .expect("the fixture has a crate `main`");
+        let every: fn(hir::DefWithBody) -> bool = hir::check::every_body;
+        let diags = std::thread::scope(|scope| {
+            scope
+                .spawn(|| {
+                    let plan = Plan::new(db, &[krate], &every);
+                    check_planned(db, krate, &plan, checked.files(), &Options::default())
+                })
+                .join()
+                .expect("the check on a thread with no database attached")
+        });
+        assert_eq!(diags, checked.diags);
     }
 }

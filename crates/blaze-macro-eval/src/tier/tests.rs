@@ -13,9 +13,11 @@ fn a_blaze_without_the_compiled_tier_evaluates_everything() {
 }
 
 #[test]
-fn a_blaze_runs_the_compiled_tier_where_it_runs_code() {
-    assert_eq!(Policy::DEFAULT.compiled, machine::SUPPORTED);
-    assert_eq!(choose(code(1), 0), Tier::Evaluator, "the first expansion is evaluated");
+fn until_std_is_planned_at_opt_level_0_every_expansion_is_evaluated() {
+    assert!(!Policy::DEFAULT.compiled);
+    for runs in [0, 1, 1_000] {
+        assert_eq!(choose(code(1), runs), Tier::Evaluator, "{runs}");
+    }
 }
 
 #[test]

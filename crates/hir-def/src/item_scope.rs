@@ -2183,24 +2183,6 @@ impl ItemScope {
 
 // These methods are a temporary measure only meant to be used by `DefCollector::push_res_and_update_glob_vis()`.
 impl ItemScope {
-    pub(crate) fn update_visibility_types(&mut self, name: &Name, vis: Visibility) {
-        let pos =
-            self.position(TYPES, name).expect("tried to update visibility of non-existent type");
-        self.types.entries[pos].set_vis(vis);
-    }
-
-    pub(crate) fn update_visibility_values(&mut self, name: &Name, vis: Visibility) {
-        let pos =
-            self.position(VALUES, name).expect("tried to update visibility of non-existent value");
-        self.values.entries[pos].set_vis(vis);
-    }
-
-    pub(crate) fn update_visibility_macros(&mut self, name: &Name, vis: Visibility) {
-        let pos =
-            self.position(MACROS, name).expect("tried to update visibility of non-existent macro");
-        self.macros.entries[pos].set_vis(vis);
-    }
-
     pub(crate) fn update_def_types(&mut self, name: &Name, def: ModuleDefId, vis: Visibility) {
         let pos = self.position(TYPES, name).expect("tried to update def of non-existent type");
         let entry = &mut self.types.entries[pos];
@@ -2227,7 +2209,8 @@ impl ItemScope {
 
     /// Binds `name` in the type namespace to `item` through glob `glob`, in place of the item
     /// another glob bound it to: of two globs giving one name different items, the first in
-    /// position order binds it, whichever arrived first (docs/v2/plan/design/dbsp.md §6).
+    /// position order binds it, whichever arrived first (docs/v2/plan/design/dbsp.md §6); of
+    /// two giving it the same item, the more visible one, as rustc's `try_define`.
     pub(crate) fn rebind_glob_types(&mut self, name: &Name, mut item: TypesItem, glob: GlobId) {
         let pos = self.position(TYPES, name).expect("tried to rebind a non-existent type");
         item.import = Some(ImportOrExternCrate::Glob(glob));
@@ -2701,20 +2684,27 @@ mod tests {
                     }
                     9 => {
                         let vis = vis(&mut rng);
+                        let glob = GlobId { use_: id(rng.below(4)), idx: tree_at(rng.below(3) as u32) };
                         let ns = [Namespace::Types, Namespace::Values, Namespace::Macros]
                             [rng.below(3) as usize];
                         match ns {
                             Namespace::Types if model.types.contains_key(&name) => {
-                                scope.update_visibility_types(&name, vis);
-                                model.types[&name].vis = vis;
+                                let it = &mut model.types[&name];
+                                it.vis = vis;
+                                scope.rebind_glob_types(&name, *it, glob);
+                                it.import = Some(ImportOrExternCrate::Glob(glob));
                             }
                             Namespace::Values if model.values.contains_key(&name) => {
-                                scope.update_visibility_values(&name, vis);
-                                model.values[&name].vis = vis;
+                                let it = &mut model.values[&name];
+                                it.vis = vis;
+                                scope.rebind_glob_values(&name, *it, glob);
+                                it.import = Some(ImportOrGlob::Glob(glob));
                             }
                             Namespace::Macros if model.macros.contains_key(&name) => {
-                                scope.update_visibility_macros(&name, vis);
-                                model.macros[&name].vis = vis;
+                                let it = &mut model.macros[&name];
+                                it.vis = vis;
+                                scope.rebind_glob_macros(&name, *it, glob);
+                                it.import = Some(ImportOrExternCrate::Glob(glob));
                             }
                             _ => {}
                         }

@@ -294,6 +294,29 @@ impl Db {
         self.write_crates(|db| files.set_crate_attr_files(db, krate, gone, durability));
     }
 
+    /// A new file with `of`'s path and text, whose appended root module is its own: see
+    /// [`Files::alias`]. [`Files::aliases_of`] lists them.
+    pub fn alias(&mut self, of: FileId) -> Result<FileId, crate::AliasError> {
+        let files = Arc::clone(&self.files);
+        self.batch(|db| {
+            let (alias, roots) = files.alias(db, of)?;
+            db.note(Note::View { set: &[], added: &[alias], removed: &[], roots: &roots });
+            Ok(alias)
+        })
+    }
+
+    /// Has `alias` append a module (`appended`: its name, and the text after its file's) to its
+    /// file's text, or nothing, in one write: its text is its file's and the suffix, kept
+    /// across every write of its file, and its appended root module the name.
+    pub fn set_alias_appended(
+        &mut self,
+        alias: FileId,
+        appended: Option<(&'static str, &str)>,
+    ) -> Result<(), crate::AliasError> {
+        let files = Arc::clone(&self.files);
+        self.write_file(alias, |db| files.set_alias_appended(db, alias, appended))
+    }
+
     /// Sets the inputs of one view's files, writing only those that changed: see
     /// [`Files::set_view_root`].
     pub fn set_view_root(&mut self, view: ViewRoot<'_>) -> Result<ViewChange, ViewError> {
@@ -413,11 +436,27 @@ impl Db {
     /// On the pool, a task that gave way ([`blaze_query::db::Cancelled::WouldWaitOnItself`])
     /// runs again on this thread once the others ended ([`blaze_query::db::par_for_each`]), and
     /// the first other panic of a task goes on from here once every task has run.
+    ///
+    /// The call is a span `run_all` and each task a span `run_all task`, both naming the
+    /// caller's file and line in `function`, so a profile says whose tasks a stretch ran.
+    #[track_caller]
     pub fn run_all<F: Fn(&Db, usize) + Sync>(&self, tag: Tag, count: usize, task: F) {
         if count == 0 {
             return;
         }
-        let run = |db: &Db, at: usize| frame::task(tag, |_| task(db, at));
+        let caller = std::panic::Location::caller();
+        let all = tracing::info_span!(target: "blaze", "run_all", function = tracing::field::Empty, count);
+        // alloc: only while a subscriber records the span, which interns it
+        let site = (!all.is_disabled()).then(|| format!("{}:{}", caller.file(), caller.line()));
+        if let Some(site) = &site {
+            all.record("function", site.as_str());
+        }
+        let _all = all.entered();
+        let run = |db: &Db, at: usize| {
+            let span = tracing::info_span!(target: "blaze", "run_all task", function = site.as_deref());
+            let _span = span.entered();
+            frame::task(tag, |_| task(db, at))
+        };
         match self.run {
             Run::Pool => blaze_query::db::par_for_each(count, |at| run(self, at)),
             Run::Here => match RUN_ORDER.get() {

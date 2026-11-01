@@ -41,6 +41,17 @@ pub(crate) enum Target {
     Counter(u32),
 }
 
+/// What a job of a stall waits for ([`super::Stalled`]).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum StallWait {
+    /// Another job's end.
+    Job(JobId),
+    /// A key's flight, and the job that claimed it.
+    Key { key: Key, claimer: JobId },
+    /// Every job counted towards a counter (a scope's jobs).
+    Counter(CounterId),
+}
+
 /// What a job waits for, as asked.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(crate) enum On {
@@ -291,6 +302,19 @@ impl Graph {
         let outer = std::mem::replace(&mut self.counter_outer[c], NONE);
         self.jobs[j].scope = outer;
         (outer != NONE).then_some(CounterId(outer))
+    }
+
+    /// `job`, failed by a stall, leaves each scope it has open, innermost first, that no job
+    /// counts towards ([`Graph::wake_all`] woke it for one): its innermost open scope after.
+    /// Their counters stay held, a stall's leak.
+    pub(crate) fn leave_empty_scopes(&mut self, job: JobId) -> Option<CounterId> {
+        loop {
+            let scope = self.jobs[job.0 as usize].scope;
+            if scope == NONE || self.counter_left[scope as usize] != self.counter_held[scope as usize] {
+                return (scope != NONE).then_some(CounterId(scope));
+            }
+            self.close_scope(job, CounterId(scope));
+        }
     }
 
     /// `job`, live and waiting for nothing, counts towards `counter` from now on.
@@ -627,6 +651,54 @@ impl Graph {
         jobs.push(JobId(asker));
         jobs.reverse();
         Cycle { jobs }
+    }
+
+    /// Whether no wait in the graph can end by what is in it: some job waits, and every live
+    /// job waits, each on a job, a counter, or a key a job claimed (one claimed by none may be
+    /// made outside the graph). Each waiting job and its wait into `into`.
+    pub(crate) fn stuck(&self, into: &mut Vec<(JobId, StallWait)>) -> bool {
+        into.clear();
+        for (j, node) in self.jobs.iter().enumerate() {
+            if node.life != Life::Live {
+                continue;
+            }
+            let wait = match node.wait {
+                Target::None => return false,
+                Target::Job(other) => StallWait::Job(JobId(other)),
+                Target::Key(entry) => {
+                    let claimer = self.key_claimer[entry as usize];
+                    if claimer == NONE {
+                        return false;
+                    }
+                    StallWait::Key { key: self.key_name[entry as usize], claimer: JobId(claimer) }
+                }
+                Target::Counter(counter) => StallWait::Counter(CounterId(counter)),
+            };
+            into.push((JobId(j as u32), wait));
+        }
+        !into.is_empty()
+    }
+
+    /// Ends every wait for a job or a key, and on a counter no job counts towards: each waiting
+    /// job into `woken`, unlinked. A wait on a counter some job counts towards is left: its
+    /// jobs wait too, and as they fail and end it ends as it would, so a scope's caller never
+    /// unwinds while its jobs, borrowing its frame, still run.
+    pub(crate) fn wake_all(&mut self, woken: &mut Vec<u32>) {
+        for j in 0..self.jobs.len() {
+            let head = std::mem::replace(&mut self.jobs[j].waiters, NONE);
+            self.drain(head, woken);
+        }
+        for e in 0..self.key_waiters.len() {
+            let head = std::mem::replace(&mut self.key_waiters[e], NONE);
+            self.drain(head, woken);
+        }
+        for c in 0..self.counter_waiters.len() {
+            if self.counter_left[c] != self.counter_held[c] {
+                continue;
+            }
+            let head = std::mem::replace(&mut self.counter_waiters[c], NONE);
+            self.drain(head, woken);
+        }
     }
 
     /// Whether `job` waits on the graph now.

@@ -559,7 +559,7 @@ pub(crate) fn generate<'db>(
     let built = {
         let guard = blaze_cas::enter();
         let store = Reading { store: &job.input.store, guard: &guard };
-        Build::new(&backends, &frontend, &policy, &job.shared.memo).run_with_statics(&asked, &roots.statics, &store)
+        Build::new(&backends, &frontend, &policy, &job.memo).run_with_statics(&asked, &roots.statics, &store)
     };
     match built {
         Ok(mut built) => {

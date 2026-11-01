@@ -68,6 +68,13 @@ const BUILD: Arg = Arg {
     ty: ArgType::U64,
     default: Some("(SELECT max(build_id) FROM spans)"),
 };
+/// A build for a view over its wall time: by default the last to end, as one still running has
+/// no `builds` row to bound it.
+const ENDED_BUILD: Arg = Arg {
+    name: "build",
+    ty: ArgType::U64,
+    default: Some("(SELECT max(build_id) FROM builds)"),
+};
 const LIMIT: Arg = Arg { name: "limit", ty: ArgType::U64, default: Some("20") };
 const EARLIER: Arg = Arg { name: "earlier", ty: ArgType::Text, default: None };
 const LATER: Arg = Arg { name: "later", ty: ArgType::Text, default: None };
@@ -85,6 +92,8 @@ pub const VIEWS: &[View] = &[
     view("time_by_span_name", &[BUILD]),
     view("frame_copies_per_query_kind", &[BUILD, LIMIT]),
     view("jobs_by_stack_high_water", &[BUILD, LIMIT]),
+    view("utilization_per_second", &[ENDED_BUILD]),
+    view("uncovered_time", &[ENDED_BUILD]),
 ];
 
 /// The view named `name`.
@@ -344,7 +353,10 @@ pub(crate) fn quote(text: &str, out: &mut String) {
     out.push('\'');
 }
 
-/// [`PRELUDE`] reading each table from `<dir>/*.<table>.parquet` of every directory of `dirs`.
+/// [`PRELUDE`] reading each table from `<dir>/*.<table>.parquet` of every directory of `dirs`,
+/// then each view of [`VIEWS`] whose arguments all have defaults as a DuckDB view of that name
+/// (the latest build, the default limit), so a query can say `FROM uncovered_time`. Other
+/// arguments take `blaze explain <view> <args>`.
 pub fn prelude(dirs: &[&Path]) -> Result<String, ViewError> {
     // alloc: the prelude, once a query
     let mut globs: Vec<&str> = Vec::with_capacity(dirs.len());
@@ -385,6 +397,11 @@ pub fn prelude(dirs: &[&Path]) -> Result<String, ViewError> {
         Ok(())
     })?;
     out.push_str(&PRELUDE[copied..]);
+    for view in VIEWS.iter().filter(|it| it.args.iter().all(|arg| arg.default.is_some())) {
+        // Writing to a `String` does not fail; a section may end in a comment, so `;` goes on a
+        // line of its own.
+        _ = write!(out, "\nCREATE OR REPLACE VIEW {} AS\n{}\n;\n", view.name, render(view, &Map::new())?);
+    }
     Ok(out)
 }
 
@@ -539,12 +556,13 @@ mod tests {
         "having", "in", "is", "join", "last", "left", "like", "limit", "not", "null", "nulls",
         "on", "or", "order", "over", "partition", "qualify", "recursive", "replace", "select",
         "then", "union", "union_by_name", "using", "view", "when", "where", "with", "true",
-        "false",
+        "false", "rows", "unbounded", "preceding", "bigint",
     ];
     /// DuckDB's functions the SQL files call.
     const FUNCTIONS: &[&str] = &[
         "any_value", "arg_max", "array_to_string", "count", "lag", "lead", "max", "median", "min",
-        "rank", "read_parquet", "round", "starts_with", "sum",
+        "rank", "read_parquet", "round", "starts_with", "sum", "unnest", "range", "least", "greatest",
+        "coalesce", "string_agg",
     ];
 
     /// The identifiers of `sql` outside comments, strings, numbers and `$`/`@` names, each with

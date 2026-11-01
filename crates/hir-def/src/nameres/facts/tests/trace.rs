@@ -8,14 +8,14 @@
 //! equals the old collector's.
 
 use base_db::Db;
-use rustc_hash::FxHashSet;
+use rustc_hash::{FxHashMap, FxHashSet};
 use blaze_query::db::FromId;
 use hir_expand::fixture;
 
 use super::{Exempt, compare_db, new_crate_local_def_map};
 use crate::{
     ModuleId,
-    nameres::facts::queries::{DeclKey, FactKey, SccKey},
+    nameres::facts::queries::{self, DeclKey, FactKey, RoundKey, RoundKind, SccKey},
     test_db::{TestDB, TestDBExt},
 };
 
@@ -155,15 +155,61 @@ fn adding_an_item_reruns_its_module_and_its_readers() {
     assert!(!events.iter().any(|(name, _)| name == "partition"), "no import changed: {events:?}");
 }
 
+/// Each module's `ModuleScope` at the crate's final round (its `fact_handle`) with the
+/// module's path. The handle's id stays the module's across revisions; its scope field moves
+/// only when the scope changed.
+fn final_scopes(db: &TestDB, krate: base_db::Crate) -> FxHashMap<blaze_query::db::Id, String> {
+    let Some(r) = (0..64).find(|&r| queries::round_kind(db, RoundKey::new(db, krate, r)) == RoundKind::Final)
+    else {
+        panic!("no final round in 64");
+    };
+    let modules = queries::round_modules(db, RoundKey::new(db, krate, r));
+    modules
+        .order
+        .iter()
+        .map(|&module| (queries::fact_handle(db, FactKey::new(db, module, krate, r)), path(db, module)))
+        .collect()
+}
+
+/// Reads every scope of `scopes` through `ModuleScope::traits`, a reader of the scope field.
+fn read_scopes(db: &TestDB, scopes: &FxHashMap<blaze_query::db::Id, String>) {
+    for &id in scopes.keys() {
+        <crate::nameres::ModuleScope<'_> as FromId>::from_id(id).traits(db);
+    }
+}
+
+/// A new import changes the partition, which every component of the round reads, so each
+/// `scc_state` is checked again (`nameres-core.md` §2): the quick path, comparing its upstream
+/// handles, for one whose reads came back the same (§7, §9). Only the scopes whose facts
+/// changed are new, so only their readers run again.
 #[test]
-fn adding_an_import_reruns_the_partition_and_the_components_whose_facts_changed() {
-    let (db, events) =
-        edit(A, "use crate::e::E;\npub struct A;\npub fn helper() { let _ = 0; }\n");
+fn adding_an_import_reruns_the_partition_and_only_the_readers_of_the_scopes_that_changed() {
+    let fx = fixture::db(FIXTURE);
+    let files = fx.files().to_vec();
+    let mut db = fx.into_db();
+    let krate = db.fetch_test_crate();
+    new_crate_local_def_map(&db, krate);
+    read_scopes(&db, &final_scopes(&db, krate));
+    let a = files[A].file_id(&db);
+    let events = executed_write(&mut db, |db| {
+        db.set_file_text(a, "use crate::e::E;\npub struct A;\npub fn helper() { let _ = 0; }\n");
+        new_crate_local_def_map(db, krate);
+    });
     assert!(events.iter().any(|(name, _)| name == "import_shape"), "{events:?}");
     assert!(events.iter().any(|(name, _)| name == "partition"), "{events:?}");
-    // `a` gains `E`; `c`'s glob reads `a` whole. `b` reads `a::foo` and `a::N`, which stay
-    // unresolved.
-    assert_eq!(ran(&db, &events, "scc_state"), set(&["crate::a", "crate::c"]), "{events:?}");
+    let mut diff = String::new();
+    compare_db(&db, "trace import", &Exempt::NONE, &mut diff);
+    assert!(diff.is_empty(), "after the edit, old and new def maps differ:\n{diff}");
+    let scopes = final_scopes(&db, krate);
+    let reads = executed(&db, || read_scopes(&db, &scopes));
+    // `a` gains `E`, private to `a`, so `c`'s glob of `a` imports nothing new. `b` reads
+    // `a::foo` and `a::N`, which stay unresolved.
+    let reran: FxHashSet<String> = reads
+        .iter()
+        .filter(|(name, _)| name.ends_with("traits"))
+        .map(|(_, id)| scopes.get(id).cloned().unwrap_or_else(|| format!("{id:?}")))
+        .collect();
+    assert_eq!(reran, set(&["crate::a"]), "{reads:?}");
 }
 
 #[test]

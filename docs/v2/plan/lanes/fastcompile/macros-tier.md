@@ -295,9 +295,11 @@ run its calls again instead.
 ## Which tier
 
 `choose(code, runs)` returns `Tier::Compiled` once the crate has run `Policy::warm` times, in
-a blaze that runs the compiled tier (`Policy::compiled`, true on the machines `machine`
-runs code on: x86-64 and AArch64 Linux and macOS); `run.rs` calls `tier::run` for
-`Tier::Compiled`. The default `warm` is 1. This is the ski-rental rule stencil's `Tiering` uses: compile when
+a blaze that runs the compiled tier (`Policy::compiled`); `run.rs` calls `tier::run` for
+`Tier::Compiled`. `compiled` is false until std can be planned at opt-level 0 (codegen, queue
+01466): every macro reaches std, whose shipped layer is opt-level 3, and the tier refuses a
+unit planned for LLVM by name rather than compiling another backend's plan as stencils. Then it
+is true on the machines `machine` runs code on (x86-64 and AArch64 Linux and macOS). The default `warm` is 1. This is the ski-rental rule stencil's `Tiering` uses: compile when
 the evaluator's extra cost has reached the compile's. One serde-sized expansion on the
 evaluator (50 to 500 ms) already costs more than compiling the crate (about 8,000 functions
 at 15 µs each, 120 ms of CPU across the workers, once per macro version, kept in the store

@@ -48,6 +48,9 @@ pub(super) struct Function<'a> {
     /// The code hash of the generic it is an instance of.
     pub(super) code: CodeHash,
     pub(super) refs: &'a [Target],
+    /// What its refusal names it by: rustc's demangled name of the instance.
+    pub(super) name: &'a str,
+    pub(super) origin: Origin,
 }
 
 /// A static of the build as [`owners`] takes it.
@@ -58,6 +61,9 @@ pub(super) struct StaticOf<'a> {
     pub(super) unit: InstanceKey,
     pub(super) owner: Owner,
     pub(super) refs: &'a [Target],
+    /// What its refusal names it by, with `origin`: its symbol, for one that has one.
+    pub(super) symbol: Option<&'a str>,
+    pub(super) origin: Origin,
 }
 
 /// What [`owners`] gives: [`super::Built::owners`] and [`super::Built::static_owners`].
@@ -100,27 +106,90 @@ where
         | Target::Counter(_)
         | Target::ProfileCounters => None,
     };
-    let checked: Vec<(InstanceKey, ItemKey, &[Target])> = functions
-        .filter(|it| it.owner == Owner::Dependency)
-        .map(|it| (it.key, it.item, it.refs))
-        .chain(statics.filter(|it| it.owner == Owner::Dependency).map(|it| (it.unit, it.id.0, it.refs)))
-        // alloc: per build, the dependency's code, a key pair and a slice each
+    // clone: the columns' iterators, a few pointers each; a refusal reads them again
+    let (dependency_functions, dependency_statics) = (functions.clone(), statics.clone());
+    let checked: Vec<Checked<'a>> = (dependency_functions.filter(|it| it.owner == Owner::Dependency))
+        .map(|it| Checked { unit: it.key, item: it.item, refs: it.refs, named: Named::Function(it.name, it.origin) })
+        .chain(dependency_statics.filter(|it| it.owner == Owner::Dependency).map(|it| Checked {
+            unit: it.unit,
+            item: it.id.0,
+            refs: it.refs,
+            named: Named::Static(it.symbol, it.origin),
+        }))
+        // alloc: per build, the dependency's code, a few words each
         .collect();
-    // alloc: the errors, none for a build that has none
-    let found: Vec<CodegenError> = par::filter_map(&checked, |&(unit, item, refs)| {
-        let target = refs.iter().find(|it| owner_of(*it) == Some(Owner::Workspace))?;
-        Some(CodegenError {
-            unit,
-            item,
+    // alloc: the refusals, none for a build that has none
+    let found: Vec<(&Checked<'a>, &Target)> = par::filter_map(&checked, |it| {
+        Some((it, it.refs.iter().find(|target| owner_of(*target) == Some(Owner::Workspace))?))
+    });
+    for (it, target) in found {
+        let to = match target {
+            Target::Function(key) | Target::Direct(key) => {
+                // clone: an iterator over the build's columns, on an error
+                functions.clone().find(|f| f.key == *key).map(|f| Named::Function(f.name, f.origin))
+            }
+            Target::Static { item, instance } => {
+                // clone: an iterator over the build's columns, on an error
+                statics.clone().find(|s| s.id == (*item, *instance)).map(|s| Named::Static(s.symbol, s.origin))
+            }
+            _ => None,
+        };
+        let to = match to {
+            Some(to) => format!("{to}, {target:?}"), // alloc: an error
+            None => format!("{target:?}"),           // alloc: an error
+        };
+        errors.push(CodegenError {
+            unit: it.unit,
+            item: it.item,
             // alloc: an error
             what: format!(
-                "is a dependency's, so it goes in the dependency image, and it refers to \
-                 {target:?}, which is the workspace's: the image would change with workspace code"
+                "{} is a dependency's, so it goes in the dependency image, and it refers to \
+                 {to}, which is the workspace's: the image would change with workspace code",
+                it.named,
             ),
-        })
-    });
-    errors.extend(found);
+        });
+    }
     owned
+}
+
+/// A dependency's function or static whose references [`owners`] checks.
+struct Checked<'a> {
+    unit: InstanceKey,
+    item: ItemKey,
+    refs: &'a [Target],
+    named: Named<'a>,
+}
+
+/// What a refusal names a function or static by: its name and whose code it is.
+#[derive(Clone, Copy)]
+enum Named<'a> {
+    Function(&'a str, Origin),
+    Static(Option<&'a str>, Origin),
+}
+
+impl std::fmt::Display for Named<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let origin = match self {
+            Named::Function(name, origin) => {
+                write!(f, "`{name}`")?;
+                origin
+            }
+            Named::Static(Some(symbol), origin) => {
+                write!(f, "the static `{symbol}`")?;
+                origin
+            }
+            Named::Static(None, origin) => {
+                write!(f, "a static")?;
+                origin
+            }
+        };
+        match origin {
+            Origin::Member(package) => write!(f, " (of member `{package}`)"),
+            Origin::Dependency(package) => write!(f, " (of dependency `{package}`)"),
+            Origin::BuildTime(package) => write!(f, " (of build-time `{package}`)"),
+            Origin::Std => write!(f, " (of the standard library)"),
+        }
+    }
 }
 
 #[cfg(test)]

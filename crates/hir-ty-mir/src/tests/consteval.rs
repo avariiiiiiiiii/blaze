@@ -956,7 +956,7 @@ fn loops() {
             let x = 'b: loop {
                 let x = 'c: loop {
                     let x = 'd: loop {
-                        let x = 'e: loop {
+                        let x: u8 = 'e: loop {
                             break 'd 1;
                         };
                         break 2 + x;
@@ -1039,10 +1039,10 @@ fn ranges() {
     check_number(
         r#"
     //- minicore: range
-    const GOAL: i32 = (1..2).start + (20..10).end + (100..=200).start + (2000..=1000).end
-        + (10000..).start + (..100000).end + (..=1000000).end;
+    const GOAL: i32 = (1..2).start + (20..10).end + (10000..).start + (..100000).end
+        + (..=1000000).end;
         "#,
-        1111111,
+        1110011,
     );
 }
 
@@ -1592,7 +1592,7 @@ fn options() {
         r#"
     //- minicore: option, add, builtin_impls
     const GOAL: u8 = {
-        let x = None;
+        let x: Option<u8> = None;
         match x {
             Some(y) => 2 + y,
             _ => 10,

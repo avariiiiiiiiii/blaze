@@ -51,6 +51,8 @@ pub(crate) struct PlanInput<'a, F: Files> {
     pub build_std: bool,
     pub ws_root: &'a Path,
     pub ws_manifest: &'a Path,
+    /// The root manifest's `[workspace.metadata]`, whose blaze lints every member gets.
+    pub ws_metadata: Option<&'a toml::Value>,
     /// The sysroot, which the standard library's packages are hashed against.
     pub sysroot: Option<&'a Path>,
     pub target_dir: &'a Path,
@@ -107,6 +109,7 @@ struct Pkg<'a> {
     id: PackageId,
     manifest: &'a Manifest,
     manifest_path: &'a Path,
+    is_member: bool,
 }
 
 /// What every unit planned here has worked out before its hashes.
@@ -215,6 +218,7 @@ fn plan_units<F: Files>(input: &PlanInput<'_, F>) -> Result<PlanOutput, LoadErro
         return Err(error(format!("the unit graph's root {root} is no unit")));
     }
     let config = input.config;
+    let workspace_lints = flags::workspace_lints(input.ws_metadata, input.ws_manifest)?;
 
     let wrapper = match config.env("RUSTC_WORKSPACE_WRAPPER") {
         Some(it) => !it.is_empty(),
@@ -286,7 +290,7 @@ fn plan_units<F: Files>(input: &PlanInput<'_, F>) -> Result<PlanOutput, LoadErro
             facts.push(None);
             continue;
         }
-        let (id, _) = input
+        let (id, package) = input
             .packages
             .get(&unit.pkg_id)
             .ok_or_else(|| error(format!("the unit graph's package `{}` is not in the resolve", unit.pkg_id)))?;
@@ -310,7 +314,7 @@ fn plan_units<F: Files>(input: &PlanInput<'_, F>) -> Result<PlanOutput, LoadErro
         }
         facts.push(Some(Facts {
             unit,
-            pkg: Pkg { id: *id, manifest, manifest_path },
+            pkg: Pkg { id: *id, manifest, manifest_path, is_member: package.is_member },
             kind,
             target_kind: hash::target_kind(&unit.target),
             mode: CompileMode::of(unit)?,
@@ -392,10 +396,13 @@ fn plan_units<F: Files>(input: &PlanInput<'_, F>) -> Result<PlanOutput, LoadErro
             Entry::Vacant(slot) => {
                 let env = env::package_env(it.pkg.id, it.pkg.manifest, it.pkg.manifest_path)?;
                 // A package's units are all the standard library's or all not.
-                let (lints, lint_check_cfg) = match it.pkg.id.source_id().is_path() && !unit.is_std {
+                let (mut lints, lint_check_cfg) = match it.pkg.id.source_id().is_path() && !unit.is_std {
                     true => flags::lints(it.pkg.manifest)?,
                     false => (Vec::new(), Vec::new()),
                 };
+                if it.pkg.is_member && !unit.is_std {
+                    lints.splice(0..0, workspace_lints.iter().cloned());
+                }
                 let mut check_cfg = flags::check_cfg(it.pkg.manifest);
                 check_cfg.extend(lint_check_cfg);
                 slot.insert(PackageFlags { env, lints, check_cfg })

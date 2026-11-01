@@ -8,12 +8,14 @@ mod db;
 mod identity;
 
 use hir_def::{
-    FunctionId, ModuleDefId, TypeAliasId,
+    DefWithBodyId, FunctionId, ModuleDefId, TypeAliasId,
+    expr_store::Body,
+    hir::Expr,
     nameres::crate_def_map,
     signatures::{FunctionSignature, TypeAliasSignature},
 };
 use hir_ty::{
-    ParamEnvAndCrate, TyDefId,
+    InferBodyId, InferenceResult, ParamEnvAndCrate, TyDefId,
     consteval::usize_const,
     db::HirDatabase,
     intrinsic::Intrinsic,
@@ -130,6 +132,8 @@ pub fn call<T: Show>(x: &T) -> u32 { x.show() }
 
 pub fn ptr<T>() -> fn(T) -> T { id::<T> }
 pub fn with_closure<T>(x: T) -> T { let f = |y: T| y; f(x) }
+pub fn apply<F: FnOnce(u32) -> u32>(f: F, x: u32) -> u32 { f(x) }
+pub fn two() -> u32 { apply(|x| x + 1, 1) + apply(|x| x * 2, 2) }
 
 pub fn rec<T>(n: u32, x: T) -> T { if n == 0 { x } else { rec::<T>(n - 1, x) } }
 pub fn ping<T>(n: u32) -> u32 { if n == 0 { 0 } else { pong::<T>(n - 1) } }
@@ -402,6 +406,29 @@ fn a_closure_shares_with_its_parent() {
     let db = fixture();
     same(&db, "with_closure", Ty("RefP"), Ty("RefQ"));
     apart(&db, "with_closure", Ty("RefP"), Ty("RefR"));
+}
+
+/// `apply`'s body calls its closure, which is all its argument says of which: two closures of
+/// one signature in a body with no generics, as `and_then`'s in rustc_apfloat's build script,
+/// were one callee, so both instances ran the first closure.
+#[test]
+fn two_closures_of_one_signature_are_two_callees() {
+    let db = fixture();
+    hir_ty::attach_db(&db, || {
+        let owner = DefWithBodyId::from(function(&db, "two"));
+        let infer = InferenceResult::of(&db, InferBodyId::DefWithBodyId(owner));
+        let keys: Vec<ShareKey> = Body::of(&db, owner)
+            .exprs()
+            .filter(|(_, expr)| matches!(expr, Expr::Closure { .. }))
+            .map(|(expr, _)| {
+                let args = GenericArgs::new_from_slice(&[infer.expr_ty(expr).into()]).store();
+                let instance = ShareInstance { def: ShareDef::Fn(function(&db, "apply")), args };
+                share_key(&db, &instance, &env(&db), RUNTIME).clone().unwrap_or_else(|why| panic!("{why}"))
+            })
+            .collect();
+        assert_eq!(keys.len(), 2);
+        assert_ne!(keys[0], keys[1], "`apply` of two closures calls two bodies");
+    });
 }
 
 #[test]

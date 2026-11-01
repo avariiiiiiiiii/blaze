@@ -288,3 +288,85 @@ fn a_bin_using_a_path_dependencys_thread_local_builds() {
     let case = Case::new("a_bin_using_a_path_dependencys_thread_local_builds");
     assert_eq!(case.ok(&["run"]), "true\n");
 }
+
+/// `simd_lt` and `simd_ge` are intrinsics of one signature, and a function's interface left
+/// an intrinsic's name out: `vcltz_s8` and `vcgez_s8` (hashbrown's `match_empty_or_deleted`
+/// and `match_full` on aarch64) had one code hash and shared one compiled body, so a
+/// `HashSet`'s first insert probed past the end of its table.
+#[test]
+fn two_simd_compares_of_one_signature_keep_their_own_code() {
+    let case = Case::new("two_simd_compares_of_one_signature_keep_their_own_code");
+    assert_eq!(case.ok(&["run"]), "00010101 11101010 3\n");
+}
+
+/// Two `and_then`s over closures of one signature in a body with no generics: the share key
+/// took a closure callee by its parent's arguments alone, so both instances were one and the
+/// second ran the first closure (rustc_apfloat's build script: "expected `src/lib.rs` to have
+/// more than 3 lines"), and std's `DebugList::finish` ran `DebugTuple::finish`'s closure (libm's
+/// build script faulted printing a `Vec<String>`).
+#[test]
+fn two_closures_of_one_signature_keep_their_own_bodies() {
+    let case = Case::new("two_closures_of_one_signature_keep_their_own_bodies");
+    assert_eq!(case.ok(&["run"]), "Ok(\"a\")\n[\"x\"] (\"y\",)\n");
+}
+
+/// A build script that prints a `Vec<String>` with `{:?}`, as libm 0.2.16's `configure.rs`
+/// does: std's `DebugList::finish` and `DebugTuple::finish` each give `Result::and_then` a
+/// closure of one signature, the share key took them as one callee, and the list was finished
+/// by the tuple's closure, which read its `Formatter` as a `DebugTuple` and faulted (exit 139).
+#[test]
+fn a_build_script_prints_a_debug_list() {
+    let case = Case::new("a_build_script_prints_a_debug_list");
+    assert_eq!(case.ok(&["run"]), "[\"default\"] (\"neon\",)\n");
+}
+
+/// `str::split_ascii_whitespace` (cc's build-time flag parsing, so every build script using cc):
+/// core's `impl_fn_for_zst!` writes `impl Fn<(&u8,)> for IsAsciiWhitespace` with an elided
+/// lifetime in its header, and `SplitAsciiWhitespace::next`, `size_hint` and
+/// `split_ascii_whitespace` failed to lower (`UnresolvedMethod("next" | "size_hint" | "map")`).
+#[test]
+fn a_program_splitting_on_ascii_whitespace_builds() {
+    let case = Case::new("a_program_splitting_on_ascii_whitespace_builds");
+    assert_eq!(case.ok(&["run"]), "[\"-O2\", \"-g\", \"-Wall\"]\n");
+}
+
+/// object's `ImageSymbol::name`, a provided trait method generic over its reader, reached
+/// through `CoffFile` (psm's build script, through ar_archive_writer): its references held a
+/// call of a trait method `distance` resolved to no impl, so the function was refused.
+#[test]
+fn a_program_reading_coff_symbol_names_builds() {
+    let case = Case::new("a_program_reading_coff_symbol_names_builds");
+    assert_eq!(case.ok(&["run"]), "Invalid COFF file header size or alignment\n");
+}
+
+/// cc's `is_flag_supported` caches into a `HashMap<CompilerFlag, bool>`: hashbrown's
+/// `reserve_rehash` closure for it went in the dependency image, and the `<*mut u8>::cast` it
+/// calls was taken for the workspace's, so the build refused ("the image would change with
+/// workspace code"; libmimalloc-sys' and blake3's build scripts).
+#[test]
+fn a_build_script_asking_cc_whether_a_flag_is_supported_builds() {
+    let case = Case::new("a_build_script_asking_cc_whether_a_flag_is_supported_builds");
+    assert_eq!(case.ok(&["run"]), "asked\n");
+}
+
+/// A path dependency whose enum has a variant, and a macro's match an arm, under a `cfg` that is
+/// off (object's `#[cfg(feature = "elf")]` variants in `read/any.rs`): the names check of a
+/// local crate resolved the disabled variant's path and reported E0433 for its module.
+#[test]
+fn a_crate_with_cfg_disabled_variants_builds() {
+    let case = Case::new("a_crate_with_cfg_disabled_variants_builds");
+    assert_eq!(case.ok(&["run"]), "1\n");
+}
+
+/// A proc-macro package's lib, with a `#[test]` of its own, and an integration test that
+/// expands its macro (01463): the lib and its lib test were one root text, so the lib test's
+/// spans named bytes the lib's text lacks and the daemon panicked.
+#[test]
+fn a_proc_macro_package_tests_build() {
+    let case = Case::new("a_proc_macro_package_tests_build");
+    let out = case.ok_in("", &["test"]);
+    let said = format!("{}{}", out.stdout, out.stderr);
+    for test in ["the_lib_test_runs", "the_macro_expands"] {
+        assert!(said.contains(&format!("test {test} ... ok")), "`{test}` did not pass:\n{said}");
+    }
+}

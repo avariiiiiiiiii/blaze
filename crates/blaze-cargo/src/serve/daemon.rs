@@ -79,6 +79,9 @@ const STAT_JOURNAL: Tag = Tag(OWN);
 const READ_JOURNAL: Tag = Tag(OWN + 1);
 const STAT_IMAGE: Tag = Tag(OWN + 2);
 const MAP_IMAGE: Tag = Tag(OWN + 3);
+/// The timer of a build nothing can move, at [`STILL_FOR`] ([`Daemon::still`]): it wakes the
+/// loop to fail the build, and moves nothing itself.
+const STILL_TIMER: Tag = Tag(OWN + 4);
 const DIAL: Tag = Tag(OWN + 6);
 const UNLINK: Tag = Tag(OWN + 7);
 const HANG_UP: Tag = Tag(OWN + 8);
@@ -91,6 +94,76 @@ const IMAGE: u64 = OWN + 10;
 const LAST_EFFECTS: Duration = Duration::from_secs(2);
 /// How often the plane's and the memory's plots are written to the flight recorder, at most.
 const PLOT_EVERY: Duration = Duration::from_millis(10);
+/// How long a build may have nothing that can move it before it fails with [`Still`]: past
+/// the loop's longest turn and a worker's wake, short of anyone waiting on it.
+const STILL_FOR: Duration = Duration::from_secs(2);
+/// The most nodes a [`Still`] names one by one.
+const STILL_NAMED: usize = 64;
+
+/// Whether `effect` ends on its own with a completion of its own: not a watch or a listen,
+/// in flight until undone, nor the server's (a client's receive waits on the client), nor one
+/// that completes nothing of its own.
+fn ends_alone(effect: &Effect) -> bool {
+    effect.tag() != STILL_TIMER
+        && !(SERVER..VFS).contains(&effect.tag().0)
+        && !matches!(
+            effect,
+            Effect::Watch { .. }
+                | Effect::Journal { .. }
+                | Effect::Unwatch { .. }
+                | Effect::Listen { .. }
+                | Effect::Unlisten { .. }
+                | Effect::Kill { .. }
+                | Effect::Hangup { .. }
+        )
+}
+
+/// A build nothing can move ([`Daemon::still`]): each node of an open request not settled.
+pub struct Still {
+    pub quiet_ns: u64,
+    /// Loop tasks started and not ended: with nothing in flight, each waits on the loop.
+    pub loops: usize,
+    /// The worker pool's jobs parked on a wait.
+    pub parked: usize,
+    pub waits: Vec<StillWait>,
+}
+
+pub struct StillWait {
+    pub request: u32,
+    pub node: u32,
+    pub name: String,
+    pub state: blaze_protocol::events::NodeState,
+    /// A dep it waits for that has not settled.
+    pub on: Option<u32>,
+    /// What the loop holds it back for ([`Jobs::holding`]).
+    pub held: Option<&'static str>,
+}
+
+impl fmt::Display for Still {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "blaze stalled: for {:.1} s nothing could move the build (no task ran or was ready, no effect was pending or in flight, the worker pool was idle with {} jobs parked; {} loop tasks open), with {} nodes not settled:",
+            self.quiet_ns as f64 / 1e9,
+            self.parked,
+            self.loops,
+            self.waits.len()
+        )?;
+        for it in self.waits.iter().take(STILL_NAMED) {
+            write!(f, "\n  request {} node {} `{}`: {:?}", it.request, it.node, it.name, it.state)?;
+            if let Some(on) = it.on {
+                write!(f, ", waits on node {on}")?;
+            }
+            if let Some(held) = it.held {
+                write!(f, ", held: {held}")?;
+            }
+        }
+        if self.waits.len() > STILL_NAMED {
+            write!(f, "\n  and {} more", self.waits.len() - STILL_NAMED)?;
+        }
+        Ok(())
+    }
+}
 
 /// The session's view of the daemon for one call, borrowing only the parts it names.
 macro_rules! cx {
@@ -212,6 +285,11 @@ pub struct Daemon<D: Driver, S: Steps> {
     state: FileName,
     observe: Observe,
     watchdog: Watchdog,
+    /// Since when nothing could move a build ([`Daemon::still`]), on the driver's clock.
+    still_since: Option<u64>,
+    /// The effects in flight that end on their own, by tag ([`ends_alone`]): what can still
+    /// move a build, where the driver's count holds every watch, listen and receive too.
+    ending: rustc_hash::FxHashMap<Tag, u32>,
     /// The plane's nodes that settled: with the spans closed, the progress the watchdog reads.
     settled: u64,
     /// When the plots were last written, on the driver's clock.
@@ -717,6 +795,8 @@ impl<D: Driver, S: Steps> Daemon<D, S> {
             state,
             observe,
             watchdog: Watchdog::new(Watchdog::BOUND),
+            still_since: None,
+            ending: rustc_hash::FxHashMap::default(),
             settled: 0,
             plotted: Duration::ZERO,
         })
@@ -833,9 +913,14 @@ impl<D: Driver, S: Steps> Daemon<D, S> {
         let until = self.session.deadline().map(|at| Duration::from_nanos(at.saturating_sub(ns(self.driver.now()))));
         let wait = until.map_or(wait, |until| wait.min(until));
         let wait = self.observe.wait(self.driver.now()).map_or(wait, |until| wait.min(until));
-        self.driver.submit(&mut self.effects);
+        self.submit();
         let mut done = std::mem::take(&mut self.done);
         self.driver.poll(&mut done, wait);
+        for completion in &done {
+            self.ended(completion);
+        }
+        // A turn with nothing to do is no span: an idle loop turns every millisecond.
+        let _span = (!done.is_empty() || self.plane.ready()).then(|| tracing::info_span!("loop turn").entered());
         self.tick();
         for completion in done.drain(..) {
             self.dispatch(completion);
@@ -851,8 +936,33 @@ impl<D: Driver, S: Steps> Daemon<D, S> {
         self.images.step(parts, idle);
         self.between();
         self.stepping_stop();
-        self.driver.submit(&mut self.effects);
+        self.submit();
         !matches!(self.stopping, Some(Stopping::Over))
+    }
+
+    /// The loop's effects to the driver, those that end on their own counted in `ending`.
+    fn submit(&mut self) {
+        for effect in &self.effects {
+            if ends_alone(effect) {
+                // alloc: an entry per tag in flight, the map kept and reused
+                *self.ending.entry(effect.tag()).or_default() += 1;
+            }
+        }
+        self.driver.submit(&mut self.effects);
+    }
+
+    /// A completion ends an effect of its tag unless it is one of many a standing effect
+    /// gives, as the drivers count it.
+    fn ended(&mut self, completion: &Completion) {
+        if matches!(completion.done, Done::Changed { .. } | Done::Journaled(_) | Done::Accepted { .. }) {
+            return;
+        }
+        if let Some(count) = self.ending.get_mut(&completion.tag) {
+            *count -= 1;
+            if *count == 0 {
+                self.ending.remove(&completion.tag);
+            }
+        }
     }
 
     /// What [`Observe`] answers this turn sent, and the builds that ended given to the
@@ -875,6 +985,10 @@ impl<D: Driver, S: Steps> Daemon<D, S> {
     /// bound, every job with a plane request under way fails with the stall, its trace is
     /// written to the state directory, and the daemon stops.
     fn watch(&mut self) {
+        self.still();
+        if self.failed.is_some() {
+            return;
+        }
         let running = self.plane.running();
         let progress = blaze_profile::flight::progress() + self.settled;
         let now = ns(self.driver.now());
@@ -884,6 +998,72 @@ impl<D: Driver, S: Steps> Daemon<D, S> {
         tracing::error!("{said}");
         let file = under(&self.state, &format!("stalls/{now}.json"));
         self.effects.push(Effect::Write { file, bytes: stall.trace, tag: STALL });
+        // clone: the error, once a stall
+        let error = ApiError::new(said.clone(), Some("stall".to_owned()));
+        let mut told = self.spare.said.pop().unwrap_or_default();
+        self.jobs.stalled(&mut world!(self, told), &error);
+        self.said(told);
+        self.fail(Failed::Stalled(said));
+    }
+
+    /// The loop's stall: a request has nodes not settled and nothing can move them (no thread
+    /// task runs or ended untaken, no effect is pending or in flight, the worker pool runs and
+    /// queues nothing, no job's write waits for readers, which whoever holds them ends). Held
+    /// for [`STILL_FOR`], every job with a plane request under way fails
+    /// with [`Still`], naming what each node waits on, and the daemon stops, as on a stall the
+    /// watchdog finds.
+    fn still(&mut self) {
+        let now = ns(self.driver.now());
+        let pool = blaze_graph::exec::shared();
+        let moving = self.plane.running() > 0
+            || self.plane.ready()
+            || self.effects.iter().any(ends_alone)
+            || !self.ending.is_empty()
+            || !pool.idle()
+            || self.jobs.writes_waiting();
+        if moving {
+            self.still_since = None;
+            return;
+        }
+        let Some(since) = self.still_since else {
+            let mut open = false;
+            self.plane.unsettled(|_| open = true);
+            if !open {
+                return;
+            }
+            self.still_since = Some(now);
+            self.effects.push(Effect::Timer { after: STILL_FOR, tag: STILL_TIMER });
+            return;
+        };
+        if now.saturating_sub(since) < ns(STILL_FOR) {
+            return;
+        }
+        // alloc: a stall, once
+        let mut waits = Vec::new();
+        let jobs = &self.jobs;
+        self.plane.unsettled(|it| {
+            waits.push(StillWait {
+                request: it.request.0,
+                node: it.id.0,
+                name: it.name.to_owned(), // alloc: a stall, once per node it names
+                state: it.state.clone(),
+                on: it.on.map(|on| on.0),
+                held: jobs.holding(it.id),
+            });
+        });
+        if waits.is_empty() {
+            self.still_since = None;
+            return;
+        }
+        waits.sort_by_key(|it| (it.request, it.node));
+        let still = Still {
+            quiet_ns: now - since,
+            loops: self.plane.loops_running(),
+            parked: pool.parked(),
+            waits,
+        };
+        let said = still.to_string();
+        tracing::error!("{said}");
         // clone: the error, once a stall
         let error = ApiError::new(said.clone(), Some("stall".to_owned()));
         let mut told = self.spare.said.pop().unwrap_or_default();

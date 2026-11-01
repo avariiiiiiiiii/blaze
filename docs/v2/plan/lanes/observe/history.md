@@ -88,11 +88,11 @@ directory. That is the history's directory, plus the live window's directory wit
 
 `sql/examples.sql` holds the named queries, each a `-- name:` line, a `-- says:` line, then its
 SQL. `views::VIEWS` cuts them out at compile time, so a missing section is a compile error.
-Their arguments are declared in Rust, each with a type and a default. The twelve:
+Their arguments are declared in Rust, each with a type and a default. The fourteen:
 `slowest_queries`, `slower_between_commits`, `memo_hit_rate_per_crate`, `critical_path`,
 `allocations_per_query_kind`, `what_reran`, `busiest_threads`, `longest_gaps`,
-`top_cpu_stacks`, `time_by_span_name`, `frame_copies_per_query_kind` and
-`jobs_by_stack_high_water`. `views::render` binds the arguments as SQL literals:
+`top_cpu_stacks`, `time_by_span_name`, `frame_copies_per_query_kind`,
+`jobs_by_stack_high_water`, `utilization_per_second` and `uncovered_time`. `views::render` binds the arguments as SQL literals:
 - an integer as it is written;
 - a float with an exponent, so DuckDB types it `DOUBLE`;
 - text single-quoted, with each quote doubled.

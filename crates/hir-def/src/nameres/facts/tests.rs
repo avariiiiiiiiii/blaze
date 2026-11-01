@@ -636,9 +636,30 @@ impl<'a> Projector<'a> {
                 true
             }
         };
+        // A name two globs give different items is ambiguous (an error where a path uses it):
+        // which of them it is bound to follows the order the globs were resolved in, which the
+        // collectors don't share. Its glob binding is listed with the other items it is
+        // ambiguous with, so both compare as the same set.
+        let ambiguous: FxHashSet<(Name, u8)> = glob_ambiguities
+            .iter()
+            .map(|it| {
+                let ns = match it.other {
+                    ItemInNs::Types(_) => 0,
+                    ItemInNs::Values(_) => 1,
+                    ItemInNs::Macros(_) => 2,
+                };
+                (it.name, ns)
+            })
+            .collect();
+        let mut c_ambiguities = Vec::new();
         let mut c_types = Vec::new();
         for (name, item) in types.iter() {
             let import = item.import.map(|it| self.import_or_extern_crate(it));
+            if ambiguous.contains(&(*name, 0)) && matches!(import, Some(CImport::Glob(_))) && !exempt.name(name) {
+                let vis = self.vis(item.vis);
+                c_ambiguities.push((*name, CItemInNs::Types(self.def(item.def)), import.expect("a glob"), vis));
+                continue;
+            }
             if column(&mut exempt_imports, name, import.clone()) {
                 c_types.push((
                     name.clone(),
@@ -649,6 +670,11 @@ impl<'a> Projector<'a> {
         let mut c_values = Vec::new();
         for (name, item) in values.iter() {
             let import = item.import.map(|it| self.import_or_glob(it));
+            if ambiguous.contains(&(*name, 1)) && matches!(import, Some(CImport::Glob(_))) && !exempt.name(name) {
+                let vis = self.vis(item.vis);
+                c_ambiguities.push((*name, CItemInNs::Values(self.def(item.def)), import.expect("a glob"), vis));
+                continue;
+            }
             if column(&mut exempt_imports, name, import.clone()) {
                 c_values.push((
                     name.clone(),
@@ -659,6 +685,11 @@ impl<'a> Projector<'a> {
         let mut c_macros = Vec::new();
         for (name, item) in macros.iter() {
             let import = item.import.map(|it| self.import_or_extern_crate(it));
+            if ambiguous.contains(&(*name, 2)) && matches!(import, Some(CImport::Glob(_))) && !exempt.name(name) {
+                let vis = self.vis(item.vis);
+                c_ambiguities.push((*name, CItemInNs::Macros(self.makro(item.def)), import.expect("a glob"), vis));
+                continue;
+            }
             if column(&mut exempt_imports, name, import.clone()) {
                 c_macros.push((
                     name.clone(),
@@ -727,6 +758,7 @@ impl<'a> Projector<'a> {
                     .map(|&GlobAmbiguity { name, other, glob, vis }| {
                         (name, self.item_in_ns(other), self.glob_id(glob), self.vis(vis))
                     })
+                    .chain(c_ambiguities)
                     .collect(),
             ),
             shadowed_imports: sorted(

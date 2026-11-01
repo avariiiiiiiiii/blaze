@@ -282,9 +282,11 @@ fn every_unit_that_compiles_is_a_crate() {
         assert_eq!(crates.krate(unit), built.lowered.krate(unit));
     }
     assert!(crates.is_proc_macro(MACRO) && !crates.is_proc_macro(LIB));
-    // The lib and its test are two crates of one root file.
+    // The lib and its test are two crates of one root file: the lib's is the file, the test's
+    // an alias of it, which its harness is appended to.
     assert_ne!(krate(&built, LIB), krate(&built, LIB_TEST));
-    assert_eq!(krate(&built, LIB).data(db).root_file_id, krate(&built, LIB_TEST).data(db).root_file_id);
+    let (lib_root, test_root) = (krate(&built, LIB).data(db).root_file_id, krate(&built, LIB_TEST).data(db).root_file_id);
+    assert_eq!(db.files().alias_of(test_root), Some(lib_root));
     // A crate comes after every crate it depends on.
     let all = base_db::all_crates(db);
     let at = |unit| all.iter().position(|it| *it == krate(&built, unit)).unwrap();
@@ -693,21 +695,24 @@ fn a_walk_leaves_out_the_directories_skipped_and_only_those() {
     assert_eq!(walked(&["/w/targe".to_owned()]), every, "a skipped path is a whole name, not a prefix");
 }
 
-/// The lib's test and the lib share `/w/a/src/lib.rs`: a harness appended for the test is the
-/// root's text and appended module, in the identity of every crate of that root, written once,
-/// and refused when another unit of the job wants the root made other.
+/// The lib's test and the lib share `/w/a/src/lib.rs`, but the test's root is its own, an alias
+/// of the file: a harness appended for the test is its root's text and appended module and in
+/// its identity alone, written once; the file on disk is never appended to.
 #[test]
 fn an_appended_root_is_its_crates_text_until_the_next_job() {
     let units = units();
     let mut built = lowered(&units).unwrap();
     let (lib, test) = (built.lowered.identity(LIB), built.lowered.identity(LIB_TEST));
-    let root = krate(&built, LIB_TEST).data(built.lowered.db()).root_file_id;
-    let disk = built.lowered.db().file_text(root).text(built.lowered.db()).to_string();
-    let harness = |body: &str| format!("{disk}\n#[cfg(test)]\npub mod __harness {{ {body} }}\n");
-    let append = |lowered: &mut Lowered, unit: usize, text: Option<String>| {
+    let db = built.lowered.db();
+    let (disk_file, root) = (krate(&built, LIB).data(db).root_file_id, krate(&built, LIB_TEST).data(db).root_file_id);
+    assert_ne!(root, disk_file, "the test's root is its own");
+    assert_eq!(db.files().alias_of(root), Some(disk_file));
+    let disk = text_of(&built.lowered, disk_file);
+    let harness = |body: &str| format!("\n#[cfg(test)]\npub mod __harness {{ {body} }}\n");
+    let append = |lowered: &mut Lowered, unit: usize, after: Option<String>| {
         lowered.append_roots([unit as u32], |_, asked, _| {
             assert_eq!(asked, unit);
-            Ok(text.clone().map(|text| Appended { text, module: "__harness" }))
+            Ok(after.clone().map(|after| Appended { after, module: "__harness" }))
         })
     };
 
@@ -715,34 +720,26 @@ fn an_appended_root_is_its_crates_text_until_the_next_job() {
     assert_eq!(append(&mut built.lowered, LIB_TEST, Some(recorded.clone())), Ok(1));
     let db = built.lowered.db();
     let input = db.file_text(root);
-    assert_eq!(**input.text(db), *recorded);
+    assert_eq!(**input.text(db), *format!("{disk}{recorded}"));
     assert_eq!(input.appended_root_module(db), Some("__harness"));
-    assert_eq!(input.content(db), base_db::FileText::content_of(&recorded, Some("__harness")));
+    assert_eq!(text_of(&built.lowered, disk_file), disk, "the file on disk is left as it is");
     let with = built.lowered.identity(LIB_TEST);
     assert_ne!(with, test, "the harness is in the test's identity");
-    assert_ne!(built.lowered.identity(LIB), lib, "and in the lib's, which reads the same root");
+    assert_eq!(built.lowered.identity(LIB), lib, "and not in the lib's, whose root is the file");
 
     assert_eq!(append(&mut built.lowered, LIB_TEST, Some(recorded.clone())), Ok(0), "already so");
     assert_eq!(append(&mut built.lowered, LIB_TEST, None), Ok(0), "no harness: left as it is");
     assert_eq!(built.lowered.identity(LIB_TEST), with);
     let Err(error) = append(&mut built.lowered, LIB, Some(harness("pub fn other() {}"))) else {
-        panic!("one root was made two texts in one job")
+        panic!("the file on disk was appended to")
     };
-    assert!(error.what.contains("share the root file"), "{error}");
-    assert_eq!(error.at.as_deref(), Some("/w/a/src/lib.rs"));
-    assert_eq!(**built.lowered.db().file_text(root).text(built.lowered.db()), *recorded, "nothing written");
-    let (lib_text, test_text) = (harness("pub fn lib() {}"), harness("pub fn test() {}"));
-    let two = built.lowered.append_roots([LIB_TEST as u32, LIB as u32], |_, unit, _| {
-        let text = if unit == LIB { lib_text.clone() } else { test_text.clone() };
-        Ok(Some(Appended { text, module: "__harness" }))
-    });
-    let Err(error) = two else { panic!("two units of one call made one root two texts") };
-    assert!(error.what.contains("share the root file"), "{error}");
+    assert!(error.what.contains("can't have a module appended"), "{error}");
+    assert_eq!(text_of(&built.lowered, disk_file), disk, "nothing written");
 
     // Given again (its proc macros loaded), a unit makes its root again.
     let expanded = harness("pub fn main() {} pub fn expanded() {}");
     assert_eq!(append(&mut built.lowered, LIB_TEST, Some(expanded.clone())), Ok(1));
-    assert_eq!(**built.lowered.db().file_text(root).text(built.lowered.db()), *expanded);
+    assert_eq!(text_of(&built.lowered, root), format!("{disk}{expanded}"));
     let with = built.lowered.identity(LIB_TEST);
 
     // The next job, of the same view: a harness of another mode is another text, and the
@@ -754,10 +751,92 @@ fn an_appended_root_is_its_crates_text_until_the_next_job() {
     assert_eq!(built.lowered.refresh(next, |_| Ok(())), Ok(true));
     let unrecorded = harness("pub fn main() { let _ = 1; }");
     assert_eq!(append(&mut built.lowered, LIB_TEST, Some(unrecorded.clone())), Ok(1));
-    assert_eq!(**built.lowered.db().file_text(root).text(built.lowered.db()), *unrecorded);
+    assert_eq!(text_of(&built.lowered, root), format!("{disk}{unrecorded}"));
     let other = built.lowered.identity(LIB_TEST);
     assert_ne!(other, with);
     assert_ne!(other, test);
+    assert_eq!(built.lowered.identity(LIB), lib);
+}
+
+fn text_of(lowered: &Lowered, file: base_db::FileId) -> String {
+    lowered.db().file_text(file).text(lowered.db()).to_string()
+}
+
+const MACRO_TEST: usize = 7;
+
+/// [`units`] with the lib test of the proc macro `m`, as `blaze test` builds it beside `m`.
+fn units_with_macro_test() -> Units {
+    let mut units = units();
+    let m = "path+file:///w/m#0.1.0";
+    let test = unit(m, target("proc-macro", "m", "/w/m/src/lib.rs", "2021"), Mode::Test, false, vec![dep(CORE, "core", true)]);
+    units.graph.units.push(test);
+    units.plans.push(plan(&[], &[], None));
+    units
+}
+
+/// The module blaze appends to a test's root: its harness.
+fn test_harness() -> Appended {
+    Appended { after: "\n#[cfg(test)]\npub mod __harness { pub fn main() {} }\n".to_owned(), module: "__harness" }
+}
+
+/// Appends the harness to the proc macro's test's root.
+fn append_macro_test_root(lowered: &mut Lowered) {
+    let written = lowered.append_roots([MACRO_TEST as u32], |_, unit, _| {
+        assert_eq!(unit, MACRO_TEST);
+        Ok(Some(test_harness()))
+    });
+    assert_eq!(written, Ok(1));
+}
+
+/// `blaze build` builds the proc macro `m`; `blaze test` builds it and its lib test, whose
+/// harness goes in a root of the test's own: the proc macro's root is its file on disk either
+/// way, so it is one unit, of one identity, under both, and nothing on it is built again
+/// between them.
+#[test]
+fn the_lib_of_a_proc_macro_is_one_unit_under_build_and_test() {
+    let mut build = lowered(&units()).unwrap();
+    let mut test = lowered(&units_with_macro_test()).unwrap();
+    append_macro_test_root(&mut test.lowered);
+    assert_eq!(build.lowered.identity(MACRO), test.lowered.identity(MACRO));
+    assert_eq!(build.lowered.identity(BIN), test.lowered.identity(BIN), "nor is the bin on it");
+
+    let db = test.lowered.db();
+    let (lib_root, test_root) = (krate(&test, MACRO).data(db).root_file_id, krate(&test, MACRO_TEST).data(db).root_file_id);
+    assert_ne!(lib_root, test_root, "the proc macro and its test have roots of their own");
+    assert_eq!(db.files().alias_of(lib_root), None, "the proc macro's root is its file on disk");
+    assert_eq!(db.files().alias_of(test_root), Some(lib_root));
+    // A path still names the file on disk alone; the alias has its path.
+    let source_root = db.source_root(db.file_source_root(lib_root).source_root_id(db)).source_root(db);
+    assert_eq!(source_root.file_for_path(&path("/w/m/src/lib.rs")), Some(&lib_root));
+    let paths = test.lowered.paths();
+    for file in [lib_root, test_root] {
+        assert_eq!(paths.get(&file).map(String::as_str), Some("/w/m/src/lib.rs"));
+    }
+    assert!(text_of(&test.lowered, test_root).ends_with(&test_harness().after));
+    assert!(!text_of(&test.lowered, lib_root).contains("__harness"), "the proc macro reads no harness");
+}
+
+/// An edit of a root file reaches every root of it in the same change: the file on disk, which
+/// is the proc macro's root, and its test's root with its harness after it.
+#[test]
+fn an_edit_of_a_root_file_reaches_every_root_of_it() {
+    let units = units_with_macro_test();
+    let mut built = lowered(&units).unwrap();
+    append_macro_test_root(&mut built.lowered);
+    let db = built.lowered.db();
+    let (disk, test_root) = (krate(&built, MACRO).data(db).root_file_id, krate(&built, MACRO_TEST).data(db).root_file_id);
+
+    const EDITED: &[u8] = b"extern crate proc_macro;\npub fn edited() {}\n";
+    let tree = MemTree::default();
+    let root = changed(&tree, &[("m/src/lib.rs", Some(EDITED))]);
+    let config = config(root, library(&tree));
+    let next = Lower { units: &units, config: &config, files: &tree, root, host_cpu: None };
+    assert_eq!(built.lowered.refresh(next, |_| Ok(())), Ok(true));
+    let edited = std::str::from_utf8(EDITED).unwrap();
+    assert_eq!(text_of(&built.lowered, disk), edited);
+    assert_eq!(text_of(&built.lowered, test_root), format!("{edited}{}", test_harness().after));
+    // Made again by the next job, it is as it is already.
+    assert_eq!(built.lowered.append_roots([MACRO_TEST as u32], |_, _, _| Ok(Some(test_harness()))), Ok(0));
 }
 
 /// The bin reaches the proc macro `m`, whose expanders are not built when lowered; the lib's
@@ -1085,4 +1164,32 @@ fn a_derived_method_has_a_body() {
         })
         .collect();
     assert_eq!(bodies, ["clone"]);
+}
+
+/// cargo passes a proc-macro target `--extern proc_macro` beside build-std's `noprelude` one:
+/// `proc_macro` is in a proc macro's extern prelude, so its `use proc_macro::TokenStream`
+/// resolves without an `extern crate`, and in no other crate's.
+#[test]
+fn a_proc_macros_proc_macro_is_in_its_extern_prelude_alone() {
+    let mut units = units();
+    let proc_macro = "path+file:///rustc/abc/library/proc_macro#0.0.0";
+    let src = "/rustc/abc/library/proc_macro/src/lib.rs";
+    let crate_of = unit(proc_macro, target("lib", "proc_macro", src, "2024"), Mode::Build, true, vec![dep(CORE, "core", true)]);
+    units.graph.units.push(crate_of);
+    units.plans.push(plan(&[], &[], None));
+    let manifest = "/rustc/abc/library/proc_macro/Cargo.toml";
+    units.packages.push(package(proc_macro, "proc_macro", manifest, Some("(/rustc/abc/library/proc_macro)"), false));
+    units.packages.sort_by(|x, y| x.id.cmp(&y.id));
+    for at in [MACRO, BIN] {
+        units.graph.units[at].dependencies.push(dep(PROC_MACRO, "proc_macro", true));
+    }
+    let tree = MemTree::default();
+    let built = lowered_with(&units, &tree, &[("m/src/lib.rs", Some(b"use proc_macro::TokenStream;\n"))]).unwrap();
+    let db = built.lowered.db();
+    let in_prelude = |unit| {
+        let data = krate(&built, unit).data(db);
+        data.dependencies.iter().find(|it| it.name.as_str() == "proc_macro").map(|it| it.is_prelude())
+    };
+    assert_eq!(in_prelude(MACRO), Some(true));
+    assert_eq!(in_prelude(BIN), Some(false), "only a proc macro is passed `--extern proc_macro`");
 }

@@ -949,9 +949,12 @@ impl<'db, 'f, A: Allocator + Clone> Unit<'db, 'f, A> {
                     }
                     Some(ModuleDefId::AdtId(AdtId::EnumId(e))) => {
                         cov_mark::hit!(glob_enum);
-                        // A variant is no binding of the enum's module: a maintainer run reads the
-                        // module whole, which a write touching the enum wakes (`enum_glob_wakes`).
-                        crate::nameres::delta::reads::note(crate::Lookup::lookup(&e, self.db).container, None);
+                        // A variant is no binding of the enum's module: a write touching the enum
+                        // wakes this read (`enum_glob_wakes`).
+                        crate::nameres::delta::reads::note(
+                            crate::Lookup::lookup(&e, self.db).container,
+                            Some(crate::nameres::delta::reads::enum_glob()),
+                        );
                         // glob import from enum => just import all the variants
                         let start = self.held.len();
                         self.held.extend(e.enum_variants(self.db).variants.iter().map(
@@ -970,7 +973,12 @@ impl<'db, 'f, A: Allocator + Clone> Unit<'db, 'f, A> {
                     Some(ModuleDefId::TraitId(it)) => {
                         // glob import from trait => its associated items, as rustc's traits are
                         // modules to `use`. None where it cannot list them, which the end of
-                        // collection reports.
+                        // collection reports. An item is no binding of the trait's module: a
+                        // write touching the trait wakes this read (`enum_glob_wakes`).
+                        crate::nameres::delta::reads::note(
+                            crate::Lookup::lookup(&it, self.db).container,
+                            Some(crate::nameres::delta::reads::trait_import()),
+                        );
                         let start = self.held.len();
                         let held = &mut self.held;
                         let listed = self.def_map.for_each_trait_item_for_import(
@@ -1169,20 +1177,24 @@ impl<'db, 'f, A: Allocator + Clone> Unit<'db, 'f, A> {
             let ImporterEdge { importer, data: (glob_import_vis, glob), next } =
                 self.state.globs.edge(edge);
             edge = next;
-            // we know all resolutions have the same visibility (`vis`), so we
-            // just need to check that once
             if !vis.is_visible_from_def_map(self.db, &self.def_map, importer) {
                 continue;
             }
             let vis = glob_import_vis.min(self.db, vis, &self.def_map).unwrap_or(glob_import_vis);
-            self.update_recursive(
-                importer,
-                // clone: a `Range` of two indices.
-                resolutions.clone(),
-                vis,
-                Some(ImportOrExternCrate::Glob(glob)),
-                depth + 1,
-            );
+            // Each name is held at the narrower of the import's visibility and its own, so the
+            // importer takes only the names whose own visibility it sees, as `pull_glob` does.
+            let from = self.held.len();
+            // clone: a `Range` of two indices.
+            for at in resolutions.clone() {
+                let (name, res) = self.held[at];
+                let res = res.filter_visibility(|it| it.is_visible_from_def_map(self.db, &self.def_map, importer));
+                if !res.is_none() {
+                    self.held.push((name, res));
+                }
+            }
+            let visible = from..self.held.len();
+            self.update_recursive(importer, visible, vis, Some(ImportOrExternCrate::Glob(glob)), depth + 1);
+            self.held.truncate(from);
         }
         self.held.truncate(held);
     }
@@ -1222,6 +1234,9 @@ impl<'db, 'f, A: Allocator + Clone> Unit<'db, 'f, A> {
         // finds the same answer if nothing it reads changed.
         self.queues.wake_slot(&self.state.imports, module_id, *name, written_ns(&defs));
 
+        // A name is unresolved only where nothing resolved it, never where every namespace was
+        // handled below.
+        let unresolved = defs.is_none();
         let mut changed = false;
 
         if let Some(ImportOrExternCrate::Glob(glob)) = def_import_type {
@@ -1242,7 +1257,7 @@ impl<'db, 'f, A: Allocator + Clone> Unit<'db, 'f, A> {
                     // This import is being handled here, don't pass it down to
                     // `ItemScope::push_res_with_import()`.
                     defs.types = None;
-                    self.scope_mut(module_id).update_visibility_types(name, def.vis);
+                    self.scope_mut(module_id).rebind_glob_types(name, def, glob);
                 }
                 // When the source module's definition changed (e.g., due to an explicit import
                 // shadowing a glob), propagate the new definition to modules that glob-import from it.
@@ -1282,7 +1297,7 @@ impl<'db, 'f, A: Allocator + Clone> Unit<'db, 'f, A> {
                 {
                     changed = true;
                     defs.values = None;
-                    self.scope_mut(module_id).update_visibility_values(name, def.vis);
+                    self.scope_mut(module_id).rebind_glob_values(name, def, glob);
                 } else if def.def != prev_def.def
                     && prev_def.import.map(ImportOrExternCrate::from) == def_import_type
                 {
@@ -1315,7 +1330,7 @@ impl<'db, 'f, A: Allocator + Clone> Unit<'db, 'f, A> {
                 {
                     changed = true;
                     defs.macros = None;
-                    self.scope_mut(module_id).update_visibility_macros(name, def.vis);
+                    self.scope_mut(module_id).rebind_glob_macros(name, def, glob);
                 } else if def.def != prev_def.def && prev_def.import == def_import_type {
                     changed = true;
                     defs.macros = None;
@@ -1337,14 +1352,16 @@ impl<'db, 'f, A: Allocator + Clone> Unit<'db, 'f, A> {
             }
         }
 
-        changed |= row_of(&mut self.def_map.modules, &mut self.touched, module_id)
-            .scope_mut()
-            .push_res_with_import(
-                &mut self.state.from_glob_import,
-                (module_id, *name),
-                defs,
-                def_import_type,
-            );
+        if unresolved || !defs.is_none() {
+            changed |= row_of(&mut self.def_map.modules, &mut self.touched, module_id)
+                .scope_mut()
+                .push_res_with_import(
+                    &mut self.state.from_glob_import,
+                    (module_id, *name),
+                    defs,
+                    def_import_type,
+                );
+        }
 
         changed
     }

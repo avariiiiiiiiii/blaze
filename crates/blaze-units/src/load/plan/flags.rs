@@ -1,8 +1,10 @@
 //! The flags cargo gives rustc: a platform's rustflags (`target_info.rs`'s `TargetInfo::new`
 //! and `extra_args`), the `--cfg`s (`features_args`), the `--check-cfg`s (`check_cfg_args`) and
-//! `[lints]` (`parser/mod.rs`'s `lints_to_rustflags`).
+//! `[lints]` (`parser/mod.rs`'s `lints_to_rustflags`), and blaze's own lints of
+//! `[workspace.metadata.blaze.lints]`.
 
 use std::cmp::Reverse;
+use std::path::Path;
 
 use blaze_manifest::Config;
 use blaze_manifest::config::{CompileKind, Flags, PathAndArgs};
@@ -192,6 +194,42 @@ pub(super) fn check_cfg_of<'a>(features: impl ExactSizeIterator<Item = &'a str>)
     }
     feature.push_str("))");
     vec!["cfg(docsrs,test)".to_owned(), feature]
+}
+
+/// The table of the workspace's root manifest that sets the levels of blaze's own lints for
+/// every member. cargo hands `[lints]` to rustc, which stops at a tool it does not know
+/// (E0602), so a `blaze` table there breaks every cargo build; cargo hands rustc no metadata.
+pub(crate) const WORKSPACE_LINTS: &str = "[workspace.metadata.blaze.lints]";
+
+/// The level flags of [`WORKSPACE_LINTS`] in `metadata`, the root manifest's
+/// `[workspace.metadata]` (at `manifest`): `hot_alloc = "warn"` is `--warn=blaze::hot_alloc`,
+/// by name. A level that is not `allow`, `warn`, `deny` or `forbid`, or a name with a path, is an
+/// error.
+pub(super) fn workspace_lints(metadata: Option<&toml::Value>, manifest: &Path) -> Result<Vec<String>, LoadError> {
+    let Some(table) = metadata.and_then(|it| it.get("blaze")).and_then(|it| it.get("lints")) else {
+        return Ok(Vec::new());
+    };
+    let wrong = |what: String| LoadError {
+        what: format!("{WORKSPACE_LINTS} in {}: {what}", manifest.display()),
+        at: Some(manifest.display().to_string()),
+    };
+    let table = table.as_table().ok_or_else(|| wrong("is a table of lint names to levels".to_owned()))?;
+    let mut flags = Vec::with_capacity(table.len());
+    for (lint, level) in table {
+        if lint.contains(':') {
+            return Err(wrong(format!("`{lint}` is named without its tool: these are blaze's own lints")));
+        }
+        let flag = match level.as_str() {
+            Some("forbid") => "--forbid",
+            Some("deny") => "--deny",
+            Some("warn") => "--warn",
+            Some("allow") => "--allow",
+            _ => return Err(wrong(format!("the level of `{lint}` is `allow`, `warn`, `deny` or `forbid`"))),
+        };
+        flags.push(format!("{flag}=blaze::{lint}"));
+    }
+    flags.sort_by(|a, b| a.split_once('=').map(|it| it.1).cmp(&b.split_once('=').map(|it| it.1)));
+    Ok(flags)
 }
 
 /// cargo's `lints_to_rustflags` of the package's `[lints]` (inherited already): the level

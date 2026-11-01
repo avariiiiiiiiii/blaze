@@ -508,10 +508,10 @@ fn exempt(s: &str) {
     );
 }
 
-/// A crate that denies `hot_alloc` (`[lints.blaze] hot_alloc = "deny"` gives the flag) fails on
-/// a fresh `Vec::new()`, `vec![]` or `String::new()`: each is an error, though none allocates
-/// until it grows. A `Vec` that names its allocator, and a line saying why it needs the global
-/// heap, pass.
+/// A crate that denies `hot_alloc` (`hot_alloc = "deny"` in `[workspace.metadata.blaze.lints]`
+/// gives the flag) fails on a fresh `Vec::new()`, `vec![]` or `String::new()`: each is an error,
+/// though none allocates until it grows. A `Vec` that names its allocator, and a line saying why
+/// it needs the global heap, pass.
 #[test]
 fn a_fresh_global_vec_in_a_crate_denying_hot_alloc_is_an_error() {
     let main = r#"

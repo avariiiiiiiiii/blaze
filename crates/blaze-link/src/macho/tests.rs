@@ -1727,6 +1727,38 @@ fn chained_fixups_slide_and_bind_what_the_opcodes_do() {
     check_signature(range(&new, (at, len)), &new[..at as usize], "hello");
 }
 
+/// dyld's page-in linking maps every page a segment's chained starts count from the file: they
+/// count the pages of its file bytes, never its zero-fill ones, which mapped from the file would
+/// hold `__LINKEDIT`'s bytes (std's `ENV_LOCK` in `__bss` read as a locked queue).
+#[test]
+fn chained_starts_count_no_zero_fill_page() {
+    let mut parts = hello(chained_executable());
+    let bss = parts.regions.iter_mut().find(|it| it.class == Class::Bss).unwrap();
+    (bss.size, bss.capacity) = (0xc000, 0xc000);
+    let writer = super::writer(&parts.output).unwrap();
+    let slices = parts.slices();
+    let file = written(&writer, &parts.placed(&slices));
+    let segments = segments_of(&file);
+    let data = segments.iter().find(|it| it.0 == "__DATA").unwrap();
+    assert!(data.2 >= data.4 + 0x8000, "`__DATA` has zero-fill pages: {data:?}");
+
+    let table = range(&file, read(&file).chained.unwrap());
+    let u32_at = |at: usize| u32::from_le_bytes(table[at..at + 4].try_into().unwrap());
+    let starts = u32_at(4) as usize;
+    let mut counted = 0;
+    for (nth, segment) in segments.iter().enumerate().take(u32_at(starts) as usize) {
+        let offset = u32_at(starts + 4 + 4 * nth) as usize;
+        if offset == 0 {
+            continue;
+        }
+        let pages = u16::from_le_bytes(table[starts + offset + 20..][..2].try_into().unwrap());
+        assert_eq!(u64::from(pages), segment.4.div_ceil(0x4000), "{}'s pages in the file", segment.0);
+        counted += 1;
+    }
+    assert_eq!(counted, 2, "`__DATA_CONST` and `__DATA` have slots");
+    assert_eq!(decode_chained(&file, &read(&file), BASE).len(), 6);
+}
+
 /// A bind added after the last slot of a page rewrites two slots: its own, and the one
 /// before it, whose `next` now reaches it. The rest are as they were.
 #[test]

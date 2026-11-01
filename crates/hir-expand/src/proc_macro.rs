@@ -102,8 +102,13 @@ thread_local! {
     static READS: std::cell::Cell<Option<ExpansionReads>> = const { std::cell::Cell::new(None) };
 }
 
+// Each access to `READS` is a call of its own, never inlined: an expansion that waits between
+// two may resume on another thread, and an inlined access may reuse the address of the first
+// thread's slot (docs/v2/plan/lanes/may-suspend.md).
+
 /// What the expansion running on this thread read: called by an expander before `expand`
 /// returns. An expander that does not call it has reads [`ExpansionReads::Unknown`].
+#[inline(never)]
 pub fn report_reads(reads: ExpansionReads) {
     carry_reads();
     READS.set(Some(reads));
@@ -122,6 +127,7 @@ fn carry_reads() {
 }
 
 /// What the expander reported since the last call, cleared.
+#[inline(never)]
 pub(crate) fn take_reads() -> Option<ExpansionReads> {
     READS.take()
 }

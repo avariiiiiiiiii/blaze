@@ -2057,6 +2057,33 @@ fn a_query_reads_the_context_of_its_type_the_database_was_given() {
     assert_eq!(db.pin().get::<Scaled>(one, &"a".to_owned()), Ok(12));
 }
 
+/// What a job on a fiber carries across a wait (`carry_with_fiber_jobs`): taking its marks off
+/// leaves the thread outside any query with empty stacks, for the next job to run there; putting
+/// them back gives the job its own again.
+#[test]
+fn a_switching_job_takes_its_query_marks_and_stacks_with_it() {
+    let key = crate::QueryKey { kind: crate::QueryKind(0x2f01), input: ContentId([4; 32]) };
+    let inside = crate::Inside::enter();
+    let frame = crate::Frame::push(key);
+    assert!(crate::inside_a_query());
+    _ = crate::unreadable(BROKEN);
+
+    let taken = (crate::take_inside(), crate::take_stacks(), crate::take_unreadable());
+    assert!(!crate::inside_a_query(), "the thread is outside any query once the job is off it");
+    assert_eq!(crate::Run::new().base, 0, "the thread's key stack is empty for the next job");
+    assert!(crate::take_unreadable_corrupt().is_none());
+
+    crate::put_inside(taken.0);
+    crate::put_stacks(taken.1);
+    crate::put_unreadable(taken.2);
+    assert!(crate::inside_a_query());
+    assert_eq!(crate::Run::new().base, 1, "the job's own key is back");
+    assert_eq!(crate::take_unreadable_corrupt(), Some(BROKEN));
+    drop(frame);
+    drop(inside);
+    assert!(!crate::inside_a_query());
+}
+
 /// Model tests of the database's own lock-free state (docs/v2/plan/lanes/safety/model.md): the
 /// collection generation with each memo's `born`, and the thread-local that marks a query
 /// running.

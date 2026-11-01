@@ -55,8 +55,8 @@ query needs it (`slower_between_commits` does).
 
 **Where the files go, and how many.** The daemon's history is `profile/` in its state directory
 (`history::dir_in(blaze_cargo::serve::state()?)`). It is capped at 1 GiB (`history::CAP_BYTES`):
-after each flush, the oldest files are deleted until the rest fit under the cap. The newest file
-is always kept, and the schema files don't count toward the cap. At about 20 bytes a span, 1 GiB
+after each flush, the oldest files are deleted until the rest fit under the cap. The newest
+flush's files are always kept, and the schema files don't count toward the cap. At about 20 bytes a span, 1 GiB
 holds about 50 million spans: days of a busy daemon.
 
 **Nothing is skipped silently.** A write that fails is a `HistoryError` naming the file and the

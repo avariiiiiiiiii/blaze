@@ -53,6 +53,9 @@ pub const REQUEST_WAIT: Duration = Duration::from_secs(10);
 pub const CLOSE_BAD_TOKEN: u32 = 1;
 /// The code every session is closed with when the explorer stops.
 pub const CLOSE_STOPPED: u32 = 0;
+/// How long dropping an [`Explorer`] waits for the blocking pool's work (a `tiles` sweep, a
+/// Flecs answer) before leaving it to finish on its own; DuckDB is killed at once.
+pub const SHUTDOWN: Duration = Duration::from_secs(1);
 const KEEP_ALIVE: Duration = Duration::from_secs(5);
 const IDLE: Duration = Duration::from_secs(30);
 
@@ -83,7 +86,8 @@ struct Shared {
     cert: watch::Sender<Arc<Current>>,
 }
 
-/// A running explorer; dropping it closes every session and stops the server.
+/// A running explorer; dropping it closes every session and stops the server, waiting at most
+/// [`SHUTDOWN`] for work under way.
 pub struct Explorer {
     shared: Arc<Shared>,
     stop: Option<oneshot::Sender<()>>,
@@ -189,6 +193,7 @@ pub fn start(config: Config) -> Result<Explorer, StartError> {
                 }
                 serve(endpoint, shared, rotation, stopped).await;
             });
+            runtime.shutdown_timeout(SHUTDOWN);
         })
         .map_err(StartError::Thread)?;
     let started = ready.recv();

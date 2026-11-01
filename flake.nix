@@ -148,14 +148,22 @@
             runHook postInstall
           '';
         });
-        # What `nix profile install` puts on PATH: the same binaries, with the toolchain.
+        # `nix run .#duckdb`: the DuckDB `blaze debug sql`, `blaze explain` and the explorer run,
+        # nixpkgs' at the locked rev, parquet built in, so nothing downloads. Pinned: a nixpkgs
+        # bump that changes it stops here, a visible change.
+        duckdb =
+          assert pkgs.duckdb.version == "1.5.5";
+          pkgs.duckdb;
+        # What `nix profile install` puts on PATH: the same binaries, with the toolchain, and
+        # BLAZE_DUCKDB naming that DuckDB (blaze never looks for one on PATH).
         daemon = pkgs.runCommand "blaze-${version}" {
           nativeBuildInputs = [ pkgs.makeWrapper ];
           meta.mainProgram = "blaze";
         } ''
           mkdir -p $out/bin
           for bin in ${dist}/bin/*; do
-            makeWrapper $bin $out/bin/$(basename $bin) --prefix PATH : ${rust}/bin
+            makeWrapper $bin $out/bin/$(basename $bin) --prefix PATH : ${rust}/bin \
+              --set BLAZE_DUCKDB ${duckdb}/bin/duckdb
           done
         '';
         # `blaze` with the toolchain and the other programs first on PATH.
@@ -238,7 +246,7 @@
           # `blaze build` works. `#blaze` names it too.
           default = daemon;
           blaze = daemon;
-          inherit dist daemon run life daemon-units life-bin;
+          inherit dist daemon run life daemon-units life-bin duckdb;
           # The pinned LLVM: its tools (llvm-dwarfdump), which CI puts on PATH where the harnesses
           # read debug info, and the prefix a build of the `llvm` feature links.
           inherit llvm;
@@ -255,6 +263,10 @@
         apps.blaze = {
           type = "app";
           program = "${run}/bin/blaze";
+        };
+        apps.duckdb = {
+          type = "app";
+          program = "${duckdb}/bin/duckdb";
         };
         # `nix develop`: the pinned LLVM (LLVM_SYS_231_PREFIX, its tools on PATH) and a C
         # toolchain with libstdc++.a, so `cargo build --features llvm` links it in. Rust is

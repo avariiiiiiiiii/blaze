@@ -14,6 +14,10 @@
 //! - A start maps that image once: the symbols are restored from it first, then the VFS, the
 //!   database and the plane's history each open their sections of it.
 //! - A stop writes the image, waits for it to be mapped, then stops listening and hangs up.
+//! - The explorer, the live feed and live SQL are answered by the loop itself ([`Observe`]);
+//!   each build that ends goes to the profile history's thread. A build whose tasks stop
+//!   moving for [`Watchdog::BOUND`] fails with the stall, whose trace is written beside the
+//!   state, and the daemon stops: its workers may be deadlocked and cannot be got back.
 
 #![forbid(unsafe_code)]
 
@@ -25,10 +29,11 @@ use std::{
 };
 
 use blaze_api::{
-    Arrived, Reply, Request,
+    ApiError, Arrived, Reply, Request,
     server::{Config as ServerConfig, Http, Server, Unix},
     session::{self, Session},
 };
+use blaze_profile::{Plot, Watchdog};
 use blaze_cas::Store;
 use blaze_core::{Address, Completion, Done, Driver, Effect, FileName, Mapping, Tag};
 use blaze_graph::{Budget, PlaneConfig, arena};
@@ -45,6 +50,7 @@ use super::{
     image::{ImageFailed, Images, Parts, Unlearned, on_pool},
     job::{Jobs, Said, Setup, Step, Value, World},
     mounts::Mounts,
+    observe::{Observe, Profiling},
     plane::{Happened, Plane, Runner, ns},
     work::Steps,
 };
@@ -72,11 +78,15 @@ const MAP_IMAGE: Tag = Tag(OWN + 3);
 const DIAL: Tag = Tag(OWN + 6);
 const UNLINK: Tag = Tag(OWN + 7);
 const HANG_UP: Tag = Tag(OWN + 8);
+/// A stall's trace, written once: the daemon stops after it.
+const STALL: Tag = Tag(OWN + 9);
 /// The image's write and its map ([`Images`]).
 const IMAGE: u64 = OWN + 10;
 
 /// How long a stop waits for the driver's last effects once it hung up.
 const LAST_EFFECTS: Duration = Duration::from_secs(2);
+/// How often the plane's and the memory's plots are written to the flight recorder, at most.
+const PLOT_EVERY: Duration = Duration::from_millis(10);
 
 /// The session's view of the daemon for one call, borrowing only the parts it names.
 macro_rules! cx {
@@ -89,6 +99,8 @@ macro_rules! cx {
             memory_bytes: arena::own(),
             budget_bytes: $daemon.plane.budget().map_or(0, |it| it.bytes),
             memory: blaze_mem::tag::snapshot,
+            profile: blaze_profile::flight::dump,
+            history: $daemon.observe.history_error(),
         }
     };
 }
@@ -135,6 +147,10 @@ pub struct Options {
     /// of one made at `socket`, where it must be bound. Its file is the manager's.
     #[cfg(unix)]
     pub activated: Option<blaze_api::activation::Passed>,
+    /// The profile history and its DuckDB ([`super::observe::keep_history`]): `blaze serve`'s.
+    /// A daemon with none (the simulation's) numbers its builds from 1 and refuses the
+    /// explorer and live SQL, saying so.
+    pub profiling: Option<Profiling>,
 }
 
 fn under(dir: &FileName, name: &str) -> FileName {
@@ -177,6 +193,14 @@ pub struct Daemon<D: Driver, S: Steps> {
     failed: Option<Failed>,
     pid: u32,
     started: Started,
+    /// Its state directory, where a stall's trace is written.
+    state: FileName,
+    observe: Observe,
+    watchdog: Watchdog,
+    /// The plane's nodes that settled: with the spans closed, the progress the watchdog reads.
+    settled: u64,
+    /// When the plots were last written, on the driver's clock.
+    plotted: Duration,
 }
 
 /// What of its image a start did not use, each by a rule: the image was written by another
@@ -381,12 +405,15 @@ pub enum Failed {
     Settle(DbError),
     /// The image a cold build or the stop asked for was not made; the one before it stays.
     Image(ImageFailed),
+    /// A build stopped moving ([`blaze_profile::Stall`]'s words): its workers may be
+    /// deadlocked, so the next request starts a fresh daemon.
+    Stalled(String),
 }
 
 impl fmt::Display for Failed {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Failed::Server(why) => f.write_str(why),
+            Failed::Server(why) | Failed::Stalled(why) => f.write_str(why),
             Failed::Corrupt(corrupt) => write!(f, "the daemon image: {corrupt}"),
             Failed::Settle(error) => write!(f, "the database could not settle onto its image: {error}"),
             Failed::Image(failed) => write!(f, "{failed}"),
@@ -599,7 +626,9 @@ impl<D: Driver, S: Steps> Daemon<D, S> {
             }
         }
         let plane_config = PlaneConfig { io: options.io, work: options.threads.max(1), budget: options.budget, starve_after: 8 };
-        let plane = Plane::new(plane_config, history, runner).map_err(|error| format!("the plane: {error}"))?;
+        let observe = Observe::new(options.profiling);
+        let mut plane = Plane::new(plane_config, history, runner).map_err(|error| format!("the plane: {error}"))?;
+        plane.number_from(observe.first_build());
         let mounts = Mounts::recover(&vfs);
         let mut listening = socket.clone();
         #[cfg(unix)]
@@ -656,6 +685,11 @@ impl<D: Driver, S: Steps> Daemon<D, S> {
             failed: None,
             pid: std::process::id(),
             started,
+            state,
+            observe,
+            watchdog: Watchdog::new(Watchdog::BOUND),
+            settled: 0,
+            plotted: Duration::ZERO,
         })
     }
 
@@ -733,6 +767,9 @@ impl<D: Driver, S: Steps> Daemon<D, S> {
             return;
         }
         self.stopping = Some(Stopping::Image);
+        let mut replies = std::mem::take(&mut self.replies);
+        self.observe.stop(&mut replies);
+        self.send(replies);
         self.heads.stop(&mut self.effects);
         self.ask_image();
         self.store.flush(&mut self.effects);
@@ -760,6 +797,7 @@ impl<D: Driver, S: Steps> Daemon<D, S> {
         };
         let until = self.session.deadline().map(|at| Duration::from_nanos(at.saturating_sub(ns(self.driver.now()))));
         let wait = until.map_or(wait, |until| wait.min(until));
+        let wait = self.observe.wait(self.driver.now()).map_or(wait, |until| wait.min(until));
         self.driver.submit(&mut self.effects);
         let mut done = std::mem::take(&mut self.done);
         self.driver.poll(&mut done, wait);
@@ -769,6 +807,9 @@ impl<D: Driver, S: Steps> Daemon<D, S> {
         }
         self.done = done;
         self.step_plane();
+        self.observed();
+        self.watch();
+        self.plot();
         let idle = self.effects.is_empty() && self.driver.in_flight() == 0;
         let front = self.jobs.front_db();
         let parts = Parts { db: &self.db, front, vfs: &mut self.vfs, predict: self.plane.predict(), effects: &mut self.effects };
@@ -777,6 +818,57 @@ impl<D: Driver, S: Steps> Daemon<D, S> {
         self.stepping_stop();
         self.driver.submit(&mut self.effects);
         !matches!(self.stopping, Some(Stopping::Over))
+    }
+
+    /// What [`Observe`] answers this turn sent, and the builds that ended given to the
+    /// history.
+    fn observed(&mut self) {
+        let now = self.driver.now();
+        let server = &self.server;
+        let mut replies = std::mem::take(&mut self.replies);
+        self.observe.tick(now, |conn| server.waiting(conn), &mut replies);
+        for reply in replies.drain(..) {
+            self.server.reply(reply, &mut self.effects);
+        }
+        self.replies = replies;
+        for row in self.jobs.rows.drain(..) {
+            self.observe.ended(row);
+        }
+    }
+
+    /// The stall watchdog's turn: once the plane's tasks run and nothing has moved for its
+    /// bound, every job with a plane request under way fails with the stall, its trace is
+    /// written to the state directory, and the daemon stops.
+    fn watch(&mut self) {
+        let running = self.plane.running();
+        let progress = blaze_profile::flight::progress() + self.settled;
+        let now = ns(self.driver.now());
+        let Some(quiet) = self.watchdog.tick(now, progress, running > 0) else { return };
+        let stall = blaze_profile::watchdog::stall(quiet, running);
+        let said = stall.to_string();
+        tracing::error!("{said}");
+        let file = under(&self.state, &format!("stall-{now}.json"));
+        self.effects.push(Effect::Write { file, bytes: stall.trace, tag: STALL });
+        // clone: the error, once a stall
+        let error = ApiError::new(said.clone(), Some("stall".to_owned()));
+        let mut told = self.spare.said.pop().unwrap_or_default();
+        self.jobs.stalled(&mut world!(self, told), &error);
+        self.said(told);
+        self.fail(Failed::Stalled(said));
+    }
+
+    /// The plane's and the memory's plots, at most once each [`PLOT_EVERY`] of the driver's
+    /// clock.
+    fn plot(&mut self) {
+        let now = self.driver.now();
+        if now.saturating_sub(self.plotted) < PLOT_EVERY {
+            return;
+        }
+        self.plotted = now;
+        blaze_profile::plot(Plot::Running, self.plane.running() as u64);
+        let memory = blaze_mem::tag::snapshot();
+        blaze_profile::plot(Plot::FrameBytes, memory.get(blaze_mem::Tag::Frames).live);
+        blaze_profile::plot(Plot::LiveBytes, memory.live());
     }
 
     /// The session told the time before anything else it is told this turn; intent whose
@@ -849,7 +941,21 @@ impl<D: Driver, S: Steps> Daemon<D, S> {
     fn outs(&mut self, mut out: Vec<Out>) {
         for it in out.drain(..) {
             match it {
+                Out::Pass(Arrived::Request { from, request: Request::Explore { dev } }) => {
+                    let mut replies = std::mem::take(&mut self.replies);
+                    self.observe.explore(from, dev, &mut replies);
+                    self.send(replies);
+                }
+                Out::Pass(Arrived::Request { from, request: Request::Live }) => self.observe.subscribe(from, self.driver.now()),
+                Out::Pass(Arrived::Request { from, request: Request::Sql { sql, last_s } }) => {
+                    let mut replies = std::mem::take(&mut self.replies);
+                    self.observe.query(from, sql, last_s, &mut replies);
+                    self.send(replies);
+                }
                 Out::Pass(arrived) => {
+                    if let Arrived::Gone { conn } = &arrived {
+                        self.observe.gone(*conn);
+                    }
                     if matches!(arrived, Arrived::Request { request: Request::Stop, .. }) {
                         self.stop_asked = true;
                     }
@@ -869,6 +975,14 @@ impl<D: Driver, S: Steps> Daemon<D, S> {
         if self.stop_asked {
             self.stop();
         }
+    }
+
+    /// `replies` sent, and given back as the loop's buffer.
+    fn send(&mut self, mut replies: Vec<Reply>) {
+        for reply in replies.drain(..) {
+            self.server.reply(reply, &mut self.effects);
+        }
+        self.replies = replies;
     }
 
     fn durable(&mut self, tickets: &[Ticket]) {
@@ -928,6 +1042,7 @@ impl<D: Driver, S: Steps> Daemon<D, S> {
             if happened.is_empty() {
                 break;
             }
+            self.settled += happened.iter().filter(|it| matches!(it, Happened::Settled { .. })).count() as u64;
             let mut said = self.spare.said.pop().unwrap_or_default();
             self.jobs.happened(&mut world!(self, said), &mut happened);
             self.said(said);

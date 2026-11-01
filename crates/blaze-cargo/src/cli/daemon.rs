@@ -477,13 +477,17 @@ pub fn status_lines(status: &Status) -> String {
         true => "0".to_owned(),
         false => format!("{} ({})", ids.len(), ids.join(", ")),
     };
-    format!(
+    let mut lines = format!(
         "pid: {}\nrequests: {requests}\nviews: {}\nmemory: {} of {}\n",
         status.pid,
         status.views,
         bytes(status.memory_bytes),
         bytes(status.budget_bytes)
-    )
+    );
+    if let Some(why) = &status.history {
+        lines.push_str(&format!("history: {why}\n"));
+    }
+    lines
 }
 
 /// `512 B`, `1.5 KiB`, `2.0 GiB`.

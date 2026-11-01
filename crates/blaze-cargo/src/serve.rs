@@ -12,6 +12,9 @@
 //!   start naming it ([`daemon::StartError`]), and one found corrupt while running stops the
 //!   daemon ([`daemon::Failed`]).
 //! - It stops on `blaze stop` ([`blaze_api::Request::Stop`]) or SIGTERM, writing its image first.
+//! - It keeps the profile history in `<state>/profile` on the thread `blaze-history`, samples
+//!   its CPUs, and answers `blaze explore`, `blaze debug live` and `blaze debug sql --live`
+//!   itself ([`observe`]).
 
 mod daemon;
 mod fetch;
@@ -19,6 +22,7 @@ mod heads;
 mod image;
 mod job;
 mod mounts;
+pub mod observe;
 mod plane;
 mod signals;
 #[cfg(test)]
@@ -198,6 +202,9 @@ fn serve(args: impl IntoIterator<Item = OsString>) -> anyhow::Result<()> {
     // dyn: the sandbox's `Confine`, asked once per spawn
     let confine: Arc<dyn Confine> = Arc::new(blaze_usercode::confine::Launcher { program: paths.launcher.clone() });
     let threads = std::thread::available_parallelism().context("the number of cores the daemon's plane works on")?.get();
+    // Read once: the explorer and live SQL run this DuckDB; set wrong, the daemon does not start.
+    let duckdb = observe::duckdb(std::env::var_os(observe::DUCKDB)).map_err(|why| anyhow::anyhow!(why))?;
+    let (profiling, keeper) = observe::keep_history(&paths.state, duckdb).map_err(|why| anyhow::anyhow!(why))?;
     let options = Options {
         state: file_name(&paths.state)?,
         socket: file_name(&paths.socket)?,
@@ -220,7 +227,13 @@ fn serve(args: impl IntoIterator<Item = OsString>) -> anyhow::Result<()> {
         outside: blaze_vfs::outside::dirs(),
         #[cfg(unix)]
         activated,
+        profiling: Some(profiling),
     };
+    // A sampler that can't be made is no other path: every dump and history says it is off.
+    if let Err(why) = blaze_profile::sampler::start(blaze_profile::sampler::HZ) {
+        tracing::warn!("{why}");
+        eprintln!("blaze serve: {why}");
+    }
     signals::catch();
     signals::record_ends();
     plane::record_panics();
@@ -234,7 +247,10 @@ fn serve(args: impl IntoIterator<Item = OsString>) -> anyhow::Result<()> {
         .scratch(&scratch)
         // alloc: an error path
         .with_context(|| format!("making {}, where each sandboxed spawn gets its directory", scratch.display()))?;
-    run(driver, options, steps, runner)
+    let ran = run(driver, options, steps, runner);
+    // The daemon is gone, and with it the history's sender: its thread's last flush ends it.
+    keeper.join().map_err(|why| anyhow::anyhow!(why))?;
+    ran
 }
 
 #[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]

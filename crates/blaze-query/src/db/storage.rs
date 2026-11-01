@@ -191,6 +191,7 @@ unsafe impl Sync for Storage {}
 
 impl Storage {
     pub fn new(hook: Option<Hook>) -> Storage {
+        crate::carry_with_fiber_jobs();
         let view = 1;
         // alloc: once per storage, its slot arrays
         let dirs = Box::new([const { AtomicPtr::new(ptr::null_mut()) }; MAX_INGREDIENTS]);

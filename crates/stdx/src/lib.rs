@@ -30,11 +30,76 @@ pub const fn is_ci() -> bool {
 /// thread long before rustc's 5,204-arm `else if` is through. Unoptimized, a query's frames
 /// between two checks (a fetch through blaze-query into the solver) take more than 100 KiB,
 /// so a debug build keeps 1 MiB left and grows by 8 MiB.
+///
+/// On a fiber, stacker's own limit is wrong: it keeps one per thread, from the thread's stack,
+/// so the fiber's limit is kept here instead ([`set_fiber_stack_limit`], set by the fiber
+/// driver at each job start and carried across a switch).
 #[cfg(not(target_family = "wasm"))]
 pub fn ensure_sufficient_stack<R>(f: impl FnOnce() -> R) -> R {
     const RED_ZONE: usize = if cfg!(debug_assertions) { 1024 * 1024 } else { 100 * 1024 };
     const SEGMENT: usize = if cfg!(debug_assertions) { 8 * 1024 * 1024 } else { 1024 * 1024 };
-    stacker::maybe_grow(RED_ZONE, SEGMENT, f)
+    let limit = fiber_stack_limit();
+    if limit == 0 {
+        return stacker::maybe_grow(RED_ZONE, SEGMENT, f);
+    }
+    if stack_pointer().saturating_sub(limit) >= RED_ZONE {
+        return f();
+    }
+    stacker::grow(SEGMENT, || {
+        // Inside `grow` stacker's limit is the new segment's, so its remaining stack is right.
+        let remaining = stacker::remaining_stack().expect("stacker knows the segment it made");
+        let _outer = FiberLimit::set(stack_pointer() - remaining);
+        f()
+    })
+}
+
+#[cfg(not(target_family = "wasm"))]
+thread_local! {
+    static FIBER_STACK_LIMIT: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// The lowest usable address of the fiber stack this thread runs now; 0 on the thread's own
+/// stack. `inline(never)`: a job can resume on another thread after a wait, and an inlined
+/// thread-local's address could be kept across it.
+#[cfg(not(target_family = "wasm"))]
+#[inline(never)]
+pub fn fiber_stack_limit() -> usize {
+    FIBER_STACK_LIMIT.get()
+}
+
+/// Sets [`fiber_stack_limit`]; `inline(never)` for the same reason.
+#[cfg(not(target_family = "wasm"))]
+#[inline(never)]
+pub fn set_fiber_stack_limit(limit: usize) {
+    FIBER_STACK_LIMIT.set(limit);
+}
+
+/// The fiber limit for a grown segment, put back to the outer one when the segment's call
+/// ends, by return or by unwind.
+#[cfg(not(target_family = "wasm"))]
+struct FiberLimit(usize);
+
+#[cfg(not(target_family = "wasm"))]
+impl FiberLimit {
+    fn set(limit: usize) -> FiberLimit {
+        let outer = fiber_stack_limit();
+        set_fiber_stack_limit(limit);
+        FiberLimit(outer)
+    }
+}
+
+#[cfg(not(target_family = "wasm"))]
+impl Drop for FiberLimit {
+    fn drop(&mut self) {
+        set_fiber_stack_limit(self.0);
+    }
+}
+
+#[cfg(not(target_family = "wasm"))]
+#[inline(always)]
+fn stack_pointer() -> usize {
+    let here = 0u8;
+    std::ptr::addr_of!(here).addr()
 }
 
 #[cfg(target_family = "wasm")]
@@ -380,6 +445,21 @@ pub fn slice_tails<T>(this: &[T]) -> impl Iterator<Item = &[T]> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn on_a_fiber_near_its_limit_the_stack_grows_and_the_limit_comes_back() {
+        // A fiber with almost no stack left, as the driver would set it at a job start.
+        let fake = stack_pointer() - 4096;
+        set_fiber_stack_limit(fake);
+        let inside = ensure_sufficient_stack(fiber_stack_limit);
+        assert_ne!(inside, fake, "the call ran on the fiber's stack instead of a new segment");
+        assert_ne!(inside, 0);
+        assert_eq!(fiber_stack_limit(), fake);
+        let unwound = std::panic::catch_unwind(|| ensure_sufficient_stack(|| panic!("in a segment")));
+        assert!(unwound.is_err());
+        assert_eq!(fiber_stack_limit(), fake, "an unwind left the segment's limit behind");
+        set_fiber_stack_limit(0);
+    }
 
     #[test]
     fn test_trim_indent() {

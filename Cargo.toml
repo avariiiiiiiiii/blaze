@@ -114,6 +114,7 @@ blaze-core = { path = "crates/blaze-core" }
 blaze-graph = { path = "crates/blaze-graph" }
 blaze-image = { path = "crates/blaze-image" }
 blaze-profile = { path = "crates/blaze-profile" }
+blaze-explore = { path = "crates/blaze-explore" }
 blaze-web = { path = "crates/blaze-web" }
 blaze-protocol = { path = "crates/blaze-protocol" }
 blaze-ui = { path = "crates/blaze-ui" }

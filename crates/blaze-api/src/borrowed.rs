@@ -17,7 +17,7 @@ use serde::Deserialize;
 
 use crate::{
     ApiError, Applicability, Artifact, Basis, BuildScriptRan, Cached, CrateType, Diagnostic,
-    Documented, Edited, FactRead, FetchVerb, Level, Memory, Mismatch, Ranked, Reach, Response, Span, Status,
+    Documented, Edited, FactRead, FetchVerb, Level, LiveFrame, Memory, Mismatch, Ranked, Reach, Response, Span, Status,
     Table, TargetKind, TestOutcome, TestResult, Traced, UnitOf, UnitStarted, UnitTarget, Verb,
     Worked,
 };
@@ -72,6 +72,44 @@ pub enum ResponseRef<'a> {
         path: &'a str,
     },
     Documented(Documented),
+    Explored { link: &'a str },
+    Profiled {
+        #[serde(deserialize_with = "blaze_protocol::bytes::borrow")]
+        trace: &'a [u8],
+    },
+    Live(#[serde(borrow)] LiveFrameRef<'a>),
+    Queried {
+        #[serde(deserialize_with = "blaze_protocol::bytes::borrow")]
+        ipc: &'a [u8],
+        rows: u64,
+    },
+}
+
+/// [`LiveFrame`], read where it lies: a frame every 250 ms decodes with no copy of its tables.
+#[derive(Deserialize, Clone, Copy, PartialEq, Eq, Debug)]
+pub struct LiveFrameRef<'a> {
+    pub lost: u64,
+    #[serde(deserialize_with = "blaze_protocol::bytes::borrow")]
+    pub open: &'a [u8],
+    pub at_ns: i64,
+    #[serde(deserialize_with = "blaze_protocol::bytes::borrow")]
+    pub spans: &'a [u8],
+    pub skipped: u64,
+    #[serde(deserialize_with = "blaze_protocol::bytes::borrow")]
+    pub counters: &'a [u8],
+}
+
+impl LiveFrameRef<'_> {
+    pub fn into_owned(self) -> LiveFrame {
+        LiveFrame {
+            lost: self.lost,
+            open: bytes(self.open),
+            at_ns: self.at_ns,
+            spans: bytes(self.spans),
+            skipped: self.skipped,
+            counters: bytes(self.counters),
+        }
+    }
 }
 
 /// [`Diagnostic`], read where it lies.
@@ -277,6 +315,10 @@ impl ResponseRef<'_> {
             ResponseRef::Packed { pack } => Response::Packed { pack: bytes(pack) },
             ResponseRef::DocPage { path, page } => Response::DocPage { path: owned(path), page: bytes(page) },
             ResponseRef::Documented(it) => Response::Documented(it),
+            ResponseRef::Explored { link } => Response::Explored { link: owned(link) },
+            ResponseRef::Profiled { trace } => Response::Profiled { trace: bytes(trace) },
+            ResponseRef::Live(it) => Response::Live(it.into_owned()),
+            ResponseRef::Queried { ipc, rows } => Response::Queried { ipc: bytes(ipc), rows },
         }
     }
 }

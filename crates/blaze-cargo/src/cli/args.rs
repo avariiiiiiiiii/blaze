@@ -294,6 +294,12 @@ pub enum Asked {
     /// the checkout did; or `blaze pack`: a program packed for the in-browser compiler. With the
     /// words after the command, which [`super::inspect`] reads.
     Inspect(super::inspect::Inspected, Vec<OsString>),
+    /// `blaze explore`, with the words after it ([`super::observe::explore`]).
+    Explore(Vec<OsString>),
+    /// `blaze debug profile|live|sql`, with the words after `debug` ([`super::observe::debug`]).
+    Debug(Vec<OsString>),
+    /// `blaze explain VIEW ...`, with the words after it ([`super::observe::explain`]).
+    Explain(Vec<OsString>),
     Help(Option<Command>),
     Version,
     /// A command that is none of blaze's.
@@ -536,6 +542,9 @@ pub fn parse(words: Vec<OsString>) -> Result<Asked, Usage> {
             Some("stop") => return Ok(Asked::Stop),
             Some("status") => return Ok(Asked::Status),
             Some("toolchain") => return Ok(Asked::Toolchain),
+            Some("explore") => return Ok(Asked::Explore(words.collect())),
+            Some("debug") => return Ok(Asked::Debug(words.collect())),
+            Some("explain") => return Ok(Asked::Explain(words.collect())),
             Some("daemon") => {
                 return Ok(match words.next().as_deref().and_then(std::ffi::OsStr::to_str) {
                     Some("install") => Asked::Daemon(DaemonVerb::Install),

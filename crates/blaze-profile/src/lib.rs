@@ -24,7 +24,7 @@
 //! [`Plot`] points in a fixed ring), which [`flight::dump`] writes as the same Chrome trace;
 //! the [`watchdog`], which turns a build that stopped moving into a [`watchdog::Stall`] error
 //! naming every thread's open spans; and in the daemon the CPU [`sampler`].
-//! docs/v2/plan/lanes/observe/profiling.md says how to read them.
+//! docs/profiling.md says how to read them.
 
 use std::{
     cell::{Cell, RefCell},

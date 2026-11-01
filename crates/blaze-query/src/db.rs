@@ -211,6 +211,11 @@ pub fn pump_barrier<R>(f: impl FnOnce() -> R) -> R {
     f()
 }
 
+/// The thread's query stack, carried with a job on a fiber across its waits.
+pub(crate) fn carried() -> blaze_graph::sched::fiber::Carried {
+    blaze_graph::sched::fiber::Carried { take: local::take, put: local::put }
+}
+
 /// Puts `db`'s storage where [`with_attached`] finds it (a `Debug` impl's database) while `f`
 /// runs on this thread.
 pub fn attach<D: Database, R>(db: &D, f: impl FnOnce() -> R) -> R {

@@ -45,7 +45,7 @@ pub mod units;
 static ALLOC: blaze_alloc_count::Counting = blaze_alloc_count::Counting;
 
 pub use borrowed::{
-    ApiErrorRef, BasisRef, BuildScriptRanRef, CachedRef, DiagnosticRef, FactReadRef, ResponseRef,
+    ApiErrorRef, BasisRef, BuildScriptRanRef, CachedRef, DiagnosticRef, FactReadRef, LiveFrameRef, ResponseRef,
     SpanRef, TestResultRef, UnitOfRef, UnitStartedRef, UnitTargetRef,
 };
 pub use blaze_protocol::events::NodeKind;
@@ -66,8 +66,10 @@ use serde::{Deserialize, Serialize};
 /// as enums ([`TargetKind`], [`CrateType`], [`ArtifactKind`], [`Applicability`]), written by
 /// name as before. [`ResponseRef`] reads the same bytes. 15: [`Request::Pack`] and
 /// [`Response::Packed`]. 16: [`Worked::links`]. 17: [`Worked::steps_us`]. 18: [`Request::Doc`],
-/// [`Response::DocPage`] and [`Response::Documented`]. 19: [`Cargo::refused`].
-pub const SCHEMA: u32 = 19;
+/// [`Response::DocPage`] and [`Response::Documented`]. 19: [`Cargo::refused`]. 20:
+/// [`Request::Explore`], [`Request::Profile`], [`Request::Live`], [`Request::Sql`], their
+/// answers, and [`Status::history`].
+pub const SCHEMA: u32 = 20;
 
 /// The most bytes a request the daemon reads may be: CBOR from a peer is decoded only up to
 /// this.
@@ -284,6 +286,39 @@ pub enum Request {
     /// [`Response::Documented`], then each file as a [`Response::DocPage`], which the client
     /// writes, then rustdoc's warnings as [`Response::Diagnostic`]s.
     Doc { view: ViewRef, no_deps: bool, private: bool, targets: Targets },
+    /// `blaze explore`: the explorer's server started in the daemon if it is not yet (with
+    /// `dev`, also accepting the page's development server), answered with
+    /// [`Response::Explored`]. Answered by the daemon's loop, which holds the server.
+    Explore { dev: bool },
+    /// `blaze debug profile`: a Chrome trace of the last `seconds` of every thread's flight
+    /// recorder and the CPU samples; answered with [`Response::Profiled`].
+    Profile { seconds: u32 },
+    /// `blaze debug live`: a [`Response::Live`] every 250 ms until the connection ends. A
+    /// subscriber whose connection has a frame not yet sent is skipped that tick; the next
+    /// frame has every row since its last. Answered by the daemon's loop, which holds the feeds.
+    Live,
+    /// `blaze debug sql --live`: `sql` over the history and the last `last_s` seconds of the
+    /// daemon's flight recorder, run by the daemon (the recorder is its); answered with
+    /// [`Response::Queried`].
+    Sql { sql: String, last_s: u32 },
+}
+
+/// One frame of [`Request::Live`]: blaze-profile's `live::Frame`, each table one Arrow IPC
+/// stream of the schema's table of that name.
+#[derive(Serialize, Deserialize, Clone, PartialEq, Eq, Debug)]
+pub struct LiveFrame {
+    /// Spans not recorded since the daemon began.
+    pub lost: u64,
+    #[serde(with = "blaze_protocol::bytes")]
+    pub open: Vec<u8>,
+    /// When it was read, on the schema's clock.
+    pub at_ns: i64,
+    #[serde(with = "blaze_protocol::bytes")]
+    pub spans: Vec<u8>,
+    /// Rows written over before this subscriber read them, since its last frame.
+    pub skipped: u64,
+    #[serde(with = "blaze_protocol::bytes")]
+    pub counters: Vec<u8>,
 }
 
 /// `blaze test --ub`: each selected test run under `hir_ty_ub::run_test`, nothing compiled.
@@ -363,6 +398,21 @@ pub enum Response {
     },
     /// What a [`Request::Doc`] documents and where, before its first [`Response::DocPage`].
     Documented(Documented),
+    /// The link of [`Request::Explore`]: `https://ix.dev/explore#127.0.0.1:<port>/<token>/<hash>`.
+    /// Its fragment holds the session's token: printed to the terminal only, never logged.
+    Explored { link: String },
+    /// [`Request::Profile`]'s Chrome trace (ui.perfetto.dev opens it).
+    Profiled {
+        #[serde(with = "blaze_protocol::bytes")]
+        trace: Vec<u8>,
+    },
+    Live(LiveFrame),
+    /// [`Request::Sql`]'s answer: one Arrow IPC stream of its batches, and its rows.
+    Queried {
+        #[serde(with = "blaze_protocol::bytes")]
+        ipc: Vec<u8>,
+        rows: u64,
+    },
 }
 
 /// What a [`Request::Doc`] documented.
@@ -923,6 +973,9 @@ pub struct Status {
     /// The daemon's process: what `kill` and the restart budgets name.
     pub pid: u32,
     pub views: u32,
+    /// The profile history's last error (`blaze_profile::history`): a flush that failed,
+    /// naming the file; `None` while every flush has been written.
+    pub history: Option<String>,
     pub requests: Vec<u64>,
     pub budget_bytes: u64,
     pub memory_bytes: u64,

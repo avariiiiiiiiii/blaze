@@ -53,7 +53,28 @@ fn job(views: Vec<Opened>) -> Job<Real> {
         served: Vec::new(),
         links: Vec::new(),
         profiled: false,
+        opened_ns: 0,
+        opened_unix_ns: None,
     }
+}
+
+/// A build's row in the history is its plane request's number, the command line it was asked
+/// as and the checkout it ran in; an agent's request without one names its work and its view.
+#[test]
+fn a_builds_history_row_names_its_request_its_command_and_its_workspace() {
+    let mut agents = job(vec![opened(4)]);
+    agents.work = Work::Tables;
+    agents.opening();
+    let stats = RequestStats { ran: 3, cached: 5, joined: 1, ..RequestStats::default() };
+    let row = agents.row(RequestId(41), Some(stats), blaze_profile::history::Outcome::Ok);
+    assert_eq!(row.build_id, 41);
+    assert_eq!(row.command, "tables");
+    assert_eq!(row.workspace, format!("view {}", ContentId([4; 32])));
+    assert_eq!((row.hits, row.misses, row.joined), (Some(5), Some(3), Some(1)));
+    assert!(row.dur_ns.is_some_and(|it| it >= 0) && row.started_unix_ns.is_some(), "{row:?}");
+    let stalled = agents.row(RequestId(42), None, blaze_profile::history::Outcome::Stalled);
+    assert_eq!((stalled.outcome, stalled.hits), (blaze_profile::history::Outcome::Stalled, None));
+    assert_eq!(command_line(&Work::Snapshot), "snapshot");
 }
 
 /// A request patched in place is one whose every link was spliced: a first link, or one that

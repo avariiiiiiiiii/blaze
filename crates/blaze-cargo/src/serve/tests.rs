@@ -682,6 +682,7 @@ fn options() -> Options {
         outside: Box::leak(Box::new(blaze_vfs::outside::Dirs::new())),
         #[cfg(unix)]
         activated: None,
+        profiling: None,
     }
 }
 

@@ -5,7 +5,8 @@
 //! (pushed around a wait that may pump other jobs onto this thread: a job pumped above it
 //! starts a stack of its own, so its reads and cycle checks never see the frames below).
 //! Reads are `u32` nodes on one edge stack, each run's from its `edges_start`; a hit inside a
-//! query is one push there and two folds into the top frame.
+//! query is one push there and two folds into the top frame. A job on a fiber keeps its stack
+//! across a wait: [`take`] and [`put`] move it with the job to the thread it resumes on.
 //!
 //! The one unsafe concern here is the thread-local's `UnsafeCell`: [`with`] lends it for a
 //! closure that never calls user code or [`with`] again (every caller below is a few loads and
@@ -16,6 +17,7 @@ use std::{cell::UnsafeCell, hash::BuildHasher, ptr};
 use rustc_hash::FxBuildHasher;
 
 use super::{Id, Storage};
+use crate::table::ShortLock;
 
 /// No head: a frame that read no provisional row.
 pub(crate) const NONE: u32 = u32::MAX;
@@ -155,9 +157,9 @@ pub(crate) struct Local {
     pub(crate) attached: *const Storage,
 }
 
-thread_local! {
-    static LOCAL: UnsafeCell<Local> = const {
-        UnsafeCell::new(Local {
+impl Local {
+    const fn empty() -> Local {
+        Local {
             // Each buffer is empty and grows once per thread to its high-water mark.
             frames: Vec::new(), // alloc: none, empty
             edges: Vec::new(), // alloc: none, empty
@@ -169,19 +171,71 @@ thread_local! {
             serial: 0,
             occurrences: hashbrown::HashMap::with_hasher(FxBuildHasher),
             attached: ptr::null(),
-        })
-    };
+        }
+    }
+}
+
+thread_local! {
+    static LOCAL: UnsafeCell<Local> = const { UnsafeCell::new(Local::empty()) };
 }
 
 /// Lends the thread's stack to `f`, which must not call user code or `with`.
-#[inline(always)]
+///
+/// Not inlined, and `f` reads or writes the stack inside: a job on a fiber may wait between
+/// two `with`s of one function and resume on another thread, and an inlined one could keep the
+/// first thread's address across the wait (as could a call that only returned the address,
+/// which the compiler may merge with the next).
+#[inline(never)]
 pub(crate) fn with<R>(f: impl FnOnce(&mut Local) -> R) -> R {
     LOCAL.with(|local| {
         // SAFETY: the cell is this thread's; `f` never re-enters `with` nor runs code that
-        // could (every caller in this module and the engine is loads, stores and pushes), so
-        // this is the only reference to it while `f` runs.
+        // could (every caller in this module and the engine is loads, stores and pushes), nor
+        // waits, so this is the only reference to it while `f` runs.
         f(unsafe { &mut *local.get() })
     })
+}
+
+/// An empty stack a thread left when a job's was put on it, kept for the next job to switch
+/// out there.
+struct Spare(Box<Local>);
+
+// SAFETY: a spare is empty (no frame, `attached` null: checked as it is kept), so it points at
+// no storage.
+unsafe impl Send for Spare {}
+
+// alloc: none: an empty `Vec` in a static; it grows to the most jobs switched out at once.
+static SPARES: ShortLock<Vec<Spare>> = ShortLock::new(Vec::new());
+
+/// Moves the stack of the job switching out off this thread, leaving an empty one
+/// ([`blaze_graph::sched::fiber::Carried`]): the job's frames, reads and cycle state are its
+/// own wherever it resumes, and a job that runs here meanwhile starts a stack of its own.
+#[inline(never)]
+pub(crate) fn take() -> usize {
+    let spare = SPARES.lock().pop().map(|it| it.0);
+    // alloc: a stack once per job switched out at once, then kept in `SPARES`.
+    let mut moved = spare.unwrap_or_else(|| Box::new(Local::empty()));
+    // A switch happens in no `with`, so `with` lends the only reference to the stack.
+    with(|local| std::mem::swap(local, &mut *moved));
+    Box::into_raw(moved).expose_provenance()
+}
+
+/// Puts the stack [`take`] moved off back, on the thread the job resumes on.
+///
+/// # Panics
+///
+/// If the thread's own stack is not empty: a job left frames on it when it ended or switched.
+#[inline(never)]
+pub(crate) fn put(taken: usize) {
+    // SAFETY: `taken` is the box `take` gave up for this job, which the driver puts back once.
+    let mut left = unsafe { Box::from_raw(ptr::with_exposed_provenance_mut::<Local>(taken)) };
+    with(|local| std::mem::swap(local, &mut *left));
+    assert!(
+        left.frames.is_empty() && left.attached.is_null(),
+        "a job resumed on a thread whose query stack still holds {} frames",
+        left.frames.len()
+    );
+    // alloc: none once warm: `SPARES` grows to its high-water mark.
+    SPARES.lock().push(Spare(left));
 }
 
 #[inline(always)]

@@ -15,14 +15,14 @@ use super::{decode, encode, encode_into};
 use crate::{
     ApiError, Applicability, Artifact, ArtifactKind, Basis, BuildScriptRan, Cached, Cargo,
     CrateType, Diagnostic, Documented, DocumentedCrate, Edit, Edited, EditedItem, Envelope, FactRead, FetchVerb, How, Level,
-    LinkHow, LinkKind, Linked, Memory, Mismatch, NodeKind, Ranked, Reach, ReachedItem, Request, Response, ResponseRef, Span,
+    LinkHow, LinkKind, Linked, LiveFrame, Memory, Mismatch, NodeKind, Ranked, Reach, ReachedItem, Request, Response, ResponseRef, Span,
     ServedCrate, ServedPart, Status, Table, TagMemory, Target, TargetKind, Targets, TestOutcome,
     TestResult, Traced, Ub,
     UnitOf, UnitProfile, UnitStarted, UnitTarget, Verb, ViewRef, Worked,
 };
 
-const REQUESTS: usize = 25;
-const RESPONSES: usize = 30;
+const REQUESTS: usize = 29;
+const RESPONSES: usize = 34;
 
 const CHARS: [char; 9] = ['a', 'Z', '0', ' ', '-', '/', '\u{e9}', '\u{6c34}', '\u{1f525}'];
 
@@ -289,6 +289,10 @@ impl Gen {
             21 => Request::Memory,
             22 => Request::Pack { view: self.view(0), targets: self.targets(), program: self.text() },
             23 => Request::Doc { view: self.view(0), no_deps: self.yes(), private: self.yes(), targets: self.targets() },
+            24 => Request::Explore { dev: self.yes() },
+            25 => Request::Profile { seconds: self.u32() },
+            26 => Request::Live,
+            27 => Request::Sql { sql: self.text(), last_s: self.u32() },
             _ => Request::Stop,
         }
     }
@@ -551,6 +555,7 @@ impl Gen {
             12 => Response::Status(Status {
                 pid: self.u32(),
                 views: self.u32(),
+                history: self.maybe(Gen::text),
                 requests: self.many(depth, Gen::wide),
                 budget_bytes: self.wide(),
                 memory_bytes: self.wide(),
@@ -620,6 +625,17 @@ impl Gen {
                 crates: self.many(depth, |g| DocumentedCrate { name: g.text(), asked: g.yes(), package: g.text() }),
                 source_pages: self.wide(),
             }),
+            29 => Response::Explored { link: self.text() },
+            30 => Response::Profiled { trace: self.bytes() },
+            31 => Response::Live(LiveFrame {
+                lost: self.wide(),
+                open: self.bytes(),
+                at_ns: self.wide() as i64,
+                spans: self.bytes(),
+                skipped: self.wide(),
+                counters: self.bytes(),
+            }),
+            32 => Response::Queried { ipc: self.bytes(), rows: self.wide() },
             _ => {
                 Response::Of { response: Box::new(self.response(depth + 1)), candidate: self.u32() }  // alloc: test and fuzz reference only
             }
@@ -680,7 +696,11 @@ fn request_index(request: &Request) -> usize {
         Request::Memory => 21,
         Request::Pack { .. } => 22,
         Request::Doc { .. } => 23,
-        Request::Stop => 24,
+        Request::Explore { .. } => 24,
+        Request::Profile { .. } => 25,
+        Request::Live => 26,
+        Request::Sql { .. } => 27,
+        Request::Stop => 28,
     }
 }
 
@@ -716,7 +736,11 @@ fn response_index(response: &Response) -> usize {
         Response::Packed { .. } => 26,
         Response::DocPage { .. } => 27,
         Response::Documented(_) => 28,
-        Response::Of { .. } => 29,
+        Response::Explored { .. } => 29,
+        Response::Profiled { .. } => 30,
+        Response::Live(_) => 31,
+        Response::Queried { .. } => 32,
+        Response::Of { .. } => 33,
     }
 }
 

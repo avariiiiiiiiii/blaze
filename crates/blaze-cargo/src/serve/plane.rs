@@ -195,6 +195,8 @@ pub struct Posting {
     pub arg: u32,
     /// Its batch reads the front end: it is posted with readers the loop made.
     pub reads: bool,
+    /// The number of its request, the build its spans are of ([`blaze_profile::flight::building`]).
+    pub build: u32,
 }
 
 /// The daemon's: work tasks on the process's worker pool, IO tasks on threads of their own.
@@ -236,7 +238,7 @@ impl<W: Work> Threads<W> {
                         // readers.
                         let mut readers = Some(job.readers);
                         let (ended, peak, ran_ns, puts) = loop {
-                            match run_measured(&*job.work, job.task.arg, readers.take().unwrap_or_default()) {
+                            match run_measured(&*job.work, job.task.arg, job.task.build, readers.take().unwrap_or_default()) {
                                 (Some(ended), peak, ran_ns, puts) => break (ended, peak, ran_ns, puts),
                                 (None, peak, ran_ns, puts) if job.task.reads => {
                                     break (Ended::GaveWay { group: None }, peak, ran_ns, puts);
@@ -260,8 +262,10 @@ impl<W: Work> Threads<W> {
 fn run_measured<W: Work>(
     work: &W,
     arg: u32,
+    build: u32,
     readers: W::Readers,
 ) -> (Option<Ended<W::Value>>, u64, u64, Vec<proc_macro_api::kept::Put>) {
+    let _build = blaze_profile::flight::building(build);
     let start = Instant::now();
     let (result, peak) = arena::measure(|| catch_unwind(AssertUnwindSafe(|| work.run(arg, readers))));
     let ran_ns = u64::try_from(start.elapsed().as_nanos()).unwrap_or(u64::MAX);
@@ -342,7 +346,7 @@ fn post_work<W: Work>(task: Posting, work: Arc<W>, readers: W::Readers, done: &'
     let pool = blaze_graph::exec::shared();
     // The batch's work comes back with the result, for a task that gave way to be posted again
     // without counting another reference.
-    let run = move || (run_measured(&*work, task.arg, readers), work);
+    let run = move || (run_measured(&*work, task.arg, task.build, readers), work);
     let then = move |result: std::thread::Result<_>| match result {
         Ok(((Some(ended), peak, ran_ns, puts), _)) => _ = done.send(Ran { task, ended, peak, ran_ns, puts }),
         Ok(((None, peak, ran_ns, puts), _)) if task.reads => {
@@ -425,7 +429,7 @@ impl<W: Work> Inline<W> {
         let now = 1 + self.rng.below(posted.len() as u64) as usize;
         self.queue.extend(posted.drain(now..));
         for (task, work, readers) in posted.drain(..) {
-            match run_measured(&*work, task.arg, readers) {
+            match run_measured(&*work, task.arg, task.build, readers) {
                 (Some(ended), peak, _, puts) => out.push(Ran { task, ended, peak, ran_ns: 0, puts }),
                 (None, peak, _, puts) if task.reads => {
                     out.push(Ran { task, ended: Ended::GaveWay { group: None }, peak, ran_ns: 0, puts });
@@ -455,6 +459,8 @@ struct Batch<W> {
     live: u32,
     work: Option<Arc<W>>,
     reads: bool,
+    /// Its request's number, which its tasks' spans carry.
+    request: u32,
 }
 
 /// The plane of thread tasks whose batches are each a `W`, given their costs and memory by `P`.
@@ -630,11 +636,18 @@ impl<W: Work, P: Predict> Plane<W, P> {
         }
     }
 
+    /// Requests are numbered from `first` on: the daemon's first build's number
+    /// ([`super::observe::Observe::first_build`]), past every build its history names, so a
+    /// request's number is its build's id in the flight recorder and the history. Never 0.
+    pub fn number_from(&mut self, first: u32) {
+        self.next_request = first.max(1);
+    }
+
     /// A request, of weight 1: every job's share of the threads is the same. An `idle` one runs
     /// on what no other can use until it is promoted ([`Plane::promote`]).
     pub fn open(&mut self, at: Duration, keep_going: bool, idle: bool) -> RequestId {
         let request = RequestId(self.next_request);
-        self.next_request = self.next_request.wrapping_add(1);
+        self.next_request = self.next_request.wrapping_add(1).max(1);
         let input = PlaneInput::Open { at_ns: ns(at), request, weight: 1, keep_going, idle };
         self.step(input).unwrap_or_else(|error| panic!("the plane refused to open {request}: {error}"));
         request
@@ -664,7 +677,7 @@ impl<W: Work, P: Predict> Plane<W, P> {
         );
         let first = nodes.first();
         if count > 0 {
-            self.batches.insert(first.0, Batch { tasks, keys, live: count, work, reads });
+            self.batches.insert(first.0, Batch { tasks, keys, live: count, work, reads, request: request.0 });
         }
         match self.step(PlaneInput::AddNodes { at_ns: ns(at), request, nodes }) {
             Ok(()) => Ok(()),
@@ -847,7 +860,7 @@ impl<W: Work, P: Predict> Plane<W, P> {
     fn run(&mut self, id: NodeId, pool: Pool, near: Option<u32>, critical: bool) {
         match self.task(id) {
             Some((batch, Task::Thread { kind, arg })) => {
-                let task = Posting { id, pool, near, critical, kind, arg, reads: batch.reads };
+                let task = Posting { id, pool, near, critical, kind, arg, reads: batch.reads, build: batch.request };
                 if batch.reads {
                     self.happened.push(Happened::Post { task, again: false });
                 } else {
@@ -915,7 +928,7 @@ mod tests {
 
     #[test]
     fn each_runner_runs_a_task_and_hands_back_its_value() {
-        let task = |pool| Posting { id: NodeId(4), pool, near: None, critical: false, kind: kinds::COMPILE, arg: 20, reads: false };
+        let task = |pool| Posting { id: NodeId(4), pool, near: None, critical: false, kind: kinds::COMPILE, arg: 20, reads: false, build: 1 };
         let runners: [(Runner<Next>, Pool); 3] = [
             (Runner::Threads(Threads::new(1, 1)), Pool::Io),
             (Runner::Threads(Threads::new(1, 1)), Pool::Work),
@@ -946,7 +959,7 @@ mod tests {
                 .expect_err("the thread panics");
             std::panic::resume_unwind(raised)
         }));
-        let task = Posting { id: NodeId(9), pool: Pool::Work, near: None, critical: false, kind: kinds::COMPILE, arg: 0, reads: false };
+        let task = Posting { id: NodeId(9), pool: Pool::Work, near: None, critical: false, kind: kinds::COMPILE, arg: 0, reads: false, build: 1 };
         let mut runner = Inline::new(5);
         runner.post(task, work, ());
         let mut ran = Vec::new();
@@ -972,7 +985,7 @@ mod tests {
                 built(0)
             }
         }));
-        let task = Posting { id: NodeId(7), pool: Pool::Work, near: None, critical: false, kind: kinds::COMPILE, arg: 0, reads: false };
+        let task = Posting { id: NodeId(7), pool: Pool::Work, near: None, critical: false, kind: kinds::COMPILE, arg: 0, reads: false, build: 1 };
         let mut runner = Inline::new(3);
         runner.post(task, work, ());
         let mut ran = Vec::new();
@@ -989,7 +1002,7 @@ mod tests {
             proc_macro_api::kept::put(put("plane-b gave way"));
             None
         }));
-        let task = Posting { id: NodeId(8), pool: Pool::Work, near: None, critical: false, kind: kinds::COMPILE, arg: 0, reads: true };
+        let task = Posting { id: NodeId(8), pool: Pool::Work, near: None, critical: false, kind: kinds::COMPILE, arg: 0, reads: true, build: 1 };
         let mut runner = Inline::new(5);
         runner.post(task, work, ());
         let mut ran = Vec::new();

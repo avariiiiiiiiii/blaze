@@ -22,7 +22,7 @@
 //! thread-local's address across the call, and after the wait the job can be on another
 //! thread. This module's own thread-local reads sit in `#[inline(never)]` functions for that
 //! reason. A thread-local whose value a job keeps across a wait is [`Carried`] with the job:
-//! taken off the thread at each switch out and put on the thread that resumes it.
+//! taken off the thread when the job parks and put on the thread that resumes it.
 
 use std::{
     any::Any,
@@ -31,14 +31,17 @@ use std::{
     panic::{self, AssertUnwindSafe},
     ptr,
     sync::{
-        Arc, Mutex, MutexGuard, OnceLock,
+        Arc, Mutex, MutexGuard, Once, OnceLock,
         atomic::{AtomicBool, AtomicUsize, Ordering},
     },
     thread::{self, JoinHandle, Thread},
     time::{Duration, Instant},
 };
 
-use corosensei::{Coroutine, CoroutineResult, Yielder, stack::DefaultStack};
+use corosensei::{
+    Coroutine, CoroutineResult, Yielder,
+    stack::{DefaultStack, Stack},
+};
 
 use super::{CoreId, CounterId, Cores, Cycle, JobId, Sched, Spawn, Stats, Suspend, Wait, Yielded};
 use crate::Key;
@@ -148,8 +151,8 @@ enum Slot<J> {
     Fresh(J),
     /// Started; on a core now.
     Running,
-    /// Started; suspended, or moved and not resumed yet.
-    Parked(Fiber<J>),
+    /// Started; suspended, or moved and not resumed yet, with the thread-locals it carries.
+    Parked(Fiber<J>, Box<Taken>),
 }
 
 struct State<W: Work> {
@@ -160,6 +163,8 @@ struct State<W: Work> {
     /// Spawned and not done.
     live: u32,
     idle: Vec<Fiber<W::Job>>,
+    /// Boxes for parked jobs' carried thread-locals, kept for the next job to park.
+    spare_taken: Vec<Box<Taken>>,
     /// A `Run` for a core made by a call from another core's worker; read by its worker.
     pending: Vec<u32>,
     closing: bool,
@@ -263,12 +268,20 @@ impl<W: Work> Shared<W> {
 fn new_fiber<W: Work>(shared: &Arc<Shared<W>>) -> Result<Fiber<W::Job>, DriverError> {
     let bytes = shared.config.stack;
     let stack = DefaultStack::new(bytes).map_err(|why| DriverError::Stack { bytes, why })?;
+    // The stack has at least `bytes` above its guard page, which `Stack::limit` counts in.
+    let limit = stack.base().get() - bytes;
     let shared = Arc::clone(shared); // clone: one per fiber made, held for its life
-    Ok(Fiber(Coroutine::with_stack(stack, move |yielder, first| body(&shared, yielder, first))))
+    Ok(Fiber(Coroutine::with_stack(stack, move |yielder, first| body(&shared, limit, yielder, first))))
 }
 
 /// A fiber's life: run each job it is started with, report its end, and wait for the next.
-fn body<W: Work>(shared: &Shared<W>, yielder: &Yielder<In<W::Job>, Out>, first: In<W::Job>) {
+/// `limit` is the lowest usable address of its stack, for [`stdx::ensure_sufficient_stack`].
+fn body<W: Work>(
+    shared: &Shared<W>,
+    limit: usize,
+    yielder: &Yielder<In<W::Job>, Out>,
+    first: In<W::Job>,
+) {
     let mut next = first;
     loop {
         let (job, payload) = match next {
@@ -278,7 +291,9 @@ fn body<W: Work>(shared: &Shared<W>, yielder: &Yielder<In<W::Job>, Out>, first: 
         };
         let cx = Cx { shared, job, yielder };
         enter(&cx);
+        stdx::set_fiber_stack_limit(limit);
         let ran = panic::catch_unwind(AssertUnwindSafe(|| shared.work.run(&cx, payload)));
+        stdx::set_fiber_stack_limit(0);
         next = yielder.suspend(Out::Done(ran.err()));
     }
 }
@@ -393,10 +408,8 @@ impl<W: Work> Cx<'_, W> {
     #[inline(never)]
     fn switch(&self, out: Out) -> Result<(), Cycle> {
         check_no_wait(self.job);
-        let carried = take_carried();
         let back = self.yielder.suspend(out);
         enter(self);
-        put_carried(&carried);
         match back {
             In::Go(Answer::Ready) => Ok(()),
             In::Go(Answer::Cycle(cycle)) => Err(cycle),
@@ -542,8 +555,10 @@ pub fn miss() {
 }
 
 /// A thread-local that a job's code keeps across a wait (the query engine's active frames):
-/// when the job switches out, `take` moves its value off the thread, leaving the thread's
-/// empty, and `put` moves it onto whichever thread resumes the job. Registered once, with
+/// when the job parks (it waits, or moves, and its core runs something else), `take` moves its
+/// value off the thread, leaving the thread's empty, and `put` moves it onto whichever thread
+/// resumes the job. A wait that comes back at once moves nothing. Both run on the worker's
+/// stack under the driver's lock: they must not call into the driver. Registered once, with
 /// [`carry`], before any driver runs.
 #[derive(Clone, Copy)]
 pub struct Carried {
@@ -556,6 +571,22 @@ pub const MAX_CARRIED: usize = 16;
 
 static CARRIED: [OnceLock<Carried>; MAX_CARRIED] = [const { OnceLock::new() }; MAX_CARRIED];
 static CARRIED_LEN: AtomicUsize = AtomicUsize::new(0);
+
+/// The fiber stack limit `stdx::ensure_sufficient_stack` checks against, carried with the job
+/// (each job's limit is set at its start, in `body`).
+fn carry_stack_limit() {
+    static ONCE: Once = Once::new();
+    ONCE.call_once(|| {
+        carry(Carried {
+            take: || {
+                let limit = stdx::fiber_stack_limit();
+                stdx::set_fiber_stack_limit(0);
+                limit
+            },
+            put: stdx::set_fiber_stack_limit,
+        });
+    });
+}
 
 /// Carries a thread-local with each job across its waits.
 ///
@@ -636,6 +667,7 @@ impl<W: Work> Driver<W> {
         config: Config,
         setup: impl Fn(CoreId) -> io::Result<()> + Send + Sync + 'static,
     ) -> Result<Driver<W>, DriverError> {
+        carry_stack_limit();
         let n = cores.len();
         let slots = (0..n)
             .map(|_| CoreSlot { moving: AtomicBool::new(false), woken: AtomicBool::new(false), thread: OnceLock::new() })
@@ -650,6 +682,7 @@ impl<W: Work> Driver<W> {
             free: Vec::with_capacity(jobs),
             live: 0,
             idle: Vec::with_capacity(config.fibers),
+            spare_taken: Vec::with_capacity(config.fibers),
             pending,
             closing: false,
             joiner: None,
@@ -811,7 +844,7 @@ impl<W: Work> Driver<W> {
         // Fibers of jobs that never ended (the driver failed): their stacks hold frames that
         // may hold locks, so they are not unwound; they stay mapped until the process ends.
         for slot in &mut st.slots {
-            if let Slot::Parked(fiber) = mem::replace(slot, Slot::Free) {
+            if let Slot::Parked(fiber, _) = mem::replace(slot, Slot::Free) {
                 mem::forget(fiber);
             }
         }
@@ -888,6 +921,16 @@ fn idle<W: Work>(shared: &Shared<W>, slot: &CoreSlot, deadline: Option<u64>) {
     slot.woken.store(false, Ordering::Release);
 }
 
+/// Takes the carried thread-locals of the job that just switched out on this thread, as it
+/// parks: before it is visible as parked, so no core resumes it first. Only a job that really
+/// waits or moves pays for it; a wait that comes back at once leaves them where they are.
+fn park_carried<W: Work>(st: &mut State<W>) -> Box<Taken> {
+    // alloc: a box once per job parked at once, then kept in `spare_taken`.
+    let mut taken = st.spare_taken.pop().unwrap_or_else(|| Box::new([None; MAX_CARRIED]));
+    *taken = take_carried();
+    taken
+}
+
 /// Runs (or resumes) `job` on core `me` until it waits, moves or ends; returns the lock and the
 /// core's next `Run`.
 fn run<'a, W: Work>(
@@ -912,7 +955,11 @@ fn run<'a, W: Work>(
             };
             (fiber, In::Start(job, payload))
         }
-        Slot::Parked(fiber) => (fiber, In::Go(Answer::Ready)),
+        Slot::Parked(fiber, taken) => {
+            put_carried(&taken);
+            st.spare_taken.push(taken);
+            (fiber, In::Go(Answer::Ready))
+        }
         Slot::Running => panic!("job {} run on core {me} while it runs", job.0),
         Slot::Free => panic!("job {} run on core {me}, never spawned", job.0),
     };
@@ -940,7 +987,8 @@ fn run<'a, W: Work>(
                     None | Some(Ok(Suspend::Ready)) => In::Go(Answer::Ready),
                     Some(Err(cycle)) => In::Go(Answer::Cycle(cycle)),
                     Some(Ok(Suspend::Waiting)) => {
-                        st.slots[j] = Slot::Parked(fiber);
+                        let taken = park_carried(&mut st);
+                        st.slots[j] = Slot::Parked(fiber, taken);
                         let next = shared.dispatch(&mut st, Some(me));
                         return (st, next);
                     }
@@ -949,7 +997,8 @@ fn run<'a, W: Work>(
             Out::Move => match st.sched.yielded(job) {
                 Yielded::Stay => In::Go(Answer::Ready),
                 Yielded::Moved => {
-                    st.slots[j] = Slot::Parked(fiber);
+                    let taken = park_carried(&mut st);
+                    st.slots[j] = Slot::Parked(fiber, taken);
                     let next = shared.dispatch(&mut st, Some(me));
                     return (st, next);
                 }

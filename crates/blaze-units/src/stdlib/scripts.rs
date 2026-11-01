@@ -25,11 +25,12 @@ pub enum Script {
     Libc,
     Object,
     Std,
+    Test,
 }
 
 /// Each script blaze has a port of: its package, and the files it is made of by path under
 /// `library/` with their BLAKE3, the script's root first.
-pub static PINNED: [(Script, &str, &[(&str, &str)]); 4] = [
+pub static PINNED: [(Script, &str, &[(&str, &str)]); 5] = [
     (
         Script::CompilerBuiltins,
         "compiler_builtins",
@@ -41,6 +42,7 @@ pub static PINNED: [(Script, &str, &[(&str, &str)]); 4] = [
     (Script::Libc, "libc", &[("vendor/libc-0.2.191/build.rs", "9eb10374afeb9cd3215c832b538db85b93f04b88de43f9e5d193b98da6c81100")]),
     (Script::Object, "object", &[("vendor/object-0.39.1/build.rs", "4872405dc10050f2ce4c3e81150a88f1e81fa4ff327c2337e80cabf84446000b")]),
     (Script::Std, "std", &[("std/build.rs", "3be73c2bf16ec86c52fb2d8973c92f1b0ef3c61f9412e8e647f7c71086f00871")]),
+    (Script::Test, "test", &[("test/build.rs", "70ac360f5b21e655e46643be153bc59cc8a89f7fc822683c76badef8545a1fc6")]),
 ];
 
 /// The script of std's package `package` whose root file is at `root` (its compile's
@@ -89,6 +91,7 @@ pub fn printed(script: Script, vars: &[(OsString, OsString)], cwd: &Path) -> Res
         Script::Libc => port_libc(&vars, &mut out)?,
         Script::Object => port_object(&vars, &mut out)?,
         Script::Std => port_std(&vars, &mut out)?,
+        Script::Test => port_test(&vars, &mut out)?,
     }
     Ok(out.into_bytes())
 }
@@ -227,6 +230,18 @@ fn port_std(vars: &Vars<'_>, out: &mut String) -> Result<(), String> {
         && version < (25, 9)
     {
         say!(out, "cargo:rustc-cfg=vxworks_lt_25_09");
+    }
+    Ok(())
+}
+
+/// library/test/build.rs: `$RUSTC -vV`, which blaze's rustc stand-in answers for `HOST`.
+fn port_test(vars: &Vars<'_>, out: &mut String) -> Result<(), String> {
+    say!(out, "cargo:rerun-if-changed=build.rs");
+    say!(out, "cargo:rustc-check-cfg=cfg(enable_unstable_features)");
+    vars.need("RUSTC")?;
+    let said = target::rustc_verbose_version(vars.need("HOST")?);
+    if said.contains("nightly") || said.contains("dev") {
+        say!(out, "cargo:rustc-cfg=enable_unstable_features");
     }
     Ok(())
 }

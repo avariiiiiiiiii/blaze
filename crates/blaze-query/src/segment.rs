@@ -62,7 +62,10 @@ thread_local! {
     static LANE: Lane = Lane::claim();
 }
 
-/// This thread's lane: no other thread holds it while this one lives.
+/// This thread's lane: no other thread holds it while this one lives. Each caller uses it for
+/// one write and makes no query call (so no wait) before it is done with the lane; not inlined,
+/// so no caller keeps a thread's address of it across a later wait.
+#[inline(never)]
 pub(crate) fn lane() -> u32 {
     LANE.with(|lane| lane.0)
 }

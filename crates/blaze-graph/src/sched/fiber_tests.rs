@@ -529,3 +529,142 @@ fn a_carried_thread_local_follows_its_job_across_waits() {
     driver.join().unwrap();
     assert_eq!(work.checked.load(Ordering::Relaxed), 6);
 }
+
+/// Jobs recurse through `stdx::ensure_sufficient_stack` far past their fiber's 256 KiB and
+/// wait at the bottom, inside a grown segment, on two cores: the stack grows instead of
+/// overflowing, and each job finds its own limit after each wait, wherever it resumes.
+struct Deep {
+    ended: AtomicU32,
+}
+
+#[inline(never)]
+fn recurse<W: Work>(cx: &Cx<'_, W>, left: u32) -> u64 {
+    stdx::ensure_sufficient_stack(|| {
+        let frame = std::hint::black_box([left as u8; 1024]);
+        if left == 0 {
+            let limit = stdx::fiber_stack_limit();
+            assert_ne!(limit, 0, "a job on a fiber has a fiber stack limit");
+            cx.wait(Wait::Until(cx.now() + 200_000)).expect("a timed wait closes no cycle");
+            assert_eq!(stdx::fiber_stack_limit(), limit, "job {} lost its stack limit across a wait", cx.job().0);
+            return u64::from(frame[0]);
+        }
+        recurse(cx, left - 1) + u64::from(frame[1023])
+    })
+}
+
+impl Work for &'static Deep {
+    type Job = ();
+
+    fn run(&self, cx: &Cx<'_, Self>, (): ()) {
+        let outer = stdx::fiber_stack_limit();
+        assert_ne!(outer, 0);
+        recurse(cx, 4096);
+        assert_eq!(stdx::fiber_stack_limit(), outer, "the grown segments' limits were put back");
+        self.ended.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+#[test]
+fn a_job_recursing_past_its_fiber_stack_grows_and_keeps_its_limit_across_waits() {
+    static WORK: OnceLock<Deep> = OnceLock::new();
+    let work = WORK.get_or_init(|| Deep { ended: AtomicU32::new(0) });
+    let driver = start(Cores::flat(2).unwrap(), work);
+    for _ in 0..6 {
+        driver.spawn((), Spawn::root());
+    }
+    driver.join().unwrap();
+    assert_eq!(work.ended.load(Ordering::Relaxed), 6);
+    assert_eq!(stdx::fiber_stack_limit(), 0, "the joining thread is not a fiber");
+}
+
+/// Repro's `scope_wait` cases (crates/blaze-graph/tests/scope_wait.rs, the self-build's
+/// deadlock of self7) on fibers: a job runs key 1 and, inside the run, waits on a scope (a
+/// parallel map: one counter, one suspend) whose job asks for key 1. The scheduler sees the
+/// whole cycle (key 1's flight, its claimer, the counter, the scope's job), so the wait that
+/// closes it is refused and gives way, and nothing parks for good.
+struct ScopeWait {
+    flights: crate::pump::Flights<u32>,
+    /// What each side came to: the owner's run of key 1 and the scope job's ask.
+    owner: Mutex<Vec<Result<u32, crate::Cancelled>>>,
+    asked: Mutex<Vec<Result<u32, crate::Cancelled>>>,
+}
+
+enum ScopeJob {
+    /// Waits for the owner it spawns: the owner a job's child, as `Db::run_all` under a query.
+    Parent,
+    Owner,
+    Ask,
+}
+
+impl ScopeWait {
+    fn leak() -> &'static ScopeWait {
+        Box::leak(Box::new(ScopeWait {
+            flights: crate::pump::Flights::new(),
+            owner: Mutex::new(Vec::new()),
+            asked: Mutex::new(Vec::new()),
+        }))
+    }
+
+    fn run_on(&'static self, cores: usize, root: ScopeJob) -> (Vec<Result<u32, crate::Cancelled>>, Vec<Result<u32, crate::Cancelled>>) {
+        let driver = start(Cores::flat(cores).unwrap(), self);
+        driver.spawn(root, Spawn::root());
+        driver.join().unwrap();
+        assert_eq!(self.flights.running(), 0, "no run of key 1 is left");
+        (self.owner.lock().unwrap().clone(), self.asked.lock().unwrap().clone())
+    }
+}
+
+impl Work for &'static ScopeWait {
+    type Job = ScopeJob;
+
+    fn run(&self, cx: &Cx<'_, Self>, job: ScopeJob) {
+        match job {
+            ScopeJob::Parent => {
+                let owner = cx.spawn(ScopeJob::Owner, Spawn::root());
+                cx.wait_job(owner).expect("a parent's wait for its owner closes no cycle");
+            }
+            ScopeJob::Owner => {
+                let got = self.flights.get_or_run(key(1), || match cx.map([ScopeJob::Ask], Spawn::root()) {
+                    Ok(()) => Ok(1),
+                    Err(_) => Err(crate::Cancelled),
+                });
+                self.owner.lock().unwrap().push(got);
+            }
+            ScopeJob::Ask => {
+                let got = self.flights.get_or_run(key(1), || Ok(7));
+                self.asked.lock().unwrap().push(got);
+            }
+        }
+    }
+}
+
+/// The owner a root job, on one core: it waits on its scope first, so the scope's job's ask
+/// closes the cycle and gives way, and the owner's run ends with its value.
+#[test]
+fn a_scope_job_asking_its_owners_key_on_fibers_gives_way() {
+    let (owner, asked) = ScopeWait::leak().run_on(1, ScopeJob::Owner);
+    assert_eq!(asked, vec![Err(crate::Cancelled)], "the scope's job gives way");
+    assert_eq!(owner, vec![Ok(1)], "the owner's run ends with its value");
+}
+
+/// The owner a job's child that its parent waits for, on one core: the same.
+#[test]
+fn a_scope_job_asking_its_owners_key_under_a_waiting_parent_gives_way() {
+    let (owner, asked) = ScopeWait::leak().run_on(1, ScopeJob::Parent);
+    assert_eq!(asked, vec![Err(crate::Cancelled)], "the scope's job gives way");
+    assert_eq!(owner, vec![Ok(1)], "the owner's run ends with its value");
+}
+
+/// On two cores the scope's job may ask before its owner waits on the scope; then the owner's
+/// wait closes the cycle and its run gives way, and the job runs key 1 itself. Either way
+/// exactly one side gives way and both end.
+#[test]
+fn a_scope_wait_on_fibers_never_leaves_every_core_parked() {
+    for _ in 0..50 {
+        let (owner, asked) = ScopeWait::leak().run_on(2, ScopeJob::Owner);
+        match (owner.as_slice(), asked.as_slice()) {
+            ([Ok(1)], [Err(crate::Cancelled)]) | ([Err(crate::Cancelled)], [Ok(7)]) => {}
+            other => panic!("one side gives way and the other ends with a value: {other:?}"),
+        }
+    }
+}

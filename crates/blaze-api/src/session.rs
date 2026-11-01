@@ -53,6 +53,11 @@ pub struct Daemon<'a> {
     /// blaze-mem's counters as they are now, for [`Response::Memory`]:
     /// `blaze_mem::tag::snapshot` in the daemon, read only when asked.
     pub memory: fn() -> Snapshot,
+    /// The flight recorder's Chrome trace of the last given time, for [`Response::Profiled`]:
+    /// `blaze_profile::flight::dump` in the daemon.
+    pub profile: fn(std::time::Duration) -> Vec<u8>,
+    /// The profile history's last error, for [`Status::history`].
+    pub history: Option<&'a str>,
 }
 
 /// The requests under way, the views each connection holds, and the jobs of the build.
@@ -713,6 +718,8 @@ impl Session {
                     pid: cx.pid,
                     requests,
                     views: self.views(),
+                    // alloc: the reply's own copy of an error, once per Status.
+                    history: cx.history.map(str::to_owned),
                     memory_bytes: cx.memory_bytes,
                     budget_bytes: cx.budget_bytes,
                 };
@@ -721,6 +728,17 @@ impl Session {
             Request::Memory => {
                 let memory = self.memory((cx.memory)());
                 answer(out, req, Response::Memory(memory));
+            }
+            Request::Profile { seconds } => {
+                let trace = (cx.profile)(std::time::Duration::from_secs(u64::from(seconds)));
+                answer(out, req, Response::Profiled { trace });
+            }
+            Request::Explore { .. } | Request::Live | Request::Sql { .. } => {
+                return Err(ApiError::new(
+                    "the explorer, the live feed and live SQL are answered by the daemon's loop, \
+                     which holds their servers and feeds; this one handed the request on instead",
+                    Some(request_name(&request).to_owned()),
+                ));
             }
             Request::Open { view } => {
                 let root = resolve(cx.vfs, &view)?;
@@ -1046,6 +1064,16 @@ fn op_path(error: &OpError) -> String {
         OpError::UnknownRoot(root) => format!("root {root:x}"),
         // alloc: error path, the image's group whose bytes failed their check.
         OpError::Corrupt { section, group } => format!("image section {section} group {group}"),
+    }
+}
+
+/// The command of a request the session does not answer itself.
+fn request_name(request: &Request) -> &'static str {
+    match request {
+        Request::Explore { .. } => "blaze explore",
+        Request::Live => "blaze debug live",
+        Request::Sql { .. } => "blaze debug sql --live",
+        _ => "a request",
     }
 }
 

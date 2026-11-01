@@ -23,7 +23,7 @@ fn config(unix: bool, http: bool) -> Config {
 }
 
 fn status() -> Status {
-    Status { pid: 6, requests: vec![1, 2], views: 3, memory_bytes: 4, budget_bytes: 5 }
+    Status { pid: 6, requests: vec![1, 2], views: 3, history: None, memory_bytes: 4, budget_bytes: 5 }
 }
 
 /// The server and a driver played by hand: what it asked for and has not been told of.
@@ -831,4 +831,19 @@ fn a_warm_request_and_its_reply_reuse_their_buffers() {
             assert!(arrived.is_empty() && !rig.hung_up(conn), "{unix}");
         }
     }
+}
+
+/// A connection waits while a send of it is in flight, and not once it completed; a stream on a
+/// clock skips the ticks it waits through.
+#[test]
+fn a_connection_waits_while_its_send_is_in_flight() {
+    let mut rig = Rig::new(config(true, false));
+    let conn = rig.accept(true, 7);
+    assert!(!rig.server.waiting(conn), "nothing queued yet");
+    rig.reply(conn, 1, Response::Done { ok: true });
+    assert!(rig.server.waiting(conn), "a send in flight");
+    let sent = rig.sent(conn);
+    assert!(!sent.is_empty());
+    assert!(!rig.server.waiting(conn), "the send completed");
+    assert!(!rig.server.waiting(Conn(99)), "a connection the server has none of waits on nothing");
 }

@@ -54,6 +54,10 @@ blaze-graph.workspace = true
 blaze-history.workspace = true
 # `BLAZE_PROFILE`: the client puts the profile together, the daemon writes its part of each build.
 blaze-profile.workspace = true
+# `blaze explore`: the explorer's server, started in the daemon on the first request for it.
+blaze-explore.workspace = true
+# The record batches of `blaze debug sql`, encoded in the daemon and printed by the CLI.
+arrow-array.workspace = true
 blaze-inproc.workspace = true
 blaze-intent.workspace = true
 blaze-image.workspace = true

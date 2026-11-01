@@ -67,6 +67,7 @@ use blaze_units::{
     schema::Mode as UnitMode,
 };
 use blaze_history::History;
+use blaze_profile::history::{self as profile_history, BuildRow};
 use blaze_vfs::{Change, Ticket, ViewId, Vfs};
 use rustc_hash::{FxHashMap, FxHashSet};
 
@@ -388,6 +389,43 @@ fn goal_of(work: &Work) -> Goal {
         | Work::Pack { .. }
         | Work::Doc { .. } => Goal::Check,
     }
+}
+
+/// What a job was asked, as the history's `builds.command` says it: a command line's
+/// subcommand and arguments, or the work an agent asked for.
+fn command_line(work: &Work) -> String {
+    if let Some(cargo) = targets_of(work).and_then(|it| it.cargo.as_ref()) {
+        let mut line = cargo.command.clone(); // clone: once a build
+        for arg in &cargo.args {
+            line.push(' ');
+            line.push_str(arg);
+        }
+        return line;
+    }
+    let what = match work {
+        Work::Check(_) => "check",
+        Work::Build(_) => "build",
+        Work::Test { .. } => "test",
+        Work::Run { .. } => "run",
+        Work::Reach { .. } => "reach",
+        Work::Verify(_) => "verify",
+        Work::Snapshot => "snapshot",
+        Work::CodegenInputs(_) => "codegen-inputs",
+        Work::Trace(_) => "trace",
+        Work::Tables => "tables",
+        Work::Pack { .. } => "pack",
+        Work::Doc { .. } => "doc",
+        Work::Edit(_) => "edit",
+        Work::Ahead { .. } => "ahead",
+    };
+    let mut line = what.to_owned();
+    if let Some(targets) = targets_of(work) {
+        for package in &targets.packages {
+            line.push_str(" -p ");
+            line.push_str(package);
+        }
+    }
+    line
 }
 
 fn targets_of(work: &Work) -> Option<&Targets> {
@@ -802,9 +840,47 @@ struct Job<S: Steps> {
     /// Its command line's environment names a profile's directory ([`profile_dir`]): the
     /// daemon's part of the build is written there as it finishes.
     profiled: bool,
+    /// When its plane request opened: on the schema's clock ([`blaze_profile::clock::mono_ns`])
+    /// and on the wall's, for its row in the history.
+    opened_ns: i64,
+    opened_unix_ns: Option<i64>,
 }
 
 impl<S: Steps> Job<S> {
+    /// Its plane request opens now.
+    fn opening(&mut self) {
+        self.opened_ns = blaze_profile::clock::mono_ns();
+        self.opened_unix_ns = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .ok()
+            .and_then(|it| i64::try_from(it.as_nanos()).ok());
+    }
+
+    /// The history's row of its plane request `request`, which ended `outcome` with the
+    /// plane's counts `stats`.
+    fn row(&self, request: RequestId, stats: Option<RequestStats>, outcome: profile_history::Outcome) -> BuildRow {
+        let cargo = targets_of(&self.work).and_then(|it| it.cargo.as_ref());
+        let workspace = match (cargo, self.views.first()) {
+            // clone: a path, once a build
+            (Some(cargo), _) => cargo.root.clone(),
+            (None, Some(view)) => format!("view {}", view.view.root),
+            (None, None) => "no view".to_owned(),
+        };
+        BuildRow {
+            build_id: u64::from(request.0),
+            commit: None,
+            workspace,
+            command: command_line(&self.work),
+            started_ns: self.opened_ns,
+            dur_ns: Some(blaze_profile::clock::mono_ns() - self.opened_ns),
+            started_unix_ns: self.opened_unix_ns,
+            outcome,
+            hits: stats.map(|it| it.cached),
+            misses: stats.map(|it| it.ran),
+            joined: stats.map(|it| it.joined),
+        }
+    }
+
     /// The value its stage waited on, if node `node` gave it.
     fn take_value(&mut self, node: NodeId) -> Option<Value<S>> {
         self.value.take_if(|(at, _)| *at == node).map(|(_, value)| value)
@@ -938,6 +1014,9 @@ pub struct Jobs<S: Steps> {
     pub cold: bool,
     /// A job finished since the last collection.
     pub ended: bool,
+    /// The plane requests that ended, as the profile history's rows, for the daemon to hand
+    /// to its history.
+    pub rows: Vec<BuildRow>,
 }
 
 impl<S: Steps> Builder for Jobs<S> {
@@ -987,6 +1066,7 @@ impl<S: Steps> Jobs<S> {
             over: Vec::new(),    // alloc: none until a job ends, then reused
             cold: false,
             ended: false,
+            rows: Vec::new(), // alloc: none until a build ends, then reused
         })
     }
 
@@ -1075,6 +1155,8 @@ impl<S: Steps> Jobs<S> {
             served: Vec::new(), // alloc: none; a build fills it once
             links: Vec::new(),  // alloc: none until a unit links
             profiled,
+            opened_ns: 0,
+            opened_unix_ns: None,
         };
         if self.jobs.put(key_of(id), job).is_err() {
             // alloc: an error the session's free list can't give
@@ -1093,6 +1175,7 @@ impl<S: Steps> Jobs<S> {
         let request = w.plane.open(w.now, keep_going, idle);
         if let Some(job) = self.jobs.get_mut(key_of(id)) {
             job.request = Some(request);
+            job.opening();
         }
         self.prepare(w, id);
     }
@@ -2294,6 +2377,12 @@ impl<S: Steps> Jobs<S> {
     }
 
     fn plane_finished(&mut self, w: &mut World<'_, S>, request: RequestId, ok: bool, stats: RequestStats) {
+        blaze_profile::built(blaze_profile::Built {
+            serial: u64::from(request.0),
+            hits: stats.cached,
+            misses: stats.ran,
+            joined: stats.joined,
+        });
         let jobs = &self.jobs;
         let Some(id) = self.order.iter().copied().find(|id| jobs.get(key_of(*id)).is_some_and(|it| it.request == Some(request)))
         else {
@@ -2301,6 +2390,12 @@ impl<S: Steps> Jobs<S> {
         };
         let Some(job) = self.jobs.get_mut(key_of(id)) else { return };
         job.finished = true;
+        let outcome = match (job.cancelled.load(Ordering::Acquire), ok && !matches!(job.over, Some((false, _)))) {
+            (true, _) => profile_history::Outcome::Cancelled,
+            (false, true) => profile_history::Outcome::Ok,
+            (false, false) => profile_history::Outcome::Failed,
+        };
+        self.rows.push(job.row(request, Some(stats), outcome));
         blaze_macro_eval::flush();
         // The snapshot waits on the last ticket; a verdict the store refuses fails the job.
         let published = proc_macro_api::kept::publish(w.store, proc_macro_api::kept::take_puts());
@@ -2439,6 +2534,7 @@ impl<S: Steps> Jobs<S> {
             }
         };
         job.request = Some(w.plane.open(w.now, false, job.idle));
+        job.opening();
         job.finished = false;
         job.closed = false;
         let what = match job.work {
@@ -2478,6 +2574,39 @@ impl<S: Steps> Jobs<S> {
                 .collect(),
         };
         w.said.push(Said::Report(id, Response::Work(worked)));
+    }
+
+    /// The daemon's tasks stalled ([`blaze_profile::Stall`]): every job with a plane request
+    /// under way ends now, failed with `error`, its request cancelled and its build written
+    /// to the history as stalled. Nothing of it is waited for: the daemon stops after this.
+    pub fn stalled(&mut self, w: &mut World<'_, S>, error: &ApiError) {
+        let jobs = &self.jobs;
+        let stalled: Vec<JobId> = self
+            .order
+            .iter()
+            .copied()
+            .filter(|id| jobs.get(key_of(*id)).is_some_and(|it| it.request.is_some() && !it.finished))
+            .collect(); // alloc: once a stall
+        for id in stalled {
+            self.kill_runs(w, id);
+            let Some(job) = self.jobs.remove(key_of(id)) else { continue };
+            if let Some(request) = job.request {
+                let stats = w.plane.stats(request);
+                self.rows.push(job.row(request, stats, profile_history::Outcome::Stalled));
+                job.cancelled.store(true, Ordering::Release);
+                w.plane.cancel(w.now, request);
+            }
+            for queries in &job.queries {
+                if job.built != Some(*queries) {
+                    w.db.close(*queries);
+                }
+            }
+            self.batches.remove(id);
+            self.order.retain(|it| *it != id);
+            self.ended = true;
+            // clone: the error, once a job the stall ends
+            w.said.push(Said::Finish(id, false, Some(error.clone()), job.built));
+        }
     }
 
     fn cancel_job(&mut self, w: &mut World<'_, S>, id: JobId) {

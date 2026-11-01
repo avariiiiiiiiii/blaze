@@ -182,6 +182,9 @@ pub fn lines_into(out: &mut String, response: &Response, color: bool) {
                 status.memory_bytes,
                 status.budget_bytes
             );
+            if let Some(why) = &status.history {
+                put!(out, "{}: the profile history: {why}\n", paint(RED, "error"));
+            }
         }
         Response::Done { ok: true } => {}
         Response::Done { ok: false } => put!(out, "{}\n", paint(RED, "failed")),
@@ -249,6 +252,17 @@ pub fn lines_into(out: &mut String, response: &Response, color: bool) {
                 put!(out, "  {head} {root}\n");
             }
         }
+        Response::Explored { link } => put!(out, "{link}\n"),
+        Response::Profiled { trace } => put!(out, "{} {} bytes of Chrome trace\n", status("Profiled"), trace.len()),
+        Response::Live(frame) => {
+            let tables = frame.spans.len() + frame.counters.len() + frame.open.len();
+            put!(out, "{} {tables} bytes of Arrow IPC", status("Live"));
+            if frame.skipped > 0 {
+                put!(out, ", {} rows skipped", frame.skipped);
+            }
+            out.push('\n');
+        }
+        Response::Queried { rows, ipc } => put!(out, "{} {rows} rows, {} bytes of Arrow IPC\n", status("Queried"), ipc.len()),
     }
 }
 

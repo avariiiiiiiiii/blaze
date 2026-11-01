@@ -34,8 +34,10 @@ struct Out {
 impl Case {
     fn new(property: &str) -> Case {
         static NEXT: AtomicU32 = AtomicU32::new(0);
-        let root = std::env::temp_dir().join(format!(
-            "blaze-repro-{property}-{}-{}",
+        // The daemon's socket is `<home>/v2.sock`, and a Unix socket's path is at most 104 bytes
+        // on macOS: a `TMPDIR` such as nix-shell's is already most of that.
+        let root = Path::new("/tmp").join(format!(
+            "blaze-repro-{}-{}",
             std::process::id(),
             NEXT.fetch_add(1, Ordering::Relaxed)
         ));
@@ -176,4 +178,22 @@ fn a_crate_rebuilds_after_its_daemon_restarts() {
     case.stop();
     case.write("src/main.rs", AFTER);
     assert_eq!(case.ok(&["run"]), "after\n");
+}
+
+/// A registry crate's build script (zmij 1.0.21's) was run before its link wrote it: `could not
+/// run .../build/zmij/<hash>/out/build_script_build: No such file or directory`, the link of
+/// that path reported after. A package's own script and a path dependency's ran.
+#[test]
+fn a_registry_dependencys_build_script_runs() {
+    let case = Case::new("a_registry_dependencys_build_script_runs");
+    assert_eq!(case.ok(&["run"]), "1.5\n");
+}
+
+/// The crates.io copy of a crate std vendors (object 0.39.1), as a dependency: once a
+/// `CrateKeyClash` of the two build scripts, now the registry script run of
+/// [`a_registry_dependencys_build_script_runs`].
+#[test]
+fn a_dependency_std_also_uses_builds() {
+    let case = Case::new("a_dependency_std_also_uses_builds");
+    assert_eq!(case.ok(&["run"]), "Little\n");
 }

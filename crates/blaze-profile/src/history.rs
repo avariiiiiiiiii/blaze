@@ -294,12 +294,12 @@ struct Kept {
 }
 
 /// The `seq` of a history file's name, `<build>-<seq>.<table>.parquet`.
-fn seq_of(name: &str) -> Option<u64> {
+/// The build and the flush's number a history file is named for.
+fn named(name: &str) -> Option<(u64, u64)> {
     let (stem, table) = name.strip_suffix(".parquet")?.split_once('.')?;
     schema::TABLES.iter().find(|it| it.name == table)?;
     let (build, seq) = stem.split_once('-')?;
-    build.parse::<u64>().ok()?;
-    seq.parse().ok()
+    Some((build.parse().ok()?, seq.parse().ok()?))
 }
 
 /// The Parquet history of this process's flight recorder, in one directory.
@@ -319,6 +319,8 @@ pub struct History {
     /// The files written, oldest first, and their bytes all told.
     kept: VecDeque<Kept>,
     total: u64,
+    /// The highest build any file of the directory is named for, or a flush was for.
+    last_build: u64,
     /// The CPU sampler's samples taken so far, and a flush's new ones.
     sampled: u64,
     samples: Vec<Sample>,
@@ -332,6 +334,7 @@ impl History {
         fs::create_dir_all(dir).map_err(io_error(dir, "making the directory"))?;
         // alloc: once a history
         let mut kept = Vec::new();
+        let mut last_build = 0;
         for entry in fs::read_dir(dir).map_err(io_error(dir, "listing"))? {
             let entry = entry.map_err(io_error(dir, "listing"))?;
             let path = entry.path();
@@ -341,7 +344,8 @@ impl History {
                 fs::remove_file(&path).map_err(io_error(&path, "deleting a half-written file"))?;
                 continue;
             }
-            let Some(seq) = seq_of(name) else { continue };
+            let Some((build, seq)) = named(name) else { continue };
+            last_build = last_build.max(build);
             let bytes = entry.metadata().map_err(io_error(&path, "reading the size of"))?.len();
             kept.push(Kept { seq, bytes, path });
         }
@@ -365,6 +369,7 @@ impl History {
             ended: Vec::new(),
             kept: kept.into(),
             total,
+            last_build,
             sampled: 0,
             // alloc: once a history
             samples: Vec::new(),
@@ -375,6 +380,13 @@ impl History {
 
     pub fn dir(&self) -> &Path {
         &self.dir
+    }
+
+    /// The first build id no file of the history names: where the daemon starts numbering its
+    /// builds, so a build id stays unique across the daemon's restarts. Never 0, which the
+    /// recorder takes for "no build".
+    pub fn next_build(&self) -> u32 {
+        u32::try_from(self.last_build + 1).unwrap_or(u32::MAX)
     }
 
     /// Notes a build that ended, for the next flush to write; the flush for its build
@@ -429,6 +441,7 @@ impl History {
             ..Flushed::default()
         };
         let build = build.unwrap_or(0);
+        self.last_build = self.last_build.max(build);
         let tables: [(&'static Table, &[RecordBatch]); 4] = [
             (&schema::SPANS, &spans),
             (&schema::COUNTERS, &counters),
@@ -465,10 +478,12 @@ impl History {
         batches::samples(&self.samples, &names, (Instant::now(), clock::mono_ns()), self.process)
     }
 
-    /// Deletes the oldest files until the rest fit under the cap, keeping at least the newest.
+    /// Deletes the oldest files until the rest fit under the cap, keeping at least the newest
+    /// flush's files, every table of it.
     fn trim(&mut self) -> Result<u32, HistoryError> {
         let mut deleted = 0;
-        while self.total > self.cap && self.kept.len() > 1 {
+        let newest = self.kept.back().map_or(0, |it| it.seq);
+        while self.total > self.cap && self.kept.front().is_some_and(|it| it.seq != newest) {
             let oldest = &self.kept[0];
             match fs::remove_file(&oldest.path) {
                 Ok(()) => {}
@@ -594,7 +609,9 @@ mod tests {
             assert_eq!(bytes, fs::metadata(&path).unwrap().len());
             let read = read_back(&path);
             same(batch, &read);
-            assert_eq!(read[0].schema().metadata()["blaze.table"], table.name);
+            // arrow-rs gives the batches it reads no schema metadata; the file's schema has it.
+            let file = ParquetRecordBatchReaderBuilder::try_new(fs::File::open(&path).unwrap()).unwrap();
+            assert_eq!(file.schema().metadata()["blaze.table"], table.name);
         }
         let read = read_back(&dir.join("1-00000001.builds.parquet"));
         let outcome = read[0].column(schema::BUILDS.column("outcome").unwrap()).as_dictionary::<UInt32Type>();
@@ -652,6 +669,7 @@ mod tests {
         fs::write(dir.join(".1-00000099.spans.parquet.tmp"), b"half").unwrap();
         let mut history = History::open(&dir, CAP_BYTES).unwrap();
         assert!(!dir.join(".1-00000099.spans.parquet.tmp").exists(), "a half-written file is deleted");
+        assert_eq!(history.next_build(), 2, "a restarted daemon numbers its builds past the history's");
         history.build_ended(row(2, Outcome::Ok));
         let second = history.flush(Some(2)).unwrap();
         assert!(second.seq > first.seq, "{first:?} then {second:?}");
@@ -671,9 +689,9 @@ mod tests {
         }
         let name = |build: u64, seq: u64| dir.join(format!("{build}-{seq:08}.builds.parquet"));
         assert!(!name(1, seqs[0]).exists() && !name(2, seqs[1]).exists(), "the older builds' files are deleted");
-        assert!(name(3, seqs[2]).exists(), "the newest file stays, though it is past the cap alone");
+        assert!(name(3, seqs[2]).exists(), "the newest flush's files stay, though they are past the cap alone");
         assert!(dir.join("schema.spans.parquet").exists(), "the schema files are not the cap's");
-        assert_eq!(history.kept.len(), 1);
+        assert!(history.kept.iter().all(|it| it.seq == seqs[2]), "only the newest flush is kept");
     }
 
     /// The flush's cost a span, in release: what docs/v2/plan/lanes/observe/history.md bounds.
@@ -718,12 +736,12 @@ mod tests {
 
     #[test]
     fn a_file_name_gives_its_seq() {
-        assert_eq!(seq_of("41-00000007.spans.parquet"), Some(7));
-        assert_eq!(seq_of("0-00000012.counters.parquet"), Some(12));
-        assert_eq!(seq_of("schema.spans.parquet"), None);
-        assert_eq!(seq_of("live.spans.parquet"), None);
-        assert_eq!(seq_of("1-2.tiles.parquet"), None, "tiles are not kept");
-        assert_eq!(seq_of("1-2.spans.parquet.tmp"), None);
+        assert_eq!(named("41-00000007.spans.parquet"), Some((41, 7)));
+        assert_eq!(named("0-00000012.counters.parquet"), Some((0, 12)));
+        assert_eq!(named("schema.spans.parquet"), None);
+        assert_eq!(named("live.spans.parquet"), None);
+        assert_eq!(named("1-2.tiles.parquet"), None, "tiles are not kept");
+        assert_eq!(named("1-2.spans.parquet.tmp"), None);
     }
 
     #[test]

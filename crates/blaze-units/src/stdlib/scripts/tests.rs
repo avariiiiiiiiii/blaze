@@ -175,6 +175,24 @@ fn object_prints_what_its_script_prints_of_blazes_rustc() {
     assert!(error.contains("`RUSTC` is not set"), "{error}");
 }
 
+#[test]
+fn test_prints_what_its_script_prints_of_blazes_rustc() {
+    assert!(target::rustc_verbose_version("aarch64-apple-darwin").contains("nightly"));
+    let host = with(&APPLE, &[("HOST", "aarch64-apple-darwin")]);
+    assert_eq!(
+        lines(Script::Test, &host),
+        [
+            "cargo:rerun-if-changed=build.rs",
+            "cargo:rustc-check-cfg=cfg(enable_unstable_features)",
+            "cargo:rustc-cfg=enable_unstable_features",
+        ]
+    );
+    let error = refused(Script::Test, &APPLE);
+    assert!(error.contains("`HOST` is not set"), "{error}");
+    let error = refused(Script::Test, &with(&APPLE[..5], &[("HOST", "aarch64-apple-darwin")]));
+    assert!(error.contains("`RUSTC` is not set"), "{error}");
+}
+
 /// libc's check-cfgs, as its script prints them past Rust 1.80.
 const LIBC_CHECK_CFG: [&str; 26] = [
     "cargo:rustc-check-cfg=cfg(libc_deny_warnings)",
@@ -380,9 +398,9 @@ fn compiler_builtins_prints_what_its_script_prints() {
     assert!(error.contains("`cc`"), "{error}");
 }
 
-/// Every target blaze knows, with the variables cargo gives a run for it: std's, object's and
-/// compiler_builtins' ports print without failing, and libc's but where its script would start
-/// `emcc`.
+/// Every target blaze knows, with the variables cargo gives a run for it: std's, object's,
+/// compiler_builtins' and test's ports print without failing, and libc's but where its script
+/// would start `emcc`.
 #[test]
 fn every_known_target_runs_each_port() {
     for triple in target::triples() {
@@ -390,7 +408,7 @@ fn every_known_target_runs_each_port() {
         let pairs: Vec<(&str, &str)> = env.iter().map(|(name, value)| (name.as_str(), value.as_str())).collect();
         let vars = vars(&pairs);
         let cwd = Path::new(BUILTINS_DIR);
-        for script in [Script::Std, Script::Object, Script::CompilerBuiltins] {
+        for script in [Script::Std, Script::Object, Script::CompilerBuiltins, Script::Test] {
             if let Err(error) = printed(script, &vars, cwd) {
                 panic!("{script:?} for {triple}: {error}");
             }

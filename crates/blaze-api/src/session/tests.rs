@@ -69,6 +69,8 @@ impl World {
             memory_bytes: 10,
             budget_bytes: 20,
             memory: counters,
+            profile: dumped,
+            history: None,
         };
         f(&mut self.session, &mut cx, &mut out);
         out
@@ -452,7 +454,7 @@ fn status_lists_every_connections_requests_sorted() {
     world.request(2, 8, Request::Check { view: head("main"), targets: targets() });
     world.request(1, 5, Request::Check { view: head("main"), targets: targets() });
     world.request(1, 1, Request::Open { view: head("main") });
-    let status = Status { pid: 30, requests: vec![5, 8], views: 3, memory_bytes: 10, budget_bytes: 20 };
+    let status = Status { pid: 30, requests: vec![5, 8], views: 3, history: None, memory_bytes: 10, budget_bytes: 20 };
     assert_eq!(world.request(3, 1, Request::Status), [reply(3, 1, Response::Status(status)), done(3, 1, true)]);
 }
 
@@ -475,6 +477,8 @@ fn a_warm_status_allocates_only_its_replys_list_of_requests() {
             memory_bytes: 10,
             budget_bytes: 20,
             memory: counters,
+            profile: dumped,
+            history: None,
         };
         let from = to(2, id);
         let arrived = Arrived::Request { from, request: Request::Status };
@@ -485,11 +489,17 @@ fn a_warm_status_allocates_only_its_replys_list_of_requests() {
             pid: 30,
             requests: vec![1],
             views: 1,
+            history: None,
             memory_bytes: 10,
             budget_bytes: 20,
         };
         assert_eq!(out, [reply(2, id, Response::Status(status)), done(2, id, true)]);
     }
+}
+
+/// The flight recorder's dump as a test's daemon has it: the window's seconds, as text.
+fn dumped(window: std::time::Duration) -> Vec<u8> {
+    window.as_secs().to_string().into_bytes()
 }
 
 /// How many times [`counters`] was read: the parse tag hands out 3 MB between reads.
@@ -513,6 +523,25 @@ fn counters() -> Snapshot {
     tags[Tag::Infer.index()].budget = 4096;
     tags[Tag::Parse.index()].allocated = 3_000_000 * reads;
     Snapshot { tags, committed: 1 << 20, committed_high_water: 1 << 21 }
+}
+
+/// A profile request is answered with the daemon's dump of the seconds it asks for; the
+/// explorer, the live feed and live SQL are the daemon loop's, so one that reaches the session
+/// fails naming its command.
+#[test]
+fn a_profile_is_the_daemons_dump_and_the_loops_requests_are_refused_by_name() {
+    let mut world = World::new();
+    let profiled = world.request(1, 1, Request::Profile { seconds: 60 });
+    assert_eq!(profiled, [reply(1, 1, Response::Profiled { trace: b"60".to_vec() }), done(1, 1, true)]);
+    for (id, request, named) in [
+        (2, Request::Explore { dev: false }, "blaze explore"),
+        (3, Request::Live, "blaze debug live"),
+        (4, Request::Sql { sql: "SELECT 1".to_owned(), last_s: 30 }, "blaze debug sql --live"),
+    ] {
+        let refused = world.request(1, id, request);
+        assert_eq!(error_at(&refused).as_deref(), Some(named), "{refused:?}");
+        assert_eq!(refused.last(), Some(&done(1, id, false)));
+    }
 }
 
 /// A memory request is answered with one record per tag, in blaze-mem's order, each the
@@ -793,6 +822,8 @@ fn a_warm_start_and_finish_of_a_job_allocates_nothing() {
             memory_bytes: 10,
             budget_bytes: 20,
             memory: counters,
+            profile: dumped,
+            history: None,
         };
         let arrived = Arrived::Request { from: to(1, id), request: Request::Snapshot };
         blaze_alloc_count::assert_at_most(0, "a warm start of a job", || {
@@ -807,6 +838,8 @@ fn a_warm_start_and_finish_of_a_job_allocates_nothing() {
             memory_bytes: 10,
             budget_bytes: 20,
             memory: counters,
+            profile: dumped,
+            history: None,
         };
         blaze_alloc_count::assert_at_most(0, "a warm finish of a job", || {
             session.finish(&mut cx, job, true, None, &mut out)

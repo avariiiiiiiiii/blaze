@@ -219,18 +219,21 @@ lands once the self-build passes.
    pumping, `PUMP_DEPTH`, its per-thread `Stack` and thread-stack edges are deleted; `pool`,
    `par` and `exec` run on the driver; the driver takes over `pool`'s binding (`setup`).
 4. **The thread-local and lock audit**: what a job keeps in a thread-local across a wait is
-   carried with it: `fiber::carry(Carried { take, put })` registers a pair, `take` called at
-   every switch out (leaving the thread's value empty) and `put` on the thread that resumes
-   the job. A region that must not wait (a lock held, a thread-local borrowed) holds a
+   carried with it: `fiber::carry(Carried { take, put })` registers a pair, `take` called when
+   the job parks (leaving the thread's value empty) and `put` on the thread that resumes it;
+   a wait that comes back at once moves nothing. Both run under the driver's lock. A region that must not wait (a lock held, a thread-local borrowed) holds a
    `NoWait`; a wait inside one panics, naming the job. Found so far:
    - `crates/blaze-query`: `LOCAL` (`db/local.rs`: active frames, edges, captures),
-     `INSIDE`, `STACKS`, `UNREADABLE` (`lib.rs`) are per run and must be carried;
-     `inside_a_query` compares with `pump::depth()`, which means nothing on a fiber; `LANE`
-     (`segment.rs`) stays per thread if never held across a wait. Queued to db (01435).
+     `INSIDE`, `STACKS`, `UNREADABLE` (`lib.rs`) are per run and are carried
+     (`blaze_query::carry_with_fiber_jobs`, from `Database::blank` and `Storage::new`); on a
+     fiber `inside_a_query` is the job's own `INSIDE`; `LANE` (`segment.rs`) stays per
+     thread. Done by db (01435).
    - `stdx::ensure_sufficient_stack` (57 call sites through it): stacker keeps the stack limit
      per thread, so on a fiber it either grows a new segment on every call or never grows and
-     overflows into the guard page. Fix queued to the coordinator (01434): a fiber stack limit
-     in `stdx`, carried with the job and set from each fiber's stack at job start.
+     overflows into the guard page. Fixed (01434): `stdx::fiber_stack_limit`, which
+     `ensure_sufficient_stack` checks on a fiber; the driver sets it from each fiber's stack at
+     job start, clears it at job end, and carries it (registered by `Driver::start`). A job
+     that waits inside a grown segment carries the segment's limit.
    - Thread-local reads must not span a wait inside one function: the compiler may keep a
      thread-local's address across the call, and the job may resume on another thread. The
      driver's and pump's reads sit in `#[inline(never)]` functions; a carried pair's `take`
@@ -250,8 +253,14 @@ core's thread with its stack intact), `a_flight_of_the_drivers_wakes_its_waiter`
 `off_a_fiber_there_is_no_job_to_suspend`, `the_free_wait_suspends_the_running_job`,
 `a_key_asked_on_fibers_runs_once_and_its_waiters_suspend` and
 `crossed_runs_on_fibers_give_way_once` (through `pump::Flights`), and
-`a_carried_thread_local_follows_its_job_across_waits`. The self-build's deadlock in the
-wait-and-pump, once lane repro pins it to a test, joins them.
+`a_carried_thread_local_follows_its_job_across_waits`,
+`a_job_recursing_past_its_fiber_stack_grows_and_keeps_its_limit_across_waits`. The self-build's deadlock in the
+wait-and-pump (self7; repro's `crates/blaze-graph/tests/scope_wait.rs`) runs on fibers as
+`a_scope_job_asking_its_owners_key_on_fibers_gives_way`,
+`a_scope_job_asking_its_owners_key_under_a_waiting_parent_gives_way` and
+`a_scope_wait_on_fibers_never_leaves_every_core_parked`: a run that waits on a scope whose job
+asks for its key. The scheduler sees that cycle whole (the key's flight, its claimer, the
+counter, the scope's job), so the wait that closes it gives way.
 
 ### What changes
 

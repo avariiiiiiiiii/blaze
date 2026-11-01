@@ -246,6 +246,13 @@ impl Server {
         arrived.append(&mut self.told);
     }
 
+    /// Whether `conn` has bytes not yet sent, queued or in flight: a stream that sends on a
+    /// clock (the live feed) skips a tick then, so it never queues more than one tick's worth.
+    /// A connection that is gone has nothing waiting.
+    pub fn waiting(&self, conn: Conn) -> bool {
+        self.conns.get(&conn).is_some_and(|it| it.sending.is_some() || !it.queue.is_empty())
+    }
+
     /// Sends a reply; one to a connection that is gone is dropped.
     pub fn reply(&mut self, reply: Reply, effects: &mut Vec<Effect>) {
         let RequestRef { conn, id } = reply.to;

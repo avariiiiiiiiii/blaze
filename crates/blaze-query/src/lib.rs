@@ -65,7 +65,10 @@ use std::{
 
 use blaze_core::{Completion, Done, Effect, FileName, Mapping, Tag};
 use blaze_format::{FormatError, Persist, SchemaHash, Writer};
-use blaze_graph::pump::{self, Flights};
+use blaze_graph::{
+    pump::{self, Flights},
+    sched::fiber,
+};
 use blaze_ids::{
     ContentId, Fingerprint, Hasher, Idx,
     bits::{AtomicBitSlice, BitSet, BitSlice, Bits},
@@ -384,15 +387,28 @@ impl Drop for Computed {
     fn drop(&mut self) {
         let bytes = std::mem::take(&mut self.bytes);
         if (1..=BUFFER_KEPT_BYTES).contains(&bytes.capacity()) {
-            // A thread being torn down has no buffers left to keep it in; the buffer is freed.
-            let _ = BUFFERS.try_with(|buffers| {
-                let mut buffers = buffers.borrow_mut();
-                if buffers.len() < BUFFERS_KEPT {
-                    buffers.push(bytes);
-                }
-            });
+            keep_buffer(bytes);
         }
     }
+}
+
+/// Gives a value buffer back to this thread's ([`BUFFERS`]). They are per-call scratch, never
+/// held across a query call, so a job on a fiber does not carry them: a buffer taken on one
+/// thread may come back to another's.
+#[inline(never)]
+fn keep_buffer(bytes: Vec<u8>) {
+    // A thread being torn down has no buffers left to keep it in; the buffer is freed.
+    let _ = BUFFERS.try_with(|buffers| {
+        let mut buffers = buffers.borrow_mut();
+        if buffers.len() < BUFFERS_KEPT {
+            buffers.push(bytes);
+        }
+    });
+}
+
+#[inline(never)]
+fn spare_buffer() -> Vec<u8> {
+    BUFFERS.with(|buffers| buffers.borrow_mut().pop()).unwrap_or_default()
 }
 
 /// Runs one kind's query.
@@ -403,7 +419,7 @@ fn run_query<Q: Query>(cx: &mut Cx<'_>, key: &AnyKey) -> Result<Computed, Cancel
         .downcast_ref::<Q::Key>()
         .unwrap_or_else(|| panic!("query {} was handed a key of another type", Q::NAME));
     let value = Q::execute(cx, key)?;
-    let buffer = BUFFERS.with(|buffers| buffers.borrow_mut().pop()).unwrap_or_default();
+    let buffer = spare_buffer();
     let mut out = Writer::with_buffer(<Q::Value as Persist>::SCHEMA, buffer);
     let root = value.write(&mut out);
     let bytes = out.finish(root);
@@ -501,7 +517,12 @@ thread_local! {
     static UNREADABLE: Cell<Option<Corrupt>> = const { Cell::new(None) };
 }
 
+// Every read of a thread-local below sits in an `#[inline(never)]` function: a job on a fiber may
+// wait between two reads in one function and resume on another thread, and an inlined read
+// could keep the first thread's address across the wait.
+
 /// Stops a run on what it could not read, for its request to fail with ([`stopped`]).
+#[inline(never)]
 fn unreadable(corrupt: Corrupt) -> Cancelled {
     UNREADABLE.with(|it| it.set(Some(corrupt)));
     Cancelled
@@ -509,30 +530,131 @@ fn unreadable(corrupt: Corrupt) -> Cancelled {
 
 /// What a [`Cancelled`] run's request fails with: the file it could not read, if that is why
 /// it stopped.
+#[inline(never)]
 fn stopped(_: Cancelled) -> DbError {
-    match UNREADABLE.with(Cell::take) {
+    match take_unreadable_corrupt() {
         Some(corrupt) => DbError::Corrupt(corrupt),
         None => DbError::Cancelled,
     }
 }
 
+#[inline(never)]
+fn take_unreadable_corrupt() -> Option<Corrupt> {
+    UNREADABLE.with(Cell::take)
+}
+
+#[inline(never)]
 fn inside_a_query() -> bool {
-    INSIDE.with(Cell::get) == Some(pump::depth())
+    let inside = INSIDE.with(Cell::get);
+    // A job on a fiber carries its own `INSIDE` and waits without pumping, so the pump's depth
+    // means nothing there.
+    if fiber::current_job().is_some() { inside.is_some() } else { inside == Some(pump::depth()) }
 }
 
 /// Marks this thread's task as running a query while it lives.
 struct Inside(Option<usize>);
 
 impl Inside {
+    #[inline(never)]
     fn enter() -> Inside {
         Inside(INSIDE.with(|it| it.replace(Some(pump::depth()))))
     }
 }
 
 impl Drop for Inside {
+    #[inline(never)]
     fn drop(&mut self) {
         INSIDE.with(|it| it.set(self.0));
     }
+}
+
+/// This thread's stacks, for `f`.
+#[inline(never)]
+fn with_stacks<R>(f: impl FnOnce(&RefCell<Stacks>) -> R) -> R {
+    STACKS.with(f)
+}
+
+/// [`with_stacks`], `None` on a thread being torn down.
+#[inline(never)]
+fn try_with_stacks<R>(f: impl FnOnce(&RefCell<Stacks>) -> R) -> Option<R> {
+    STACKS.try_with(f).ok()
+}
+
+/// Empty stacks threads left when a job's were put on them, for the next job to switch out.
+// alloc: none: an empty `Vec` in a static; it grows to the most jobs switched out at once.
+static SPARE_STACKS: ShortLock<Vec<Box<Stacks>>> = ShortLock::new(Vec::new());
+
+/// Carries this engine's per-run thread-locals with each job on a fiber across its waits
+/// ([`fiber::carry`]): the query stacks (`db`'s and [`STACKS`]), [`INSIDE`] and
+/// [`UNREADABLE`]. Once per process; every database's construction calls it, before a driver
+/// can run one of its queries.
+pub fn carry_with_fiber_jobs() {
+    static CARRIED: std::sync::Once = std::sync::Once::new();
+    CARRIED.call_once(|| {
+        fiber::carry(db::carried());
+        fiber::carry(fiber::Carried { take: take_stacks, put: put_stacks });
+        fiber::carry(fiber::Carried { take: take_inside, put: put_inside });
+        fiber::carry(fiber::Carried { take: take_unreadable, put: put_unreadable });
+    });
+}
+
+/// Moves the switching job's [`STACKS`] off this thread, leaving empty ones.
+#[inline(never)]
+fn take_stacks() -> usize {
+    let spare = SPARE_STACKS.lock().pop();
+    // alloc: stacks once per job switched out at once, then kept in `SPARE_STACKS`.
+    let mut moved = spare.unwrap_or_else(|| Box::new(Stacks { keys: Vec::new(), edges: Vec::new() }));
+    STACKS.with(|stacks| std::mem::swap(&mut *stacks.borrow_mut(), &mut *moved));
+    Box::into_raw(moved).expose_provenance()
+}
+
+/// Puts the stacks [`take_stacks`] moved off back, on the thread the job resumes on.
+///
+/// # Panics
+///
+/// If the thread's own stacks are not empty: a job left keys or edges when it ended.
+#[inline(never)]
+fn put_stacks(taken: usize) {
+    // SAFETY: `taken` is the box `take_stacks` gave up for this job, which the driver puts back
+    // once.
+    let mut left = unsafe { Box::from_raw(std::ptr::with_exposed_provenance_mut::<Stacks>(taken)) };
+    STACKS.with(|stacks| std::mem::swap(&mut *stacks.borrow_mut(), &mut *left));
+    assert!(
+        left.keys.is_empty() && left.edges.is_empty(),
+        "a job resumed on a thread that still runs {} keys",
+        left.keys.len()
+    );
+    // alloc: none once warm: `SPARE_STACKS` grows to its high-water mark.
+    SPARE_STACKS.lock().push(left);
+}
+
+/// The switching job's [`INSIDE`]: 0 for none, else its depth plus one.
+#[inline(never)]
+fn take_inside() -> usize {
+    INSIDE.with(Cell::take).map_or(0, |depth| depth + 1)
+}
+
+#[inline(never)]
+fn put_inside(taken: usize) {
+    INSIDE.with(|it| it.set(taken.checked_sub(1)));
+}
+
+/// The switching job's [`UNREADABLE`]: 0 for none, else a box of it.
+#[inline(never)]
+fn take_unreadable() -> usize {
+    // A run stopped on a file it could not read, switching out before its request fails with it.
+    // alloc: only on that error path.
+    UNREADABLE.with(Cell::take).map_or(0, |corrupt| Box::into_raw(Box::new(corrupt)).expose_provenance())
+}
+
+#[inline(never)]
+fn put_unreadable(taken: usize) {
+    let corrupt = (taken != 0).then(|| {
+        // SAFETY: a nonzero `taken` is the box `take_unreadable` made for this job, which the
+        // driver puts back once.
+        *unsafe { Box::from_raw(std::ptr::with_exposed_provenance_mut::<Corrupt>(taken)) }
+    });
+    UNREADABLE.with(|it| it.set(corrupt));
 }
 
 /// One request's root and everything it runs inline, on one task: the keys of this thread's
@@ -548,7 +670,7 @@ struct Run {
 
 impl Run {
     fn new() -> Run {
-        Run { base: STACKS.with(|stacks| stacks.borrow().keys.len()), ahead: false }
+        Run { base: with_stacks(|stacks| stacks.borrow().keys.len()), ahead: false }
     }
 
     fn ahead() -> Run {
@@ -557,7 +679,7 @@ impl Run {
 
     /// Panics, naming the chain, if `key` is running in this run already.
     fn check(self, key: QueryKey) {
-        STACKS.with(|stacks| {
+        with_stacks(|stacks| {
             let stacks = stacks.borrow();
             let running = &stacks.keys[self.base.min(stacks.keys.len())..];
             if running.contains(&key) {
@@ -576,14 +698,14 @@ struct Frame;
 
 impl Frame {
     fn push(key: QueryKey) -> Frame {
-        STACKS.with(|stacks| stacks.borrow_mut().keys.push(key));
+        with_stacks(|stacks| stacks.borrow_mut().keys.push(key));
         Frame
     }
 }
 
 impl Drop for Frame {
     fn drop(&mut self) {
-        _ = STACKS.try_with(|stacks| {
+        _ = try_with_stacks(|stacks| {
             if let Ok(mut stacks) = stacks.try_borrow_mut() {
                 stacks.keys.pop();
             }
@@ -599,17 +721,17 @@ struct Recording {
 
 impl Recording {
     fn start() -> Recording {
-        Recording { base: STACKS.with(|stacks| stacks.borrow().edges.len()) }
+        Recording { base: with_stacks(|stacks| stacks.borrow().edges.len()) }
     }
 
     fn with<R>(&self, f: impl FnOnce(&[EdgeRecord]) -> R) -> R {
-        STACKS.with(|stacks| f(&stacks.borrow().edges[self.base..]))
+        with_stacks(|stacks| f(&stacks.borrow().edges[self.base..]))
     }
 }
 
 impl Drop for Recording {
     fn drop(&mut self) {
-        _ = STACKS.try_with(|stacks| {
+        _ = try_with_stacks(|stacks| {
             if let Ok(mut stacks) = stacks.try_borrow_mut() {
                 stacks.edges.truncate(self.base);
             }
@@ -640,7 +762,7 @@ impl<'db> Cx<'db> {
     }
 
     fn record(&mut self, read: QueryKey, saw: Fingerprint) {
-        STACKS.with(|stacks| stacks.borrow_mut().edges.push(EdgeRecord::new(read, saw)));
+        with_stacks(|stacks| stacks.borrow_mut().edges.push(EdgeRecord::new(read, saw)));
     }
 
     /// Another query's value: reused, waited on if running, or run inline. Records the edge.
@@ -1390,7 +1512,7 @@ impl Pinned<'_> {
         let state = db.view_state(task, view).ok_or(DbError::NoView(view))?;
         let query = QueryKey { kind: Q::KIND, input: Q::input(key) };
         let run = Run::new();
-        UNREADABLE.with(|it| it.set(None));
+        _ = take_unreadable_corrupt();
         let memo = db.find::<Q>(task, state, query, run, key).map_err(stopped)?;
         let bytes = db.value_of(task, state, query, memo, run, key).map_err(stopped)?;
         Ok(read_value::<Q>(bytes))
@@ -1399,6 +1521,7 @@ impl Pinned<'_> {
 
 impl Database {
     fn blank(config: Config) -> Database {
+        carry_with_fiber_jobs();
         let mut db = Database {
             config,
             kinds: Kinds::new(),
@@ -2456,7 +2579,7 @@ impl Database {
         self.learn_key::<Q>(&task, query, key);
         if self.resolve(&task, state, query, Run::ahead(), Some(key)).is_err() {
             // Not this job's to report: the asker meets the same file and fails with it.
-            UNREADABLE.with(Cell::take);
+            _ = take_unreadable_corrupt();
         }
     }
 

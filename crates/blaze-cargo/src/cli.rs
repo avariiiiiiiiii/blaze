@@ -12,6 +12,7 @@
 //! - [`run`] and [`test`]: what runs after the build; [`doc`]: `doc`'s pages, written.
 //! - [`inspect`]: blaze's own looks at the last build (`codegen-inputs`, `trace`, `tables`),
 //!   and `pack`, the in-browser compiler's pack of a program.
+//! - [`observe`]: blaze's looks at itself: `explore`, `debug profile|live|sql`, `explain`.
 
 #![forbid(unsafe_code)]
 
@@ -20,6 +21,7 @@ pub mod daemon;
 pub mod doc;
 pub mod inspect;
 pub mod json;
+pub mod observe;
 pub mod place;
 pub mod print;
 pub mod run;
@@ -70,6 +72,11 @@ Commands:
     trace --out PATH               Every result of the last build, with its edges, as CBOR
     tables --format=json           The size of each of the daemon's long-lived tables
     pack -p PACKAGE --out PATH     The program checked for wasm32, packed for the in-browser compiler
+    explore [--dev] [--print]      The explorer: the daemon's builds and spans at https://ix.dev/explore
+    debug profile [--seconds N]    The daemon's flight recorder as a Chrome trace
+    debug live                     The daemon's threads as they run
+    debug sql [--live] QUERY       SQL over the profile history (with `--live`, the flight recorder too)
+    explain VIEW [NAME=VALUE ...]  One of the history's named views
 
 Options:
     -V, --version  Print version info and exit
@@ -141,7 +148,8 @@ pub fn command(words: Vec<OsString>) -> i32 {
         Asked::Unknown(name) => {
             let what = format!(
                 "no such command: `{name}`\n\nhelp: blaze's commands are build, check, run, test, bench, \
-                 doc, serve, stop, status, toolchain, daemon, codegen-inputs, trace, tables and pack"
+                 doc, serve, stop, status, toolchain, daemon, codegen-inputs, trace, tables, pack, explore, debug \
+                 and explain"
             );
             eprint!("{}", say::error(&what, auto_color()));
             FAILED
@@ -160,6 +168,9 @@ pub fn command(words: Vec<OsString>) -> i32 {
         },
         Asked::Daemon(verb) => said(daemon::units(verb, &mut io::stderr().lock(), auto_color())),
         Asked::Inspect(what, words) => inspect::main(what, words, auto_color()),
+        Asked::Explore(words) => observe::explore(words, auto_color()),
+        Asked::Debug(words) => observe::debug(words, auto_color()),
+        Asked::Explain(words) => observe::explain(words, auto_color()),
         Asked::Cargo(asked) => cargo(&asked),
     }
 }

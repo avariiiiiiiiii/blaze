@@ -1144,9 +1144,24 @@ fn main() {
 #[test]
 fn plain_and_checker_agree() {
     let fixture = program!(
-        "sized, cell, copy",
+        "sized, cell, copy, drop",
         r#"
 use core::cell::Cell;
+
+#[rustc_intrinsic]
+unsafe fn size_of_val<T: ?Sized>(ptr: *const T) -> usize;
+#[rustc_intrinsic]
+unsafe fn align_of_val<T: ?Sized>(ptr: *const T) -> usize;
+
+// The box is freed, as std's is: the checker would report it leaked.
+impl<T: ?Sized> Drop for Box<T> {
+    fn drop(&mut self) {
+        unsafe {
+            let (size, align) = (size_of_val(self.inner), align_of_val(self.inner));
+            __rust_dealloc(self.inner as *mut u8, size, align);
+        }
+    }
+}
 
 fn next(c: &Cell<u8>) -> u8 {
     c.set(c.get() + 1);

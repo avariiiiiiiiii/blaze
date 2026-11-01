@@ -536,6 +536,36 @@ pub fn compile<A: Glue, R>(
     compile_in::<A, R>(func, target, library.reader(), |code, _| sink(code))
 }
 
+/// What keeps `func` from compiling with `A`'s glue and `library`'s stencils: every
+/// instruction selection refuses (each with its [`crate::Gap`]) or, when it refuses none, the
+/// error the rest of the compile stops at. Empty when `func` compiles.
+pub fn survey<A: Glue>(func: &ir::Function, target: &Target, library: &Library) -> Vec<Error> {
+    survey_in::<A>(func, target, library.reader())
+}
+
+/// [`survey`] from a library's reader.
+pub(crate) fn survey_in<A: Glue>(func: &ir::Function, target: &Target, reader: &Reader<'_>) -> Vec<Error> {
+    // alloc: once per function surveyed, its refusals.
+    let mut out = Vec::new();
+    if func.layout.entry_block().is_none() {
+        out.push(Error::new("a function with no blocks"));
+        return out;
+    }
+    frame::task(Tag::Codegen, |temp| {
+        let mut plan = Plan::new_in(temp);
+        match scan::run(&mut plan, func) {
+            Ok(()) => select::survey::<A>(&mut plan, func, target, reader, &mut out),
+            Err(error) => out.push(error),
+        }
+    });
+    if out.is_empty()
+        && let Err(error) = compile_in::<A, ()>(func, target, reader, |_, _| ())
+    {
+        out.push(error);
+    }
+    out
+}
+
 /// [`compile`] from a library's reader, also showing `sink` the plan: the tests' own libraries
 /// come in here, and the tests read where values went.
 pub(crate) fn compile_in<A: Glue, R>(

@@ -80,16 +80,9 @@ pub fn script(args: &[String]) -> bool {
     false
 }
 
-/// The checkout of `manifest`: the root of the git repository it is in (a workspace's root and
-/// its members are in the same one), else the highest directory above it with a `Cargo.toml`,
-/// which the workspace's root manifest is in whichever of them it is.
+/// The checkout of `manifest` ([`blaze_api::client::checkout`] of its directory).
 pub fn root(manifest: &Path) -> PathBuf {
-    let dir = manifest.parent().unwrap_or(manifest);
-    if let Some(repository) = dir.ancestors().find(|it| std::fs::metadata(it.join(".git")).is_ok()) {
-        return repository.to_owned();
-    }
-    let highest = dir.ancestors().filter(|it| std::fs::metadata(it.join("Cargo.toml")).is_ok()).last();
-    highest.unwrap_or(dir).to_owned()
+    blaze_api::client::checkout(manifest.parent().unwrap_or(manifest))
 }
 
 pub fn find(cwd: &Path, manifest_path: Option<&str>, script: bool) -> Result<Place, String> {

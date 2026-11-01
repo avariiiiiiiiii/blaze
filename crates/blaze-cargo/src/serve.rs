@@ -58,23 +58,14 @@ pub struct Paths {
     pub launcher: PathBuf,
 }
 
-/// Where the daemon's socket is: `<home>/v2.sock`.
+/// Where the daemon's socket is ([`blaze_api::client::socket`]).
 pub fn socket() -> anyhow::Result<PathBuf> {
-    Ok(home()?.join("v2.sock"))
+    blaze_api::client::socket().map_err(anyhow::Error::msg)
 }
 
-/// Where the daemon's socket lives: `BLAZE_HOME`, else `blaze` in `XDG_RUNTIME_DIR`, else
-/// `~/.cache/blaze`.
+/// Where the daemon's socket lives ([`blaze_api::client::home`]).
 pub fn home() -> anyhow::Result<PathBuf> {
-    if let Some(home) = std::env::var_os("BLAZE_HOME").filter(|it| !it.is_empty()) {
-        return Ok(PathBuf::from(home));
-    }
-    if let Some(runtime) = std::env::var_os("XDG_RUNTIME_DIR").filter(|it| !it.is_empty()) {
-        return Ok(PathBuf::from(runtime).join("blaze"));
-    }
-    let home = std::env::var_os("HOME").or_else(|| std::env::var_os("USERPROFILE"));
-    Ok(PathBuf::from(home.context("no BLAZE_HOME, XDG_RUNTIME_DIR or HOME says where the daemon's socket is")?)
-        .join(".cache/blaze"))
+    blaze_api::client::home().map_err(anyhow::Error::msg)
 }
 
 /// Where the daemon keeps what outlives it: `$BLAZE_HOME/v2`, else `blaze/v2` in the user's

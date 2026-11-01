@@ -254,14 +254,41 @@ pub fn install() {
 }
 
 /// Moves each fiber job's open spans and build with it when it resumes on another thread
-/// (`blaze_graph::sched::fiber::carry`), and records its switches. Once a process, before any
-/// driver runs: [`install`] calls it.
+/// (`blaze_graph::sched::fiber::carry`), records its switches, and spans each wait for a key
+/// another task runs (`blaze_graph::pump::span_waits`). Once a process, before any driver
+/// runs: [`install`] calls it.
 fn carry_with_fiber_jobs() {
-    use blaze_graph::sched::fiber;
+    use blaze_graph::{pump, sched::fiber};
     static CARRIED: std::sync::Once = std::sync::Once::new();
     CARRIED.call_once(|| {
         fiber::carry(fiber::Carried { take: flight::take_open, put: flight::put_open });
         _ = fiber::observe(observed);
+        _ = pump::span_waits(pump::WaitSpans { begin: wait_began, end: wait_ended });
+    });
+}
+
+/// Opens and enters the span `wait`, its `function` what it waits for: its id, 0 when no
+/// subscriber records it. The span outlives this call, closed by [`wait_ended`].
+fn wait_began(awaited: &str) -> u64 {
+    let span = tracing::info_span!(target: "blaze", "wait", function = awaited);
+    let Some(id) = span.id() else { return 0 };
+    tracing::dispatcher::get_default(|it| {
+        // The handle `span` drops is given back: the wait keeps the span open.
+        _ = it.clone_span(&id);
+        it.enter(&id);
+    });
+    id.into_u64()
+}
+
+/// Leaves and closes the span [`wait_began`] opened, on the thread the wait ended on (where its
+/// job's open spans moved, for a job on a fiber).
+fn wait_ended(span: u64) {
+    let Some(span) = std::num::NonZero::new(span) else { return };
+    let id = tracing::span::Id::from_non_zero_u64(span);
+    tracing::dispatcher::get_default(|it| {
+        it.exit(&id);
+        // clone: an id is a number; `get_default` may call this more than once
+        _ = it.try_close(id.clone());
     });
 }
 

@@ -224,7 +224,25 @@ thread_local! {
 /// added when `f` returns or unwinds. Scopes do not nest; `f` must not call into the database,
 /// whose own buffers are never relocated.
 pub(crate) fn relocating<T>(table: &mut Relocation, f: impl FnOnce() -> T) -> T {
+    carry_scopes();
     stdx::lend(&RELOCATION, table, f)
+}
+
+/// Carries [`RELOCATION`] and [`ANONYMOUS`] with each job on a fiber across its waits
+/// ([`blaze_query::carry`]), from the first scope on: a job that waits inside one resumes in
+/// it, wherever it resumes.
+fn carry_scopes() {
+    static CARRIED: std::sync::Once = std::sync::Once::new();
+    CARRIED.call_once(|| {
+        blaze_query::carry(blaze_query::Carried {
+            take: || stdx::lend::take_carried(&RELOCATION, Option::is_none),
+            put: |it| stdx::lend::put_carried(&RELOCATION, Option::is_none, it),
+        });
+        blaze_query::carry(blaze_query::Carried {
+            take: || stdx::lend::take_carried(&ANONYMOUS, Option::is_none),
+            put: |it| stdx::lend::put_carried(&ANONYMOUS, Option::is_none, it),
+        });
+    });
 }
 
 /// The index of an id written in a [`relocating`] scope, `None` outside one.
@@ -263,6 +281,7 @@ pub(crate) struct Anonymous {
 /// Runs `f` with what [`Words`] writes anonymous as `it` says. Scopes do not nest. Only a
 /// write that is hashed, never read back, may be anonymous: it does not round-trip.
 pub(crate) fn anonymous<T>(it: &mut Anonymous, f: impl FnOnce() -> T) -> T {
+    carry_scopes();
     stdx::lend(&ANONYMOUS, it, f)
 }
 

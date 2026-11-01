@@ -483,11 +483,12 @@ fn a_wait_inside_a_no_wait_region_panics() {
     let _ = driver.join();
 }
 
-/// Off a fiber, the free functions do nothing: the caller waits its own way.
+/// Off a fiber, the thread waits as a job of its own: on a key with no flight, at once.
 #[test]
-fn off_a_fiber_there_is_no_job_to_suspend() {
+fn off_a_fiber_the_thread_waits_as_a_job_of_its_own() {
     assert_eq!(fiber::current_job(), None);
-    assert!(fiber::wait(Wait::Until(0)).is_none());
+    assert!(!fiber::on_fiber());
+    super::wait(Wait::Key(key(9_999))).expect("a key with no flight closes no cycle");
     fiber::miss();
 }
 
@@ -502,7 +503,7 @@ impl Work for &'static Free {
     fn run(&self, cx: &Cx<'_, Self>, (): ()) {
         assert_eq!(fiber::current_job(), Some(cx.job()));
         let at = cx.now() + 1_000_000;
-        fiber::wait(Wait::Until(at)).expect("on a fiber").expect("no cycle");
+        super::wait(Wait::Until(at)).expect("no cycle");
         assert_eq!(fiber::current_job(), Some(cx.job()), "the job's identity after the wait");
         self.seen.lock().unwrap().push(cx.job());
     }

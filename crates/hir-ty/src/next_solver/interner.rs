@@ -3065,78 +3065,67 @@ mod tls_db {
     }
 
     impl Attached {
+        /// Attaches `db` for `op`, unless it is attached already. The slot is looked up again
+        /// on return, never kept: a job that waits inside `op` may resume on another thread,
+        /// with its database carried there ([`carry_attached`]).
         #[inline]
-        fn attach<R>(&self, db: &Db, op: impl FnOnce() -> R) -> R {
-            struct DbGuard<'s> {
-                state: Option<&'s Attached>,
+        fn attach<R>(db: &Db, op: impl FnOnce() -> R) -> R {
+            struct DbGuard {
+                set: bool,
             }
 
-            impl<'s> DbGuard<'s> {
-                #[inline]
-                fn new(attached: &'s Attached, db: &Db) -> Self {
-                    match attached.database.get() {
-                        Some(current_db) => {
-                            let new_db = NonNull::from(db);
-                            if !std::ptr::addr_eq(current_db.as_ptr(), new_db.as_ptr()) {
-                                panic!(
-                                    "Cannot change attached database. This is likely a bug.\n\
-                                    If this is not a bug, you can use `attach_db_allow_change()`."
-                                );
-                            }
-                            Self { state: None }
-                        }
-                        None => {
-                            // Otherwise, set the database.
-                            attached.database.set(Some(NonNull::from(db)));
-                            Self { state: Some(attached) }
-                        }
-                    }
-                }
-            }
-
-            impl Drop for DbGuard<'_> {
+            impl Drop for DbGuard {
                 #[inline]
                 fn drop(&mut self) {
-                    // Reset database to null if we did anything in `DbGuard::new`.
-                    if let Some(attached) = self.state {
-                        attached.database.set(None);
+                    if self.set {
+                        GLOBAL_DB.with(|it| it.database.set(None));
                     }
                 }
             }
 
-            let _guard = DbGuard::new(self, db);
+            let new_db = NonNull::from(db);
+            let set = GLOBAL_DB.with(|it| match it.database.get() {
+                Some(current_db) => {
+                    if !std::ptr::addr_eq(current_db.as_ptr(), new_db.as_ptr()) {
+                        panic!(
+                            "Cannot change attached database. This is likely a bug.\n\
+                            If this is not a bug, you can use `attach_db_allow_change()`."
+                        );
+                    }
+                    false
+                }
+                None => {
+                    it.database.set(Some(new_db));
+                    true
+                }
+            });
+            let _guard = DbGuard { set };
             op()
         }
 
+        /// Attaches `db` for `op` in place of the one attached, as [`Attached::attach`] does.
         #[inline]
-        fn attach_allow_change<R>(&self, db: &Db, op: impl FnOnce() -> R) -> R {
-            struct DbGuard<'s> {
-                state: &'s Attached,
+        fn attach_allow_change<R>(db: &Db, op: impl FnOnce() -> R) -> R {
+            struct DbGuard {
                 prev: Option<NonNull<Db>>,
             }
 
-            impl<'s> DbGuard<'s> {
-                #[inline]
-                fn new(attached: &'s Attached, db: &Db) -> Self {
-                    let prev = attached.database.replace(Some(NonNull::from(db)));
-                    Self { state: attached, prev }
-                }
-            }
-
-            impl Drop for DbGuard<'_> {
+            impl Drop for DbGuard {
                 #[inline]
                 fn drop(&mut self) {
-                    self.state.database.set(self.prev);
+                    GLOBAL_DB.with(|it| it.database.set(self.prev));
                 }
             }
 
-            let _guard = DbGuard::new(self, db);
+            let _guard = DbGuard { prev: GLOBAL_DB.with(|it| it.database.replace(Some(NonNull::from(db)))) };
             op()
         }
 
         #[inline]
-        fn with<R>(&self, op: impl FnOnce(&Db) -> R) -> R {
-            let db = self.database.get().expect("Tried to use attached db, but no db is attached");
+        fn with<R>(op: impl FnOnce(&Db) -> R) -> R {
+            let db = GLOBAL_DB
+                .with(|it| it.database.get())
+                .expect("Tried to use attached db, but no db is attached");
 
             // SAFETY: `database` holds a pointer only while the `DbGuard` that set it is alive,
             // which borrows the database for that long and puts back the pointer before it on
@@ -3150,22 +3139,151 @@ mod tls_db {
         static GLOBAL_DB: Attached = const { Attached { database: Cell::new(None) } };
     }
 
+    /// Moves the switching job's attached database off this thread: a job that attached one
+    /// and waits on a query may resume on another thread, and reads it there.
+    fn take_attached() -> usize {
+        GLOBAL_DB
+            .try_with(|it| it.database.replace(None))
+            .ok()
+            .flatten()
+            .map_or(0, |db| db.as_ptr().expose_provenance())
+    }
+
+    /// Puts back what [`take_attached`] took, on a thread with no database attached.
+    fn put_attached(taken: usize) {
+        GLOBAL_DB.with(|it| {
+            assert!(it.database.get().is_none(), "a job's database put back on a thread with one attached");
+            it.database.set(NonNull::new(std::ptr::with_exposed_provenance_mut(taken)));
+        });
+    }
+
+    /// Carries the attached database with each job on a fiber ([`blaze_query::carry`]), from
+    /// the first attach on, before any job that attached one can wait.
+    #[inline]
+    fn carry_attached() {
+        static CARRIED: std::sync::Once = std::sync::Once::new();
+        CARRIED.call_once(|| blaze_query::carry(blaze_query::Carried { take: take_attached, put: put_attached }));
+    }
+
     #[inline]
     pub fn attach_db<R>(db: &Db, op: impl FnOnce() -> R) -> R {
-        GLOBAL_DB.with(|global_db| global_db.attach(db, op))
+        carry_attached();
+        Attached::attach(db, op)
     }
 
     #[inline]
     pub fn attach_db_allow_change<R>(db: &Db, op: impl FnOnce() -> R) -> R {
-        GLOBAL_DB.with(|global_db| global_db.attach_allow_change(db, op))
+        carry_attached();
+        Attached::attach_allow_change(db, op)
     }
 
     #[inline]
     pub fn with_attached_db<R>(op: impl FnOnce(&Db) -> R) -> R {
-        GLOBAL_DB.with(
-            #[inline]
-            |a| a.with(op),
-        )
+        Attached::with(op)
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use std::sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+            mpsc,
+        };
+
+        use blaze_graph::{Key, pool::Pool, pump::Flights, topology::Topology};
+        use hir_expand::fixture;
+
+        fn attached_here() -> Option<usize> {
+            super::GLOBAL_DB.with(|it| it.database.get()).map(|it| it.as_ptr().addr())
+        }
+
+        /// Two jobs on a pool of two workers each attach a database of their own (one with
+        /// `attach_db`, one with `attach_db_allow_change`) and wait for a key, parked where they
+        /// ran and resumed on whichever worker is free, so often on the one where the other
+        /// attached its own. After the wait each sees its own; once it detached it, the worker
+        /// it ended on has none, and so does every worker the jobs after them run on.
+        #[test]
+        fn jobs_with_databases_of_their_own_park_and_resume_on_each_others_workers() {
+            let dbs = [(), ()].map(|()| Arc::new(fixture::db("fn f() {}").into_db()));
+            let pool = Pool::new(&Topology::flat(2), false).unwrap();
+            let flights = Arc::new(Flights::<u32>::new());
+            for round in 0..50u32 {
+                let mut bytes = [0u8; 32];
+                bytes[..4].copy_from_slice(&round.to_le_bytes());
+                let key = Key(bytes);
+                let (tx, rx) = mpsc::channel::<Result<(), String>>();
+                let waiting = Arc::new(AtomicUsize::new(0));
+                let held = flights.get_or_run(key, || {
+                    for (at, db) in dbs.iter().enumerate() {
+                        let (db, flights, waiting) = (db.clone(), flights.clone(), waiting.clone());
+                        let tx = tx.clone();
+                        pool.submit(
+                            None,
+                            move || {
+                                let mine = Arc::as_ptr(&db).addr();
+                                let wait = || {
+                                    assert_eq!(attached_here(), Some(mine));
+                                    waiting.fetch_add(1, Ordering::SeqCst);
+                                    assert_eq!(flights.get_or_run(key, || panic!("the test holds the key")), Ok(round));
+                                    assert_eq!(attached_here(), Some(mine), "a job resumed with another's database");
+                                };
+                                if at == 0 {
+                                    super::attach_db(&db, wait);
+                                } else {
+                                    super::attach_db_allow_change(&db, wait);
+                                }
+                                assert_eq!(attached_here(), None, "a worker kept a database its job detached");
+                            },
+                            move |it| _ = tx.send(it.map_err(|_| format!("job {at} of round {round} panicked"))),
+                        );
+                    }
+                    while waiting.load(Ordering::SeqCst) < 2 {
+                        std::thread::yield_now();
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(2));
+                    Ok(round)
+                });
+                assert_eq!(held, Ok(round));
+                for _ in 0..2 {
+                    rx.recv().unwrap().unwrap();
+                }
+                for _ in 0..4 {
+                    let tx = tx.clone();
+                    pool.submit(
+                        None,
+                        || assert_eq!(attached_here(), None, "a job began with a database attached"),
+                        move |it| _ = tx.send(it.map_err(|_| format!("a later job of round {round} panicked"))),
+                    );
+                }
+                for _ in 0..4 {
+                    rx.recv().unwrap().unwrap();
+                }
+            }
+        }
+
+        /// A job that attached the database and switched out (its carried thread-locals taken,
+        /// as the scheduler takes them when it parks the job) sees it again on the thread it
+        /// resumes on, which had none; the thread it left has none meanwhile.
+        #[test]
+        fn the_attached_database_moves_with_a_job_to_another_thread() {
+            let db = fixture::db("fn f() {}").into_db();
+            let here = std::ptr::from_ref(&db).addr();
+            super::attach_db(&db, || {
+                let taken = super::take_attached();
+                assert_eq!(taken, here);
+                assert!(super::GLOBAL_DB.with(|it| it.database.get().is_none()), "the thread it left has none");
+                let (seen, back) = std::thread::spawn(move || {
+                    super::put_attached(taken);
+                    let seen = super::with_attached_db(|it| std::ptr::from_ref(it).addr());
+                    (seen, super::take_attached())
+                })
+                .join()
+                .unwrap();
+                assert_eq!(seen, here, "the job sees its database on the thread it resumed on");
+                super::put_attached(back);
+                assert_eq!(super::with_attached_db(|it| std::ptr::from_ref(it).addr()), here);
+            });
+        }
     }
 }
 

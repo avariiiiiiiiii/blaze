@@ -143,7 +143,7 @@ fn hand_written<'db>(k: &Known<'db>, ty: &hir::Type<'db>, adt: AdtId) -> Why {
     let Some((_, clone_fn)) = k.clone else { return Why::HandWritten };
     let args = GenericArgs::new_from_slice(&[GenericArg::from(ty.to_next_solver())]);
     let resolved = alloc::resolve(k.db, k.env, clone_fn, args);
-    match alloc::instance_reaches(k.db, k.env, resolved) {
+    match alloc::instance_reaches(k.db, k.env, resolved, true) {
         true => Why::Allocates,
         false => Why::HandWritten,
     }

@@ -578,6 +578,8 @@ struct Slot {
     allocs: AtomicU64,
     frame_copies: AtomicU64,
     frame_bytes: AtomicU64,
+    /// The ring's [`Ring::lease`] when the span began: which thread's counts it began with.
+    lease: AtomicU64,
 }
 
 impl Slot {
@@ -593,6 +595,7 @@ impl Slot {
         allocs: AtomicU64::new(0),
         frame_copies: AtomicU64::new(0),
         frame_bytes: AtomicU64::new(0),
+        lease: AtomicU64::new(0),
     };
 }
 
@@ -608,6 +611,7 @@ struct Opened {
     unit: u64,
     alloc: Allocated,
     copied: FrameCopied,
+    lease: u64,
 }
 
 pub(crate) struct Ring {
@@ -627,6 +631,10 @@ pub(crate) struct Ring {
     open: [Slot; SLOTS_OPEN],
     /// Whether a live thread holds it.
     live: AtomicBool,
+    /// Threads that have held it: a span closed by the thread that began it closes on the
+    /// same ring with the same lease. A ring an ended thread left passes to the next thread,
+    /// so the number alone does not say which thread.
+    lease: AtomicU64,
     /// The thread that holds it now or held it last: its tid and name, as [`Owner`] has them,
     /// read with no lock by a reader holding another ring's `owners`.
     current: AtomicU64,
@@ -655,6 +663,7 @@ impl Ring {
             entered: [const { AtomicU64::new(0) }; OPEN_MAX],
             open: [Slot::FREE; SLOTS_OPEN],
             live: AtomicBool::new(true),
+            lease: AtomicU64::new(0),
             current: AtomicU64::new(0),
             words,
             // alloc: once per thread, as it first records
@@ -733,6 +742,7 @@ impl Ring {
                 copies: slot.frame_copies.load(Ordering::Relaxed),
                 bytes: slot.frame_bytes.load(Ordering::Relaxed),
             },
+            lease: slot.lease.load(Ordering::Relaxed),
         };
         fence(Ordering::Acquire);
         (slot.id.load(Ordering::Relaxed) == id).then_some(opened)
@@ -854,6 +864,7 @@ fn claim() -> Option<&'static Ring> {
             owners.remove(0);
         }
         drop(owners);
+        ring.lease.fetch_add(1, Ordering::Relaxed);
         ring.current.store(u64::from(tid) << 32 | u64::from(name), Ordering::Release);
         ring.depth.store(0, Ordering::Relaxed);
         lock(&ring.sampled).enter(u64::from(tid));
@@ -952,6 +963,7 @@ pub(crate) fn opened(span: &tracing::span::Attributes<'_>, site: u16) -> u64 {
     slot.allocs.store(alloc.count, Ordering::Relaxed);
     slot.frame_copies.store(copied.copies, Ordering::Relaxed);
     slot.frame_bytes.store(copied.bytes, Ordering::Relaxed);
+    slot.lease.store(ring.lease.load(Ordering::Relaxed), Ordering::Relaxed);
     slot.refs.store(1, Ordering::Relaxed);
     slot.id.store(id, Ordering::Release);
     id
@@ -1069,7 +1081,7 @@ pub(crate) fn closed(id: u64) -> Option<u64> {
     ring.put([now, opened.start, id, opened.parent, what, opened.of, build_unit, bytes]);
     if FRAME_COPIED.get().is_some() {
         let copied = frame_copied();
-        let row = if ring.number != made_by.number {
+        let row = if ring.number != made_by.number || ring.lease.load(Ordering::Relaxed) != opened.lease {
             Some([0, 0, UNCOUNTED])
         } else if copied.copies != opened.copied.copies {
             Some([copied.copies - opened.copied.copies, copied.bytes - opened.copied.bytes, 0])
@@ -1546,12 +1558,20 @@ mod tests {
     }
 
     #[test]
-    fn a_thread_that_ended_gives_its_ring_to_the_next() {
-        let first = std::thread::spawn(|| ring().unwrap().number).join().unwrap();
-        let rings = lock(&RINGS).len();
-        let second = std::thread::spawn(|| ring().unwrap().number).join().unwrap();
-        // Another test's thread may have taken the ring in between; then a new one was made.
-        assert!(second == first || lock(&RINGS).len() > rings);
+    fn a_thread_that_ended_lets_its_ring_go_to_the_next() {
+        let (first, tid, lease) = std::thread::spawn(|| {
+            let ring = ring().unwrap();
+            (ring.number, crate::sampler::os_tid() as u32, ring.lease.load(Ordering::Relaxed))
+        })
+        .join()
+        .unwrap();
+        let ring = by_number(usize::from(first)).unwrap();
+        // Other tests' threads take and leave rings meanwhile, the lowest free first, so the
+        // ring is free or has passed to another thread, with a new lease.
+        let passed = || {
+            ring.lease.load(Ordering::Relaxed) != lease && lock(&ring.owners).last().is_some_and(|it| it.tid != tid)
+        };
+        assert!(!ring.live.load(Ordering::Acquire) || passed(), "the ended thread let its ring go");
     }
 
     #[test]
@@ -1631,6 +1651,56 @@ mod tests {
             (Some("shapes"), Some("shapes::area::of_square"), Some("5"))
         );
         assert_eq!(row("flight never named").function, 0);
+    }
+
+    #[test]
+    fn a_thread_waiting_on_a_query_another_runs_spans_the_wait_naming_it() {
+        use std::{sync::mpsc, time::Duration};
+
+        use blaze_graph::{Key, pump::Flights};
+
+        crate::install();
+        let flights: &'static Flights<u32> = Box::leak(Box::new(Flights::new()));
+        let key = Key([0x5a; 32]);
+        let named = |it: &mut String| it.push_str("slow_query(of_square)");
+        let (started, has_started) = mpsc::channel();
+        let runner = std::thread::spawn(move || {
+            let got = flights.get_or_run_named(key, named, || {
+                started.send(()).unwrap();
+                std::thread::sleep(Duration::from_millis(300));
+                Ok(5)
+            });
+            (crate::sampler::os_tid() as u32, got)
+        });
+        has_started.recv().unwrap();
+        let asker = std::thread::spawn(move || {
+            let asking = tracing::info_span!(target: "blaze", "flight asking").entered();
+            let asking_id = asking.id().unwrap().into_u64();
+            let got = flights.get_or_run_named(key, named, || Ok(0));
+            drop(asking);
+            (crate::sampler::os_tid() as u32, asking_id, got)
+        });
+        let (asker, asking_id, asked) = asker.join().unwrap();
+        let (runner, ran) = runner.join().unwrap();
+        assert_eq!((ran, asked), (Ok(5), Ok(5)), "the second thread waited for the first's run");
+        let mut cursor = Cursor::default();
+        let mut read = Read::default();
+        self::read(&mut cursor, &mut read);
+        let named_on = |thread: u32, name: &str| {
+            read.spans
+                .iter()
+                .filter(|it| it.thread == thread && meta(it.site).map(|it| it.name()) == Some(name))
+                .collect::<Vec<_>>()
+        };
+        let [wait] = named_on(asker, "wait")[..] else { panic!("the asker waited once") };
+        let [asking] = named_on(asker, "flight asking")[..] else { panic!("the asking span is a row") };
+        assert_eq!(asking.span_id, asking_id);
+        assert_eq!(self::name(wait.function), Some("slow_query(of_square)"));
+        assert_eq!((wait.parent, wait.depth), (asking_id, 1));
+        assert!(wait.dur_ns >= 100_000_000, "the wait lasted while the run slept: {} ns", wait.dur_ns);
+        let asking_self = asking.dur_ns - wait.dur_ns;
+        assert!(asking_self < wait.dur_ns / 4, "the asker's own time leaves out the wait: {asking_self} ns");
+        assert!(named_on(runner, "wait").is_empty(), "the run's own thread waited for nothing");
     }
 
     #[test]

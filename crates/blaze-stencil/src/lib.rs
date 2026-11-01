@@ -98,15 +98,25 @@ pub enum TlsModel {
 pub struct Error {
     pub inst: Option<ir::Inst>,
     pub what: String,
+    /// Set when no stencil writes the instruction: what the library lacks.
+    pub gap: Option<Gap>,
+}
+
+/// An instruction no stencil and no glue writes, by its opcode and controlling type
+/// (`types::INVALID` for one with no value): what the stencil library must grow.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub struct Gap {
+    pub opcode: ir::Opcode,
+    pub ty: ir::Type,
 }
 
 impl Error {
     pub fn new(what: impl Into<String>) -> Error {
-        Error { inst: None, what: what.into() }
+        Error { inst: None, what: what.into(), gap: None }
     }
 
     pub fn at(inst: ir::Inst, what: impl Into<String>) -> Error {
-        Error { inst: Some(inst), what: what.into() }
+        Error { inst: Some(inst), what: what.into(), gap: None }
     }
 }
 
@@ -148,6 +158,20 @@ pub fn compile_to<R>(
         blaze_codegen::Arch::Aarch64 => {
             patch::compile::<arch::aarch64::Aarch64, R>(func, target, library, sink)
         }
+        blaze_codegen::Arch::Wasm32 => {
+            Err(Error::new("wasm32 has no stencils: its code is written from the IR as a module"))
+        }
+    }
+}
+
+/// What keeps `func` from compiling for `target`: every instruction no stencil or glue
+/// writes, each with its [`Gap`], or the one error the compile stops at past selection. Empty
+/// when it compiles. The coverage survey's entry: [`compile`] stops at the first refusal.
+pub fn survey(func: &ir::Function, target: &Target) -> Result<Vec<Error>, Error> {
+    let library = table::Library::get(table::Variant::of(target)?)?;
+    match target.arch {
+        blaze_codegen::Arch::X86_64 => Ok(patch::survey::<arch::x64::X64>(func, target, library)),
+        blaze_codegen::Arch::Aarch64 => Ok(patch::survey::<arch::aarch64::Aarch64>(func, target, library)),
         blaze_codegen::Arch::Wasm32 => {
             Err(Error::new("wasm32 has no stencils: its code is written from the IR as a module"))
         }

@@ -1290,6 +1290,46 @@ pub fn current<R>(f: impl FnOnce(&Frame) -> R) -> R {
     f(frame)
 }
 
+/// The calling thread's innermost task frame, taken off it for a job that switches out (a
+/// fiber's, which may resume on another thread): the thread is in no task after, until
+/// [`put_current`] puts back what this took, on the thread the job resumes on. With
+/// [`take_below`] and [`take_cancelling`], the rest of the job's task state.
+pub fn take_current() -> usize {
+    STACK.try_with(|stack| stack.current.replace(ptr::null()).expose_provenance()).unwrap_or(0)
+}
+
+/// Puts back what [`take_current`] took, on a thread in no task.
+///
+/// # Panics
+///
+/// Where the thread is in a task: another job's frame would be lost.
+pub fn put_current(taken: usize) {
+    STACK.with(|stack| {
+        assert!(stack.current.get().is_null(), "a job's frame put back on a thread inside another task");
+        // Used only as `innermost` says: by the job that owns the frame, which runs on this
+        // thread from now on.
+        stack.current.set(ptr::with_exposed_provenance(taken));
+    });
+}
+
+/// What the frames enclosing the switching job's task used ([`take_current`]).
+pub fn take_below() -> usize {
+    STACK.try_with(|stack| stack.below.replace(0)).unwrap_or(0)
+}
+
+pub fn put_below(taken: usize) {
+    STACK.with(|stack| stack.below.set(taken));
+}
+
+/// Whether the switching job is unwinding from [`cancel`] ([`take_current`]).
+pub fn take_cancelling() -> usize {
+    STACK.try_with(|stack| usize::from(stack.cancelling.replace(false))).unwrap_or(0)
+}
+
+pub fn put_cancelling(taken: usize) {
+    STACK.with(|stack| stack.cancelling.set(taken != 0));
+}
+
 /// Whether the calling thread is in a [`task`], so [`current`] has a frame to give.
 pub fn in_task() -> bool {
     STACK.try_with(|stack| !stack.current.get().is_null()).unwrap_or(false)

@@ -1,0 +1,25 @@
+{
+  "id": "01463",
+  "from_lane": "cargo",
+  "owner": "cargo",
+  "paths": [
+    "crates/blaze-cargo/src/serve/unit/harness.rs",
+    "crates/blaze-lower/src/harness.rs",
+    "crates/blaze-cargo/src/serve/unit/tests.rs"
+  ],
+  "what": "One root text for a proc macro's lib and its lib test: when one job builds both (blaze test of a proc-macro package), the shared root is on disk + the proc-macro list + the #[cfg(test)] harness, so both build as under the pinned nightly. Until then Lowered::append_roots refuses naming both. One self-run request of its own, after the proc-macro list fix's result.",
+  "state": "open",
+  "created": "2026-11-01T05:38:38Z",
+  "updated": "2026-11-01T05:38:38Z",
+  "taken_by": null,
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-11-01T05:38:38Z",
+      "by": "cargo",
+      "action": "add",
+      "note": ""
+    }
+  ]
+}

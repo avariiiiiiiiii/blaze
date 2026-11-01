@@ -26,6 +26,11 @@ struct Case {
     root: PathBuf,
     dir: PathBuf,
     home: PathBuf,
+    /// `XDG_CACHE_HOME` of every blaze it runs, under `root`: the machine's shared store
+    /// (`<cache>/blaze`) is the case's own, never the real one.
+    cache: PathBuf,
+    /// Whether dropping it removes `root`: a [`Case::second_home`] shares its case's.
+    owns_root: bool,
 }
 
 struct Out {
@@ -47,9 +52,20 @@ impl Case {
         let _ = fs::remove_dir_all(&root);
         let dir = root.join(property);
         let home = root.join("home");
+        let cache = root.join("cache");
         copy_dir(&Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/repro").join(property), &dir);
         fs::create_dir_all(&home).unwrap();
-        Case { root, dir, home }
+        fs::create_dir_all(&cache).unwrap();
+        Case { root, dir, home, cache, owns_root: true }
+    }
+
+    /// The same crate and machine cache under a `BLAZE_HOME` of its own: a second daemon on the
+    /// machine.
+    fn second_home(&self) -> Case {
+        let home = self.root.join("home2");
+        fs::create_dir_all(&home).unwrap();
+        // clone: the case's paths, shared by the second home
+        Case { root: self.root.clone(), dir: self.dir.clone(), home, cache: self.cache.clone(), owns_root: false }
     }
 
     fn write(&self, path: &str, text: &str) {
@@ -58,11 +74,14 @@ impl Case {
         fs::write(path, text).unwrap();
     }
 
-    fn blaze(&self, args: &[&str]) -> Out {
+    /// `blaze args` in `sub`, a directory of the case's crate (`""` for the crate itself).
+    fn blaze_in(&self, sub: &str, args: &[&str]) -> Out {
+        let dir = self.dir.join(sub);
         let mut child = Command::new(env!("CARGO_BIN_EXE_blaze"))
             .args(args)
-            .current_dir(&self.dir)
+            .current_dir(&dir)
             .env("BLAZE_HOME", &self.home)
+            .env("XDG_CACHE_HOME", &self.cache)
             .env_remove("CARGO_TARGET_DIR")
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
@@ -83,7 +102,7 @@ impl Case {
                 panic!(
                     "`blaze {}` in {} ran {} s without finishing: a hang\n{}",
                     args.join(" "),
-                    self.dir.display(),
+                    dir.display(),
                     DEADLINE.as_secs(),
                     stderr.join().unwrap()
                 );
@@ -95,16 +114,21 @@ impl Case {
 
     /// `blaze args`, which must succeed; its stdout.
     fn ok(&self, args: &[&str]) -> String {
-        let out = self.blaze(args);
+        self.ok_in("", args).stdout
+    }
+
+    /// `blaze args` in `sub`, which must succeed.
+    fn ok_in(&self, sub: &str, args: &[&str]) -> Out {
+        let out = self.blaze_in(sub, args);
         assert!(
             out.ok,
             "`blaze {}` in {} failed:\n{}\n(the daemon's log: {})",
             args.join(" "),
-            self.dir.display(),
+            self.dir.join(sub).display(),
             out.stderr,
             self.home.join("v2/serve.log").display()
         );
-        out.stdout
+        out
     }
 
     fn stop(&self) {
@@ -127,6 +151,7 @@ impl Drop for Case {
             .arg("stop")
             .current_dir(&self.dir)
             .env("BLAZE_HOME", &self.home)
+            .env("XDG_CACHE_HOME", &self.cache)
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .status()
@@ -134,7 +159,7 @@ impl Drop for Case {
         if !stopped {
             self.kill_daemon();
         }
-        if !thread::panicking() {
+        if self.owns_root && !thread::panicking() {
             let _ = fs::remove_dir_all(&self.root);
         }
     }
@@ -183,6 +208,59 @@ fn a_crate_rebuilds_after_its_daemon_restarts() {
     assert_eq!(case.ok(&["run"]), "after\n");
 }
 
+/// The standard library is built once per daemon, not per workspace: a second workspace on the
+/// daemon that built the first compiles its own package and nothing else (it has no
+/// dependencies), so no `core`, `alloc`, `std`, `compiler_builtins`, `panic_*` or std's vendored
+/// crates. It used to build std again for each workspace, a cold std's minutes each time.
+#[test]
+fn a_second_workspace_on_one_daemon_compiles_no_std_crate() {
+    let case = Case::new("a_second_workspace_on_one_daemon_compiles_no_std_crate");
+    assert_eq!(case.ok_in("one", &["run"]).stdout, "one\n");
+    let second = case.ok_in("two", &["run"]);
+    assert_eq!(second.stdout, "two\n");
+    compiled_only(&second, "repro-two", "the second workspace");
+    holds_no_std(&case, "one");
+    holds_no_std(&case, "two");
+}
+
+/// Std is built once per machine: a second `BLAZE_HOME`'s daemon takes it from the machine's
+/// shared store (`<XDG_CACHE_HOME>/blaze`) the first daemon put it in, and compiles only its
+/// workspace's package.
+#[test]
+fn a_second_home_on_one_machine_compiles_no_std_crate() {
+    let case = Case::new("a_second_home_on_one_machine_compiles_no_std_crate");
+    assert_eq!(case.ok_in("one", &["run"]).stdout, "one\n");
+    let other = case.second_home();
+    let second = other.ok_in("two", &["run"]);
+    assert_eq!(second.stdout, "two\n");
+    compiled_only(&second, "repro-two", "the second home's daemon");
+    holds_no_std(&case, "one");
+    holds_no_std(&case, "two");
+}
+
+/// `out`'s `Compiling` lines are `package`'s alone: no std crate, vendored ones included.
+fn compiled_only(out: &Out, package: &str, who: &str) {
+    let compiled: Vec<&str> =
+        out.stderr.lines().filter_map(|line| line.trim_start().strip_prefix("Compiling ")).collect();
+    assert!(
+        compiled.len() == 1 && compiled[0].starts_with(&format!("{package} ")),
+        "{who} compiled more than {package}:\n{}",
+        compiled.join("\n")
+    );
+}
+
+/// The workspace `sub`'s target directory holds none of std's outputs, which are the daemon's.
+fn holds_no_std(case: &Case, sub: &str) {
+    let deps = case.dir.join(sub).join("target/debug/deps");
+    let core: Vec<String> = fs::read_dir(&deps)
+        .into_iter()
+        .flatten()
+        .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+        .filter(|name| name.starts_with("libcore-"))
+        .collect();
+    assert!(core.is_empty(), "std's outputs are the daemon's, yet {} holds {core:?}", deps.display());
+}
+
 /// A registry crate's build script (zmij 1.0.21's) was run before its link wrote it: `could not
 /// run .../build/zmij/<hash>/out/build_script_build: No such file or directory`, the link of
 /// that path reported after. A package's own script and a path dependency's ran.
@@ -199,4 +277,14 @@ fn a_registry_dependencys_build_script_runs() {
 fn a_dependency_std_also_uses_builds() {
     let case = Case::new("a_dependency_std_also_uses_builds");
     assert_eq!(case.ok(&["run"]), "Little\n");
+}
+
+/// A bin over a path dependency with a `thread_local!` whose value has a `Drop` (blaze's own
+/// `blaze-reclaim`): its release imports are decided from the build's summaries, and one each
+/// of 16 functions imports is called by none of the bodies it builds in ("imports <id>, which
+/// nothing it builds calls"), the self-build's wall.
+#[test]
+fn a_bin_using_a_path_dependencys_thread_local_builds() {
+    let case = Case::new("a_bin_using_a_path_dependencys_thread_local_builds");
+    assert_eq!(case.ok(&["run"]), "true\n");
 }

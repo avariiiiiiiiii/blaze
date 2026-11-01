@@ -267,8 +267,24 @@ pub(crate) fn emit(
     let mut inlined = Vec::with_capacity(imported.len());
     for (import, module, funcs, datas) in merged {
         let id = requests_of(places, refs, import.key).next().ok_or_else(|| {
+            let callers: Vec<String> = imported
+                .iter()
+                .filter(|it| requests_of(&it.export.places, it.refs, import.key).next().is_some())
+                // alloc: an error's, each a caller's name
+                .map(|it| it.key.0.to_string())
+                .collect();
+            let why = if callers.is_empty() {
+                // alloc: an error's
+                format!(
+                    "none of its {} imports' bodies calls it, though the summaries its imports were decided by do",
+                    imported.len()
+                )
+            } else {
+                // alloc: an error's
+                format!("the bodies of {} call it, and merging them lost the call", callers.join(", "))
+            };
             // alloc: an error
-            failed(unit, format!("imports {}, which nothing it builds calls", import.key.0))
+            failed(unit, format!("imports {}, which nothing it builds calls: {why}", import.key.0))
         })?;
         // clone: a count of the `Arc`, one an import; LLVM's import holds the export it links
         linked.push(crate::imports::Import { export: module.clone(), id, funcs, datas });

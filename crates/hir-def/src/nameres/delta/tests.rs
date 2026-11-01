@@ -419,6 +419,39 @@ fn removing_a_crate_feature_removes_it_from_the_maintained_map() {
     assert!(failures.is_empty(), "{failures}");
 }
 
+/// One write that adds an item to the root and removes a child of another module: the second
+/// file's changed children make the read walk the tree, which still sees the root's new log.
+#[test]
+fn a_write_that_walks_keeps_the_logs_it_compared_before() {
+    let mut loaded =
+        Loaded::new("//- /lib.rs\nmod foo;\n//- /foo/mod.rs\npub mod bar;\n//- /foo/bar.rs\npub struct B;\n");
+    let (lib, foo) = (loaded.file("/lib.rs"), loaded.file("/foo/mod.rs"));
+    loaded.db.batch(|db| {
+        db.set_file_text(lib, "pub struct S;\nmod foo;\n");
+        db.set_file_text(foo, "");
+    });
+    let krate = loaded.krate();
+    let map = crate_local_def_map(&loaded.db, krate).def_map(&loaded.db);
+    assert!(map.module(&loaded.db, map.root).scope(&loaded.db).get(&name("S")).take_types().is_some(), "`S` is in");
+    let mut failures = String::new();
+    check_db(&loaded.db, "a write that walks", &Exempt::NONE, false, &mut failures);
+    assert!(failures.is_empty(), "{failures}");
+}
+
+/// A variant renamed is no binding of its enum's module: a glob of the enum, in another crate
+/// or in this one, still takes the new name.
+#[test]
+fn renaming_a_variant_reaches_the_globs_of_its_enum() {
+    let mut loaded = Loaded::new(
+        "//- /main.rs crate:main deps:dep\nuse dep::Foo::*;\n//- /lib.rs crate:dep\npub enum Foo { Bar, Baz }\npub mod m { pub use super::Foo::*; }\n",
+    );
+    let lib = loaded.file("/lib.rs");
+    loaded.db.set_file_text(lib, "pub enum Foo { S, Baz }\npub mod m { pub use super::Foo::*; }\n");
+    let mut failures = String::new();
+    check_db(&loaded.db, "a variant renamed", &Exempt::NONE, false, &mut failures);
+    assert!(failures.is_empty(), "{failures}");
+}
+
 /// An edit of a dependency's macro body that keeps the macro's id changes no binding, and
 /// still changes what a call of it in this crate expands to.
 #[test]

@@ -949,6 +949,9 @@ impl<'db, 'f, A: Allocator + Clone> Unit<'db, 'f, A> {
                     }
                     Some(ModuleDefId::AdtId(AdtId::EnumId(e))) => {
                         cov_mark::hit!(glob_enum);
+                        // A variant is no binding of the enum's module: a maintainer run reads the
+                        // module whole, which a write touching the enum wakes (`enum_glob_wakes`).
+                        crate::nameres::delta::reads::note(crate::Lookup::lookup(&e, self.db).container, None);
                         // glob import from enum => just import all the variants
                         let start = self.held.len();
                         self.held.extend(e.enum_variants(self.db).variants.iter().map(

@@ -1,5 +1,6 @@
 //! A crate root as the compiler sees it, which is not the file on disk: the root's text with a
-//! module the compiler appends after it, a test crate's harness ([`Lowered::append_roots`]).
+//! module the compiler appends after it, a test crate's harness or a proc macro's list of its
+//! macros ([`Lowered::append_roots`]).
 //! What the module is, is the caller's: this crate writes it into the front end and keeps one
 //! root file one text for every crate that has it.
 
@@ -85,7 +86,7 @@ impl Lowered {
             // alloc: as `at`
             format!(
                 "{first} and {second} share the root file `{at}` and would each have it end with \
-                 another test harness, which one file can't"
+                 another module (a test harness, a proc macro's list), which one file can't"
             ),
             at,
         )

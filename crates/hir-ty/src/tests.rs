@@ -8,6 +8,7 @@ mod const_bounds;
 mod const_param_ty;
 mod elided_lifetime_args;
 mod fn_cache;
+mod fn_item_predicates;
 mod hir_eval_shifts;
 mod impossible_items;
 mod index_places;

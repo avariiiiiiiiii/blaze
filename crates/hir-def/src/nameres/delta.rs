@@ -127,6 +127,7 @@ fn maintain_all(db: &mut Db, written: &Written<'_>, state: &mut State, last: &mu
             continue;
         }
         let mut work = Work::default();
+        carry_maintaining();
         let _maintaining = Maintaining { before: MAINTAINING.replace(Some(krate)) };
         if let Some(delta) = maintain_crate(db, krate, state, written, last, &mut modules_changed, &mut work) {
             last.push(delta);
@@ -137,6 +138,18 @@ fn maintain_all(db: &mut Db, written: &Written<'_>, state: &mut State, last: &mu
 
 thread_local! {
     static MAINTAINING: std::cell::Cell<Option<Crate>> = const { std::cell::Cell::new(None) };
+}
+
+/// Carries [`MAINTAINING`] with each job on a fiber across its waits ([`blaze_query::carry`]):
+/// a maintainer run that waits on a query resumes maintaining its crate, wherever it resumes.
+fn carry_maintaining() {
+    static CARRIED: std::sync::Once = std::sync::Once::new();
+    CARRIED.call_once(|| {
+        blaze_query::carry(blaze_query::Carried {
+            take: || stdx::lend::take_carried_cell(&MAINTAINING, Option::is_none),
+            put: |it| stdx::lend::put_carried_cell(&MAINTAINING, Option::is_none, it),
+        });
+    });
 }
 
 /// Restores the crate maintained before when it drops.
@@ -185,7 +198,8 @@ fn maintain_crate(
         true => diff::update_positions(&mut cs),
         false => Vec::new(), // alloc: empty, allocates nothing
     };
-    let wakes = dependency_wakes(db, &cs, earlier, modules_changed);
+    let mut wakes = dependency_wakes(db, &cs, earlier, modules_changed);
+    wakes.extend(enum_glob_wakes(db, &cs, &delta, earlier));
     let mut region = initial_region(&cs, &mut state.scratch, &delta, wakes, cold);
     if region.is_empty() && !delta.deleted.is_empty() {
         // The rows and inputs of a group gone go with a run, which reports their keys.
@@ -243,6 +257,34 @@ fn dependency_wakes(
     }
     for &module in modules_changed {
         out.extend(cs.reads.readers((module, None)));
+    }
+    out
+}
+
+/// The groups that glob-imported an enum the write may have changed: one declared by a group
+/// of this crate it read again, or one an earlier crate's write touched. A variant is no
+/// binding of the enum's module, so nothing else wakes them; the glob reads the module whole.
+fn enum_glob_wakes(db: &Db, cs: &CrateState, delta: &Delta, earlier: &[CrateDelta]) -> Vec<ModuleId> {
+    let mut out = Vec::new(); // alloc: the groups woken, once per write that touches an enum
+    let mut wake = |def: ModuleDefId| {
+        if let ModuleDefId::AdtId(crate::AdtId::EnumId(it)) = def {
+            out.extend(cs.reads.readers((crate::Lookup::lookup(&it, db).container, None)));
+        }
+    };
+    let direct = delta.direct.iter().map(|(it, _)| it);
+    for group in delta.touched.iter().chain(&delta.seeds).chain(direct) {
+        let Some(g) = cs.groups.get(group) else { continue };
+        for module in &g.modules {
+            let Some(row) = cs.rows.get(module) else { continue };
+            for def in row.scope(db).declarations() {
+                wake(def);
+            }
+        }
+    }
+    for it in earlier {
+        for &def in &it.touched {
+            wake(def);
+        }
     }
     out
 }

@@ -75,6 +75,15 @@ anonymous const in a body. `hir_def::body_span!` writes them, and only while a s
 the span. The recorder interns each string, so a row holds a number, and also takes values
 recorded after the span began.
 
+A wait for a query another task is running is a span `wait`, its `function` naming the query
+it waits for, such as `infer_body_query(Id(1234))`, or a `QueryKey` for the build's own queries.
+Its parent is the asking span, whose self time therefore leaves the wait out, so a convoy behind
+one slow query reads as many waits naming it. `blaze_graph::pump::Flights::get_or_run_named`
+opens it through the hook `pump::span_waits`, which `blaze_profile::install` registers. Jobs it
+pumps while it waits are its children. On a fiber, the span moves with the job and closes where
+the job resumes. The awaited row's path is not in the span yet. Find the awaited run by its
+`infer_query` or `mir_body_query` span on another thread that ends as the waits end.
+
 A `Vec` in a frame grows in place while it is the frame's last block. Once something is
 allocated after it, it moves when it grows, copied whole. blaze-mem counts those moves per
 frame in two `Cell`s, on the slow path only. The frame reports them at task end

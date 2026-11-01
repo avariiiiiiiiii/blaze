@@ -1,6 +1,6 @@
 ---
 status: plan
-summary: blaze's own lints (`blaze::hot_clone`, `hot_alloc`, `hot_dyn`, `std_hashmap`, the group `blaze::hot`) — what each flags, how to exempt a line, and what they miss; the page each finding's help line links to.
+summary: blaze's own lints (`blaze::hot_clone`, `hot_alloc`, `hot_alloc_call`, `hot_dyn`, `std_hashmap`, the group `blaze::hot`) — what each flags, how to exempt a line, and what they miss; the page each finding's help line links to.
 date: 2026-10-29
 ---
 # blaze's own lints
@@ -9,7 +9,7 @@ date: 2026-10-29
 `tools/v2/hot_lint.py` checks by pattern ([principles](../../goals/principles.md): allocate
 like a game engine, no `dyn` in hot paths, no SipHash), but from types and resolutions: a
 `.clone()` of a `Copy` struct is not flagged, a `String` behind a type alias is, and so is a
-call of your own function that allocates three calls down.
+call of std's that allocates three calls down.
 
 Each lint is allow by default. Turn the group on where code is hot:
 
@@ -19,7 +19,7 @@ fn step(world: &mut World) { /* ... */ }
 ```
 
 or for a crate, `--deny=blaze::hot`. `#[allow(blaze::hot)]` (or `#[allow(blaze::hot_alloc)]`,
-...) turns it off again for an item. `blaze::hot` is all four lints below.
+...) turns it off again for an item. `blaze::hot` is all five lints below.
 
 ## Exempting a line
 
@@ -29,7 +29,7 @@ a reason:
 | lint | tag |
 |---|---|
 | `hot_clone` | `// clone: <reason>` |
-| `hot_alloc`, `std_hashmap` | `// alloc: <reason>` |
+| `hot_alloc`, `hot_alloc_call`, `std_hashmap` | `// alloc: <reason>` |
 | `hot_dyn` | `// dyn: <reason>` |
 
 ```rust
@@ -72,9 +72,15 @@ allocates only through `A: Allocator` a few calls down, and `collect` only throu
 "no" for both. Recursion is fine: a cycle of functions starts as not reaching and is iterated
 to its answer.
 
+The walk stops at a function of a workspace member (a crate whose origin is local): its
+allocations are found in its own body, once, and a call of it is not a finding. It goes on
+through std and registry crates, and through a workspace function they call back through a
+generic only for `hot_alloc_call`. So a crate denying `hot_alloc` (`[lints.blaze] hot_alloc =
+"deny"`) is told where each allocation is made, not at every caller up the stack.
+
 Flagged: `String::from`, `.to_string()`, `.to_owned()`, `.to_vec()`, `Vec::with_capacity`,
-`.collect()` into an owning type, `Box::new`, `Arc::new`, a call of your own function that does
-any of these. A macro call is reported once, at the call: `format!`, `vec![1, 2]`.
+`.collect()` into an owning type, `Box::new`, `Arc::new`, a call of a registry crate's function
+that does any of these. A macro call is reported once, at the call: `format!`, `vec![1, 2]`.
 
 Also flagged, though it allocates nothing yet: a call that makes a value of the global
 allocator's, which allocates from the global heap once it grows (rule `bump-allocate`):
@@ -99,6 +105,8 @@ Not flagged:
 
 What it misses, and why:
 
+- A call of a workspace function that allocates: `hot_alloc` finds it in that function, and
+  `hot_alloc_call` at the call.
 - Operators (`a + b` on `String`), `Drop`, and calls a pattern or `for` loop makes: only call and
   method call expressions are followed.
 - A call through `dyn` or through a type parameter of the hot function itself (`f: F` with
@@ -113,6 +121,14 @@ What it misses, and why:
 - Derived methods other than `clone` and `default` (`fmt`, `hash`, `eq`), which have no body of
   their own: counted as not reaching. Formatting allocates only when written into a `String`,
   which the `format!` call is flagged for.
+
+## `hot_alloc_call`
+
+A call that reaches the global allocator only through a function of a workspace member, which
+`hot_alloc` does not walk into. It is in `blaze::hot` and not turned on by `hot_alloc`: an item
+marked `#[deny(blaze::hot)]` promises that nothing it calls allocates, the workspace's own
+helpers included, so the call of `helper()` is a finding there, through any depth of calls.
+Under `hot_alloc` alone the same allocation is one finding in `helper` itself.
 
 ## `hot_dyn`
 

@@ -282,7 +282,7 @@ pub mod collections {
         }
     }
 }
-//- /rustc_hash/lib.rs crate:rustc_hash deps:std
+//- /rustc_hash/lib.rs crate:rustc_hash deps:std library
 pub struct FxBuildHasher;
 impl Default for FxBuildHasher {
     fn default() -> FxBuildHasher {
@@ -300,6 +300,8 @@ const HOT_ATTR: &str = "#[deny(blaze::hot)]";
 fn lint_of(message: &str) -> Option<&'static str> {
     if message.starts_with("this `clone` of") {
         Some("hot_clone")
+    } else if message.contains("through the workspace's own code") {
+        Some("hot_alloc_call")
     } else if message.contains("the global allocator") {
         Some("hot_alloc")
     } else if message.contains("goes through the vtable") {
@@ -340,7 +342,7 @@ fn expected(main: &str) -> Vec<(u32, &'static str)> {
             None => (number, marks),
         };
         for mark in marks.split_whitespace() {
-            let lint = ["hot_clone", "hot_alloc", "hot_dyn", "std_hashmap"]
+            let lint = ["hot_clone", "hot_alloc", "hot_alloc_call", "hot_dyn", "std_hashmap"]
                 .into_iter()
                 .find(|&it| it == mark)
                 .unwrap_or_else(|| panic!("`{mark}` is not a lint of blaze's"));
@@ -457,8 +459,8 @@ fn hot(s: &str, v: &[u32], buf: &mut Vec<u32>) {
     let _ = Box::new(1u32); //~ hot_alloc
     let _ = Arc::new(1u32); //~ hot_alloc
     buf.push(1);
-    let _ = make(); //~ hot_alloc
-    let _ = ping(true); //~ hot_alloc
+    let _ = make(); //~ hot_alloc_call
+    let _ = ping(true); //~ hot_alloc_call
     let _ = even(true);
 }
 
@@ -537,6 +539,51 @@ pub fn task(frame: &Frame) -> usize {
     assert_eq!(found(&out), expected(main), "the findings of:\n{main}\nwere:\n{out}");
     let errors = out.lines().filter(|it| it.starts_with("error: ")).count();
     assert_eq!(errors, 3, "each finding is an error:\n{out}");
+}
+
+/// Under `hot_alloc` a function of the workspace's allocation is found once, in that function:
+/// a call of it is none, while a call into std that allocates is one.
+#[test]
+fn hot_alloc_finds_a_helpers_allocation_in_the_helper_not_at_its_caller() {
+    let main = r#"
+fn helper() -> String {
+    String::from("made") //~ hot_alloc
+}
+
+pub fn caller() {
+    let _ = helper();
+    let _ = Box::new(1u32); //~ hot_alloc
+}
+"#;
+    let main = main.trim_start_matches('\n');
+    let fixture = format!("{MINICORE}{ALLOC_STD}{MAIN}{main}");
+    let out = lint(&fixture, "-A clippy::all --deny=blaze::hot_alloc");
+    assert_eq!(found(&out), expected(main), "the findings of:\n{main}\nwere:\n{out}");
+}
+
+/// A function marked hot promises that nothing it calls allocates: a call of a function of the
+/// workspace that does is a finding at the call, through any depth of calls.
+#[test]
+fn a_hot_function_calling_an_allocating_helper_is_a_finding_at_the_call() {
+    check(
+        r#"
+#[allow(blaze::hot)]
+fn helper() -> String {
+    String::from("made")
+}
+
+#[allow(blaze::hot)]
+fn wrapper() -> String {
+    helper()
+}
+
+#[deny(blaze::hot)]
+fn caller() {
+    let _ = helper(); //~ hot_alloc_call
+    let _ = wrapper(); //~ hot_alloc_call
+}
+"#,
+    );
 }
 
 #[test]

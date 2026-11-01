@@ -10,6 +10,10 @@ use rustc_hash::FxHashMap;
 use super::{CounterId, Cycle, JobId, MAX_JOBS, NONE};
 use crate::Key;
 
+/// Marks a scope's counter on the cycle check's stack of jobs.
+const SCOPE: u32 = 1 << 31;
+const _: () = assert!(MAX_JOBS <= SCOPE);
+
 /// Where a job lives: its driver ([`super::World`]'s member) and its id there.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(crate) struct Home {
@@ -56,6 +60,9 @@ struct Node {
     /// Head of the list of key entries this job claimed, linked through `key_next_claim`.
     claims: u32,
     counter: u32,
+    /// The innermost scope it runs, a counter it waits on before it ends; the scopes around it
+    /// linked through `counter_outer`. A wait for this job is a wait on each of them.
+    scope: u32,
     /// Its links in its counter's list of jobs.
     item_prev: u32,
     item_next: u32,
@@ -72,6 +79,7 @@ const VACANT: Node = Node {
     next: NONE,
     claims: NONE,
     counter: NONE,
+    scope: NONE,
     item_prev: NONE,
     item_next: NONE,
     mark: 0,
@@ -107,13 +115,23 @@ pub(crate) struct Graph {
     key_claimer: Vec<u32>,
     key_waiters: Vec<u32>,
     key_next_claim: Vec<u32>,
+    /// The claimer's innermost scope as its run of the key began: a wait for the key waits on
+    /// the claimer's scopes inside it, not on it or those around it.
+    key_scope: Vec<u32>,
     key_free: Vec<u32>,
 
     // Per counter.
     counter_state: Vec<CounterState>,
     counter_left: Vec<u32>,
+    /// Of `counter_left`, the counts no job holds ([`Graph::hold`]).
+    counter_held: Vec<u32>,
     counter_waiters: Vec<u32>,
     counter_head: Vec<u32>,
+    /// The scope around a counter's, of the job that runs both ([`Graph::open_scope`]).
+    counter_outer: Vec<u32>,
+    /// The cycle check's visit mark of a scope, and the job whose scope it is.
+    counter_mark: Vec<u32>,
+    counter_via: Vec<u32>,
     counter_free: Vec<u32>,
 }
 
@@ -128,11 +146,16 @@ impl Graph {
             key_claimer: Vec::with_capacity(jobs),
             key_waiters: Vec::with_capacity(jobs),
             key_next_claim: Vec::with_capacity(jobs),
+            key_scope: Vec::with_capacity(jobs),
             key_free: Vec::with_capacity(jobs),
             counter_state: Vec::with_capacity(64),
             counter_left: Vec::with_capacity(64),
+            counter_held: Vec::with_capacity(64),
             counter_waiters: Vec::with_capacity(64),
             counter_head: Vec::with_capacity(64),
+            counter_outer: Vec::with_capacity(64),
+            counter_mark: Vec::with_capacity(64),
+            counter_via: Vec::with_capacity(64),
             counter_free: Vec::with_capacity(64),
         }
     }
@@ -171,16 +194,22 @@ impl Graph {
             None => {
                 self.counter_state.push(CounterState::Free);
                 self.counter_left.push(0);
+                self.counter_held.push(0);
                 self.counter_waiters.push(NONE);
                 self.counter_head.push(NONE);
+                self.counter_outer.push(NONE);
+                self.counter_mark.push(0);
+                self.counter_via.push(NONE);
                 (self.counter_state.len() - 1) as u32
             }
         };
         let c = counter as usize;
         self.counter_state[c] = CounterState::Live;
         self.counter_left[c] = 0;
+        self.counter_held[c] = 0;
         self.counter_waiters[c] = NONE;
         self.counter_head[c] = NONE;
+        self.counter_outer[c] = NONE;
         CounterId(counter)
     }
 
@@ -200,6 +229,98 @@ impl Graph {
         }
     }
 
+    /// One more count on `counter` that no job holds: a scope that counts its jobs itself
+    /// holds it until the last of them ends ([`Graph::release`]), so only the jobs that wait
+    /// need be counted in the graph (a job that waits for nothing is on no cycle).
+    ///
+    /// # Panics
+    ///
+    /// Where the counter is not live.
+    pub(crate) fn hold(&mut self, counter: CounterId) {
+        let c = counter.0 as usize;
+        assert!(self.counter_state.get(c) == Some(&CounterState::Live), "counter {} held while not live", counter.0);
+        self.counter_left[c] += 1;
+        self.counter_held[c] += 1;
+    }
+
+    /// Lets go of a [`Graph::hold`]: the counter's waiters go into `woken` if it was the last
+    /// count.
+    ///
+    /// # Panics
+    ///
+    /// Where the counter has no count left.
+    pub(crate) fn release(&mut self, counter: CounterId, woken: &mut Vec<u32>) {
+        let c = counter.0 as usize;
+        assert!(
+            matches!(self.counter_state.get(c), Some(CounterState::Live | CounterState::Dropped)),
+            "counter {} released while free",
+            counter.0
+        );
+        assert!(self.counter_held[c] > 0, "counter {} released with no hold", counter.0);
+        self.counter_held[c] -= 1;
+        self.counter_left[c] -= 1;
+        if self.counter_left[c] == 0 {
+            let head = std::mem::replace(&mut self.counter_waiters[c], NONE);
+            self.drain(head, woken);
+            if self.counter_state[c] == CounterState::Dropped {
+                self.free_counter(counter.0);
+            }
+        }
+    }
+
+    /// `job`, live, runs a scope of `counter` from now on: it waits on the counter before it ends,
+    /// so a wait for the job is a wait on the counter's jobs too, before the job itself waits.
+    pub(crate) fn open_scope(&mut self, job: JobId, counter: CounterId) {
+        let (j, c) = (job.0 as usize, counter.0 as usize);
+        assert!(self.jobs[j].life == Life::Live, "job {} opened a scope while not live", job.0);
+        assert!(self.counter_state.get(c) == Some(&CounterState::Live), "scope of counter {} not live", counter.0);
+        self.counter_outer[c] = self.jobs[j].scope;
+        self.jobs[j].scope = counter.0;
+    }
+
+    /// `job`'s innermost open scope, if any.
+    pub(crate) fn innermost_scope(&self, job: JobId) -> Option<CounterId> {
+        let scope = self.jobs[job.0 as usize].scope;
+        (scope != NONE).then_some(CounterId(scope))
+    }
+
+    /// `job`'s innermost scope, of `counter`, is over: the scope around it, if any.
+    pub(crate) fn close_scope(&mut self, job: JobId, counter: CounterId) -> Option<CounterId> {
+        let (j, c) = (job.0 as usize, counter.0 as usize);
+        assert!(self.jobs[j].scope == counter.0, "job {} closed scope {}, not its innermost", job.0, counter.0);
+        let outer = std::mem::replace(&mut self.counter_outer[c], NONE);
+        self.jobs[j].scope = outer;
+        (outer != NONE).then_some(CounterId(outer))
+    }
+
+    /// `job`, live and waiting for nothing, counts towards `counter` from now on.
+    pub(crate) fn count_towards(&mut self, job: JobId, counter: CounterId) {
+        assert!(self.jobs[job.0 as usize].counter == NONE, "job {} counted twice", job.0);
+        self.attach(job.0, counter.0);
+    }
+
+    /// As [`Graph::claim`] by `job`, for a run it began inside `scope` (its innermost then, or
+    /// none), which may be outside the scopes it has open now: a wait for the key waits on the
+    /// scopes the job opened inside `scope` (which the run waits on before it ends), not on
+    /// `scope` or those around it (which the run ends inside).
+    ///
+    /// # Panics
+    ///
+    /// Where `scope` is not one `job` has open.
+    pub(crate) fn claim_in(&mut self, key: Key, job: JobId, scope: Option<CounterId>) -> bool {
+        let scope = scope.map_or(NONE, |it| it.0);
+        let mut open = self.jobs[job.0 as usize].scope;
+        while open != scope {
+            assert!(open != NONE, "key {key:?} claimed for job {} in scope {scope}, not one it has open", job.0);
+            open = self.counter_outer[open as usize];
+        }
+        if !self.claim(key, Some(job)) {
+            return false;
+        }
+        self.key_scope[self.keys[&key] as usize] = scope;
+        true
+    }
+
     /// `by` (a live job, or `None` for a driver: IO, a child process) makes `key`'s value.
     /// `false` when the key has a flight already.
     pub(crate) fn claim(&mut self, key: Key, by: Option<JobId>) -> bool {
@@ -216,6 +337,7 @@ impl Graph {
                 self.key_claimer.push(NONE);
                 self.key_waiters.push(NONE);
                 self.key_next_claim.push(NONE);
+                self.key_scope.push(NONE);
                 (self.key_name.len() - 1) as u32
             }
         };
@@ -223,6 +345,7 @@ impl Graph {
         self.key_claimer[e] = by.map_or(NONE, |job| job.0);
         self.key_waiters[e] = NONE;
         self.key_next_claim[e] = NONE;
+        self.key_scope[e] = by.map_or(NONE, |job| self.jobs[job.0 as usize].scope);
         if let Some(job) = by {
             self.key_next_claim[e] = self.jobs[job.0 as usize].claims;
             self.jobs[job.0 as usize].claims = entry;
@@ -287,6 +410,7 @@ impl Graph {
         let j = job.0 as usize;
         assert!(self.jobs[j].life == Life::Live, "job {} ended while not live", job.0);
         assert!(self.jobs[j].wait == Target::None, "job {} ended while it waits", job.0);
+        assert!(self.jobs[j].scope == NONE, "job {} ended inside a scope", job.0);
         self.jobs[j].life = Life::Done;
         let head = std::mem::replace(&mut self.jobs[j].waiters, NONE);
         self.drain(head, woken);
@@ -405,14 +529,16 @@ impl Graph {
         }
     }
 
-    /// Whether the jobs `target` reaches, followed through every waiting job's wait, reach
-    /// `job`: the job whose wait closes the cycle, if so.
+    /// Whether the jobs `target` reaches, followed through every waiting job's wait and every
+    /// job's scopes, reach `job`: the job whose wait closes the cycle, if so. The stack holds
+    /// jobs, and scopes' counters marked with [`SCOPE`].
     fn closes_cycle(&mut self, job: u32, target: Target) -> Option<u32> {
         self.epoch = self.epoch.wrapping_add(1);
         if self.epoch == 0 {
             for node in &mut self.jobs {
                 node.mark = 0;
             }
+            self.counter_mark.fill(0);
             self.epoch = 1;
         }
         self.jobs[job as usize].mark = self.epoch;
@@ -421,8 +547,13 @@ impl Graph {
         let mut found = self.expand(job, job, target, &mut stack);
         while found.is_none() {
             let Some(from) = stack.pop() else { break };
-            let wait = self.jobs[from as usize].wait;
-            found = self.expand(job, from, wait, &mut stack);
+            found = if from & SCOPE != 0 {
+                let counter = from & !SCOPE;
+                self.expand(job, self.counter_via[counter as usize], Target::Counter(counter), &mut stack)
+            } else {
+                let wait = self.jobs[from as usize].wait;
+                self.expand(job, from, wait, &mut stack)
+            };
         }
         self.dfs = stack;
         found
@@ -430,16 +561,17 @@ impl Graph {
 
     fn expand(&mut self, asker: u32, from: u32, target: Target, stack: &mut Vec<u32>) -> Option<u32> {
         match target {
-            Target::Job(other) => self.visit(asker, from, other, stack),
+            Target::Job(other) => self.visit(asker, from, other, NONE, stack),
+            // A run begun inside a scope of its claimer ends before the claimer waits on it.
             Target::Key(entry) => match self.key_claimer[entry as usize] {
                 NONE => None,
-                claimer => self.visit(asker, from, claimer, stack),
+                claimer => self.visit(asker, from, claimer, self.key_scope[entry as usize], stack),
             },
             Target::Counter(counter) => {
                 let mut at = self.counter_head[counter as usize];
                 while at != NONE {
                     let next = self.jobs[at as usize].item_next;
-                    if let Some(found) = self.visit(asker, from, at, stack) {
+                    if let Some(found) = self.visit(asker, from, at, NONE, stack) {
                         return Some(found);
                     }
                     at = next;
@@ -450,10 +582,13 @@ impl Graph {
         }
     }
 
-    fn visit(&mut self, asker: u32, from: u32, job: u32, stack: &mut Vec<u32>) -> Option<u32> {
+    /// Reaches `job`, through the scopes it has open inside `until` (exclusive; [`NONE`] for
+    /// all).
+    fn visit(&mut self, asker: u32, from: u32, job: u32, until: u32, stack: &mut Vec<u32>) -> Option<u32> {
         if job == asker {
             return Some(from);
         }
+        self.visit_scopes(job, until, stack);
         let node = &mut self.jobs[job as usize];
         if node.mark == self.epoch {
             return None;
@@ -464,6 +599,21 @@ impl Graph {
             stack.push(job);
         }
         None
+    }
+
+    /// The scopes `job` has open from its innermost out to `until` (exclusive), each followed
+    /// once: a wait for the job is a wait on each.
+    fn visit_scopes(&mut self, job: u32, until: u32, stack: &mut Vec<u32>) {
+        let mut scope = self.jobs[job as usize].scope;
+        while scope != NONE && scope != until {
+            let s = scope as usize;
+            if self.counter_mark[s] != self.epoch {
+                self.counter_mark[s] = self.epoch;
+                self.counter_via[s] = job;
+                stack.push(scope | SCOPE);
+            }
+            scope = self.counter_outer[s];
+        }
     }
 
     /// The cycle `closes_cycle` found, from the asker: back from `from` along each job's `via`.
@@ -495,6 +645,12 @@ impl Graph {
             if node.wait != Target::None {
                 assert_eq!(node.life, Life::Live, "job {job} waits while not live");
             }
+            let mut scope = node.scope;
+            while scope != NONE {
+                assert_eq!(node.life, Life::Live, "job {job} runs a scope while not live");
+                assert_eq!(self.counter_state[scope as usize], CounterState::Live, "job {job}'s scope {scope}");
+                scope = self.counter_outer[scope as usize];
+            }
         }
         for (c, &state) in self.counter_state.iter().enumerate() {
             let mut items = 0;
@@ -507,11 +663,11 @@ impl Graph {
             match state {
                 CounterState::Free => assert_eq!(items, 0, "free counter {c}"),
                 CounterState::Live | CounterState::Dropped => {
-                    assert_eq!(items, self.counter_left[c], "counter {c}'s count");
+                    assert_eq!(items + self.counter_held[c], self.counter_left[c], "counter {c}'s count");
                 }
             }
             if state == CounterState::Dropped {
-                assert!(items > 0 && self.counter_waiters[c] == NONE, "dropped counter {c}");
+                assert!(self.counter_left[c] > 0 && self.counter_waiters[c] == NONE, "dropped counter {c}");
             }
         }
     }

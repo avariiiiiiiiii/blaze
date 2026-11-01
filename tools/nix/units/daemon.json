@@ -1192,6 +1192,7 @@
      "arrow-array",
      "arrow-ipc",
      "arrow-schema",
+     "blaze-graph",
      "libc",
      "object 0.40.0",
      "parquet",
@@ -19472,6 +19473,10 @@
       {
        "name": "arrow_schema",
        "unit": "arrow-schema@60.1.0 lib arrow_schema build"
+      },
+      {
+       "name": "blaze_graph",
+       "unit": "blaze-graph@0.0.0 lib blaze_graph build"
       },
       {
        "name": "libc",
@@ -39566,6 +39571,10 @@
        "unit": "arrow-schema@60.1.0 lib arrow_schema build"
       },
       {
+       "name": "blaze_graph",
+       "unit": "blaze-graph@0.0.0 lib blaze_graph build"
+      },
+      {
        "name": "libc",
        "unit": "libc@0.2.191 lib libc build"
       },
@@ -59366,6 +59375,10 @@
       {
        "name": "arrow_schema",
        "unit": "arrow-schema@60.1.0 lib arrow_schema build"
+      },
+      {
+       "name": "blaze_graph",
+       "unit": "blaze-graph@0.0.0 lib blaze_graph build"
       },
       {
        "name": "libc",
@@ -79453,6 +79466,10 @@
       {
        "name": "arrow_schema",
        "unit": "arrow-schema@60.1.0 lib arrow_schema build"
+      },
+      {
+       "name": "blaze_graph",
+       "unit": "blaze-graph@0.0.0 lib blaze_graph build"
       },
       {
        "name": "libc",

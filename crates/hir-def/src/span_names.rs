@@ -35,7 +35,7 @@ macro_rules! body_span {
 /// declares the fields `krate` and `function`.
 pub fn of_body(db: &Db, def: DefWithBodyId, span: tracing::Span) -> tracing::Span {
     if !span.is_disabled() {
-        name(db, def.krate(db), &span, &mut |write| write_body_path(db, def, write));
+        name(db, def.krate(db), &span, |text| write_body_path(db, def, &mut |it| text.push_str(it)));
     }
     span
 }
@@ -47,9 +47,9 @@ pub fn of_anon_const(db: &Db, owner: ExpressionStoreOwnerId, span: tracing::Span
         return span;
     }
     match owner {
-        ExpressionStoreOwnerId::Body(def) => name(db, owner.krate(db), &span, &mut |write| {
-            write_body_path(db, def, write);
-            write("::{const}");
+        ExpressionStoreOwnerId::Body(def) => name(db, owner.krate(db), &span, |text| {
+            write_body_path(db, def, &mut |it| text.push_str(it));
+            text.push_str("::{const}");
         }),
         ExpressionStoreOwnerId::Signature(_) | ExpressionStoreOwnerId::VariantFields(_) => {
             span.record("krate", crate_name(db, owner.krate(db)));
@@ -59,17 +59,12 @@ pub fn of_anon_const(db: &Db, owner: ExpressionStoreOwnerId, span: tracing::Span
 }
 
 /// Writes `krate`'s name and the path `path` writes in `span`'s fields `krate` and `function`.
-pub fn name(
-    db: &Db,
-    krate: Crate,
-    span: &tracing::Span,
-    path: &mut dyn FnMut(&mut dyn FnMut(&str)),
-) {
+/// The path's queries may name spans of their own, so each span has its own buffer.
+fn name(db: &Db, krate: Crate, span: &tracing::Span, path: impl FnOnce(&mut String)) {
     span.record("krate", crate_name(db, krate));
-    // alloc: only while a subscriber records the span; the path's queries may name spans of
-    // their own, so no buffer is shared
+    // alloc: only while a subscriber records the span, which interns it
     let mut text = String::new();
-    path(&mut |it| text.push_str(it));
+    path(&mut text);
     span.record("function", text.as_str());
 }
 
@@ -83,7 +78,7 @@ fn crate_name(db: &Db, krate: Crate) -> &str {
 /// The path of `def` a segment at a time: its crate, its modules (`{block}` for a block), the
 /// trait or impl it is in (`<impl Type>` by the last segment of the impl's type, `<impl>` for a
 /// type that is not a path), and its name; an enum's variant under its enum.
-pub fn write_body_path(db: &Db, def: DefWithBodyId, write: &mut dyn FnMut(&str)) {
+pub fn write_body_path(db: &Db, def: DefWithBodyId, write: &mut impl FnMut(&str)) {
     match def {
         DefWithBodyId::FunctionId(it) => {
             container_path(db, it.lookup(db).container, write);
@@ -111,7 +106,7 @@ pub fn write_body_path(db: &Db, def: DefWithBodyId, write: &mut dyn FnMut(&str))
 
 /// The path of the modules, and the trait or impl, an item in `container` is under, ending in
 /// `::`.
-fn container_path(db: &Db, container: ItemContainerId, write: &mut dyn FnMut(&str)) {
+fn container_path(db: &Db, container: ItemContainerId, write: &mut impl FnMut(&str)) {
     match container {
         ItemContainerId::ModuleId(it) => module_path(db, it, write),
         ItemContainerId::ExternBlockId(it) => module_path(db, it.lookup(db).container, write),
@@ -141,7 +136,7 @@ fn container_path(db: &Db, container: ItemContainerId, write: &mut dyn FnMut(&st
     write("::");
 }
 
-fn module_path<'db>(db: &'db Db, module: ModuleIdLt<'db>, write: &mut dyn FnMut(&str)) {
+fn module_path<'db>(db: &'db Db, module: ModuleIdLt<'db>, write: &mut impl FnMut(&str)) {
     match module.containing_module(db) {
         Some(parent) => {
             module_path(db, parent, write);

@@ -536,6 +536,25 @@ fn a_release_build_summarizes_decides_and_keeps_by_imports() {
     assert_eq!(again.functions, cold.functions);
 }
 
+/// An edit of 4 renames 4 and not its caller 2, whose key takes it by its interface: the
+/// summary 2's imports are decided by is of 2 calling the new 4, never the stored one of 2
+/// calling the old.
+#[test]
+fn a_summary_names_the_callees_its_body_calls() {
+    let (mut program, policy) = (program(), policy(OptLevel::O3, Mode::Output));
+    let mut store = Store::default();
+    let main = |built: &Built| built.functions.iter().find(|it| it.code[0] == 0x11).unwrap().code.clone();
+    let cold = build(&program, &Machine::default(), &policy, &Memo::new(), &store).unwrap();
+    // Built in at depth through 2: what 2's summary says it calls.
+    assert!(main(&cold).contains(&0x44), "{:x?}", main(&cold));
+    store.keep(&cold.puts);
+
+    program.functions.get_mut(&4).unwrap().body = 0x45;
+    let after = build(&program, &Machine::default(), &policy, &Memo::new(), &store).unwrap();
+    assert!(main(&after).contains(&0x45), "{:x?}", main(&after));
+    assert!(!main(&after).contains(&0x44), "{:x?}", main(&after));
+}
+
 #[test]
 fn a_live_build_starts_at_cranelift_and_tiers_up() {
     let mut policy = policy(OptLevel::O0, Mode::Live);

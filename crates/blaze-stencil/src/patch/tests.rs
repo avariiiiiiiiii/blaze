@@ -17,7 +17,7 @@ use cranelift_codegen::{
 use cranelift_frontend::{FunctionBuilder, FunctionBuilderContext};
 
 use blaze_bytes::le::u32 as u32_at;
-use super::{Kind, NONE, Plan, Sel, compile_in, slots::GLOBAL};
+use super::{Kind, NONE, Plan, Sel, compile_in, slots::GLOBAL, survey_in};
 use crate::{
     Cpu, Error, Os, Target, TlsModel,
     arch::{Area, Cx, Glue},
@@ -1046,6 +1046,44 @@ fn what_no_stencil_and_no_glue_takes_is_an_error_naming_it() {
     let error = try_compile(&mut scratch, &func, &Reader::new(bytes).unwrap()).unwrap_err();
     assert_eq!(error.inst, Some(s_inst(&func, 0)));
     assert!(error.what.contains("udiv") && error.what.contains("i64"), "{error}");
+}
+
+#[test]
+fn the_survey_lists_every_refused_instruction_by_its_opcode_and_type() {
+    static NO_UDIV: OnceLock<Vec<u8>> = OnceLock::new();
+    let bytes = NO_UDIV.get_or_init(|| build(|shape| OPS.contains(&shape.op) && shape.op != Op::Udiv));
+    let library = Reader::new(bytes).unwrap();
+    let func = function(&[types::I64, types::I64, types::I32, types::I32], &[types::I64], |b, p| {
+        let sp = b.ins().get_stack_pointer(types::I64);
+        let q = b.ins().udiv(p[0], p[1]);
+        let r = b.ins().udiv(p[2], p[3]);
+        let r = b.ins().uextend(types::I64, r);
+        let s = b.ins().iadd(q, r);
+        let s = b.ins().iadd(s, sp);
+        b.ins().return_(&[s]);
+    });
+    let gaps: Vec<_> = survey_in::<Mock>(&func, &TARGET, &library).iter().map(|e| (e.inst, e.gap)).collect();
+    let gap = |opcode, ty| Some(crate::Gap { opcode, ty });
+    assert_eq!(
+        gaps,
+        [
+            (Some(s_inst(&func, 0)), gap(ir::Opcode::GetStackPointer, types::I64)),
+            (Some(s_inst(&func, 1)), gap(ir::Opcode::Udiv, types::I64)),
+            (Some(s_inst(&func, 2)), gap(ir::Opcode::Udiv, types::I32)),
+        ]
+    );
+    let mut scratch = Scratch::new();
+    let first = try_compile(&mut scratch, &func, &library).unwrap_err();
+    assert_eq!(first.gap, gap(ir::Opcode::GetStackPointer, types::I64), "a compile stops at the first, typed");
+}
+
+#[test]
+fn the_survey_of_a_function_that_compiles_is_empty() {
+    let func = function(&[types::I64, types::I64], &[types::I64], |b, p| {
+        let s = b.ins().iadd(p[0], p[1]);
+        b.ins().return_(&[s]);
+    });
+    assert_eq!(survey_in::<Mock>(&func, &TARGET, &library()), []);
 }
 
 #[test]

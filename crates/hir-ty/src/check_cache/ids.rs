@@ -196,7 +196,20 @@ thread_local! {
 /// flags, which [`outside`] leaves the scope for; it has no path that writes or reads a
 /// persisted record of its own there (`evict.rs` drops values and computes them again).
 pub(crate) fn relocating<T>(table: &mut Table, f: impl FnOnce() -> T) -> T {
+    carry_table();
     stdx::lend(&TABLE, table, f)
+}
+
+/// Carries [`TABLE`] with each job on a fiber across its waits ([`blaze_query::carry`]): a
+/// scope whose interning waits on a query resumes in it, wherever it resumes.
+fn carry_table() {
+    static CARRIED: std::sync::Once = std::sync::Once::new();
+    CARRIED.call_once(|| {
+        blaze_query::carry(blaze_query::Carried {
+            take: || stdx::lend::take_carried(&TABLE, Option::is_none),
+            put: |it| stdx::lend::put_carried(&TABLE, Option::is_none, it),
+        });
+    });
 }
 
 /// Runs `f` outside the [`relocating`] scope this thread is in, if any: what `f` writes or

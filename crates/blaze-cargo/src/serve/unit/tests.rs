@@ -780,3 +780,137 @@ fn a_units_key_is_the_same_wherever_the_graph_puts_its_dependencies() {
     other.dependencies[0].index = 0;
     assert_ne!(bytes(&first, &first[1]), bytes(&second, &other), "a dependency on another unit is another key");
 }
+
+const MACROS: &[u8] = b"extern crate proc_macro;\nuse proc_macro::TokenStream;\n\n\
+#[proc_macro]\npub fn shout(input: TokenStream) -> TokenStream { input }\n\n\
+#[proc_macro_attribute]\npub fn tag(_: TokenStream, item: TokenStream) -> TokenStream { item }\n";
+
+/// The standard library's `proc_macro`, as much of it as the list of a proc macro's macros
+/// names.
+const PROC_MACRO_LIB: &[u8] = b"pub struct TokenStream;\npub mod bridge {\n    pub mod client {\n        \
+pub struct Client;\n        impl Client {\n            \
+pub const fn expand1(_: fn(crate::TokenStream) -> crate::TokenStream) -> Client { Client }\n            \
+pub const fn expand2(_: fn(crate::TokenStream, crate::TokenStream) -> crate::TokenStream) -> Client { Client }\n        \
+}\n    }\n}\n";
+
+/// A proc macro `m` on the standard library's `core` and `proc_macro`, lowered over files in
+/// memory: the proc macro is unit 2.
+fn lowered_proc_macro() -> blaze_lower::Lowered {
+    use blaze_units::{
+        query::{BuildConfig, Command, Invocation, Mount, Origin},
+        schema::{Strip, Stripped},
+    };
+    let tree = blaze_query::MemTree::default();
+    let library = tree.root(&[
+        ("core/Cargo.toml", b"[package]\nname = \"core\"\n"),
+        ("core/src/lib.rs", b"pub mod marker {}\n"),
+        ("proc_macro/Cargo.toml", b"[package]\nname = \"proc_macro\"\n"),
+        ("proc_macro/src/lib.rs", PROC_MACRO_LIB),
+    ]);
+    let view = tree.root(&[
+        ("Cargo.toml", b"[package]\nname = \"m\"\n\n[lib]\nproc-macro = true\n"),
+        ("src/lib.rs", MACROS),
+    ]);
+    let (core, proc_macro, m) =
+        ("path+file:///rustc/abc/library/core#0.0.0", "path+file:///rustc/abc/library/proc_macro#0.0.0", "path+file:///w#0.1.0");
+    let std_dep = |index: usize, name: &str| UnitDep {
+        index,
+        extern_crate_name: name.to_owned(),
+        public: None,
+        noprelude: Some(true),
+        nounused: None,
+    };
+    let made = |pkg: &str, target: Target, is_std: bool, dependencies: Vec<UnitDep>| Unit {
+        profile: Profile { incremental: true, strip: Strip::Resolved(Stripped::None), ..Profile::dev() },
+        is_std,
+        dependencies,
+        ..unit(pkg, target, Mode::Build, &[])
+    };
+    let mut macro_target = target("m", "lib", "/w/src/lib.rs");
+    macro_target.kind = vec!["proc-macro".to_owned()];
+    macro_target.crate_types = vec!["proc-macro".to_owned()];
+    let units = Units {
+        graph: UnitGraph {
+            version: 1,
+            units: vec![
+                made(core, target("core", "lib", "/rustc/abc/library/core/src/lib.rs"), true, Vec::new()),
+                made(proc_macro, target("proc_macro", "lib", "/rustc/abc/library/proc_macro/src/lib.rs"), true, vec![std_dep(0, "core")]),
+                made(m, macro_target, false, vec![std_dep(0, "core"), std_dep(1, "proc_macro")]),
+            ],
+            roots: vec![2],
+        },
+        plans: vec![plan("", &[]), plan("", &[]), plan("", &[])],
+        packages: vec![
+            PackagePlan { is_member: false, ..package(core, "core", "/rustc/abc/library/core") },
+            PackagePlan { is_member: false, ..package(proc_macro, "proc_macro", "/rustc/abc/library/proc_macro") },
+            package(m, "m", "/w"),
+        ],
+        lock: None,
+        warnings: Vec::new(),
+        target_dir: "/w/target".to_owned(),
+        build_dir: "/w/target".to_owned(),
+        finished: String::new(),
+        link_dirs: Vec::new(),
+        sandboxed_tests: false,
+    };
+    let config = BuildConfig {
+        invocation: Invocation {
+            command: Command::Build,
+            args: Vec::new(),
+            root: "/w".to_owned(),
+            cwd: "/w".to_owned(),
+            env: Vec::new(),
+            files: Vec::new(),
+        },
+        mounts: vec![
+            Mount { at: "/rustc/abc/library".to_owned(), origin: Origin::Root(library), under: String::new() },
+            Mount { at: "/w".to_owned(), origin: Origin::View, under: String::new() },
+        ],
+        host: HOST.to_owned(),
+        library: "/rustc/abc/library".to_owned(),
+        std: "/s/std".to_owned(),
+    };
+    blaze_lower::lower(blaze_lower::Lower { units: &units, config: &config, files: &tree, root: view, host_cpu: None }).unwrap()
+}
+
+/// What the code generator's roots of a proc macro require, its root ending with the list of
+/// its macros, is what its unit's root is made before the unit is identified: the text on disk,
+/// then the list, which a root made again leaves as it is.
+#[test]
+fn a_proc_macros_root_ends_with_the_list_of_its_macros_its_roots_are_found_by() {
+    use hir_ty_codegen::v2::{BuildTime, Databases, HashSource, HirFrontend, ItemHashes, RootKind, proc_macro_list};
+    let mut lowered = lowered_proc_macro();
+    assert!(lowered.crates().is_proc_macro(2));
+    let krate = lowered.krate(2).unwrap();
+    fn frontend(db: &base_db::Db) -> HirFrontend<'_> {
+        // alloc: once a front end of the test, its namer of files
+        let names = ItemHashes::new(Box::new(|_: base_db::FileId| None::<String>));
+        // alloc: as `names`
+        HirFrontend::new(Databases::new(db), HashSource::Items(names), std::sync::Arc::new(BuildTime(Default::default())))
+    }
+    let refused = frontend(lowered.db()).roots(krate, RootKind::ProcMacro).err().expect("a root without the list is refused");
+    assert!(refused.what.contains(proc_macro_list::MODULE), "{}", refused.what);
+
+    let root = |lowered: &mut blaze_lower::Lowered| {
+        lowered
+            .append_roots([2], |db, unit, krate| {
+                assert_eq!(unit, 2);
+                super::harness::proc_macro_root(db, &frontend(db), krate)
+                    .map(Some)
+                    .map_err(|what| blaze_lower::LowerError { what, at: None })
+            })
+            .unwrap()
+    };
+    assert_eq!(root(&mut lowered), 1);
+    let db = lowered.db();
+    let input = db.file_text(krate.data(db).root_file_id);
+    let text = input.text(db).to_string();
+    let on_disk = std::str::from_utf8(MACROS).unwrap();
+    assert!(text.starts_with(on_disk) && text.len() > on_disk.len(), "{text}");
+    assert_eq!(HirFrontend::on_disk(&text), on_disk);
+    assert!(text.contains("name: \"shout\"") && text.contains("name: \"tag\""), "{text}");
+    assert_eq!(input.appended_root_module(db), Some(proc_macro_list::MODULE));
+    let roots = frontend(db).roots(krate, RootKind::ProcMacro).unwrap_or_else(|it| panic!("{}", it.what));
+    assert!(roots.roots.len() >= 2, "each macro's function is a root");
+    assert_eq!(root(&mut lowered), 0, "a root made again is as it was");
+}

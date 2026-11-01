@@ -57,4 +57,4 @@ coordinator; its fallbacks are listed below as dead rather than fixed.
 | `crates/blaze-live/src/format.rs:260` | dead | v1: a patch with no count of statics' first values is read as having none | deleted with v1 (2026-10-31, queue 01110) |
 | `crates/blaze-live/src/sample.rs:187`, `:200` | dead | v1's sampler: an unreadable or malformed request is "not asked"; a profile that can't be written is an `eprintln!` | deleted with v1 (2026-10-31, queue 01110) |
 | `crates/blaze-live/src/lib.rs:246` `tiers` | dead | an unreadable or malformed `tiers` file is `None`, the same as "not tiering"; nothing in v2 writes the file | deleted with v1 (2026-10-31, queue 01110) |
-| `crates/blaze-live/src/lib.rs:257` `edit` | dead | v1's daemon protocol; no v2 daemon reads it | deleted with v1 (2026-10-31, queue 01110) |
+| `crates/blaze-live/src/lib.rs:257` `edit` | dead | v1's daemon protocol; no v2 daemon reads it | deleted with `src/socket.rs` (2026-10-31, queue 01170): demo/life's editor commits its text through blaze-api (`Request::Commit` of an `Op::Write`, then `Request::Build`) |

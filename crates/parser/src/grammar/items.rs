@@ -51,16 +51,30 @@ pub(super) fn item_or_macro(
     is_in_extern: bool,
     is_in_trait: bool,
 ) {
-    stdx::ensure_sufficient_stack(|| item_or_macro_here(p, stop_on_r_curly, is_in_extern, is_in_trait))
+    stdx::ensure_sufficient_stack(|| {
+        item_or_macro_here(p, stop_on_r_curly, is_in_extern, is_in_trait, true)
+    })
 }
 
-fn item_or_macro_here(p: &mut Parser<'_>, stop_on_r_curly: bool, is_in_extern: bool, is_in_trait: bool) {
+/// One item and no more, as a macro's `$i:item` takes it: a `;` after the item is the
+/// macro's next token (`($i:item ; $l:lifetime)`), not a stray one of a list of items.
+pub(super) fn item_fragment(p: &mut Parser<'_>) {
+    stdx::ensure_sufficient_stack(|| item_or_macro_here(p, true, true, false, false))
+}
+
+fn item_or_macro_here(
+    p: &mut Parser<'_>,
+    stop_on_r_curly: bool,
+    is_in_extern: bool,
+    is_in_trait: bool,
+    stray_semicolon: bool,
+) {
     let m = p.start();
     attributes::outer_attrs(p);
 
     let m = match opt_item(p, m, is_in_extern, is_in_trait) {
         Ok(()) => {
-            if p.at(T![;]) {
+            if stray_semicolon && p.at(T![;]) {
                 p.err_and_bump(
                     "expected item, found `;`\n\
                      consider removing this semicolon",

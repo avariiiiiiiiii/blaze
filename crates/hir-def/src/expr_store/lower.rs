@@ -1903,6 +1903,8 @@ impl<'db> ExprCollector<'db> {
                         // alloc: a diagnostic, the error path.
                         location: location.to_string(),
                     });
+                    // rustc's lowering makes it `ExprKind::Err`: nothing more is reported of it.
+                    return Some(self.alloc_expr(Expr::Missing, syntax_ptr));
                 }
                 self.alloc_expr(Expr::Await { expr }, syntax_ptr)
             }
@@ -3070,6 +3072,20 @@ impl<'db> ExprCollector<'db> {
             macro_ptr,
             false,
             |this, expansion: Option<ast::MacroStmts<'_>>| match expansion {
+                Some(expansion)
+                    if this
+                        .expander
+                        .current_file_id()
+                        .macro_file()
+                        .is_some_and(|it| it.is_include_macro(this.db))
+                        && let Some(ast::Stmt::ExprStmt(first)) = expansion.statements().next()
+                        && let Some(expr) = first.expr() =>
+                {
+                    // rustc reads one expression of an included file wherever the call is
+                    // (`ExpandInclude::make_expr`), and lints what follows it
+                    // (`incomplete_include`): `include!("f.rs");` of `1 2` is `1;`.
+                    this.maybe_collect_expr(expr)
+                }
                 Some(expansion) => {
                     // rustc parses the expansion of such a call as one expression, and takes
                     // one `;` after it (`ParserAnyMacro::make`, the lint

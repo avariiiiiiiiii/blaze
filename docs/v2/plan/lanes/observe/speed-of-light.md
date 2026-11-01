@@ -13,21 +13,23 @@ measurement that turns them into numbers is at the end.
 ## A span
 
 What an info span of a `blaze` target (or a rust-analyzer `*_query` span) does, without
-`BLAZE_PROFILE` and without the feature `tracy`:
+`BLAZE_PROFILE`, with the schema's 64-byte row:
 
 | step | work |
 |---|---|
-| open (`opened`) | hash the callsite's address, probe the site table (1 load, rarely 2), read the clock, test `on()` (1 load) |
+| open (`flight::opened`) | hash the callsite's address, probe the site table (1 load, rarely 2), find a free open slot (1 load, the one at the depth), read the clock, 9 relaxed stores and a release store into the slot (one cache line and a half), the allocator's two counters when counted |
 | enter (`flight::entered`) | thread-local read, load and store the depth, store the id |
 | exit (`flight::exited`) | thread-local read, load the depth, compare the top, store the depth |
-| close (`flight::closed`) | thread-local read, read the clock, a release fence, 2 relaxed stores and a release store (the entry), a relaxed add (the progress count) |
+| close (`flight::closed`) | look up the ring by number (1 load), an acquire load and an `AcqRel` decrement of the slot's handle count, read the slot back (8 loads), free it, read the clock, a release fence, 8 relaxed stores and a release store (the row: one cache line), a relaxed add (the progress count) |
 
 On top of that, `tracing` itself makes 4 dynamic calls through the global dispatcher and checks
-the callsite's cached interest. Nothing allocates and nothing locks; the site table is filled
-once per callsite (`register`, under a lock, at interest time).
+the callsite's cached interest. Nothing allocates and nothing locks on a span with no `crate`,
+`function` or `unit` field. A span with one interns each value (a hash and a lock of one of 16
+shards); the spans that carry them are per query or per function compiled, never per memo hit.
+The site table is filled once per callsite (`register`, under a lock, at interest time).
 
-The bound: two clock reads plus about ten loads and stores to one thread's own cache lines plus
-one fence. On aarch64 the clock is `CNTVCT_EL0` (a few cycles) and the fence is a `dmb ish`
+The bound: two clock reads, two cache lines written at open and one at close, one atomic
+read-modify-write and one fence. On aarch64 the clock is `CNTVCT_EL0` (a few cycles) and the fence is a `dmb ish`
 (tens of cycles); on x86_64 it is `rdtsc` (about 25 cycles each) and the fence is free (x86
 stores are already release). Expected: 15 to 30 ns a span on Apple M-series, 25 to 50 ns on
 x86_64, most of it `tracing`'s dispatch and the fence.
@@ -40,15 +42,27 @@ matter.
 
 ## Memory
 
-Each thread that records holds one ring of `CAP` = 32768 entries, 16 bytes each: 512 KiB of
-address space. It is allocated zeroed and never written up front, so a page is committed only
-once entries reach it: a pool thread that records a few spans holds a few pages. A thread that
-records steadily commits the whole 512 KiB after 32768 entries. With 64 such threads that is
-32 MiB, which is the ring's real cost; at 10,000 spans a second a ring holds the last 3 s. The
+Each thread that records holds one ring of `CAP` = 16384 rows, 64 bytes each: 1 MiB of address
+space, plus 64 open-span slots (4.6 KiB). It is allocated zeroed and never written up front, so
+a page is committed only once rows reach it: a pool thread that records a few spans holds a few
+pages. A thread that records steadily commits the whole 1 MiB after 16384 rows. With 64 such
+threads that is 64 MiB, which is the ring's real cost; at 5,000 spans a second a ring holds the
+last 3 s. The
 rings of threads that ended are reused, never freed, so the total is bounded by the most threads
 alive at once. Halving `CAP` halves both the memory and the window.
 
 The site table is 4095 slots of 8 bytes (32 KiB, static). The open-span stack is 32 ids per ring.
+
+## The live feed
+
+It costs nothing until something subscribes. Then each frame (every 250 ms) reads each ring once
+(64 bytes a row, sequential: memory bandwidth, about 20 GB/s on one core), resolves each
+distinct callsite and name once into a dictionary (a hash-map probe a row), writes about 70
+bytes of columns a row, and compresses with zstd (about 500 MB/s at level 1 on one core). At
+20,000 spans a second across the daemon, a frame is 5,000 rows: about 0.3 ms to read and build
+and 0.7 ms to compress 350 KB. That is 1 ms of one core per 250 ms, or 0.4% of a core while one
+subscriber watches, and none of it on the threads that record. Compression sets the bound, and
+it pays for the explorer's page, which pulls frames through the browser.
 
 ## The watchdog
 

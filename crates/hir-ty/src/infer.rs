@@ -251,7 +251,8 @@ fn infer_anon_const_query<'db>(
             frame,
         );
 
-        ctx.infer_expr(
+        // As a const's body ([`InferenceContext::infer_body`]): a `!` value coerces to the type.
+        _ = ctx.infer_expr_coerce(
             loc.expr,
             &Expectation::has_type(loc.ty.get().instantiate_identity().skip_norm_wip()),
             ExprIsRead::Yes,

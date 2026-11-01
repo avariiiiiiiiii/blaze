@@ -158,8 +158,10 @@ pub fn walk_bodies<'db>(
     mut lower: impl FnMut(DefWithBodyId) -> bool,
     mut each: impl FnMut(DefWithBodyId, &BodyBlocks<'db>),
 ) {
-    // alloc: the query's result, once per execution (per crate or per body)
-    let mut seen: FxHashSet<DefWithBodyId> = roots.iter().copied().collect();
+    // alloc: once per walk, at the roots' count
+    let mut seen: FxHashSet<DefWithBodyId> =
+        FxHashSet::with_capacity_and_hasher(roots.len(), Default::default());
+    seen.extend(roots.iter().copied());
     let mut queue = roots;
     queue.reverse();
     while let Some(owner) = queue.pop() {
@@ -175,9 +177,10 @@ pub fn walk_bodies<'db>(
 /// Every body of `krate`, those declared in bodies included, each lowered: for a crate that is
 /// checked fully. The order is the def map's, each body before those declared in it.
 pub fn every_body(db: &Db, krate: Crate) -> Vec<DefWithBodyId> {
-    // alloc: the query's result, once per execution (per crate or per body)
-    let mut bodies = Vec::new();
-    walk_bodies(db, crate_body_owners(db, krate), |_| true, |owner, _| bodies.push(owner));
+    let roots = crate_body_owners(db, krate);
+    // alloc: the result, once per call, at the roots' count: bodies declared in bodies are few
+    let mut bodies = Vec::with_capacity(roots.len());
+    walk_bodies(db, roots, |_| true, |owner, _| bodies.push(owner));
     bodies
 }
 

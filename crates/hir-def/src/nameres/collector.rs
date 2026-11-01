@@ -1918,6 +1918,11 @@ impl<'db> DefCollector<'db> {
                     }
                 }
             };
+            // A glob carries no unresolved name, as when it is first pulled: else an importer
+            // would hold one only when it shares a run with the import that failed.
+            if res.is_none() {
+                continue;
+            }
             self.held.push((name, res));
         }
         let end = self.held.len();

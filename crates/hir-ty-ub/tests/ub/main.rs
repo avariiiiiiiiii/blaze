@@ -81,9 +81,17 @@ fn join(thread: usize) {
     };
 }
 
+/// The target of every program: the evaluator's thread shims follow the target's
+/// `pthread` ABI, and the prelude's `pthread_t` is Linux's.
+macro_rules! target {
+    () => {
+        "//- /main.rs cfg:target_os=linux,target_arch=x86_64\n"
+    };
+}
+
 macro_rules! program {
     ($minicore:literal, $body:literal) => {
-        concat!("//- minicore: ", $minicore, "\n", prelude!(), $body)
+        concat!("//- minicore: ", $minicore, "\n", target!(), prelude!(), $body)
     };
 }
 
@@ -127,7 +135,7 @@ fn ub(fixture: &str, expect: &str) -> (Found, String) {
         Outcome::Ub { found, report, .. } => {
             let message = found.ub.to_string();
             assert!(message.contains(expect), "expected `{expect}`, found:\n{report}");
-            assert!(report.starts_with("error: Undefined Behavior: ") || report.starts_with("error: memory leaked: "));
+            assert!(report.starts_with(&format!("error: {message}")), "{report}");
             (found, report)
         }
         other => panic!("expected undefined behavior `{expect}`, got {other:?}"),
@@ -966,7 +974,8 @@ fn main() {
 macro_rules! simd {
     ($body:literal) => {
         concat!(
-            "//- minicore: sized, copy, index\n",
+            "//- minicore: sized, copy, index, slice\n",
+            target!(),
             prelude!(),
             r#"
 #[repr(simd)]
@@ -1143,7 +1152,7 @@ fn main() {
         let checker: Checker<'_> = Checker::new(8, &Config::default(), 0);
         let (checked, checked_out, checker) = run_function(&db, main, checker);
         assert!(plain.is_ok(), "{plain:?}");
-        assert!(checked.is_ok(), "{checked:?}");
+        assert!(checked.is_ok(), "{checked:?}, the checker found {:?}", checker.found());
         assert!(checker.found().is_none(), "{:?}", checker.found());
         assert_eq!(plain_out.stdout(), checked_out.stdout());
         assert_eq!(plain_out.stdout(), "bcde");

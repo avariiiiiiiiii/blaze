@@ -43,6 +43,28 @@ fn frequency() -> u64 {
     hz
 }
 
+/// Nanoseconds now on the clock every instant of the schema counts on ([`crate::schema::CLOCK`]):
+/// the machine's monotonic clock, one for every process on it.
+pub fn mono_ns() -> i64 {
+    #[cfg(any(target_os = "linux", target_vendor = "apple"))]
+    {
+        #[cfg(target_os = "linux")]
+        const CLOCK: libc::clockid_t = libc::CLOCK_MONOTONIC;
+        #[cfg(target_vendor = "apple")]
+        const CLOCK: libc::clockid_t = libc::CLOCK_UPTIME_RAW;
+        let mut at = libc::timespec { tv_sec: 0, tv_nsec: 0 };
+        // SAFETY: `at` is a timespec to write; the clock exists on every version of the OS.
+        let read = unsafe { libc::clock_gettime(CLOCK, &mut at) };
+        assert_eq!(read, 0, "the monotonic clock is always readable");
+        at.tv_sec as i64 * 1_000_000_000 + at.tv_nsec as i64
+    }
+    #[cfg(not(any(target_os = "linux", target_vendor = "apple")))]
+    {
+        let (_, began) = origin();
+        began.elapsed().as_nanos() as i64
+    }
+}
+
 /// A tick and the instant it was read at, once a process: [`crate::began`] takes it first.
 pub fn origin() -> (u64, Instant) {
     static ORIGIN: OnceLock<(u64, Instant)> = OnceLock::new();
@@ -55,6 +77,8 @@ pub fn origin() -> (u64, Instant) {
 pub struct Scale {
     ticks: u64,
     at: Instant,
+    /// [`mono_ns`] read with `ticks`.
+    mono: i64,
     ns_per_tick: f64,
 }
 
@@ -86,7 +110,14 @@ impl Scale {
             _ = (first, began);
             1.0
         };
-        Scale { ticks, at, ns_per_tick }
+        Scale { ticks, at, mono: mono_ns(), ns_per_tick }
+    }
+
+    /// `ticks` on the schema's clock ([`mono_ns`]), in nanoseconds. A tick read after
+    /// [`Scale::now`] (by a thread racing the reader) maps past it, not wrapped around.
+    pub fn mono(&self, ticks: u64) -> i64 {
+        let ago = self.ticks.wrapping_sub(ticks) as i64;
+        self.mono - (ago as f64 * self.ns_per_tick) as i64
     }
 
     /// The nanoseconds `ticks` ticks last.
@@ -116,5 +147,16 @@ mod tests {
         assert!(off.as_micros() < 200, "a tick read back {off:?} from when it was read");
         let later = ticks();
         assert!(later > tick, "the counter goes forward");
+    }
+
+    #[test]
+    fn ticks_map_onto_the_monotonic_clock() {
+        let before = mono_ns();
+        let tick = ticks();
+        std::thread::sleep(std::time::Duration::from_millis(2));
+        let scale = Scale::now();
+        let off = (scale.mono(tick) - before).abs();
+        assert!(off < 200_000, "a tick mapped {off} ns from the clock read beside it");
+        assert!(scale.mono(ticks()) >= scale.mono(tick));
     }
 }

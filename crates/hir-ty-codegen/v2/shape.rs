@@ -24,7 +24,7 @@ use crate::{
     fragment::{self, DataRequest, Hint, RelocName, Requests},
 };
 
-const VERSION: u8 = 9;
+const VERSION: u8 = 10;
 
 /// Where data is in a shape, as the names of its IR have it.
 mod namespace {
@@ -354,7 +354,7 @@ fn reloc_kind(kind: cranelift_codegen::binemit::Reloc) -> u8 {
 fn variables(out: &mut Out<'_>, variables: &[Variable]) {
     out.u32(variables.len() as u32);
     for variable in variables {
-        out.bytes(variable.name.as_str().as_bytes());
+        out.u32(variable.binding);
         out.u8(u8::from(variable.param));
         out.raw(&variable.ty.0);
         out.u32(variable.slot);

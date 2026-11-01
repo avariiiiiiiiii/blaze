@@ -1,8 +1,8 @@
 //! The one schema of what blaze records about itself: every reader (the Parquet history,
 //! `blaze debug sql`, `blaze debug live`, the explorer at ix.dev/explore, the stall reports)
 //! reads these tables, and nothing else defines them. The Arrow schema of each table is made
-//! from it ([`crate::arrow`]), and so are the DuckDB views and docs/profiling.md's table of
-//! columns.
+//! from it (`arrow.rs`), and so are the DuckDB views and the table of columns in
+//! docs/v2/plan/lanes/observe/profiling.md.
 //!
 //! Time: every `*_ns` instant is nanoseconds on the machine's monotonic clock ([`CLOCK`]): the
 //! same clock in every process of the machine, so the spans of the client, the daemon and the
@@ -227,7 +227,24 @@ pub const TILES: Table = Table {
     ],
 };
 
-/// Every table the history and the live feed hold. [`TILES`] is a result, not kept.
+/// The spans each thread is inside now, not yet rows of `spans`: what the live feed sends
+/// beside the rows that closed.
+pub const OPEN: Table = Table {
+    name: "open",
+    doc: "one row a span a live thread is inside now, outermost first",
+    columns: &[
+        PROCESS,
+        THREAD,
+        THREAD_NAME,
+        col("depth", Type::U16, "its place on its thread's stack, 0 outermost"),
+        col("name", Type::Dict, "the span's name"),
+        col("target", Type::Dict, "the module path it was made in"),
+        col("start_ns", Type::I64, "when it began"),
+    ],
+};
+
+/// Every table the history and the live feed hold. [`TILES`] and [`OPEN`] are results, not
+/// kept.
 pub const TABLES: [&Table; 8] =
     [&SPANS, &COUNTERS, &BUILDS, &SAMPLES, &PROVENANCE, &INPUTS, &ALLOC_SAMPLES, &HEAP_BY_OWNER];
 
@@ -237,7 +254,7 @@ mod tests {
 
     #[test]
     fn every_table_names_each_column_once() {
-        for table in TABLES.iter().copied().chain([&TILES]) {
+        for table in TABLES.iter().copied().chain([&TILES, &OPEN]) {
             for (i, it) in table.columns.iter().enumerate() {
                 assert_eq!(
                     table.column(it.name),

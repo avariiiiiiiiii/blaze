@@ -419,6 +419,52 @@ fn removing_a_crate_feature_removes_it_from_the_maintained_map() {
     assert!(failures.is_empty(), "{failures}");
 }
 
+/// A glob of a module with an unresolved import takes no name of it, whether the glob shares a
+/// run with the import (the maintainer's region) or reads it from upstream (`facts`' components).
+#[test]
+fn a_glob_carries_no_unresolved_name() {
+    const LIB: &str = "mod foo;\nuse crate::foo::E;\n";
+    let mut loaded = Loaded::new(&format!("//- /lib.rs\n{LIB}//- /foo.rs\nenum E {{}}\n"));
+    let root = loaded.file("/lib.rs");
+    loaded.db.set_file_text(root, &format!("pub mod m {{ pub use super::*; }}\n{LIB}"));
+    let krate = loaded.krate();
+    let map = crate_local_def_map(&loaded.db, krate).def_map(&loaded.db);
+    let m = module_at(&loaded.db, krate, &["m"]);
+    let e = name("E");
+    assert!(
+        !map.module(&loaded.db, m).scope(&loaded.db).resolutions().any(|(it, _)| it == Some(e)),
+        "`m` has no `E` of the failed import"
+    );
+    let mut failures = String::new();
+    check_db(&loaded.db, "a glob of a failed import", &Exempt::NONE, false, &mut failures);
+    assert!(failures.is_empty(), "{failures}");
+}
+
+/// A crate's injected std prelude is a dependency's module, named in its root's round-0 log:
+/// an edit of the dependency alone that renames the module away takes it out of the crate's
+/// map, and renaming it back brings it in again.
+#[test]
+fn a_dependencys_prelude_renamed_away_leaves_the_maintained_map() {
+    const CORE: &str = "pub mod prelude {\n    pub mod rust_2018 {\n        pub struct Rust;\n    }\n}\n";
+    let mut loaded = Loaded::new(&format!(
+        "//- /main.rs edition:2018 crate:main deps:core\n#![no_std]\nuse Rust;\n//- /core.rs crate:core\n{CORE}"
+    ));
+    let core = loaded.file("/core.rs");
+    let main = loaded.file("/main.rs");
+    let main =
+        *all_crates(&loaded.db).iter().find(|it| it.data(&loaded.db).root_file_id == main).expect("`main`");
+    let prelude = |db: &Db| crate_local_def_map(db, main).def_map(db).prelude();
+    assert!(prelude(&loaded.db).is_some(), "loaded: `core::prelude::rust_2018` is the prelude");
+    loaded.db.set_file_text(core, &CORE.replacen("prelude", "S", 1));
+    assert_eq!(prelude(&loaded.db), None, "the prelude is gone with its module");
+    let mut failures = String::new();
+    check_db(&loaded.db, "a dependency's prelude renamed away", &Exempt::NONE, false, &mut failures);
+    loaded.db.set_file_text(core, CORE);
+    assert!(prelude(&loaded.db).is_some(), "the prelude is back with its module");
+    check_db(&loaded.db, "a dependency's prelude renamed back", &Exempt::NONE, false, &mut failures);
+    assert!(failures.is_empty(), "{failures}");
+}
+
 /// A module's id outlives the revisions that never read it: the maintainer publishes each
 /// crate in a write of its own, so a crate maintained early goes unread for as many revisions
 /// as there are crates after it, while their scopes hold its modules' ids. Were

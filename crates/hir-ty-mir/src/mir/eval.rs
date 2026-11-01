@@ -1848,6 +1848,16 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
             Rvalue::Ref(super::BorrowKind::Mut { kind: super::MutBorrowKind::TwoPhasedBorrow }, _) => {
                 RetagMode::TwoPhase
             }
+            // A static's operand is typed `&'static T` here, but rustc's (`static_ptr_ty`) is a
+            // raw pointer for a `static mut` or a foreign static, which `AddRetag` leaves alone:
+            // a shared retag would freeze what the program writes through it.
+            Rvalue::Use(Operand { kind: OperandKind::Static(s), .. })
+                if StaticSignature::of(self.db, *s)
+                    .flags
+                    .intersects(StaticFlags::MUTABLE | StaticFlags::EXTERN) =>
+            {
+                RetagMode::None
+            }
             _ => RetagMode::Default,
         };
         let size = self.size_of_sized(ty, locals, "the place of an assignment")?;

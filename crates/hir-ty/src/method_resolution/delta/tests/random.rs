@@ -369,6 +369,34 @@ fn declarations(db: &Db, krate: Crate) -> Vec<String> {
     out
 }
 
+/// Each root trait's slice as the impl-set hash reads it: every row's module, impl identity and
+/// head, its derives, the body modules it lists, and the hash of their impls.
+fn slice_rows(db: &Db, krate: Crate) -> Vec<String> {
+    use crate::method_resolution::delta::{
+        impl_identity, publish::trait_slice, read::body_impl_set_hash,
+    };
+
+    let mut out = Vec::new();
+    for name in TRAITS {
+        let trait_ = trait_named(db, krate, name);
+        let Some(slice) = trait_slice(db, krate, trait_) else {
+            out.push(format!("{name}: no slice"));
+            continue;
+        };
+        let rows = slice.rows(db);
+        for &(module, imp, head) in rows.impls.iter() {
+            out.push(format!("{name}: {module:?} {:?} {head:?}", impl_identity(db, imp)));
+        }
+        out.push(format!(
+            "{name}: {} derives, bodies {:?}, bodies hash {:?}",
+            rows.derives.len(),
+            rows.bodies,
+            body_impl_set_hash(db, krate, trait_),
+        ));
+    }
+    out
+}
+
 /// A trait of `krate` or of its dependencies by name (`Clone` is minicore's).
 fn trait_named_anywhere(db: &Db, krate: Crate, name: &str) -> TraitId {
     if TRAITS.contains(&name) {
@@ -414,11 +442,15 @@ fn every_slice_and_reader_is_the_fresh_one_after_each_edit() {
         let (maintained, made) = (hashes(&loaded.db, krate), hashes(&fresh.db, fresh.krate()));
         if maintained != made {
             let kept = declarations(&loaded.db, krate);
-            let fresh = declarations(&fresh.db, fresh.krate());
+            let fresh_krate = fresh.krate();
+            let made_decls = declarations(&fresh.db, fresh_krate);
+            let kept_rows = slice_rows(&loaded.db, krate);
+            let made_rows = slice_rows(&fresh.db, fresh_krate);
             _ = writeln!(
                 failures,
                 "seed {seed}: the hashes differ from a fresh database's:\n{maintained:#?}\n\
-                 {made:#?}\nthe declarations, maintained then fresh:\n{kept:#?}\n{fresh:#?}"
+                 {made:#?}\nthe declarations, maintained then fresh:\n{kept:#?}\n{made_decls:#?}\n\
+                 the slices, maintained then fresh:\n{kept_rows:#?}\n{made_rows:#?}"
             );
         }
     }

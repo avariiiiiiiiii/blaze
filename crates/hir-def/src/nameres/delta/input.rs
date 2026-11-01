@@ -44,8 +44,18 @@ pub(super) struct Delta {
 }
 
 /// Reads the crate's round-0 logs that `written` may have changed into `state`'s groups.
-/// `cold`: the state is new, every group is a seed.
-pub(super) fn read(db: &Db, krate: Crate, state: &mut CrateState, written: &Written<'_>, cold: bool) -> Delta {
+/// `cold`: the state is new, every group is a seed. `deps_changed`: a crate maintained before
+/// this one changed a binding or a module in this write, so the root's log is read again: it
+/// alone reads other crates at round 0 (the injected std prelude, `#[macro_use] extern crate`),
+/// and `root_decl` holds only their roots.
+pub(super) fn read(
+    db: &Db,
+    krate: Crate,
+    state: &mut CrateState,
+    written: &Written<'_>,
+    cold: bool,
+    deps_changed: bool,
+) -> Delta {
     let mut delta = Delta::default();
     let root_key = queries::root_decl(db, krate);
     let full = cold
@@ -53,7 +63,7 @@ pub(super) fn read(db: &Db, krate: Crate, state: &mut CrateState, written: &Writ
         || !written.removed.is_empty()
         || !written.roots.is_empty()
         || state.groups.get(&state.root).is_none_or(|it| it.key != root_key);
-    if full || !incremental(db, state, written, &mut delta) {
+    if full || !incremental(db, state, written, deps_changed, &mut delta) {
         delta = Delta::default();
         walk(db, state, root_key, written, cold, &mut delta);
     }
@@ -62,10 +72,19 @@ pub(super) fn read(db: &Db, krate: Crate, state: &mut CrateState, written: &Writ
     delta
 }
 
-/// The groups of the written files, their logs compared; `false` when a group's round-0
-/// children changed, which only a walk follows.
-fn incremental(db: &Db, state: &mut CrateState, written: &Written<'_>, delta: &mut Delta) -> bool {
+/// The groups of the written files (and the root when `deps_changed`), their logs compared;
+/// `false` when a group's round-0 children changed, which only a walk follows.
+fn incremental(
+    db: &Db,
+    state: &mut CrateState,
+    written: &Written<'_>,
+    deps_changed: bool,
+    delta: &mut Delta,
+) -> bool {
     let mut checked: Vec<ModuleId> = Vec::new(); // alloc: the groups of the written files, once per write
+    if deps_changed {
+        checked.push(state.root);
+    }
     for file in written.set {
         let Some(groups) = state.files.get(file) else { continue };
         for &group in groups {

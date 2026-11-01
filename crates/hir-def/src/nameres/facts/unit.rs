@@ -1151,6 +1151,11 @@ impl<'db, 'f, A: Allocator + Clone> Unit<'db, 'f, A> {
                     }
                 }
             };
+            // A glob carries no unresolved name, as when it is first pulled (`pull_glob`): else
+            // an importer would hold one only when it shares a unit with the import that failed.
+            if res.is_none() {
+                continue;
+            }
             self.held.push((name, res));
         }
         let resolutions = held..self.held.len();

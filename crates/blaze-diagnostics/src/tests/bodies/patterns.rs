@@ -787,7 +787,8 @@ LL +     Enum::SingleVariant(..) = Enum::SingleVariant(1, 2);
 #[test]
 fn a_reference_pattern_of_a_trait_object_cannot_dereference_it() {
     // tests/ui/error-codes/E0033.rs
-    let fixture = "//- minicore: coerce_unsized
+    // `dispatch_from_dyn` makes `&self` dispatchable, so `SomeTrait` is dyn-compatible.
+    let fixture = "//- minicore: coerce_unsized, dispatch_from_dyn
 //- /E0033.rs crate:other:main edition:2015
 trait SomeTrait {
     fn foo(&self);

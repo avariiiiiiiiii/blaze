@@ -114,7 +114,7 @@ mod tests {
         }
         assert_eq!(lang::DECLARED.len(), unstable);
         let declared: Vec<_> = unstable_declared().take(3).collect();
-        assert_eq!(declared, ["abi_unadjusted", "allocator_internals", "allow_internal_unsafe"]);
+        assert_eq!(declared, ["allocator_internals", "allow_internal_unsafe", "allow_internal_unstable"]);
     }
 
     #[test]

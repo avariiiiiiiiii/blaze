@@ -19,6 +19,9 @@
 //! steps 4 to 7). [`par`] is the parallel loops of every crate, on the same pool: blaze has no
 //! other.
 //!
+//! [`sched`] is the scheduler the pool and the pump are to become (docs/v2/plan/lanes/sched.md):
+//! a state machine with no thread, clock or sleep, in which a waiting job holds no thread.
+//!
 //! Unsafe code is in [`exec`]'s slot table, [`pool`]'s jobs and queues, [`par`]'s item
 //! sources and [`pump`]'s waiter
 //! lists (lock-free structures whose safe versions would take a lock or an `Arc` per job or
@@ -41,6 +44,7 @@ pub mod plane;
 pub mod pool;
 #[allow(unsafe_code)]
 pub mod pump;
+pub mod sched;
 mod sync;
 pub mod topology;
 pub mod trace;

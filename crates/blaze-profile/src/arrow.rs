@@ -1,7 +1,7 @@
 //! The Arrow schema of each [`crate::schema`] table: what the Parquet files, the live feed's
 //! IPC batches and the explorer's results are typed by.
 
-use std::{collections::HashMap, sync::Arc};
+use std::sync::Arc;
 
 use arrow_schema::{DataType, Field, Schema};
 
@@ -26,8 +26,8 @@ pub fn data_type(ty: Type) -> DataType {
 
 pub fn field(column: &Column) -> Field {
     // alloc: a schema, made once a table per process
-    let doc = HashMap::from([("doc".to_owned(), column.doc.to_owned())]);
-    Field::new(column.name, data_type(column.ty), column.nullable).with_metadata(doc)
+    Field::new(column.name, data_type(column.ty), column.nullable)
+        .with_metadata([("doc", column.doc)])
 }
 
 /// The table's Arrow schema, with the schema's version and the clock in its metadata.
@@ -36,10 +36,11 @@ pub fn schema(table: &Table) -> Schema {
     let fields: Vec<Field> = table.columns.iter().map(field).collect();
     // alloc: a schema, made once a table per process
     let version = schema::VERSION.to_string();
-    let meta =
-        [("blaze.table", table.name), ("blaze.schema", &version), ("blaze.clock", schema::CLOCK)];
-    // alloc: a schema, made once a table per process
-    let meta = meta.into_iter().map(|(key, value)| (key.to_owned(), value.to_owned())).collect();
+    let meta = [
+        ("blaze.table", table.name),
+        ("blaze.schema", version.as_str()),
+        ("blaze.clock", schema::CLOCK),
+    ];
     Schema::new(fields).with_metadata(meta)
 }
 
@@ -49,7 +50,7 @@ mod tests {
 
     #[test]
     fn each_table_has_an_arrow_schema_with_its_columns_in_order() {
-        for table in schema::TABLES.iter().copied().chain([&schema::TILES]) {
+        for table in schema::TABLES.iter().copied().chain([&schema::TILES, &schema::OPEN]) {
             let arrow = schema(table);
             let names: Vec<&str> = arrow.fields().iter().map(|it| it.name().as_str()).collect();
             let want: Vec<&str> = table.columns.iter().map(|it| it.name).collect();

@@ -367,8 +367,9 @@ fn thread_cpu_ns() -> u64 {
     0
 }
 
-/// The subscriber: a span id is the flight recorder's (its callsite and the tick it began at,
-/// [`flight::id`]), so nothing is kept per open span but a profiled `blaze` one's CPU time.
+/// The subscriber: a span id is the flight recorder's (the ring and slot holding its open
+/// state, [`flight::opened`]), so nothing else is kept per open span but a profiled `blaze`
+/// one's CPU time.
 struct Recorder;
 
 impl Recorder {
@@ -384,40 +385,30 @@ fn wants(meta: &'static tracing::Metadata<'static>) -> bool {
     Recorder::wanted(meta) && flight::register(meta).is_some()
 }
 
-/// The id of a span of a kept callsite beginning now; while profiling, what a `blaze` span
-/// began with.
-fn opened(span: &tracing::span::Attributes<'_>) -> Option<u64> {
+/// The id of a span beginning now: [`flight::UNRECORDED`] for a callsite past the flight
+/// recorder's table. While profiling, what a `blaze` span began with.
+fn opened(span: &tracing::span::Attributes<'_>) -> u64 {
     let meta = span.metadata();
-    let id = flight::id(flight::site(meta)?);
-    if on() && ours(meta) {
+    let Some(site) = flight::site(meta) else { return flight::UNRECORDED };
+    let id = flight::opened(span, site);
+    if id != flight::UNRECORDED && on() && ours(meta) {
         let mut subject = Subject(None);
         span.record(&mut subject);
         let open = Open { id, cpu_ns: thread_cpu_ns(), under_ns: 0, subject: subject.0 };
         _ = OPEN.try_with(|it| it.borrow_mut().push(open));
     }
-    Some(id)
+    id
 }
 
-fn entered(id: u64) {
-    if flight::site_of(id) != 0 {
-        flight::entered(id);
+/// Whether the span `id` closed: its last handle was dropped.
+fn closed(id: u64) -> bool {
+    // The site is read before the close frees the span's slot, and only while profiling.
+    let site = if on() { flight::site_of(id) } else { None };
+    let Some(ticks) = flight::closed(id) else { return false };
+    if let Some(site) = site {
+        profiled(id, site, ticks);
     }
-}
-
-fn exited(id: u64) {
-    if flight::site_of(id) != 0 {
-        flight::exited(id);
-    }
-}
-
-fn closed(id: u64) {
-    if flight::site_of(id) == 0 {
-        return;
-    }
-    flight::closed(id);
-    if on() {
-        profiled(id);
-    }
+    true
 }
 
 fn ours(meta: &tracing::Metadata<'_>) -> bool {
@@ -463,8 +454,12 @@ impl tracing::Subscriber for Recorder {
     }
 
     fn new_span(&self, span: &tracing::span::Attributes<'_>) -> tracing::span::Id {
-        // A callsite past the flight recorder's table is site 0: its spans are not kept.
-        tracing::span::Id::from_u64(opened(span).unwrap_or(1 << flight::SITE_BITS))
+        tracing::span::Id::from_u64(opened(span))
+    }
+
+    fn clone_span(&self, id: &tracing::span::Id) -> tracing::span::Id {
+        flight::cloned(id.into_u64());
+        tracing::span::Id::from_u64(id.into_u64())
     }
 
     fn record(&self, _: &tracing::span::Id, _: &tracing::span::Record<'_>) {}
@@ -474,24 +469,23 @@ impl tracing::Subscriber for Recorder {
     fn event(&self, _: &tracing::Event<'_>) {}
 
     fn enter(&self, id: &tracing::span::Id) {
-        entered(id.into_u64());
+        flight::entered(id.into_u64());
     }
 
     fn exit(&self, id: &tracing::span::Id) {
-        exited(id.into_u64());
+        flight::exited(id.into_u64());
     }
 
     fn try_close(&self, id: tracing::span::Id) -> bool {
-        closed(id.into_u64());
-        true
+        closed(id.into_u64())
     }
 }
 
-/// What a profile keeps of the span `id`, closing now.
-fn profiled(id: u64) {
-    let Some(meta) = flight::meta(flight::site_of(id)) else { return };
-    let (scale, now, end) = (clock::Scale::now(), clock::ticks(), Instant::now());
-    let wall_ns = scale.ns(flight::ticks_since(id, now));
+/// What a profile keeps of the span `id` of `site`, closing now after `ticks`.
+fn profiled(id: u64, site: u16, ticks: u64) {
+    let Some(meta) = flight::meta(site) else { return };
+    let end = Instant::now();
+    let wall_ns = clock::Scale::now().ns(ticks);
     let start = end.checked_sub(Duration::from_nanos(wall_ns)).unwrap_or(end);
     // A `blaze` span closed on the thread it was opened on has its own CPU time.
     let own = ours(meta)

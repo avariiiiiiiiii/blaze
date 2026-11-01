@@ -740,8 +740,19 @@ impl<'db, 'f> InferenceContext<'db, 'f> {
                 let cast_ty = self.make_ty(type_ref);
                 let expr_ty =
                     self.infer_expr(expr, &Expectation::Castable(cast_ty), ExprIsRead::Yes);
-                self.deferred_cast_checks.push(CastCheck::new(tgt_expr, expr, expr_ty, cast_ty));
-                cast_ty
+                // As rustc's `CastCheck::new`, a cast to an unsized type is reported here and is
+                // of the error type, so nothing that uses its value reports it again.
+                let resolved = self.table.resolve_vars_with_obligations(cast_ty);
+                if !resolved.has_infer_types() && !self.table.type_is_sized_modulo_regions(resolved) {
+                    self.push_diagnostic(InferenceDiagnostic::CastToUnsized {
+                        expr: tgt_expr,
+                        cast_ty: resolved.store(),
+                    });
+                    self.err_ty()
+                } else {
+                    self.deferred_cast_checks.push(CastCheck::new(tgt_expr, expr, expr_ty, cast_ty));
+                    cast_ty
+                }
             }
             Expr::Ref { expr, rawness, mutability } => self.infer_ref_expr(
                 rawness,
@@ -1656,6 +1667,8 @@ impl<'db, 'f> InferenceContext<'db, 'f> {
                 if let Some(expr) = expr {
                     self.infer_expr_no_expect(expr, ExprIsRead::Yes);
                 }
+                // rustc's lowering makes it `ExprKind::Err`: nothing more is reported of it.
+                return self.err_ty();
             }
         }
         self.types.types.never
@@ -1679,6 +1692,7 @@ impl<'db, 'f> InferenceContext<'db, 'f> {
                     kind: ReturnKind::BecomeExpr,
                 });
                 self.infer_expr_no_expect(expr, ExprIsRead::Yes);
+                return self.err_ty();
             }
         }
 

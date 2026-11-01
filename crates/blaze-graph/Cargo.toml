@@ -14,6 +14,7 @@ repository.workspace = true
 doctest = false
 
 [dependencies]
+blaze-core.workspace = true
 blaze-format.workspace = true
 blaze-image.workspace = true
 blaze-mem.workspace = true
@@ -37,6 +38,7 @@ blaze-check.workspace = true
 blaze-alloc-count.workspace = true
 blaze-ids.workspace = true
 expect-test.workspace = true
+hegeltest.workspace = true
 
 [lints]
 workspace = true

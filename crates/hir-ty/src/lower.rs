@@ -388,7 +388,8 @@ pub struct TyLoweringContext<'db, 'a> {
     group_placeholders: bool,
     placeholders: Option<usize>,
     /// The next bound lowered is one on an associated type, `X: for<'b> B<'a, 'b>` in
-    /// `for<'a> T: A<'a, X: for<'b> B<'a, 'b>>`, whose `for` adds to the enclosing binder.
+    /// `for<'a> T: A<'a, X: for<'b> B<'a, 'b>>`, or one of a `for<'a>` predicate, whose `for`
+    /// adds to the enclosing binder.
     bound_of_assoc_ty: bool,
     lifetime_lowering_mode: LifetimeLoweringMode,
     /// The frame of the run lowering: its query's, or that of the inference that made it.
@@ -1459,17 +1460,24 @@ impl<'db, 'a> TyLoweringContext<'db, 'a> {
     ) -> impl Iterator<Item = (Clause<'db>, GenericPredicateSource)> + use<'a, 'b, 'db> {
         let lower_type_outlives = |ctx: &mut TyLoweringContext<'db, 'a>,
                                    target: &TypeRefId,
-                                   bound| {
+                                   bound,
+                                   under_for: bool| {
             let self_ty = ctx.lower_ty(*target);
+            // As rustc's `poly_trait_ref_binder_info`, a `for<'b>` bound of `for<'a> T: ..`
+            // adds to the predicate's binder (after E0316): `for<'a, 'b>`.
+            ctx.bound_of_assoc_ty = under_for;
             Either::Left(ctx.lower_type_bound(bound, self_ty, ignore_bindings))
         };
 
         match where_predicate {
             WherePredicate::TypeBound { lifetimes, target, bound } => match lifetimes {
                 Some(lifetimes) => {
-                    self.with_shifted_in(self.store.names(*lifetimes), |ctx| lower_type_outlives(ctx, target, bound)).0
+                    self.with_shifted_in(self.store.names(*lifetimes), |ctx| {
+                        lower_type_outlives(ctx, target, bound, true)
+                    })
+                    .0
                 }
-                None => lower_type_outlives(self, target, bound),
+                None => lower_type_outlives(self, target, bound, false),
             },
             &WherePredicate::Lifetime { bound, target } => Either::Right(iter::once((
                 Clause(Predicate::new(
@@ -4394,9 +4402,12 @@ fn fn_sig_for_fn_in<'db>(
     ctx_params.defined_anon_consts.extend(ctx_ret.defined_anon_consts);
 
     let binder = ctx_params.bound_vars[0].1;
+    // rustc's `fn_sig` of a foreign item: unsafe unless declared `safe`.
+    let foreign_unsafe =
+        matches!(def.lookup(db).container, ItemContainerId::ExternBlockId(_)) && !data.is_safe();
     let fn_sig_kind = FnSigKind::new(
         data.abi,
-        if data.is_unsafe() { Safety::Unsafe } else { Safety::Safe },
+        if data.is_unsafe() || foreign_unsafe { Safety::Unsafe } else { Safety::Safe },
         data.is_varargs(),
         data.splatted,
         data.params.len(),

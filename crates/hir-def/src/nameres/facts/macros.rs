@@ -34,7 +34,7 @@ use syntax::ast;
 use triomphe::Arc;
 
 use crate::{
-    AstId, AstIdWithPath, ItemContainerId, MacroId, ModuleDefId, ModuleId, UnresolvedMacro,
+    AstId, AstIdWithPath, ItemContainerId, MacroId, ModuleDefId, ModuleId, UnresolvedMacro, UseId,
     item_scope::{BuiltinShadowMode, ImportOrExternCrate, ItemScope, PerNsGlobImports},
     item_tree::{AttrsOrCfgRef, ImportKind, ModItemId, ModItemKind, TreeId},
     macro_call_as_call_id,
@@ -939,6 +939,10 @@ struct StepSink<'db, 'f> {
     /// The crate env the round starts from, and the one the step's crate-level ops made.
     env: &'db CrateEnv,
     env_now: Option<CrateEnv>,
+    /// The std prelude the crate's own `#[prelude_import]` resolved to (core's `prelude::v1`),
+    /// as each component installs it: the env has only the injected one, and this one stays
+    /// over it when an expansion changes the env.
+    own_prelude: Option<(ModuleId, Option<UseId>)>,
     /// The glob marks of the module's scope, read off it at the first `Update`.
     marks: Option<PerNsGlobImports<&'f Frame>>,
     /// Every op but the module's own directives; [`StepSink::into_step`] makes the [`OpLog`].
@@ -995,10 +999,9 @@ impl<'db, 'f> StepSink<'db, 'f> {
             data: cx.data.clone(),
         };
         env.install(&mut def_map);
-        // The crate's own `#[prelude_import]` (core's `prelude::v1`), as each component has it:
-        // the env has only the injected std prelude.
-        if let Some(prelude) = super::unit::round_prelude(db, round) {
-            def_map.prelude = Some(prelude);
+        let own_prelude = super::unit::round_prelude(db, round);
+        if own_prelude.is_some() {
+            def_map.prelude = own_prelude;
         }
         StepSink {
             db,
@@ -1009,6 +1012,7 @@ impl<'db, 'f> StepSink<'db, 'f> {
             local: env.local_def_map(),
             env,
             env_now: None,
+            own_prelude,
             marks: None,
             log: Vec::new_in(frame),
             macros: Vec::new_in(frame),
@@ -1216,6 +1220,9 @@ impl<'db, 'f> StepSink<'db, 'f> {
                 if let Some(next) = self.env().after(op) {
                     self.local = next.local_def_map();
                     next.install(&mut self.def_map);
+                    if self.own_prelude.is_some() {
+                        self.def_map.prelude = self.own_prelude;
+                    }
                     self.env_now = Some(next);
                 }
             }

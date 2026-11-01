@@ -169,7 +169,9 @@ fn maintain_crate(
         Some(it) if !written.crates && it.root == root => (false, it),
         old => (true, CrateState::cold(root, old)),
     };
-    let mut delta = input::read(db, krate, &mut cs, written, cold);
+    let deps_changed =
+        !modules_changed.is_empty() || earlier.iter().any(|it| it.fresh || !it.bindings.is_empty());
+    let mut delta = input::read(db, krate, &mut cs, written, cold, deps_changed);
     work.ops += delta.ops;
     // The root of a crate exporting procedural macros is published censored, and its state row
     // keeps the scope before the censor: a run makes both.
@@ -658,7 +660,7 @@ fn cold(db: &Db, frame: &Frame, krate: Crate) -> (crate::nameres::DefMap, crate:
     let root = queries::crate_root(db, krate);
     let mut cs = CrateState::new(root);
     let none = Written { set: &[], added: &[], removed: &[], roots: &[], crates: true, included: &[] };
-    input::read(db, krate, &mut cs, &none, true);
+    input::read(db, krate, &mut cs, &none, true, false);
     let mut region: FxHashSet<ModuleId> = cs.groups.keys().copied().collect();
     let mut work = Work::default();
     let Cutoff { mut out, mut outside, order, .. } =

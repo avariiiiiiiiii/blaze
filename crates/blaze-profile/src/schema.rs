@@ -111,6 +111,13 @@ pub const SPANS: Table = Table {
             "the function it was of, from its field `function` or `subject`",
         ),
         opt("unit", Type::Utf8, "the codegen unit it was of, from its field `unit`"),
+        // Beside `alloc_bytes` in meaning; at the end so adding them keeps `VERSION`.
+        opt(
+            "frame_grow_copies",
+            Type::U64,
+            "blocks its thread's task frames moved to grow them while it was open (a block grown while not its frame's last is copied whole); null when not counted or when it closed on another thread",
+        ),
+        opt("frame_copied_bytes", Type::U64, "bytes those moves copied"),
     ],
 };
 
@@ -126,6 +133,39 @@ pub const COUNTERS: Table = Table {
         col("value", Type::F64, "the value then"),
         opt("fiber", Type::U32, "the fiber a fiber stack counter is of; null for any other counter"),
         opt("job", Type::U64, "the job that ran on that fiber; null for any other counter"),
+    ],
+};
+
+/// One row a switch of a job on a fiber: started, parked (waiting, or moving to another core),
+/// resumed and ended, on the thread it happened on. A wait is a job's `parked` row and its next
+/// `resumed` one; when their threads differ, the job moved.
+pub const SWITCHES: Table = Table {
+    name: "switches",
+    doc: "one row a switch of a job on a fiber, on the thread it happened on",
+    columns: &[
+        BUILD_ID,
+        PROCESS,
+        THREAD,
+        THREAD_NAME,
+        col("t_ns", Type::I64, "when"),
+        col("event", Type::Dict, "started, parked, resumed or ended"),
+        col(
+            "job",
+            Type::U64,
+            "the job: its slot's generation << 32 | its slot, one job of its driver's life",
+        ),
+        col("fiber", Type::U32, "the fiber it runs on, numbered in its process"),
+        col("core", Type::U32, "the driver's core of the thread"),
+        opt(
+            "wait_kind",
+            Type::Dict,
+            "for parked: what it waits for (job, key, counter, until) or moved; null otherwise",
+        ),
+        opt(
+            "wait_value",
+            Type::U64,
+            "the job's slot, the key's hash, the counter or the driver-clock deadline; null for moved",
+        ),
     ],
 };
 
@@ -233,6 +273,25 @@ pub const TILES: Table = Table {
     ],
 };
 
+/// The tiles of the jobs' lanes: `tiles` with a lane per fiber job in place of a lane per
+/// thread, so a job that waits shows its wait as a gap and a job that moved between threads
+/// is one lane. A result, not stored: the explorer's `tiles` op with `"lane": "job"` makes it
+/// from the `job_spans` view.
+pub const JOB_TILES: Table = Table {
+    name: "job_tiles",
+    doc: "spans of a time range per (process, job, depth, bucket): the explorer's lane per fiber job",
+    columns: &[
+        PROCESS,
+        col("job", Type::U64, "the job, as `switches` numbers it"),
+        col("depth", Type::U16, "the spans' depth"),
+        col("t0_ns", Type::I64, "the bucket's start"),
+        col("t1_ns", Type::I64, "the bucket's end"),
+        col("count", Type::U32, "spans overlapping it"),
+        col("busy_ns", Type::I64, "of the bucket, the time inside any of them"),
+        col("name", Type::Dict, "the longest one's name"),
+    ],
+};
+
 /// The spans each thread is inside now, not yet rows of `spans`: what the live feed sends
 /// beside the rows that closed.
 pub const OPEN: Table = Table {
@@ -249,10 +308,12 @@ pub const OPEN: Table = Table {
     ],
 };
 
-/// Every table the history and the live feed hold. [`TILES`] and [`OPEN`] are results, not
-/// kept.
-pub const TABLES: [&Table; 8] =
-    [&SPANS, &COUNTERS, &BUILDS, &SAMPLES, &PROVENANCE, &INPUTS, &ALLOC_SAMPLES, &HEAP_BY_OWNER];
+/// Every table the history and the live feed hold.
+pub const TABLES: [&Table; 9] =
+    [&SPANS, &COUNTERS, &BUILDS, &SAMPLES, &PROVENANCE, &INPUTS, &ALLOC_SAMPLES, &HEAP_BY_OWNER, &SWITCHES];
+
+/// The tables that are results, made on request and not kept.
+pub const RESULTS: [&Table; 3] = [&TILES, &JOB_TILES, &OPEN];
 
 #[cfg(test)]
 mod tests {
@@ -260,7 +321,7 @@ mod tests {
 
     #[test]
     fn every_table_names_each_column_once() {
-        for table in TABLES.iter().copied().chain([&TILES, &OPEN]) {
+        for table in TABLES.iter().chain(&RESULTS).copied() {
             for (i, it) in table.columns.iter().enumerate() {
                 assert_eq!(
                     table.column(it.name),

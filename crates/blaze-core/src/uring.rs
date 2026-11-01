@@ -1179,7 +1179,7 @@ fn conn_of(conn: Conn) -> Handle<Connection> {
     if handle.generation() % 2 == 1 { handle } else { Handle::from_bits(u64::MAX) }
 }
 
-const _: () = assert!(CONNS < u32::MAX as usize, "u32::MAX is no connection's index");
+const _: () = assert!(CONNS < u32::MAX, "u32::MAX is no connection's index");
 
 /// The tag of a request that is no effect's own (a receive, a cancel).
 const NOBODYS: Tag = Tag(u64::MAX);

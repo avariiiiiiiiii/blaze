@@ -250,10 +250,17 @@ pub(super) fn region_liveness<'a, 'db>(
     }
     let rank: &[usize] = rank;
     let block_end = |point| cfg.block_end(body, cfg.location(point).block);
-    radix::sort_by_key(&mut dropped, |&local| {
+    // Each key holds its local, so the keys are distinct and an unstable sort is stable; in the
+    // frame, so a body of any size sorts them without the global heap.
+    let keys = frame.alloc_slice_fill_with(dropped.len(), |at| {
+        let local = dropped[at];
         let first = least_rank(&drop_live[local], rank, cfg.points, block_end);
         radix::pack_64(first as u64, local as u64)
     });
+    keys.sort_unstable();
+    for (local, &key) in dropped.iter_mut().zip(keys.iter()) {
+        *local = key as u64 as usize;
+    }
     let mut components = DropComponents::new(ctx, regions);
     for &local in dropped.iter() {
         for &rv in components.of(regions.local_tys[local]) {

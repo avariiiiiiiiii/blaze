@@ -31,24 +31,30 @@
 //! - A big core never sits idle while a small core runs a critical job: the scheduler asks the
 //!   job to move ([`Decision::Yield`]), the job looks at its core's flag at its next query miss
 //!   and calls [`Sched::yielded`], and moves to the big core. Nothing is preempted.
+//!
+//! Every driver of the process is a member of one [`World`]: its placement (cores, queues,
+//! clock) is its own, and the wait graph ([`graph`]) is one for all, so a cycle of waits
+//! through jobs of two drivers is refused as one of a single driver is. [`Sched`] is a world
+//! of one driver.
 
 mod cores;
 pub mod fiber;
 #[cfg(all(test, not(blaze_check)))]
 mod fiber_tests;
+mod graph;
 #[cfg(test)]
 mod tests;
 
 use std::{collections::VecDeque, fmt};
 
 use blaze_core::wheel::Wheel;
-use rustc_hash::FxHashMap;
 
 pub use cores::{CoreInfo, Cores, Distances, LEVELS, Level, MAX_CORES, ShapeError};
-pub use fiber::{Carried, NoWait, carry, claim, current_job, key_done, miss, wait};
+pub use fiber::{Carried, NoWait, Switch, SwitchEvent, carry, claim, current_job, key_done, miss, observe, wait};
 
 use crate::Key;
 use cores::{any_in, first_from, get, set};
+use graph::{Graph, Home, Life, On, Waited};
 
 /// How many slot jobs a core runs in a row before it looks at its inbox and queues (Tokio's
 /// `MAX_LIFO_POLLS_PER_TICK`).
@@ -217,69 +223,6 @@ pub enum CoreState {
     Woken,
 }
 
-/// What a suspended job's wait is on, as stored.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-enum Target {
-    None,
-    Job(u32),
-    /// A key entry's index.
-    Key(u32),
-    Counter(u32),
-    Until,
-}
-
-const _: () = assert!(size_of::<Target>() == 8);
-
-/// A job's hot fields: every one a spawn, a pick, a wait or an end reads or writes, in one
-/// record, so each touches one cache line of it.
-#[derive(Clone, Copy)]
-struct Job {
-    state: JobState,
-    critical: bool,
-    /// Queued: the core that holds it; running: its core; suspended or done: where it last ran.
-    core: u32,
-    wait: Target,
-    /// Head of the list of jobs waiting for this one, linked through `next`.
-    waiters: u32,
-    next: u32,
-    /// Head of the list of key entries this job claimed, linked through `key_next_claim`.
-    claims: u32,
-}
-
-const _: () = assert!(size_of::<Job>() <= 32);
-
-const VACANT: Job = Job {
-    state: JobState::Vacant,
-    critical: false,
-    core: NONE,
-    wait: Target::None,
-    waiters: NONE,
-    next: NONE,
-    claims: NONE,
-};
-
-/// A job's cold fields: only counted jobs and the cycle check touch them.
-#[derive(Clone, Copy)]
-struct Cold {
-    counter: u32,
-    /// Its links in its counter's list of jobs.
-    item_prev: u32,
-    item_next: u32,
-    /// The cycle check's visit mark, and the job whose wait reached it.
-    mark: u32,
-    via: u32,
-}
-
-const COLD: Cold = Cold { counter: NONE, item_prev: NONE, item_next: NONE, mark: 0, via: NONE };
-
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-enum CounterState {
-    Free,
-    Live,
-    /// Its owner let it go while jobs still count towards it; freed when the last ends.
-    Dropped,
-}
-
 /// Counts of what the scheduler decided, for a driver's report.
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
 pub struct Stats {
@@ -302,7 +245,25 @@ pub(crate) struct StealRecord {
     on_thief_node: usize,
 }
 
-pub struct Sched {
+/// A job as its member's placement sees it.
+#[derive(Clone, Copy)]
+struct Job {
+    state: JobState,
+    critical: bool,
+    /// Suspended on a timed wait, which the placement keeps; any other wait is the graph's.
+    timed: bool,
+    /// Queued: the core that holds it; running: its core; suspended or done: where it last ran.
+    core: u32,
+    /// Its id in the [`World`].
+    global: u32,
+}
+
+const _: () = assert!(size_of::<Job>() <= 16);
+
+const VACANT: Job = Job { state: JobState::Vacant, critical: false, timed: false, core: NONE, global: NONE };
+
+/// One driver's cores, queues and clock: where its jobs run. Its job ids are its own.
+pub(crate) struct Place {
     cores: Cores,
     now: u64,
     decisions: Vec<Decision>,
@@ -328,39 +289,19 @@ pub struct Sched {
     /// Bit per core asked to move its job and not answered yet.
     yield_sent: Vec<u64>,
 
-    /// By job id.
+    /// By local job id.
     jobs: Vec<Job>,
-    cold: Vec<Cold>,
-    epoch: u32,
-    /// The cycle check's stack of suspended jobs to follow.
-    dfs: Vec<u32>,
-
-    // Per key flight.
-    keys: FxHashMap<Key, u32>,
-    key_name: Vec<Key>,
-    key_claimer: Vec<u32>,
-    key_waiters: Vec<u32>,
-    key_next_claim: Vec<u32>,
-    key_free: Vec<u32>,
-
-    // Per counter.
-    counter_state: Vec<CounterState>,
-    counter_left: Vec<u32>,
-    counter_waiters: Vec<u32>,
-    counter_head: Vec<u32>,
-    counter_free: Vec<u32>,
-
     timers: Wheel<u32>,
-    /// What a step collects before it acts on it: waiters woken, timers fired.
+    /// What a step collects before it acts on it: timers fired.
     scratch: Vec<u32>,
 
     #[cfg(test)]
-    pub(crate) steals: Vec<StealRecord>,
+    steals: Vec<StealRecord>,
 }
 
-impl Sched {
+impl Place {
     /// Every core parked, room for `jobs` job ids before a column grows.
-    pub fn new(cores: Cores, jobs: usize) -> Sched {
+    fn new(cores: Cores, jobs: usize) -> Place {
         let n = cores.len();
         let words = cores.words();
         let mut parked = Vec::with_capacity(words);
@@ -378,7 +319,7 @@ impl Sched {
             queue.push(VecDeque::with_capacity(256));
             urgent.push(VecDeque::with_capacity(64));
         }
-        let mut sched = Sched {
+        let mut place = Place {
             now: 0,
             decisions: Vec::with_capacity(64),
             stats: Stats::default(),
@@ -396,116 +337,95 @@ impl Sched {
             critical_small: zeros(words),
             yield_sent: zeros(words),
             jobs: Vec::with_capacity(jobs),
-            cold: Vec::with_capacity(jobs),
-            epoch: 0,
-            dfs: Vec::with_capacity(64),
-            keys: FxHashMap::with_capacity_and_hasher(jobs, Default::default()),
-            key_name: Vec::with_capacity(jobs),
-            key_claimer: Vec::with_capacity(jobs),
-            key_waiters: Vec::with_capacity(jobs),
-            key_next_claim: Vec::with_capacity(jobs),
-            key_free: Vec::with_capacity(jobs),
-            counter_state: Vec::with_capacity(64),
-            counter_left: Vec::with_capacity(64),
-            counter_waiters: Vec::with_capacity(64),
-            counter_head: Vec::with_capacity(64),
-            counter_free: Vec::with_capacity(64),
             timers: Wheel::new(),
             scratch: Vec::with_capacity(64),
             cores,
             #[cfg(test)]
             steals: Vec::new(), // alloc: test bookkeeping
         };
-        sched.core_state.resize(n, CoreState::Parked);
-        sched.running.resize(n, NONE);
-        sched.reserved.resize(n, NONE);
-        sched.slot.resize(n, NONE);
-        sched.lifo_runs.resize(n, 0);
-        sched
+        place.core_state.resize(n, CoreState::Parked);
+        place.running.resize(n, NONE);
+        place.reserved.resize(n, NONE);
+        place.slot.resize(n, NONE);
+        place.lifo_runs.resize(n, 0);
+        place
     }
 
-    pub fn cores(&self) -> &Cores {
+    pub(crate) fn cores(&self) -> &Cores {
         &self.cores
     }
 
-    pub fn stats(&self) -> Stats {
+    pub(crate) fn stats(&self) -> Stats {
         self.stats
     }
 
-    pub fn now(&self) -> u64 {
+    pub(crate) fn now(&self) -> u64 {
         self.now
     }
 
-    pub fn job_state(&self, job: JobId) -> JobState {
-        self.state_of(job.0)
-    }
-
-    /// Where the job is held, runs, or last ran.
-    pub fn job_core(&self, job: JobId) -> Option<CoreId> {
-        let core = self.jobs.get(job.0 as usize).map_or(NONE, |it| it.core);
-        (core != NONE).then_some(CoreId(core))
-    }
-
-    pub fn is_critical(&self, job: JobId) -> bool {
-        self.jobs.get(job.0 as usize).is_some_and(|it| it.critical)
-    }
-
-    fn state_of(&self, job: u32) -> JobState {
+    pub(crate) fn job_state(&self, job: u32) -> JobState {
         self.jobs.get(job as usize).map_or(JobState::Vacant, |it| it.state)
     }
 
-    pub fn core_state(&self, core: CoreId) -> CoreState {
+    /// Where the job is held, runs, or last ran.
+    pub(crate) fn job_core(&self, job: u32) -> Option<CoreId> {
+        let core = self.jobs.get(job as usize).map_or(NONE, |it| it.core);
+        (core != NONE).then_some(CoreId(core))
+    }
+
+    pub(crate) fn is_critical(&self, job: u32) -> bool {
+        self.jobs.get(job as usize).is_some_and(|it| it.critical)
+    }
+
+    /// The job's id in the world.
+    pub(crate) fn global(&self, job: u32) -> JobId {
+        JobId(self.jobs[job as usize].global)
+    }
+
+    pub(crate) fn core_state(&self, core: CoreId) -> CoreState {
         self.core_state[core.0 as usize]
     }
 
-    pub fn running(&self, core: CoreId) -> Option<JobId> {
+    /// The local id of the job `core` runs.
+    pub(crate) fn running(&self, core: CoreId) -> Option<u32> {
         let job = self.running[core.0 as usize];
-        (job != NONE).then_some(JobId(job))
+        (job != NONE).then_some(job)
     }
 
-    /// The decisions made since the last call, in the order made.
-    pub fn take_decisions(&mut self) -> std::vec::Drain<'_, Decision> {
+    /// The decisions made since the last call, in the order made, by local job id.
+    pub(crate) fn take_decisions(&mut self) -> std::vec::Drain<'_, Decision> {
         self.decisions.drain(..)
     }
 
-    /// When the next timed wait is due: the driver calls [`Sched::advance_clock`] by then.
-    pub fn next_deadline(&mut self) -> Option<u64> {
+    pub(crate) fn next_deadline(&mut self) -> Option<u64> {
         self.timers.next_deadline()
     }
 
-    /// `job` is new, to run where `how` says.
-    ///
-    /// # Panics
-    ///
-    /// Where `job` is live (spawned and not done), its parent is not running, its counter is
-    /// not live, or its hint names a core, group or node the shape does not have.
-    pub fn spawn(&mut self, job: JobId, how: Spawn) {
-        assert!(job.0 < MAX_JOBS, "job {} is past the scheduler's {MAX_JOBS} ids", job.0);
-        self.ensure(job.0);
-        let j = job.0 as usize;
+    /// `job` is new, world id `global`; `spawner` is its parent's local id when its parent
+    /// runs here.
+    fn spawn(&mut self, job: u32, global: JobId, spawner: Option<u32>, hint: Affinity, critical: bool) {
+        let need = job as usize + 1;
+        if self.jobs.len() < need {
+            self.jobs.resize(need, VACANT);
+        }
+        let j = job as usize;
         assert!(
             matches!(self.jobs[j].state, JobState::Vacant | JobState::Done),
             "job {} spawned while it is live ({:?})",
-            job.0,
+            global.0,
             self.jobs[j].state
         );
-        let spawner = how.parent.map(|parent| {
-            assert!(
-                self.state_of(parent.0) == JobState::Running,
-                "job {}'s parent {} is not running",
-                job.0,
-                parent.0
-            );
-            self.jobs[parent.0 as usize].core
+        let spawner = spawner.map(|parent| {
+            assert!(self.job_state(parent) == JobState::Running, "job {}'s parent is not running", global.0);
+            self.jobs[parent as usize].core
         });
-        let critical = how.critical;
-        let home = match how.hint {
+        let home = match hint {
             Affinity::Spawner => match spawner {
                 Some(core) => core,
                 None => self.least_loaded(critical, |_, _| true),
             },
             Affinity::Core(core) => {
-                assert!((core.0 as usize) < self.cores.len(), "job {} hinted to core {}, past the shape", job.0, core.0);
+                assert!((core.0 as usize) < self.cores.len(), "job {} hinted to core {}, past the shape", global.0, core.0);
                 core.0
             }
             Affinity::L3(l3) => match spawner.filter(|&core| self.cores.in_l3(core, l3)) {
@@ -518,266 +438,62 @@ impl Sched {
             },
             Affinity::Any => self.least_loaded(critical, |_, _| true),
         };
-        self.jobs[j] = Job { state: JobState::Queued, critical: how.critical, core: home, ..VACANT };
-        self.cold[j] = COLD;
-        if let Some(counter) = how.counter {
-            self.attach(job.0, counter.0);
-        }
+        self.jobs[j] = Job { state: JobState::Queued, critical, timed: false, core: home, global: global.0 };
         if spawner == Some(home) {
-            self.enqueue(home, job.0);
+            self.enqueue(home, job);
             self.refresh(home);
             self.balance(home);
         } else {
-            self.place_remote(job.0, home);
+            self.place_remote(job, home);
         }
     }
 
-    /// A counter at zero, for a parallel map's jobs to count towards ([`Spawn::counted`]).
-    pub fn counter(&mut self) -> CounterId {
-        let counter = match self.counter_free.pop() {
-            Some(counter) => counter,
-            None => {
-                self.counter_state.push(CounterState::Free);
-                self.counter_left.push(0);
-                self.counter_waiters.push(NONE);
-                self.counter_head.push(NONE);
-                (self.counter_state.len() - 1) as u32
-            }
-        };
-        let c = counter as usize;
-        self.counter_state[c] = CounterState::Live;
-        self.counter_left[c] = 0;
-        self.counter_waiters[c] = NONE;
-        self.counter_head[c] = NONE;
-        CounterId(counter)
-    }
-
-    /// The counter's owner is done with it; it is freed once no job counts towards it.
-    ///
-    /// # Panics
-    ///
-    /// Where the counter is not live or a job still waits on it.
-    pub fn drop_counter(&mut self, counter: CounterId) {
-        let c = counter.0 as usize;
-        assert!(self.counter_state.get(c) == Some(&CounterState::Live), "counter {} dropped while not live", counter.0);
-        assert!(self.counter_waiters[c] == NONE, "counter {} dropped while a job waits on it", counter.0);
-        if self.counter_left[c] == 0 {
-            self.free_counter(counter.0);
-        } else {
-            self.counter_state[c] = CounterState::Dropped;
-        }
-    }
-
-    /// `by` (running, or the driver for `None`: IO, a child process) makes `key`'s value.
-    /// `false` when the key has a flight already: wait for it instead.
-    ///
-    /// # Panics
-    ///
-    /// Where `by` is not running.
-    pub fn claim(&mut self, key: Key, by: Option<JobId>) -> bool {
-        if let Some(job) = by {
-            assert!(self.state_of(job.0) == JobState::Running, "job {} claimed a key while not running", job.0);
-        }
-        if self.keys.contains_key(&key) {
-            return false;
-        }
-        let entry = match self.key_free.pop() {
-            Some(entry) => {
-                self.key_name[entry as usize] = key;
-                entry
-            }
-            None => {
-                self.key_name.push(key);
-                self.key_claimer.push(NONE);
-                self.key_waiters.push(NONE);
-                self.key_next_claim.push(NONE);
-                (self.key_name.len() - 1) as u32
-            }
-        };
-        let e = entry as usize;
-        self.key_claimer[e] = by.map_or(NONE, |job| job.0);
-        self.key_waiters[e] = NONE;
-        self.key_next_claim[e] = NONE;
-        if let Some(job) = by {
-            self.key_next_claim[e] = self.jobs[job.0 as usize].claims;
-            self.jobs[job.0 as usize].claims = entry;
-        }
-        self.keys.insert(key, entry);
-        true
-    }
-
-    /// `job`, running, waits for `on`; its core runs something else.
-    ///
-    /// # Errors
-    ///
-    /// The [`Cycle`] the wait would close; the job goes on running and nothing changed.
-    ///
-    /// # Panics
-    ///
-    /// Where `job` is not running, or waits for a job never spawned or a counter not live.
-    pub fn suspended(&mut self, job: JobId, on: Wait) -> Result<Suspend, Cycle> {
-        let j = job.0 as usize;
-        assert!(self.state_of(job.0) == JobState::Running, "job {} suspended while not running", job.0);
-        let target = match on {
-            Wait::Job(other) => match self.state_of(other.0) {
-                JobState::Done => return Ok(Suspend::Ready),
-                JobState::Vacant => panic!("job {} waits for job {}, never spawned", job.0, other.0),
-                _ => Target::Job(other.0),
-            },
-            Wait::Key(key) => match self.keys.get(&key) {
-                None => return Ok(Suspend::Ready),
-                Some(&entry) => Target::Key(entry),
-            },
-            Wait::Counter(counter) => {
-                let c = counter.0 as usize;
-                assert!(
-                    self.counter_state.get(c) == Some(&CounterState::Live),
-                    "job {} waits on counter {}, not live",
-                    job.0,
-                    counter.0
-                );
-                if self.counter_left[c] == 0 {
-                    return Ok(Suspend::Ready);
-                }
-                Target::Counter(counter.0)
-            }
-            Wait::Until(at) => {
-                if at <= self.now {
-                    return Ok(Suspend::Ready);
-                }
-                Target::Until
-            }
-        };
-        if let Some(from) = self.closes_cycle(job.0, target) {
-            self.stats.cycles += 1;
-            return Err(self.cycle(job.0, from));
-        }
-        match target {
-            Target::Job(other) => {
-                self.jobs[j].next = self.jobs[other as usize].waiters;
-                self.jobs[other as usize].waiters = job.0;
-            }
-            Target::Key(entry) => {
-                self.jobs[j].next = self.key_waiters[entry as usize];
-                self.key_waiters[entry as usize] = job.0;
-            }
-            Target::Counter(counter) => {
-                self.jobs[j].next = self.counter_waiters[counter as usize];
-                self.counter_waiters[counter as usize] = job.0;
-            }
-            Target::Until => {
-                let Wait::Until(at) = on else { unreachable!("an `Until` target is an `Until` wait") };
-                self.timers.insert(at, job.0);
-            }
-            Target::None => unreachable!("a wait has a target"),
-        }
-        self.jobs[j].wait = target;
+    /// `job`, running, waits (on the graph); its core runs something else.
+    fn suspend(&mut self, job: u32) {
+        let j = job as usize;
         self.jobs[j].state = JobState::Suspended;
         let core = self.jobs[j].core;
         self.vacate(core);
         self.pick(core);
-        Ok(Suspend::Waiting)
     }
 
-    /// `job`, running, ended, and with it every key it claimed. Its waiters and theirs, and
-    /// those of its counter if it was the last, wake on its core, the first in its slot; the
-    /// core runs its next job.
-    ///
-    /// # Panics
-    ///
-    /// Where `job` is not running.
-    pub fn done(&mut self, job: JobId) {
-        let j = job.0 as usize;
-        assert!(self.state_of(job.0) == JobState::Running, "job {} done while not running", job.0);
+    /// `job`, running, waits for the clock to reach `at`.
+    fn wait_until(&mut self, job: u32, at: u64) -> Suspend {
+        if at <= self.now {
+            return Suspend::Ready;
+        }
+        self.timers.insert(at, job);
+        self.jobs[job as usize].timed = true;
+        self.suspend(job);
+        Suspend::Waiting
+    }
+
+    /// `job`, running, ended; `woken` (local ids) wake on its core, the first in its slot.
+    fn done(&mut self, job: u32, woken: &[u32]) {
+        let j = job as usize;
         let core = self.jobs[j].core;
         self.jobs[j].state = JobState::Done;
         self.vacate(core);
-        let mut woken = std::mem::take(&mut self.scratch);
-        woken.clear();
-        let head = std::mem::replace(&mut self.jobs[j].waiters, NONE);
-        Sched::drain_list(head, &mut self.jobs, &mut woken);
-        let mut claim = std::mem::replace(&mut self.jobs[j].claims, NONE);
-        while claim != NONE {
-            let next = self.key_next_claim[claim as usize];
-            let head = std::mem::replace(&mut self.key_waiters[claim as usize], NONE);
-            Sched::drain_list(head, &mut self.jobs, &mut woken);
-            self.free_key(claim);
-            claim = next;
-        }
-        let counter = self.cold[j].counter;
-        if counter != NONE {
-            self.detach(job.0);
-            let c = counter as usize;
-            self.counter_left[c] -= 1;
-            if self.counter_left[c] == 0 {
-                let head = std::mem::replace(&mut self.counter_waiters[c], NONE);
-                Sched::drain_list(head, &mut self.jobs, &mut woken);
-                if self.counter_state[c] == CounterState::Dropped {
-                    self.free_counter(counter);
-                }
-            }
-        }
-        self.wake_local(core, &woken);
-        self.scratch = woken;
+        self.wake_local(core, woken);
         self.pick(core);
         self.balance(core);
     }
 
-    /// `key`'s flight ended. Its waiters wake on its claimer's core, the first in its slot, or
-    /// for a flight of the driver's, each on the core it last ran on.
-    ///
-    /// # Panics
-    ///
-    /// Where the key has no flight, or its claimer is not running.
-    pub fn key_done(&mut self, key: Key) {
-        let entry = self.keys.get(&key).copied().unwrap_or_else(|| panic!("key {key:?} done with no flight"));
-        let e = entry as usize;
-        let claimer = self.key_claimer[e];
-        let mut woken = std::mem::take(&mut self.scratch);
-        woken.clear();
-        let head = std::mem::replace(&mut self.key_waiters[e], NONE);
-        Sched::drain_list(head, &mut self.jobs, &mut woken);
-        if claimer != NONE {
-            let c = claimer as usize;
-            assert!(self.jobs[c].state == JobState::Running, "key {key:?} done while its job {claimer} is not running");
-            let mut at = self.jobs[c].claims;
-            if at == entry {
-                self.jobs[c].claims = self.key_next_claim[e];
-            } else {
-                while at != NONE {
-                    let next = self.key_next_claim[at as usize];
-                    if next == entry {
-                        self.key_next_claim[at as usize] = self.key_next_claim[e];
-                        break;
-                    }
-                    at = next;
-                }
-            }
-            self.free_key(entry);
-            let core = self.jobs[c].core;
-            self.wake_local(core, &woken);
-            self.balance(core);
-        } else {
-            self.free_key(entry);
-            for &waiter in &woken {
-                self.ready(waiter);
-                let home = self.jobs[waiter as usize].core;
-                self.place_remote(waiter, home);
-            }
-        }
-        self.scratch = woken;
+    /// `woken` wake on `core`, which finished what they waited for and goes on running.
+    fn woken_on(&mut self, core: u32, woken: &[u32]) {
+        self.wake_local(core, woken);
+        self.balance(core);
     }
 
-    /// `job`, running, saw its core's move flag at a query miss. It moves to the nearest idle
-    /// core of the highest capacity, if one is still idle and the flag is not stale (the job
-    /// stopped being critical since).
-    ///
-    /// # Panics
-    ///
-    /// Where `job` is not running.
-    pub fn yielded(&mut self, job: JobId) -> Yielded {
-        let j = job.0 as usize;
-        assert!(self.state_of(job.0) == JobState::Running, "job {} yielded while not running", job.0);
+    /// A suspended job is runnable again, woken from elsewhere: on the core it last ran on.
+    fn ready_remote(&mut self, job: u32) {
+        self.ready(job);
+        let home = self.jobs[job as usize].core;
+        self.place_remote(job, home);
+    }
+
+    fn yielded(&mut self, job: u32) -> Yielded {
+        let j = job as usize;
         let core = self.jobs[j].core;
         let asked = get(&self.yield_sent, core);
         set(&mut self.yield_sent, core, false);
@@ -787,17 +503,14 @@ impl Sched {
         let Some(big) = self.search_parked(core, Some(self.cores.big())) else { return Yielded::Stay };
         self.vacate(core);
         self.jobs[j].state = JobState::Queued;
-        self.hand(big, job.0);
+        self.hand(big, job);
         self.stats.moves += 1;
         self.pick(core);
         Yielded::Moved
     }
 
-    /// The profiler says whether `job` is on the critical path. A running job moves at its
-    /// next miss if it should; a queued one keeps its queue until it next moves.
-    pub fn set_critical(&mut self, job: JobId, critical: bool) {
-        let j = job.0 as usize;
-        assert!(j < self.jobs.len(), "job {} was never spawned", job.0);
+    fn set_critical(&mut self, job: u32, critical: bool) {
+        let j = job as usize;
         self.jobs[j].critical = critical;
         if self.jobs[j].state == JobState::Running {
             let core = self.jobs[j].core;
@@ -809,13 +522,7 @@ impl Sched {
         }
     }
 
-    /// `core`'s thread is free: it started, was woken, or woke for no reason. It runs what it
-    /// was handed, or its own next job, or steals; with nothing, it parks.
-    ///
-    /// # Panics
-    ///
-    /// Where `core` is running a job.
-    pub fn core_idle(&mut self, core: CoreId) {
+    fn core_idle(&mut self, core: CoreId) {
         let c = core.0 as usize;
         assert!(self.running[c] == NONE, "core {} idle while it runs job {}", core.0, self.running[c]);
         if self.core_state[c] == CoreState::Parked {
@@ -825,83 +532,15 @@ impl Sched {
         self.pick(core.0);
     }
 
-    /// The clock reads `now` nanoseconds: every wait due by then is runnable, on the core its
-    /// job last ran on.
-    pub fn advance_clock(&mut self, now: u64) {
+    fn advance_clock(&mut self, now: u64) {
         self.now = self.now.max(now);
         let mut fired = std::mem::take(&mut self.scratch);
         fired.clear();
         self.timers.advance(self.now, |_, job| fired.push(job));
         for &job in &fired {
-            self.ready(job);
-            let home = self.jobs[job as usize].core;
-            self.place_remote(job, home);
+            self.ready_remote(job);
         }
         self.scratch = fired;
-    }
-
-    fn ensure(&mut self, job: u32) {
-        let need = job as usize + 1;
-        if self.jobs.len() < need {
-            self.jobs.resize(need, VACANT);
-            self.cold.resize(need, COLD);
-        }
-    }
-
-    fn free_key(&mut self, entry: u32) {
-        let e = entry as usize;
-        self.keys.remove(&self.key_name[e]);
-        self.key_claimer[e] = NONE;
-        self.key_waiters[e] = NONE;
-        self.key_next_claim[e] = NONE;
-        self.key_free.push(entry);
-    }
-
-    fn free_counter(&mut self, counter: u32) {
-        let c = counter as usize;
-        self.counter_state[c] = CounterState::Free;
-        self.counter_head[c] = NONE;
-        self.counter_free.push(counter);
-    }
-
-    /// Counts `job` towards `counter`, at the head of its list.
-    fn attach(&mut self, job: u32, counter: u32) {
-        let c = counter as usize;
-        assert!(
-            self.counter_state.get(c) == Some(&CounterState::Live),
-            "job {job} counted towards counter {counter}, not live"
-        );
-        self.counter_left[c] += 1;
-        let head = self.counter_head[c];
-        self.cold[job as usize] = Cold { counter, item_prev: NONE, item_next: head, ..COLD };
-        if head != NONE {
-            self.cold[head as usize].item_prev = job;
-        }
-        self.counter_head[c] = job;
-    }
-
-    fn detach(&mut self, job: u32) {
-        let Cold { counter, item_prev, item_next, .. } = self.cold[job as usize];
-        match item_prev {
-            NONE => self.counter_head[counter as usize] = item_next,
-            prev => self.cold[prev as usize].item_next = item_next,
-        }
-        if item_next != NONE {
-            self.cold[item_next as usize].item_prev = item_prev;
-        }
-        let cold = &mut self.cold[job as usize];
-        cold.counter = NONE;
-        cold.item_prev = NONE;
-        cold.item_next = NONE;
-    }
-
-    /// The jobs of a waiter list from `head` into `into`, unlinked.
-    fn drain_list(head: u32, jobs: &mut [Job], into: &mut Vec<u32>) {
-        let mut at = head;
-        while at != NONE {
-            into.push(at);
-            at = std::mem::replace(&mut jobs[at as usize].next, NONE);
-        }
     }
 
     /// A suspended job is runnable again.
@@ -909,7 +548,7 @@ impl Sched {
         let j = job as usize;
         debug_assert_eq!(self.jobs[j].state, JobState::Suspended);
         self.jobs[j].state = JobState::Queued;
-        self.jobs[j].wait = Target::None;
+        self.jobs[j].timed = false;
     }
 
     /// `core` no longer runs a job.
@@ -1203,80 +842,6 @@ impl Sched {
         }
     }
 
-    /// Whether the jobs `target` reaches, followed through every suspended job's wait, reach
-    /// `job`: the job whose wait closes the cycle, if so.
-    fn closes_cycle(&mut self, job: u32, target: Target) -> Option<u32> {
-        self.epoch = self.epoch.wrapping_add(1);
-        if self.epoch == 0 {
-            for cold in &mut self.cold {
-                cold.mark = 0;
-            }
-            self.epoch = 1;
-        }
-        self.cold[job as usize].mark = self.epoch;
-        let mut stack = std::mem::take(&mut self.dfs);
-        stack.clear();
-        let mut found = self.expand(job, job, target, &mut stack);
-        while found.is_none() {
-            let Some(from) = stack.pop() else { break };
-            let wait = self.jobs[from as usize].wait;
-            found = self.expand(job, from, wait, &mut stack);
-        }
-        self.dfs = stack;
-        found
-    }
-
-    fn expand(&mut self, asker: u32, from: u32, target: Target, stack: &mut Vec<u32>) -> Option<u32> {
-        match target {
-            Target::Job(other) => self.visit(asker, from, other, stack),
-            Target::Key(entry) => match self.key_claimer[entry as usize] {
-                NONE => None,
-                claimer => self.visit(asker, from, claimer, stack),
-            },
-            Target::Counter(counter) => {
-                let mut at = self.counter_head[counter as usize];
-                while at != NONE {
-                    let next = self.cold[at as usize].item_next;
-                    if let Some(found) = self.visit(asker, from, at, stack) {
-                        return Some(found);
-                    }
-                    at = next;
-                }
-                None
-            }
-            Target::Until | Target::None => None,
-        }
-    }
-
-    fn visit(&mut self, asker: u32, from: u32, job: u32, stack: &mut Vec<u32>) -> Option<u32> {
-        if job == asker {
-            return Some(from);
-        }
-        let cold = &mut self.cold[job as usize];
-        if cold.mark == self.epoch {
-            return None;
-        }
-        cold.mark = self.epoch;
-        cold.via = from;
-        if self.jobs[job as usize].state == JobState::Suspended {
-            stack.push(job);
-        }
-        None
-    }
-
-    /// The cycle `closes_cycle` found, from the asker: back from `from` along each job's `via`.
-    fn cycle(&self, asker: u32, from: u32) -> Cycle {
-        let mut jobs = Vec::with_capacity(4); // alloc: an error, off every hot path
-        let mut at = from;
-        while at != asker {
-            jobs.push(JobId(at));
-            at = self.cold[at as usize].via;
-        }
-        jobs.push(JobId(asker));
-        jobs.reverse();
-        Cycle { jobs }
-    }
-
     #[cfg(not(test))]
     fn record_steal(&mut self, _thief: u32, _victim: u32) {}
 
@@ -1297,10 +862,10 @@ impl Sched {
         self.steals.push(StealRecord { thief, victim, on_thief_node });
     }
 
-    /// Every structure agrees with every other, and no job is stealable while a core is
-    /// parked.
+    /// Every invariant of the placement that a step must keep, checked by a full scan; a
+    /// suspended job's wait is checked against the graph by [`World::audit`].
     #[cfg(test)]
-    pub(crate) fn audit(&self) {
+    fn audit(&self) {
         let n = self.cores.len();
         let mut seen = vec![0u32; self.jobs.len()]; // alloc: test check
         let mut parked = 0;
@@ -1348,29 +913,470 @@ impl Sched {
             let state = record.state;
             let held = seen[job];
             assert_eq!(held, u32::from(state == JobState::Queued), "job {job} ({state:?}) is held {held} times");
-            assert_eq!(record.wait != Target::None, state == JobState::Suspended, "job {job}'s wait");
-            let counter = self.cold[job].counter;
-            if counter != NONE {
-                assert!(matches!(state, JobState::Queued | JobState::Running | JobState::Suspended), "job {job} counted");
+            assert!(!record.timed || state == JobState::Suspended, "job {job} timed while {state:?}");
+        }
+    }
+}
+
+/// Every driver of the process: one wait graph ([`graph::Graph`]) over all their jobs, and each
+/// driver's own placement (its member, a [`Place`]). A job has a world id, unique among live
+/// jobs of every driver, and a local id, its index in its member; a wait, a claim and a cycle
+/// name world ids, and a member's decisions name local ones. A job woken by a job of another
+/// member goes to the core it last ran on, as a wake from a timer does. Sans-IO, as [`Sched`].
+pub(crate) struct World {
+    graph: Graph,
+    /// By member; a driver that stopped leaves `None`, never reused, so a stale home names
+    /// no other driver's job.
+    members: Vec<Option<Place>>,
+    /// By world id: bumped at each end, so a [`fiber::Handle`] tells an old job from a new one.
+    generation: Vec<u32>,
+    free: Vec<u32>,
+    /// Members whose placement made decisions since the last [`World::take_dirty`].
+    dirty: Vec<u32>,
+    woken: Vec<u32>,
+    here: Vec<u32>,
+}
+
+impl World {
+    pub(crate) fn new(jobs: usize) -> World {
+        World {
+            graph: Graph::new(jobs),
+            members: Vec::with_capacity(4),
+            generation: Vec::with_capacity(jobs),
+            free: Vec::with_capacity(jobs),
+            dirty: Vec::with_capacity(4),
+            woken: Vec::with_capacity(64),
+            here: Vec::with_capacity(64),
+        }
+    }
+
+    /// A new member, every core parked.
+    pub(crate) fn join(&mut self, cores: Cores, jobs: usize) -> u32 {
+        self.members.push(Some(Place::new(cores, jobs)));
+        (self.members.len() - 1) as u32
+    }
+
+    /// The member stopped; its placement goes.
+    pub(crate) fn leave(&mut self, member: u32) -> Option<Place> {
+        self.members.get_mut(member as usize).and_then(Option::take)
+    }
+
+    pub(crate) fn place(&self, member: u32) -> &Place {
+        self.members[member as usize].as_ref().expect("a member of the world that left")
+    }
+
+    fn place_mut(&mut self, member: u32) -> &mut Place {
+        self.members[member as usize].as_mut().expect("a member of the world that left")
+    }
+
+    /// A world id for a new job.
+    pub(crate) fn alloc(&mut self) -> JobId {
+        match self.free.pop() {
+            Some(job) => JobId(job),
+            None => {
+                self.generation.push(0);
+                JobId((self.generation.len() - 1) as u32)
             }
         }
-        for (c, &state) in self.counter_state.iter().enumerate() {
-            let mut items = 0;
-            let mut at = self.counter_head[c];
-            while at != NONE {
-                assert_eq!(self.cold[at as usize].counter, c as u32, "job {at} in counter {c}'s list");
-                items += 1;
-                at = self.cold[at as usize].item_next;
+    }
+
+    pub(crate) fn generation(&self, job: JobId) -> u32 {
+        self.generation.get(job.0 as usize).copied().unwrap_or(0)
+    }
+
+    /// The local id of a live or ended job, and its member.
+    pub(crate) fn home(&self, job: JobId) -> (u32, u32) {
+        let home = self.graph.home(job);
+        (home.member, home.local)
+    }
+
+    /// The members whose placements made decisions, taken into `into` (cleared first).
+    pub(crate) fn take_dirty(&mut self, into: &mut Vec<u32>) {
+        into.clear();
+        into.append(&mut self.dirty);
+        into.sort_unstable();
+        into.dedup();
+    }
+
+    pub(crate) fn take_decisions(&mut self, member: u32) -> std::vec::Drain<'_, Decision> {
+        self.place_mut(member).take_decisions()
+    }
+
+    fn touch(&mut self, member: u32) {
+        if !self.dirty.contains(&member) {
+            self.dirty.push(member);
+        }
+    }
+
+    /// `job` (from [`World::alloc`], or the caller's own ids where it is the one member) is
+    /// new, local id `local` of `member`, placed as `how` says. A parent of another member
+    /// is no spawner.
+    ///
+    /// # Panics
+    ///
+    /// Where `job` is live, its parent is not running, its counter is not live, or its hint
+    /// names a core, group or node the shape does not have.
+    pub(crate) fn spawn(&mut self, member: u32, local: u32, job: JobId, how: Spawn) {
+        if self.generation.len() <= job.0 as usize {
+            self.generation.resize(job.0 as usize + 1, 0);
+        }
+        let spawner = how.parent.and_then(|parent| {
+            let home = self.graph.home(parent);
+            let running = home.member != NONE
+                && self.members.get(home.member as usize).is_some_and(|place| {
+                    place.as_ref().is_some_and(|place| place.job_state(home.local) == JobState::Running)
+                });
+            assert!(running, "job {}'s parent {} is not running", job.0, parent.0);
+            (home.member == member).then_some(home.local)
+        });
+        assert!(self.graph.life(job) != Life::Live, "job {} spawned while it is live", job.0);
+        self.place_mut(member).spawn(local, job, spawner, how.hint, how.critical);
+        self.graph.add(job, Home { member, local }, how.counter);
+        self.touch(member);
+    }
+
+    pub(crate) fn counter(&mut self) -> CounterId {
+        self.graph.counter()
+    }
+
+    pub(crate) fn drop_counter(&mut self, counter: CounterId) {
+        self.graph.drop_counter(counter);
+    }
+
+    fn assert_running(&self, job: JobId, what: &str) -> (u32, u32) {
+        let (member, local) = self.home(job);
+        let running = member != NONE
+            && self.members.get(member as usize).is_some_and(|place| {
+                place.as_ref().is_some_and(|place| place.job_state(local) == JobState::Running)
+            });
+        assert!(running, "job {} {what} while not running", job.0);
+        (member, local)
+    }
+
+    /// `by` (running, or a driver for `None`: IO, a child process) makes `key`'s value.
+    /// `false` when the key has a flight already.
+    pub(crate) fn claim(&mut self, key: Key, by: Option<JobId>) -> bool {
+        if let Some(job) = by {
+            self.assert_running(job, "claimed a key");
+        }
+        self.graph.claim(key, by)
+    }
+
+    /// `job`, running on `member`, waits for `on`; its core runs something else.
+    pub(crate) fn suspended(&mut self, member: u32, job: JobId, on: Wait) -> Result<Suspend, Cycle> {
+        let (home, local) = self.assert_running(job, "suspended");
+        assert_eq!(home, member, "job {} suspended on a member not its own", job.0);
+        let on = match on {
+            Wait::Until(at) => {
+                let waited = self.place_mut(member).wait_until(local, at);
+                self.touch(member);
+                return Ok(waited);
             }
-            match state {
-                CounterState::Free => assert_eq!(items, 0, "free counter {c}"),
-                CounterState::Live | CounterState::Dropped => {
-                    assert_eq!(items, self.counter_left[c], "counter {c}'s count");
+            Wait::Job(other) => On::Job(other),
+            Wait::Key(key) => On::Key(key),
+            Wait::Counter(counter) => On::Counter(counter),
+        };
+        match self.graph.wait(job, on) {
+            Ok(Waited::Ready) => Ok(Suspend::Ready),
+            Ok(Waited::Waiting) => {
+                self.place_mut(member).suspend(local);
+                self.touch(member);
+                Ok(Suspend::Waiting)
+            }
+            Err(cycle) => {
+                self.place_mut(member).stats.cycles += 1;
+                Err(cycle)
+            }
+        }
+    }
+
+    /// The woken jobs in `self.woken` of `member` into `self.here` (local ids), the others
+    /// handed to their members.
+    fn split(&mut self, member: Option<u32>) {
+        let mut woken = std::mem::take(&mut self.woken);
+        let mut here = std::mem::take(&mut self.here);
+        here.clear();
+        for &job in &woken {
+            let home = self.graph.home(JobId(job));
+            if Some(home.member) == member {
+                here.push(home.local);
+            } else if let Some(Some(place)) = self.members.get_mut(home.member as usize) {
+                place.ready_remote(home.local);
+                self.touch(home.member);
+            }
+        }
+        woken.clear();
+        self.woken = woken;
+        self.here = here;
+    }
+
+    /// `job`, running on `member`, ended, and with it every key it claimed. Its waiters and
+    /// theirs, and those of its counter if it was the last, wake: those of its member on its
+    /// core, the first in its slot.
+    pub(crate) fn done(&mut self, member: u32, job: JobId) {
+        let (home, local) = self.assert_running(job, "done");
+        assert_eq!(home, member, "job {} done on a member not its own", job.0);
+        let mut woken = std::mem::take(&mut self.woken);
+        woken.clear();
+        self.graph.end(job, &mut woken);
+        self.woken = woken;
+        self.split(Some(member));
+        let here = std::mem::take(&mut self.here);
+        self.place_mut(member).done(local, &here);
+        self.here = here;
+        self.touch(member);
+        let generation = &mut self.generation[job.0 as usize];
+        *generation = generation.wrapping_add(1);
+        self.free.push(job.0);
+    }
+
+    /// `key`'s flight ended. Its waiters of its claimer's member wake on the claimer's core,
+    /// the first in its slot; every other, and each of a flight of a driver's, on the core it
+    /// last ran on.
+    pub(crate) fn key_done(&mut self, key: Key) {
+        let mut woken = std::mem::take(&mut self.woken);
+        woken.clear();
+        let claimer = self.graph.key_done(key, &mut woken);
+        self.woken = woken;
+        match claimer {
+            Some(claimer) => {
+                let (member, local) = self.home(claimer);
+                assert!(
+                    self.place(member).job_state(local) == JobState::Running,
+                    "key {key:?} done while its job {} is not running",
+                    claimer.0
+                );
+                self.split(Some(member));
+                let here = std::mem::take(&mut self.here);
+                let place = self.place_mut(member);
+                let core = place.jobs[local as usize].core;
+                place.woken_on(core, &here);
+                self.here = here;
+                self.touch(member);
+            }
+            None => self.split(None),
+        }
+    }
+
+    pub(crate) fn yielded(&mut self, member: u32, job: JobId) -> Yielded {
+        let (home, local) = self.assert_running(job, "yielded");
+        assert_eq!(home, member, "job {} yielded on a member not its own", job.0);
+        let yielded = self.place_mut(member).yielded(local);
+        self.touch(member);
+        yielded
+    }
+
+    pub(crate) fn set_critical(&mut self, job: JobId, critical: bool) {
+        let (member, local) = self.home(job);
+        assert!(member != NONE, "job {} was never spawned", job.0);
+        if let Some(Some(place)) = self.members.get_mut(member as usize) {
+            place.set_critical(local, critical);
+            self.touch(member);
+        }
+    }
+
+    pub(crate) fn core_idle(&mut self, member: u32, core: CoreId) {
+        self.place_mut(member).core_idle(core);
+        self.touch(member);
+    }
+
+    pub(crate) fn advance_clock(&mut self, member: u32, now: u64) {
+        self.place_mut(member).advance_clock(now);
+        self.touch(member);
+    }
+
+    pub(crate) fn next_deadline(&mut self, member: u32) -> Option<u64> {
+        self.place_mut(member).next_deadline()
+    }
+
+    /// Every invariant a step must keep, checked by a full scan.
+    #[cfg(test)]
+    pub(crate) fn audit(&self) {
+        self.graph.audit();
+        for place in self.members.iter().flatten() {
+            place.audit();
+            for job in &place.jobs {
+                if job.state == JobState::Suspended {
+                    assert_ne!(self.graph.waits(job.global), job.timed, "job {}'s wait", job.global);
+                } else if matches!(job.state, JobState::Queued | JobState::Running) {
+                    assert!(!self.graph.waits(job.global), "job {} waits while {:?}", job.global, job.state);
                 }
             }
-            if state == CounterState::Dropped {
-                assert!(items > 0 && self.counter_waiters[c] == NONE, "dropped counter {c}");
-            }
         }
+    }
+}
+
+/// The scheduler of one driver alone: a [`World`] of one member, whose world ids are its local
+/// ids (the caller's own).
+pub struct Sched {
+    world: World,
+}
+
+impl Sched {
+    /// Every core parked, room for `jobs` job ids before a column grows.
+    pub fn new(cores: Cores, jobs: usize) -> Sched {
+        let mut world = World::new(jobs);
+        world.join(cores, jobs);
+        Sched { world }
+    }
+
+    fn place(&self) -> &Place {
+        self.world.place(0)
+    }
+
+    pub fn cores(&self) -> &Cores {
+        self.place().cores()
+    }
+
+    pub fn stats(&self) -> Stats {
+        self.place().stats()
+    }
+
+    pub fn now(&self) -> u64 {
+        self.place().now()
+    }
+
+    pub fn job_state(&self, job: JobId) -> JobState {
+        self.place().job_state(job.0)
+    }
+
+    /// Where the job is held, runs, or last ran.
+    pub fn job_core(&self, job: JobId) -> Option<CoreId> {
+        self.place().job_core(job.0)
+    }
+
+    pub fn is_critical(&self, job: JobId) -> bool {
+        self.place().is_critical(job.0)
+    }
+
+    pub fn core_state(&self, core: CoreId) -> CoreState {
+        self.place().core_state(core)
+    }
+
+    pub fn running(&self, core: CoreId) -> Option<JobId> {
+        self.place().running(core).map(JobId)
+    }
+
+    /// The decisions made since the last call, in the order made.
+    pub fn take_decisions(&mut self) -> std::vec::Drain<'_, Decision> {
+        self.world.dirty.clear();
+        self.world.take_decisions(0)
+    }
+
+    /// When the next timed wait is due: the driver calls [`Sched::advance_clock`] by then.
+    pub fn next_deadline(&mut self) -> Option<u64> {
+        self.world.next_deadline(0)
+    }
+
+    /// `job` is new, to run where `how` says.
+    ///
+    /// # Panics
+    ///
+    /// Where `job` is live (spawned and not done), its parent is not running, its counter is
+    /// not live, or its hint names a core, group or node the shape does not have.
+    pub fn spawn(&mut self, job: JobId, how: Spawn) {
+        self.world.spawn(0, job.0, job, how);
+    }
+
+    /// A counter at zero, for a parallel map's jobs to count towards ([`Spawn::counted`]).
+    pub fn counter(&mut self) -> CounterId {
+        self.world.counter()
+    }
+
+    /// The counter's owner is done with it; it is freed once no job counts towards it.
+    ///
+    /// # Panics
+    ///
+    /// Where the counter is not live or a job still waits on it.
+    pub fn drop_counter(&mut self, counter: CounterId) {
+        self.world.drop_counter(counter);
+    }
+
+    /// `by` (running, or the driver for `None`: IO, a child process) makes `key`'s value.
+    /// `false` when the key has a flight already: wait for it instead.
+    ///
+    /// # Panics
+    ///
+    /// Where `by` is not running.
+    pub fn claim(&mut self, key: Key, by: Option<JobId>) -> bool {
+        self.world.claim(key, by)
+    }
+
+    /// `job`, running, waits for `on`; its core runs something else.
+    ///
+    /// # Errors
+    ///
+    /// The [`Cycle`] the wait would close; the job goes on running and nothing changed.
+    ///
+    /// # Panics
+    ///
+    /// Where `job` is not running, or waits for a job never spawned or a counter not live.
+    pub fn suspended(&mut self, job: JobId, on: Wait) -> Result<Suspend, Cycle> {
+        self.world.suspended(0, job, on)
+    }
+
+    /// `job`, running, ended, and with it every key it claimed. Its waiters and theirs, and
+    /// those of its counter if it was the last, wake on its core, the first in its slot; the
+    /// core runs its next job.
+    ///
+    /// # Panics
+    ///
+    /// Where `job` is not running.
+    pub fn done(&mut self, job: JobId) {
+        self.world.done(0, job);
+    }
+
+    /// `key`'s flight ended. Its waiters wake on its claimer's core, the first in its slot, or
+    /// for a flight of the driver's, each on the core it last ran on.
+    ///
+    /// # Panics
+    ///
+    /// Where the key has no flight, or its claimer is not running.
+    pub fn key_done(&mut self, key: Key) {
+        self.world.key_done(key);
+    }
+
+    /// `job`, running, saw its core's move flag at a query miss. It moves to the nearest idle
+    /// core of the highest capacity, if one is still idle and the flag is not stale (the job
+    /// stopped being critical since).
+    ///
+    /// # Panics
+    ///
+    /// Where `job` is not running.
+    pub fn yielded(&mut self, job: JobId) -> Yielded {
+        self.world.yielded(0, job)
+    }
+
+    /// The profiler says whether `job` is on the critical path. A running job moves at its
+    /// next miss if it should; a queued one keeps its queue until it next moves.
+    pub fn set_critical(&mut self, job: JobId, critical: bool) {
+        self.world.set_critical(job, critical);
+    }
+
+    /// `core`'s thread is free: it started, was woken, or woke for no reason. It runs what it
+    /// was handed, or its own next job, or steals; with nothing, it parks.
+    ///
+    /// # Panics
+    ///
+    /// Where `core` is running a job.
+    pub fn core_idle(&mut self, core: CoreId) {
+        self.world.core_idle(0, core);
+    }
+
+    /// The clock reads `now` nanoseconds: every wait due by then is runnable, on the core its
+    /// job last ran on.
+    pub fn advance_clock(&mut self, now: u64) {
+        self.world.advance_clock(0, now);
+    }
+
+    /// Every invariant a step must keep, checked by a full scan.
+    #[cfg(test)]
+    pub(crate) fn audit(&self) {
+        self.world.audit();
+    }
+
+    #[cfg(test)]
+    pub(crate) fn steals(&mut self) -> &mut Vec<StealRecord> {
+        &mut self.world.place_mut(0).steals
     }
 }

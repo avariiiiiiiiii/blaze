@@ -11,6 +11,7 @@
 
 use base_db::{Crate, Db, Written};
 use blaze_dbsp::{Arrangement, Pos, ReadIndex, Work};
+use blaze_mem::Tag;
 use hir_def::{
     BuiltinDeriveImplId, HasModule, ImplId, ModuleDefId, ModuleId, TraitId,
     builtin_derive::BuiltinDeriveImplTrait,
@@ -19,6 +20,7 @@ use hir_def::{
         delta::{CrateDelta, LastWrite},
         crate_def_map, module_impls,
     },
+    signatures::ImplSignature,
 };
 use hir_expand::name::Name;
 use intern::Symbol;
@@ -114,6 +116,10 @@ struct Scratch {
     redo_traits: Vec<TraitId>,
     assoc: SmallVec<[Name; 8]>,
     body_modules: Vec<ModuleId>,
+    /// The impls a delta adds, each with whether it is a trait impl.
+    added: Vec<(ImplId, bool)>,
+    /// The modules of the crates a write sweeps, every crate's in graph order.
+    swept: Vec<ModuleId>,
     units: Vec<()>,
     keys_changed: Vec<ImplId>,
     traits_changed: Vec<TraitId>,
@@ -163,6 +169,21 @@ pub(crate) fn run(
     if changed {
         scratch.woken.extend(state.wild.iter().copied());
     }
+    // A load (every crate fresh) or a crate graph change sweeps every module of the crates it
+    // runs: their body parts are read as one batch across the crates on the database's workers,
+    // so the crates' sweeps below diff memos.
+    let mut swept = std::mem::take(&mut scratch.swept);
+    swept.clear();
+    for &krate in crates.iter() {
+        let fresh = scratch.deltas.get(&krate).is_some_and(|&at| last.crates[at].fresh);
+        if (fresh || written.crates) && !frozen::served(&*db, krate) {
+            swept.extend(crate_def_map(&*db, krate).modules(&*db).map(|(module, _)| module));
+        }
+    }
+    if swept.len() > 1 {
+        db.run_all(Tag::Infer, swept.len(), |db, at| _ = body_part(db, swept[at]));
+    }
+    state.scratch.swept = swept;
     for &krate in crates.iter() {
         if frozen::served(&*db, krate) {
             continue;
@@ -300,6 +321,22 @@ fn apply_impls(
             state.scratch.keys_changed.push(*imp);
         }
     }
+    // An added impl's key and read set lower its header: the queries they read are run as one
+    // batch on the database's workers, and the loop below reads their memos in the delta's order.
+    let mut added = std::mem::take(&mut state.scratch.added);
+    added.clear();
+    for (imp, _, _) in delta.impls.iter().filter(|it| it.2 > 0) {
+        let module = imp.loc(&*db).container;
+        added.push((*imp, is_trait_impl(&*db, &mut state.scratch, module, *imp)));
+    }
+    if added.len() > 1 {
+        db.run_all(Tag::Infer, added.len(), |db, at| {
+            let (imp, trait_impl) = added[at];
+            _ = impl_key(db, imp, trait_impl);
+            _ = ImplSignature::of(db, imp);
+        });
+    }
+    state.scratch.added = added;
     for (imp, pos, _) in delta.impls.iter().filter(|it| it.2 > 0) {
         work.ops += 1;
         remove_impl(state, crate_state, *imp);
@@ -696,6 +733,16 @@ fn apply_bodies(
     modules.extend(crate_state.bodies.keys().copied());
     modules.sort_unstable();
     modules.dedup();
+    // A part is a query that lowers the module's bodies, and a sweep reads every module's: they
+    // are read as one batch on the database's workers, and the loop below diffs their memos in
+    // module order.
+    if modules.len() > 1 {
+        db.run_all(Tag::Infer, modules.len(), |db, at| {
+            if def_map.module_rank(db, modules[at]).is_some() {
+                _ = body_part(db, modules[at]);
+            }
+        });
+    }
     let empty = BodyPart::default();
     for &module in modules.iter() {
         let now = match def_map.module_rank(db, module) {

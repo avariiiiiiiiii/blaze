@@ -148,11 +148,13 @@ fn a_cold_infer_allocates_its_result_alone() {
     // below allocates is its own.
     infer_all(&db, &bodies);
     for &body in &bodies {
+        // The memo's copy is measured first, so a failure's traces (`BLAZE_ALLOC_TRACE=1`) are
+        // the run's.
+        let (memo, owned) = measure(|| InferenceResult::of(&db, body).clone());
         frame::task(Tag::Infer, |frame| {
             let (result, used) =
                 measure(|| infer_body_in(&db, body, None, LoweringMode::Analysis, frame));
-            let (copy, owned) = measure(|| result.clone());
-            assert!(copy == result, "a run gives the memoized result: {body:?}");
+            assert!(memo == result, "a run gives the memoized result: {body:?}");
             assert!(
                 used.allocations <= owned.allocations,
                 "{body:?}: inference made {} allocations ({} bytes), its result owns {} ({} bytes)",

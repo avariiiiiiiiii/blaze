@@ -28,7 +28,7 @@ use super::{
 use crate::{
     method_resolution::{
         InherentImpls, InherentImplsBuilder, SelfTyKey, TraitImpls, TraitImplsBuilder,
-        impl_holders,
+        impl_holders, trace_holders, tracing_holders,
     },
     next_solver::SimplifiedType,
 };
@@ -80,8 +80,12 @@ pub(in crate::method_resolution) struct BodyPart {
 pub(in crate::method_resolution) fn body_part(db: &Db, module: ModuleId) -> BodyPart {
     blaze_mem::frame::current(|frame| {
         let scope = module.def_map(db).module(db, module).scope(db);
-        if impl_holders(db, frame, module.krate(db), scope).is_empty() {
+        let holders = impl_holders(db, frame, module.krate(db), scope);
+        if holders.is_empty() {
             return BodyPart::default();
+        }
+        if tracing_holders() {
+            trace_holders(db, module, &holders);
         }
         let mut heads: Vec<Head, &Frame> = Vec::new_in(frame);
         heads.extend(inherent_bodies(db, module).iter().map(|(self_ty, _)| {

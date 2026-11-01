@@ -113,6 +113,7 @@ pub struct Flushed {
     pub counters: usize,
     pub builds: usize,
     pub samples: usize,
+    pub switches: usize,
     pub files: u32,
     pub bytes: u64,
     /// Rows the rings wrote over before this flush read them, CPU samples included.
@@ -427,6 +428,8 @@ impl History {
         let counters =
             [batches::counters(&self.read.counters, self.process).map_err(arrow_error(&schema::COUNTERS))?];
         let builds = [builds(&self.ended).map_err(arrow_error(&schema::BUILDS))?];
+        let switches =
+            [batches::switches(&self.read.switches, self.process).map_err(arrow_error(&schema::SWITCHES))?];
         self.samples.clear();
         let samples_skipped = sampler::since(&mut self.sampled, &mut self.samples);
         let samples = [self.samples_batch().map_err(arrow_error(&schema::SAMPLES))?];
@@ -437,16 +440,18 @@ impl History {
             counters: rows(&counters),
             builds: rows(&builds),
             samples: rows(&samples),
+            switches: rows(&switches),
             skipped: self.read.skipped + samples_skipped,
             ..Flushed::default()
         };
         let build = build.unwrap_or(0);
         self.last_build = self.last_build.max(build);
-        let tables: [(&'static Table, &[RecordBatch]); 4] = [
+        let tables: [(&'static Table, &[RecordBatch]); 5] = [
             (&schema::SPANS, &spans),
             (&schema::COUNTERS, &counters),
             (&schema::BUILDS, &builds),
             (&schema::SAMPLES, &samples),
+            (&schema::SWITCHES, &switches),
         ];
         for (table, parts) in tables {
             if rows(parts) == 0 {
@@ -516,10 +521,17 @@ pub fn write_live(window: Duration, dir: &Path) -> Result<Flushed, HistoryError>
     let process = Process::this();
     let spans = batches::spans(&read.spans, process).map_err(arrow_error(&schema::SPANS))?;
     let counters = batches::counters(&read.counters, process).map_err(arrow_error(&schema::COUNTERS))?;
+    let switches = batches::switches(&read.switches, process).map_err(arrow_error(&schema::SWITCHES))?;
     let mut writer = Writer::new();
     writer.schemas(dir)?;
-    let mut flushed = Flushed { spans: spans.num_rows(), counters: counters.num_rows(), ..Flushed::default() };
-    let tables: [(&'static Table, RecordBatch); 2] = [(&schema::SPANS, spans), (&schema::COUNTERS, counters)];
+    let mut flushed = Flushed {
+        spans: spans.num_rows(),
+        counters: counters.num_rows(),
+        switches: switches.num_rows(),
+        ..Flushed::default()
+    };
+    let tables: [(&'static Table, RecordBatch); 3] =
+        [(&schema::SPANS, spans), (&schema::COUNTERS, counters), (&schema::SWITCHES, switches)];
     for (table, batch) in tables {
         // alloc: a file's name, once a file
         let path = dir.join(format!("live.{}.parquet", table.name));
@@ -535,7 +547,7 @@ mod tests {
     use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 
     use super::*;
-    use crate::flight::{Allocated, CounterRow, Plot};
+    use crate::flight::{Allocated, CounterRow, FrameCopied, Plot};
 
     fn scratch(name: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!("blaze-history-{}-{name}", std::process::id()));
@@ -589,6 +601,7 @@ mod tests {
             start_ns: 1_000 + i as i64,
             dur_ns: 50 - i as i64,
             alloc: (i % 2 == 0).then_some(Allocated { bytes: 64 * i, count: i }),
+            copied: (i % 3 == 0).then_some(FrameCopied { copies: i, bytes: 1024 * i }),
             krate: 0,
             function: 0,
             unit: 0,
@@ -717,6 +730,7 @@ mod tests {
                 start_ns: (i * 1000) as i64,
                 dur_ns: ((i * 7919) % 100_000) as i64,
                 alloc: Some(Allocated { bytes: i % 4096, count: i % 17 }),
+                copied: Some(FrameCopied { copies: 0, bytes: 0 }),
                 krate: 0,
                 function: functions[(i % 1000) as usize],
                 unit: 0,

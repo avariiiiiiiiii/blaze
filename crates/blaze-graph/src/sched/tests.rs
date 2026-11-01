@@ -154,7 +154,8 @@ impl Sim {
             }
         }
         self.sched.audit();
-        for steal in &self.sched.steals {
+        let steals = std::mem::take(self.sched.steals());
+        for steal in &steals {
             if self.sched.cores().info(steal.thief).node != self.sched.cores().info(steal.victim).node {
                 assert_eq!(
                     steal.on_thief_node, 0,
@@ -163,7 +164,8 @@ impl Sim {
                 );
             }
         }
-        self.sched.steals.clear();
+        *self.sched.steals() = steals;
+        self.sched.steals().clear();
         // A big core never sits idle while a small core runs a critical job unasked.
         if self.big_parked() {
             for core in 0..self.cores() {
@@ -1066,7 +1068,7 @@ fn a_warm_scheduler_allocates_nothing() {
         }
         assert!(dropped);
         assert!((0..12).all(|job| sched.job_state(JobId(job)) == JobState::Done));
-        sched.steals.clear();
+        sched.steals().clear();
     }
     let mut sched = Sched::new(two_nodes(), 64);
     round(&mut sched, 0);

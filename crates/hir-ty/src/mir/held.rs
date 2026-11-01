@@ -359,6 +359,56 @@ impl MirBody<'_> {
         }
     }
 
+    /// The locals held across the call that ends each block of `points`, as
+    /// [`MirBody::held_locals_in`] finds them across a yield: live after the call (the call's
+    /// own destination not), or borrowed before it, while their storage is required (after the
+    /// call's whole moves of its operands). The first parameter is an ordinary one here (not
+    /// removed as a coroutine's receiver is); promoted constants are removed as there. One slice
+    /// per point, in order, each in the order the body declares its locals; an unreached
+    /// block's is empty.
+    pub fn held_across_calls_in<'f>(
+        &self,
+        frame: &'f Frame,
+        points: &[BasicBlockId],
+    ) -> &'f [&'f [LocalId]] {
+        let count = self.locals.len();
+        let reached = reachable(frame, self);
+        let forward = self.forward(frame, reached);
+        let live_out = self.liveness(frame, reached);
+        let mut borrowed = empty_in(frame, count);
+        let mut requires = empty_in(frame, count);
+        let mut held = Vec::new_in(frame);
+        frame.alloc_slice_fill_with(points.len(), |at| {
+            let id = points[at];
+            if !reached[block_index(id)] {
+                return &[][..];
+            }
+            let block = &self.basic_blocks[id];
+            forward.load(block_index(id), &mut borrowed, &mut requires);
+            for statement in &block.statements {
+                self.storage_statement(statement, &mut borrowed, &mut requires, &mut |_| ());
+            }
+            if let Some(terminator) = &block.terminator {
+                let kind = &terminator.kind;
+                kind.for_each_operand(&mut |op| kill_whole_move(op, &borrowed, &mut requires));
+                if let TerminatorKind::Call { destination, .. } = kind {
+                    requires.remove(local_index(destination.local));
+                }
+            }
+            let mut live = copy_in(&live_out[block_index(id)], frame);
+            live.union_with(&borrowed);
+            live.intersect_with(&requires);
+            for &local in &self.promoted_constants {
+                live.remove(local_index(local));
+            }
+            held.clear();
+            held.extend(
+                self.locals.iter().map(|(local, _)| local).filter(|&it| live.contains(local_index(it))),
+            );
+            &*frame.alloc_slice_copy(&held)
+        })
+    }
+
     /// `always_storage_live_locals`: the locals no `StorageLive` or `StorageDead` mentions.
     fn always_storage_live<'f>(&self, frame: &'f Frame) -> Set<'f> {
         let mut always = filled_in(frame, self.locals.len());

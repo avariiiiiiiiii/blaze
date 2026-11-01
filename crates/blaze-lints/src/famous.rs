@@ -10,6 +10,7 @@ use intern::Symbol;
 /// written `crate:module:...:name`. A crate resolves them all once
 /// ([`crate::query::famous_defs`]); a lookup is one perfect hash of the path and one load.
 pub(crate) const KNOWN: &[&str] = &[
+    "alloc:alloc:Global",
     "alloc:borrow:Cow",
     "alloc:borrow:ToOwned",
     "alloc:collections:BTreeMap",
@@ -56,6 +57,7 @@ pub(crate) const KNOWN: &[&str] = &[
     "core:slice:Iter",
     "core:slice:IterMut",
     "core:slice:Windows",
+    "std:alloc:Global",
     "std:array:IntoIter",
     "std:cmp:Ord",
     "std:cmp:max",

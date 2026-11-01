@@ -141,6 +141,23 @@ inputs (`blaze-usercode`'s `RunKey`), which take in the C compiler they ran.
 public dependencies. They are opened as the store is and never written; a put of a key a layer
 has is durable at once. A layer that is not there stops the store.
 
+## A shared store
+
+`Store::open_shared` opens a store several daemons on one machine write at once: one build's
+std under `<user cache>/blaze/std/<blaze build id>/store`, shared by every BLAZE_HOME. No lock
+is taken. Each daemon is a writer (`SharedConfig::writer`, one per BLAZE_HOME) with a store
+directory of its own in the shared one, `w-<writer>`, written as any store is, so two daemons'
+commits never touch one file. Every other writer's directory is read as a layer behind its own,
+as of its last look: a get that misses calls `Store::look_again`, which lists the shared
+directory, reads each writer's head again, and maps a writer whose head changed afresh,
+checking it whole before readers see it (until then they read it as it was), and gets again
+once `Store::looked` reaches the number it returned. A put of a key another writer's commit
+holds keeps nothing, so equal values are one entry; two writers that put one key before either
+has seen the other each keep a copy, which reads the same. Every value is checked against its
+hash wherever it is read. `Effect::Private` is asked of the whole shared directory, and a writer's
+store that cannot be read once its head has been read again `FAILURES_MOST` times stops the store
+naming the file; there is no other store it reads instead.
+
 ## The remote tier
 
 `remote::Server` serves a VM daemon's store over a Unix socket or a loopback port (forwarded over

@@ -24,7 +24,7 @@ use std::{
     },
 };
 
-use blaze_mem::{Tag, frame, scratch};
+use blaze_mem::{Tag, frame};
 use blaze_query::db::Durability;
 use span::{FileId, TextSize};
 use triomphe::Arc;
@@ -409,15 +409,17 @@ impl Db {
     /// Each task runs in a frame of its own, tagged `tag` (the caller's subsystem): its body
     /// runs outside the query engine's executor, and a task the pump runs on a waiting thread stays out of
     /// the waiting caller's frame.
+    ///
+    /// On the pool, a task that gave way ([`blaze_query::db::Cancelled::WouldWaitOnItself`])
+    /// runs again on this thread once the others ended ([`blaze_query::db::par_for_each`]), and
+    /// the first other panic of a task goes on from here once every task has run.
     pub fn run_all<F: Fn(&Db, usize) + Sync>(&self, tag: Tag, count: usize, task: F) {
         if count == 0 {
             return;
         }
         let run = |db: &Db, at: usize| frame::task(tag, |_| task(db, at));
         match self.run {
-            Run::Pool => blaze_query::db::pump_barrier(|| {
-                run_on_pool(self, blaze_graph::exec::shared(), count, &run)
-            }),
+            Run::Pool => blaze_query::db::par_for_each(count, |at| run(self, at)),
             Run::Here => match RUN_ORDER.get() {
                 RunOrder::InOrder => (0..count).for_each(|at| run(self, at)),
                 RunOrder::Reversed => (0..count).rev().for_each(|at| run(self, at)),
@@ -504,59 +506,3 @@ impl blaze_query::db::Database for Db {
 }
 
 impl panic::RefUnwindSafe for Db {}
-
-/// [`Db::run_all`] on `pool`: each task is a job near this thread's group, reading `db` by
-/// reference, and the calling thread pump-waits for the batch ([`Pool::scope`]).
-///
-/// A task that unwinds with [`blaze_query::db::Cancelled::WouldWaitOnItself`] asked for a query that a
-/// task below it on its thread runs, which can't end before it does; it runs again in another
-/// round, once every task of this one has ended. A job's completion can't reach its scope, so
-/// the round is the way back. The first other panic, the engine's other cancellations included,
-/// goes on from here once its round is over, and nothing is run again after it.
-///
-/// [`Pool::scope`]: blaze_graph::pool::Pool::scope
-pub fn run_on_pool<F: Fn(&Db, usize) + Sync>(
-    db: &Db,
-    pool: &blaze_graph::pool::Pool,
-    count: usize,
-    task: &F,
-) {
-    let count = u32::try_from(count).expect("a batch of more than `u32::MAX` tasks");
-    let near = blaze_graph::pool::group();
-    let panicked = Mutex::new(None);
-    let again = Mutex::new(scratch::lend_u32s());
-    let mut round = scratch::lend_u32s();
-    round.extend(0..count);
-    while !round.is_empty() {
-        pool.scope(|scope| {
-            for &at in round.iter() {
-                let (panicked, again) = (&panicked, &again);
-                scope.submit(
-                    near,
-                    move || task(db, at as usize),
-                    move |ran| {
-                        let Err(panic) = ran else { return };
-                        let waited_on_itself = matches!(
-                            panic.downcast_ref::<blaze_query::db::Cancelled>(),
-                            Some(blaze_query::db::Cancelled::WouldWaitOnItself)
-                        );
-                        if waited_on_itself {
-                            again.lock().unwrap_or_else(|it| it.into_inner()).push(at);
-                        } else {
-                            let mut first = panicked.lock().unwrap_or_else(|it| it.into_inner());
-                            first.get_or_insert(panic);
-                        }
-                    },
-                );
-            }
-        });
-        round.clear();
-        std::mem::swap(&mut *round, &mut **again.lock().unwrap_or_else(|it| it.into_inner()));
-        if panicked.lock().unwrap_or_else(|it| it.into_inner()).is_some() {
-            break;
-        }
-    }
-    if let Some(panic) = panicked.into_inner().unwrap_or_else(|it| it.into_inner()) {
-        panic::resume_unwind(panic);
-    }
-}

@@ -30,12 +30,11 @@ use crate::{
 
 /// Builds the model of every crate placed.
 pub(crate) fn build(db: &Db, places: &Places) -> Model {
-    use blaze_graph::par;
     let files = Files::new(db, places);
     let std = StdItems::find(db, places);
     let by_trait_arg = impls_by_trait_arg(db, places);
     // As in `places::place`: a waiting worker may run another database's job above this one.
-    let built: Vec<(CrateDoc, Vec<Warning>)> = par::map(0..places.crates.len(), |krate| {
+    let built: Vec<(CrateDoc, Vec<Warning>)> = base_db::par_map(places.crates.len(), |krate| {
         hir::attach_db_allow_change(db, || {
             let builder = Builder {
                 db,

@@ -129,6 +129,9 @@ struct Line {
     allocated: AtomicU64,
     /// The most one task of this tag took from its frame.
     task_peak: AtomicU64,
+    /// What its tasks' frames copied to grow a block ([`Copied`]).
+    grow_copies: AtomicU64,
+    grow_copied: AtomicU64,
     budget: AtomicU64,
 }
 
@@ -139,6 +142,8 @@ impl Line {
             high_water: AtomicU64::new(0),
             allocated: AtomicU64::new(0),
             task_peak: AtomicU64::new(0),
+            grow_copies: AtomicU64::new(0),
+            grow_copied: AtomicU64::new(0),
             budget: AtomicU64::new(u64::MAX),
         }
     }
@@ -234,9 +239,42 @@ thread_local! {
     static PENDING: Pending = const { Pending([const { Cell::new(0) }; Tag::COUNT]) };
 }
 
-/// A task of `tag` took `peak` bytes of its frame at most, all given back now. Warm, it writes
-/// no shared line: the peak is written only when it rises, and the bytes gather per thread.
-pub fn task_ended(tag: Tag, peak: usize) {
+/// What a frame copied to grow blocks: a block that grows while it is not the frame's last
+/// (another allocation came after it) moves to a new one, copied whole. A frame counts these;
+/// a block growing in place costs nothing and is not counted.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub struct Copied {
+    /// Blocks moved.
+    pub copies: u64,
+    /// Bytes copied moving them.
+    pub bytes: u64,
+}
+
+thread_local! {
+    /// What the frames of the thread's ended tasks copied, never decreasing.
+    static COPIED: Cell<Copied> = const { Cell::new(Copied { copies: 0, bytes: 0 }) };
+}
+
+/// What the frames of the calling thread's ended tasks copied so far, never decreasing: a
+/// span's part is the difference across it ([`task_ended`] adds a task's at its end).
+pub fn copied_on_thread() -> Copied {
+    COPIED.try_with(Cell::get).unwrap_or_default()
+}
+
+/// A task of `tag` took `peak` bytes of its frame at most, all given back now, and its frame
+/// copied `copied` to grow blocks. Warm, it writes no shared line: the peak is written only
+/// when it rises, the bytes gather per thread, and copies, which only a task that moved a
+/// block has, are added to the tag's line.
+pub fn task_ended(tag: Tag, peak: usize, copied: Copied) {
+    if copied.copies != 0 {
+        let line = line(tag);
+        line.grow_copies.fetch_add(copied.copies, Ordering::Relaxed);
+        line.grow_copied.fetch_add(copied.bytes, Ordering::Relaxed);
+        _ = COPIED.try_with(|it| {
+            let was = it.get();
+            it.set(Copied { copies: was.copies + copied.copies, bytes: was.bytes + copied.bytes });
+        });
+    }
     if peak == 0 {
         return;
     }
@@ -306,6 +344,9 @@ pub struct Counters {
     pub high_water: u64,
     pub allocated: u64,
     pub task_peak: u64,
+    /// Blocks its tasks' frames moved to grow them, and the bytes that copied ([`Copied`]).
+    pub grow_copies: u64,
+    pub grow_copied: u64,
     pub budget: u64,
 }
 
@@ -341,6 +382,8 @@ pub fn snapshot() -> Snapshot {
             high_water: line.high_water.load(Ordering::Relaxed),
             allocated: line.allocated.load(Ordering::Relaxed),
             task_peak: line.task_peak.load(Ordering::Relaxed),
+            grow_copies: line.grow_copies.load(Ordering::Relaxed),
+            grow_copied: line.grow_copied.load(Ordering::Relaxed),
             budget: line.budget.load(Ordering::Relaxed),
         };
     }

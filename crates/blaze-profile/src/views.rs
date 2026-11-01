@@ -9,8 +9,8 @@ use serde_json::{Map, Value};
 
 use crate::schema;
 
-/// The DuckDB views every query runs after: one a table, and `queries`, `passes` and
-/// `fiber_stacks`. Each
+/// The DuckDB views every query runs after: one a table, and `queries`, `passes`,
+/// `fiber_stacks`, `job_waits` and `job_spans`. Each
 /// `@<table>` in it is a list of globs, filled in by [`prelude`].
 pub const PRELUDE: &str = include_str!("../sql/views.sql");
 
@@ -83,6 +83,7 @@ pub const VIEWS: &[View] = &[
     view("longest_gaps", &[BUILD, LIMIT]),
     view("top_cpu_stacks", &[BUILD, LIMIT]),
     view("time_by_span_name", &[BUILD]),
+    view("frame_copies_per_query_kind", &[BUILD, LIMIT]),
     view("jobs_by_stack_high_water", &[BUILD, LIMIT]),
 ];
 
@@ -533,7 +534,7 @@ mod tests {
 
     /// DuckDB's words the SQL files use: keywords, types and named parameters.
     const KEYWORDS: &[&str] = &[
-        "all", "and", "any", "as", "asc", "between", "by", "case", "cast", "create", "desc",
+        "all", "and", "any", "as", "asc", "asof", "between", "by", "case", "cast", "create", "desc",
         "distinct", "double", "else", "end", "exists", "filter", "first", "from", "group",
         "having", "in", "is", "join", "last", "left", "like", "limit", "not", "null", "nulls",
         "on", "or", "order", "over", "partition", "qualify", "recursive", "replace", "select",
@@ -542,7 +543,7 @@ mod tests {
     ];
     /// DuckDB's functions the SQL files call.
     const FUNCTIONS: &[&str] = &[
-        "any_value", "arg_max", "array_to_string", "count", "lag", "max", "median", "min",
+        "any_value", "arg_max", "array_to_string", "count", "lag", "lead", "max", "median", "min",
         "rank", "read_parquet", "round", "starts_with", "sum",
     ];
 

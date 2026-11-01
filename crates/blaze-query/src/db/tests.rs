@@ -650,7 +650,7 @@ query!(
     }
 );
 
-/// `F`'s value, asked again each time the task gave way (as `base_db::run_on_pool` posts it).
+/// `F`'s value, asked again each time the task gave way, as a thread with no query below it does.
 fn until_it_holds<F: Function<Db = TestDb, Key = Cell, Value = u64>>(
     db: &TestDb,
     cell: Cell,
@@ -676,6 +676,23 @@ fn a_cycle_across_two_tasks_is_resolved_by_one_of_them() {
         (a.join().unwrap(), b.join().unwrap())
     });
     assert_eq!((a, b), (1, 2));
+}
+
+#[test]
+fn a_job_that_gave_way_runs_again_on_its_caller_and_never_reaches_it() {
+    let db = TestDb::new();
+    let cell = Cell::new(&db, 0, 0);
+    db.armed[0].store(true, Ordering::SeqCst);
+    db.armed[1].store(true, Ordering::SeqCst);
+    let pool =
+        blaze_graph::pool::Pool::new(&blaze_graph::topology::Topology::flat(2), false).unwrap();
+    let both = pool.install(|| {
+        super::par_map(
+            2,
+            |at| if at == 0 { *get::<TaskA>(&db, cell) } else { *get::<TaskB>(&db, cell) },
+        )
+    });
+    assert_eq!(both, [1, 2]);
 }
 
 query!(Slow, u64, |db, key| {

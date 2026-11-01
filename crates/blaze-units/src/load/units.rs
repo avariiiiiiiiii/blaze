@@ -241,11 +241,16 @@ pub(crate) fn units(
                     StdPlanned::Ready(std) => std,
                     StdPlanned::Failed(error) => return Ok(Staged::Failed(error)),
                 };
-                let out = match &platform {
-                    Some(triple) => build_dir.join(triple).join(&dir_name),
-                    None => build_dir.join(&dir_name),
-                };
-                merge_std(&mut graph, &mut std_plans, &mut std_packages, std, &platform, &out.display().to_string());
+                // Named by its key alone, never by the workspace: every workspace on the daemon
+                // asking for the same std names the same outputs, and builds it once.
+                if !Path::new(&spec.std).is_absolute() {
+                    return Ok(fail(anyhow::anyhow!(
+                        "the daemon names `{}`, no absolute directory, for the standard library's builds",
+                        spec.std
+                    )));
+                }
+                let out = format!("{}/{:x}", spec.std, key.id());
+                merge_std(&mut graph, &mut std_plans, &mut std_packages, std, &platform, &out);
             }
         }
     }

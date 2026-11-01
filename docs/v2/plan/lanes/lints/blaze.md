@@ -76,9 +76,22 @@ Flagged: `String::from`, `.to_string()`, `.to_owned()`, `.to_vec()`, `Vec::with_
 `.collect()` into an owning type, `Box::new`, `Arc::new`, a call of your own function that does
 any of these. A macro call is reported once, at the call: `format!`, `vec![1, 2]`.
 
+Also flagged, though it allocates nothing yet: a call that makes a value of the global
+allocator's, which allocates from the global heap once it grows (rule `bump-allocate`):
+`Vec::new()`, `vec![]`, `String::new()`, `VecDeque::default()`, `FxHashMap::default()`. A value is
+the global allocator's when a type argument of it is `Global`, or it is `String` or std's
+`HashMap` or `HashSet` (a map hashing with `RandomState` is `std_hashmap`'s finding instead). A
+call makes one when its callee is a trait's method other than `clone`, or a method of the type's
+own impl; a function that hands one on (`mem::take`) does not. Fix: name the allocator
+(`Vec::new_in(frame)`, from `blaze_mem::frame::current`), grow a buffer the caller keeps, or say
+why it needs the global heap with `// alloc: <why>`.
+
 Not flagged:
 
-- `Vec::new()`, `String::new()`, `vec![]`: they allocate nothing.
+- A collection that names its allocator: `Vec::new_in(frame)`.
+- A value of the global allocator's made by a method of another type
+  (`opt.unwrap_or_default()`, `s.into_bytes()`) or a struct of your own holding one
+  (`Index::default()`): only the call that makes the collection itself is found.
 - `Clone::clone`: `hot_clone` says it.
 - A `&mut self` method on a place (`buf.push(x)`, `self.out.extend(..)`): a buffer the caller
   keeps grows only past its capacity, which a reused buffer reaches once. On a temporary it is

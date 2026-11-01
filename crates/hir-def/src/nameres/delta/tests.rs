@@ -419,6 +419,29 @@ fn removing_a_crate_feature_removes_it_from_the_maintained_map() {
     assert!(failures.is_empty(), "{failures}");
 }
 
+/// An edit of a dependency's macro body that keeps the macro's id changes no binding, and
+/// still changes what a call of it in this crate expands to.
+#[test]
+fn editing_a_dependencys_macro_body_expands_its_calls_again() {
+    const STD: &str = "pub mod prelude {\n    pub mod rust_2018 {\n        pub macro global_asm() {\n            pub struct S;\n        }\n    }\n}\n";
+    let mut loaded = Loaded::new(&format!(
+        "//- /lib.rs edition:2018 crate:lib deps:std\nglobal_asm!();\n//- /std.rs crate:std\n{STD}"
+    ));
+    let std = loaded.file("/std.rs");
+    let lib = loaded.file("/lib.rs");
+    let lib = *all_crates(&loaded.db).iter().find(|it| it.data(&loaded.db).root_file_id == lib).expect("`lib`");
+    let has_s = |db: &Db| {
+        let map = crate_local_def_map(db, lib).def_map(db);
+        map.module(db, map.root).scope(db).get(&name("S")).take_types().is_some()
+    };
+    assert!(has_s(&loaded.db), "loaded: the call declares `S`");
+    loaded.db.set_file_text(std, &STD.replace("            pub struct S;\n", ""));
+    assert!(!has_s(&loaded.db), "the call expands to nothing now");
+    let mut failures = String::new();
+    check_db(&loaded.db, "a dependency's macro body edited", &Exempt::NONE, false, &mut failures);
+    assert!(failures.is_empty(), "{failures}");
+}
+
 /// A `mod` whose file is configured out by its `#![cfg]` has no module, so no group holds the
 /// file: a write of the file alone that drops the `#![cfg]` still brings the module in.
 #[test]

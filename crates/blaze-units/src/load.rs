@@ -130,6 +130,9 @@ pub(crate) struct Spec {
     /// The standard library's mount, where the view has one at [`Spec::library_at`].
     pub library: Option<Mount>,
     pub library_at: String,
+    /// [`crate::query::BuildConfig::std`]: where the standard library's units place what they
+    /// make, in a directory of their [`crate::query::StdKey`]'s.
+    pub std: String,
     /// `-Zbuild-std=` and `-Zbuild-std-features=`.
     pub build_std: Option<Vec<String>>,
     pub build_std_features: Option<Vec<String>>,
@@ -214,6 +217,7 @@ fn view_spec(asked: &Asked, library: Option<Mount>) -> Result<Spec, LoadError> {
         honor_rust_version: !asked.ignore_rust_version,
         library,
         library_at: asked.library.clone(),
+        std: asked.std.clone(),
         build_std,
         build_std_features,
         foreign: None,
@@ -260,6 +264,8 @@ fn foreign_spec(ask: &ForeignAsk) -> Spec {
         honor_rust_version: false,
         library: None,
         library_at: String::new(),
+        // Its units are a standard library's, placed where the workspace that asks puts them.
+        std: String::new(),
         build_std: None,
         build_std_features: None,
         foreign: Some(ask.clone()),

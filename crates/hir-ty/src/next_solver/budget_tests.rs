@@ -132,6 +132,11 @@ fn solve_both<'db>(infcx: &InferCtxt<'db>, items: &Items, var: Ty<'db>) {
 
 /// mem-db-solver 8: the hit path canonicalizes the goal, instantiates the cached response and
 /// applies it, all on the context's warm tables and the solver's scratch.
+///
+/// Each hit runs in a probe: instantiating an ambiguous response makes a fresh type variable
+/// (as rustc's `compute_query_response_instantiation_values_in_universe` does), so hits that
+/// stay in one context grow it by a variable each, while a probe's rollback makes every hit
+/// reuse the same variables.
 #[test]
 fn a_goal_from_the_global_cache_allocates_nothing() {
     let (db, krate) = fixture();
@@ -139,9 +144,10 @@ fn a_goal_from_the_global_cache_allocates_nothing() {
     let infcx = build(DbInterner::new_with(&db, krate));
     let var = infcx.next_ty_var(Span::Dummy);
     solve_both(&infcx, &items, var);
+    infcx.probe(|_| solve_both(&infcx, &items, var));
     assert_at_most(0, "a goal from the global cache", || {
         for _ in 0..100 {
-            solve_both(&infcx, &items, var);
+            infcx.probe(|_| solve_both(&infcx, &items, var));
         }
     });
 }

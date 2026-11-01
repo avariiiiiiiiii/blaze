@@ -211,6 +211,47 @@ pub fn pump_barrier<R>(f: impl FnOnce() -> R) -> R {
     f()
 }
 
+/// `task(at)` for each `at` in `0..count`, each a job of its own on the pool this thread's
+/// loops run on, inside a [`pump_barrier`]. A task that gave way
+/// ([`Cancelled::WouldWaitOnItself`]: its wait would have closed a cycle of tasks) runs again
+/// here once the others ended, on this thread and outside the barrier, where it meets the
+/// cycle on its own stack: never in another round on the pool, which would meet the same cycle
+/// while this caller (or a task below it) holds what it waits for. A rerun that gives way
+/// again unwinds to this caller, which gives way in turn; the first other panic of a job is
+/// raised once every job has ended.
+///
+/// Every loop over jobs that ask queries goes through here (or [`par_map`]): a give-way that
+/// left a job some other way would reach a caller with no query below it as a panic with no
+/// message.
+pub fn par_for_each(count: usize, task: impl Fn(usize) + Sync) {
+    let again = pump_barrier(|| {
+        blaze_graph::par::for_each_giving_way(count, &task, |panic| {
+            matches!(panic.downcast_ref::<Cancelled>(), Some(Cancelled::WouldWaitOnItself))
+        })
+    });
+    for at in again {
+        task(at);
+    }
+}
+
+/// `f(at)` for each `at` in `0..count`, in order, run as [`par_for_each`] runs its tasks.
+pub fn par_map<R: Send>(count: usize, f: impl Fn(usize) -> R + Sync) -> Vec<R> {
+    // alloc: the results, once per loop
+    let made: Vec<std::sync::Mutex<Option<R>>> =
+        (0..count).map(|_| std::sync::Mutex::new(None)).collect();
+    par_for_each(count, |at| {
+        let it = f(at);
+        *made[at].lock().unwrap_or_else(std::sync::PoisonError::into_inner) = Some(it);
+    });
+    made.into_iter()
+        .map(|it| {
+            it.into_inner()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .expect("every task ran")
+        })
+        .collect()
+}
+
 /// The thread's query stack, carried with a job on a fiber across its waits.
 pub(crate) fn carried() -> blaze_graph::sched::fiber::Carried {
     blaze_graph::sched::fiber::Carried { take: local::take, put: local::put }

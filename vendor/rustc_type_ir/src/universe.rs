@@ -1,6 +1,6 @@
 use tracing::{debug, instrument};
 
-use crate::data_structures::HashSet;
+use crate::data_structures::SsoHashSet;
 use crate::inherent::*;
 use crate::visit::TypeVisitableExt;
 use crate::{
@@ -71,7 +71,7 @@ struct MaxUniverse<
 > {
     max_universe: UniverseIndex,
     infcx: &'a Infcx,
-    cache: HashSet<I::Ty>,
+    cache: SsoHashSet<I::Ty>,
 }
 
 impl<

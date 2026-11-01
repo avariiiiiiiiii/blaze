@@ -21,7 +21,6 @@ use crate::{
         REPARSED, TextEdit, assert_whole, common_prefix, common_prefix_scalar, common_suffix,
         common_suffix_scalar,
     },
-    run_on_pool,
     target::{Arch, TargetData},
 };
 
@@ -907,13 +906,15 @@ fn two_workers() -> blaze_graph::pool::Pool {
 
 #[test]
 fn a_task_that_waited_on_itself_runs_again() {
-    let db = Db::for_tests();
+    let db = Db::new();
     let pool = two_workers();
     let runs: Vec<AtomicUsize> = (0..8).map(|_| AtomicUsize::new(0)).collect();
-    run_on_pool(&db, &pool, runs.len(), &|_: &Db, at: usize| {
-        if runs[at].fetch_add(1, Ordering::Relaxed) == 0 && at % 3 == 0 {
-            std::panic::resume_unwind(Box::new(blaze_query::db::Cancelled::WouldWaitOnItself));
-        }
+    pool.install(|| {
+        db.run_all(blaze_mem::Tag::Parse, runs.len(), |_: &Db, at: usize| {
+            if runs[at].fetch_add(1, Ordering::Relaxed) == 0 && at % 3 == 0 {
+                std::panic::resume_unwind(Box::new(blaze_query::db::Cancelled::WouldWaitOnItself));
+            }
+        });
     });
     let runs: Vec<usize> = runs.iter().map(|it| it.load(Ordering::Relaxed)).collect();
     assert_eq!(runs, [2, 1, 1, 2, 1, 1, 2, 1]);
@@ -921,15 +922,17 @@ fn a_task_that_waited_on_itself_runs_again() {
 
 #[test]
 fn any_other_panic_of_a_task_reaches_the_caller() {
-    let db = Db::for_tests();
+    let db = Db::new();
     let pool = two_workers();
     let ran = AtomicUsize::new(0);
     let caught = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        run_on_pool(&db, &pool, 4, &|_: &Db, at: usize| {
-            ran.fetch_add(1, Ordering::Relaxed);
-            if at == 2 {
-                std::panic::resume_unwind(Box::new("task 2 failed"));
-            }
+        pool.install(|| {
+            db.run_all(blaze_mem::Tag::Parse, 4, |_: &Db, at: usize| {
+                ran.fetch_add(1, Ordering::Relaxed);
+                if at == 2 {
+                    std::panic::resume_unwind(Box::new("task 2 failed"));
+                }
+            });
         });
     }));
     assert_eq!(caught.unwrap_err().downcast_ref::<&str>(), Some(&"task 2 failed"));

@@ -92,6 +92,34 @@ pub fn state() -> anyhow::Result<PathBuf> {
         .join(".cache/blaze/v2"))
 }
 
+/// Where every daemon of this machine, whatever its `BLAZE_HOME`, keeps what they share:
+/// `blaze` in the user's cache directory (`XDG_CACHE_HOME`, or `~/.cache`).
+pub fn machine() -> anyhow::Result<PathBuf> {
+    if let Some(caches) = std::env::var_os("XDG_CACHE_HOME").filter(|it| !it.is_empty()) {
+        return Ok(PathBuf::from(caches).join("blaze"));
+    }
+    let home = std::env::var_os("HOME").or_else(|| std::env::var_os("USERPROFILE"));
+    Ok(PathBuf::from(home.context("no XDG_CACHE_HOME or HOME says where this machine's daemons share the standard library")?)
+        .join(".cache/blaze"))
+}
+
+/// Which blaze `exe` is: the hash of its bytes, so two builds of one commit, a dirty tree's,
+/// are two. What the daemons of one build share is under it, as only that build made it.
+pub fn build_id(exe: &Path) -> anyhow::Result<blaze_ids::ContentId> {
+    use std::io::Read as _;
+    let mut file = std::fs::File::open(exe).with_context(|| format!("reading blaze itself, {}", exe.display()))?;
+    let mut hasher = blaze_ids::Hasher::new("blaze v2 build id 1");
+    let mut chunk = vec![0u8; 1 << 20]; // alloc: one buffer, once per start
+    loop {
+        let read = file.read(&mut chunk).with_context(|| format!("reading blaze itself, {}", exe.display()))?;
+        if read == 0 {
+            break;
+        }
+        hasher.update(&chunk[..read]);
+    }
+    Ok(hasher.finish())
+}
+
 /// An absolute path as the driver names it: the driver's root is `/`.
 pub fn file_name(path: &Path) -> anyhow::Result<FileName> {
     let text = path.to_str().with_context(|| format!("{} is not UTF-8", path.display()))?;

@@ -14,7 +14,7 @@ use rustc_type_ir::search_graph::{
 use rustc_type_ir::solve::{
     AccessedOpaques, ExternalRegionConstraints, FastPathDepth, FetchEligibleAssocItemResponse,
     MaybeInfo, NoSolutionOrRerunNonErased, OpaqueTypesJank, QueryResultOrRerunNonErased, RerunCondition,
-    RerunNonErased, RerunReason, RerunResultExt, SmallCopySet, TyOrConstInferVar,
+    RerunNonErased, RerunReason, RerunResultExt, SmallCopySet, SubRoots, TyOrConstInferVar,
 };
 use rustc_type_ir::transmute::Answer;
 use rustc_type_ir::{
@@ -22,7 +22,6 @@ use rustc_type_ir::{
     PredicateKind, PredicateProxy, Region, RegionVid, TypeFoldable, TypeSuperVisitable,
     TypeVisitable, TypeVisitableExt, TypeVisitor, TypingMode, max_universe,
 };
-use thin_vec::ThinVec;
 use tracing::{Level, debug, instrument, trace, warn};
 
 use super::has_only_region_constraints;
@@ -972,7 +971,7 @@ where
         previously_succeeded_in_erased: SucceededInErased<I>,
     ) -> GoalStalledOn<I> {
         // Remove the canonicalized universal vars, since we only care about stalled existentials.
-        let mut sub_roots = ThinVec::new();
+        let mut sub_roots = SubRoots::new();
         let stalled_vars = stalled_vars
             .iter()
             .copied()

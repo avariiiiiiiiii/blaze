@@ -1320,7 +1320,13 @@ fn get_env_inner(db: &Db, arg_id: MacroCallId, key: &Symbol) -> Option<String> {
     let krate = arg_id.loc(db).krate;
     db.env_is_read(krate, key.as_str());
     // As rustc reads them: what cargo set for the crate, then the process the build is for.
-    krate.env(db).get(key.as_str()).or_else(|| base_db::process_env_var(db, key.as_str()))
+    // The standard library's crates read their own alone, as a std built elsewhere does: no
+    // workspace's environment is in their identity.
+    let own = krate.env(db).get(key.as_str());
+    match krate.data(db).origin.is_lang() {
+        true => own,
+        false => own.or_else(|| base_db::process_env_var(db, key.as_str())),
+    }
 }
 
 fn env_expand<'f>(

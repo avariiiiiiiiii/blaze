@@ -108,6 +108,31 @@ the interner to `DefId::is_local` (`rustc_type_ir` patch `0008-def-id-is-local`)
 
 Why: see that patch.
 
+### 0007-solver-temporaries-kept
+
+What:
+- `EvalCtxt::build_stalled_on` builds `SubRoots` (`rustc_type_ir` patch
+  `0009-small-sets-and-stalled-lists-inline`), not a `ThinVec`.
+- On a canonical param-env cache hit, the canonicalizer refills its recycled `variables` with
+  `clear` and `extend_from_slice`. `ThinVec::clone_from` is the default one, a new clone,
+  which dropped the recycled capacity.
+- `BoundVarReplacer::replace_bound_vars` copies `universe_indices` only when
+  `assumptions_on_binders` is on, the only case that reads the copy.
+
+Why: each allocated once per goal on warm storage (`docs/v2/plan/lanes/mem/db-solver.md`,
+item 8). Answers are unchanged.
+
+### 0008-scratch-buffers-raised
+
+What: `solve::scratch` (patch `0004-solver-temporaries-recycled`) grows a buffer given back
+to the largest capacity its pool holds.
+
+Why: the pools hand buffers out last in, first out, so a goal could get a buffer smaller than
+one a sibling had outgrown and grow it again on the next run; warm re-solves of one body still
+allocated a nested-goals list (`docs/v2/plan/lanes/mem/db-solver.md`, item 8). Raised, every
+buffer a warm run takes holds what any goal of the run needed. A pool now holds its depth times
+its largest buffer.
+
 ## Dropped since the previous base (ra-ap-rustc_next_trait_solver 0.166.0, rustc `ce89c898`)
 
 - The backport of rust-lang/rust#161380 (a constant sends a goal back to the caller's typing

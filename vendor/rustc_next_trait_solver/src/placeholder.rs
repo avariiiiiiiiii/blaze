@@ -48,7 +48,8 @@ where
         IndexMap<ty::PlaceholderType<I>, ty::BoundTy<I>>,
         IndexMap<ty::PlaceholderConst<I>, ty::BoundConst<I>>,
     ) {
-        let old_universes = universe_indices.clone();
+        // Read only with `assumptions_on_binders`, so copied only then.
+        let old_universes = infcx.cx().assumptions_on_binders().then(|| universe_indices.clone());
         let mut replacer = BoundVarReplacer {
             infcx,
             mapped_regions: Default::default(),
@@ -68,7 +69,7 @@ where
             current_index: _,
         } = replacer;
 
-        if infcx.cx().assumptions_on_binders() {
+        if let Some(old_universes) = old_universes {
             for (old, new) in old_universes.into_iter().zip(universe_indices.iter()) {
                 if let (None, Some(new)) = (old, new) {
                     // FIXME(-Zassumptions-on-binders): `replace_bound_vars` does not have enough

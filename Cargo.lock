@@ -4291,6 +4291,7 @@ dependencies = [
  "arrayvec",
  "bitflags 2.13.2",
  "blaze-alloc-count",
+ "blaze-mem",
  "derive-where",
  "ena",
  "indexmap",

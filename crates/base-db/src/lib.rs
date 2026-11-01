@@ -38,7 +38,7 @@ pub use crate::{
         CRATE_ATTR_FILE_NAME, CrateAttrError, applied_crate_attr_files, crate_attr_error,
         crate_attr_files, crate_attr_owner,
     },
-    db::{Db, Reader, RunOrder, Shared, executions, run_on_pool, set_run_order},
+    db::{Db, Reader, RunOrder, Shared, executions, set_run_order},
     editioned_file_id::EditionedFileId,
     files::Files,
     input::{
@@ -57,6 +57,7 @@ pub use blaze_ids::ContentId;
 use blaze_ids::Hasher;
 use rustc_hash::FxHashSet;
 use blaze_query::db::{Durability, Setter};
+pub use blaze_query::db::{par_for_each, par_map};
 pub use semver::{BuildMetadata, Prerelease, Version, VersionReq};
 use triomphe::Arc;
 pub use crate::{

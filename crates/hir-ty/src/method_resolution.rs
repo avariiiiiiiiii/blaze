@@ -1124,6 +1124,146 @@ fn macro_is_inert(db: &Db, krate: Crate, name: &Symbol) -> bool {
     matches!(known.binary_search_by(|(it, _)| it.cmp_order(name)), Ok(i) if !known[i].1)
 }
 
+/// Whether `BLAZE_TRACE_HOLDERS=1` asks for [`trace_holders`]; read once per process.
+pub(crate) fn tracing_holders() -> bool {
+    static TRACE: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+        std::env::var_os("BLAZE_TRACE_HOLDERS").is_some_and(|it| it == "1")
+    });
+    *TRACE
+}
+
+/// Writes to stderr, one line per holder of `module` ([`impl_holders`]), why it makes the
+/// maintainer lower the module's bodies: `blaze-holders`, the crate, the holder's file and
+/// offset, its kind (`const`, `fn`, `static`) and the reason, tab-separated. The reason is
+/// `impl`, `attr NAME`, `call NAME RESOLVED` (see [`macro_resolution`]), `macro-written` (the
+/// item has no text of its own) or `unconditional` (a constant whose text has no mark).
+pub(crate) fn trace_holders(db: &Db, module: ModuleId, holders: &[DefWithBodyId]) {
+    use std::io::Write as _;
+    let krate = module.krate(db);
+    let crate_name = crate_name(db, krate);
+    let mut out = String::new();
+    for holder in holders {
+        let (kind, (place, reason)) = match *holder {
+            DefWithBodyId::FunctionId(it) => ("fn", why_held(db, krate, it.loc(db).id)),
+            DefWithBodyId::StaticId(it) => ("static", why_held(db, krate, it.loc(db).id)),
+            DefWithBodyId::ConstId(it) => ("const", why_held(db, krate, it.loc(db).id)),
+            // alloc: a trace line, only under BLAZE_TRACE_HOLDERS
+            DefWithBodyId::VariantId(it) => ("variant", (format!("{it:?}"), String::new())),
+        };
+        // alloc: as above
+        out.push_str(&format!("blaze-holders\t{crate_name}\t{place}\t{kind}\t{reason}\n"));
+    }
+    // A failed write to stderr loses a trace line and nothing else.
+    _ = std::io::stderr().lock().write_all(out.as_bytes());
+}
+
+fn crate_name(db: &Db, krate: Crate) -> String {
+    let name = krate.extra_data(db).display_name.as_ref();
+    // alloc: a trace line's crate, only under BLAZE_TRACE_HOLDERS
+    name.map_or_else(|| format!("{krate:?}"), |it| it.to_string())
+}
+
+/// Where the item of `id` is (`path@offset`) and the first mark in its text that made
+/// [`may_hold`] count it, as [`trace_holders`] writes them.
+fn why_held<N: syntax::AstNode>(
+    db: &Db,
+    krate: Crate,
+    id: hir_expand::AstId<N>,
+) -> (String, String) {
+    let Some(file) = id.file_id.file_id() else {
+        // alloc: a trace line's place and reason, only under BLAZE_TRACE_HOLDERS
+        return (format!("{:?}", id.file_id), "macro-written".to_owned());
+    };
+    let range = id.file_id.ast_id_map(db).get(id.value).text_range();
+    let path = db.path_for_file(file.file_id(db));
+    // alloc: as above
+    let path = path.map_or_else(|| format!("{file:?}"), |it| it.to_string());
+    // alloc: as above
+    let place = format!("{path}@{}", u32::from(range.start()));
+    let reason = impls_in_bodies(db, file).iter().filter(|(at, _)| range.contains(*at)).find_map(
+        |(_, mark)| match mark {
+            // alloc: as above
+            BodyMark::Impl => Some("impl".to_owned()),
+            BodyMark::Call(name) if !macro_is_inert(db, krate, name) => {
+                // alloc: as above
+                Some(format!("call {} {}", name.as_str(), macro_resolution(db, krate, name)))
+            }
+            BodyMark::Attribute(name) if !attribute_is_inert(name.as_str()) => {
+                // alloc: as above
+                Some(format!("attr {}", name.as_str()))
+            }
+            _ => None,
+        },
+    );
+    // alloc: as above
+    (place, reason.unwrap_or_else(|| "unconditional".to_owned()))
+}
+
+/// Why [`macro_is_inert`] says a macro called `name` in `krate` may write an impl: `include`,
+/// `unknown` (no `macro_rules!` or procedural macro of `krate` or its dependencies has the
+/// name), or `writes:` and every definition of the name that may write one, comma-separated:
+/// `CRATE:macro_rules` (its transcribers do), `CRATE:macro_rules(calls)` (a macro it calls
+/// may) or `CRATE:proc_macro`.
+fn macro_resolution(db: &Db, krate: Crate, name: &Symbol) -> String {
+    // Every allocation below is a trace line's, only under BLAZE_TRACE_HOLDERS.
+    if *name == sym::include {
+        // alloc: as above
+        return "include".to_owned();
+    }
+    let known = macros_writing_impls(db, krate);
+    if known.binary_search_by(|(it, _)| it.cmp_order(name)).is_err() {
+        // alloc: as above
+        return "unknown".to_owned();
+    }
+    let mut found = Vec::new();
+    let mut seen = rustc_hash::FxHashSet::default();
+    // alloc: as above
+    let mut stack = vec![krate];
+    while let Some(at) = stack.pop() {
+        // alloc: as above
+        if !seen.insert(at) {
+            continue;
+        }
+        // alloc: as above
+        stack.extend(at.data(db).dependencies.iter().map(|dep| dep.crate_id));
+        let def_map = crate_def_map(db, at);
+        if at.data(db).target_kind.is_proc_macro() {
+            for (_, module) in def_map.modules(db) {
+                for (macro_name, item) in module.scope(db).macros() {
+                    if macro_name.symbol() == name && matches!(item.def, MacroId::ProcMacroId(_)) {
+                        // alloc: as above
+                        found.push(format!("{}:proc_macro", crate_name(db, at)));
+                    }
+                }
+            }
+        }
+        let writes = macros_writing_impls(db, at);
+        let Ok(i) = writes.binary_search_by(|(it, _)| it.cmp_order(name)) else { continue };
+        if !writes[i].1 {
+            continue;
+        }
+        let mut files = rustc_hash::FxHashSet::default();
+        for (_, module) in def_map.modules(db) {
+            let Some(file) = module.origin.file_id() else { continue };
+            // alloc: as above
+            if !files.insert(file) {
+                continue;
+            }
+            for (defined, direct, _) in macro_definitions(db, file).iter() {
+                if defined == name {
+                    let how = if direct { "" } else { "(calls)" };
+                    // alloc: as above
+                    found.push(format!("{}:macro_rules{how}", crate_name(db, at)));
+                }
+            }
+        }
+    }
+    found.sort_unstable();
+    found.dedup();
+    // alloc: as above
+    format!("writes:{}", found.join(","))
+}
+
 /// Where `file` may write an impl in a body, found by its tokens: each `impl`, macro call and
 /// attribute inside the braces that follow `fn name`, or between the `=` and the `;` of a
 /// `const` or `static`. An `impl Trait` type is found as well, which costs a lowering and

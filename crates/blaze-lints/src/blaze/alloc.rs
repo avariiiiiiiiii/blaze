@@ -27,7 +27,7 @@ use hir_def::{
 use hir_ty::{
     InferenceResult, ParamEnvAndCrate,
     db::HirDatabase as _,
-    next_solver::{DbInterner, EarlyBinder, GenericArg, GenericArgs, StoredGenericArgs, TyKind},
+    next_solver::{DbInterner, EarlyBinder, GenericArg, GenericArgs, StoredGenericArgs, Ty, TyKind},
     traits::StoredParamEnvAndCrate,
 };
 use intern::sym;
@@ -191,6 +191,40 @@ pub(super) fn any_variant(db: &Db, adt: AdtId, mut f: impl FnMut(VariantId) -> b
             it.enum_variants(db).variants.values().any(|&(id, _)| f(VariantId::EnumVariantId(id)))
         }
     }
+}
+
+/// std's `Global`, the allocator a collection's `A` defaults to, and `String`, which allocates
+/// from it with no parameter naming it.
+#[derive(Clone, Copy)]
+pub(super) struct Std {
+    global: Option<AdtId>,
+    string: Option<AdtId>,
+}
+
+impl Std {
+    pub(super) fn new(cx: &crate::check::Cx<'_, '_>) -> Std {
+        let adt = |path: &[&str]| match cx.std_def(path) {
+            Some(hir::ModuleDef::Adt(it)) => Some(AdtId::from(it)),
+            _ => None,
+        };
+        Std {
+            global: adt(&["alloc", "alloc", "Global"]).or_else(|| adt(&["std", "alloc", "Global"])),
+            string: adt(&["alloc", "string", "String"]).or_else(|| adt(&["std", "string", "String"])),
+        }
+    }
+}
+
+/// The type a call of `callee` whose value has type `ty` makes, when it makes a value of the
+/// global allocator's that has not allocated yet and will when it grows: one with `Global` as a
+/// type argument (`Vec::new()`, `vec![]`, `VecDeque::default()`), `String::new()`, or std's
+/// `HashMap` or `HashSet`, which take no allocator (one hashing with `RandomState` is
+/// `std_hashmap`'s). A collection that names its allocator (`Vec::new_in(frame)`) is not one.
+pub(super) fn makes_global(k: &super::Known<'_>, callee: FunctionId, ty: Ty<'_>) -> Option<AdtId> {
+    let (adt, args) = ty.as_adt()?;
+    let global = Some(adt) == k.alloc.string
+        || (k.std.is_map_or_set(adt) && !k.std.is_random_map(ty))
+        || args.types().any(|it| it.as_adt().is_some_and(|(it, _)| Some(it) == k.alloc.global));
+    (global && super::hashmap::constructs(k, callee, adt)).then_some(adt)
 }
 
 /// Whether the call `id` grows a buffer its caller keeps: `f` takes `&mut self` and the

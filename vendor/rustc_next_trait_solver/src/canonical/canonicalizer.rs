@@ -176,7 +176,10 @@ impl<'a, D: SolverDelegate<Interner = I>, I: Interner> Canonicalizer<'a, D, I> {
                         delegate,
                         CanonicalizeMode::Input(CanonicalizeInputKind::Predicate),
                     );
-                    rest_canonicalizer.state.variables.clone_from(&e.variables);
+                    // Not `clone_from`: `ThinVec`'s is the default, a new clone, which would drop
+                    // the recycled state's capacity.
+                    rest_canonicalizer.state.variables.clear();
+                    rest_canonicalizer.state.variables.extend_from_slice(&e.variables);
                     rest_canonicalizer.state.var_kinds.clone_from(&e.var_kinds);
                     rest_canonicalizer
                         .state

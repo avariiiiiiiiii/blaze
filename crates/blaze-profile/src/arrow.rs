@@ -50,7 +50,7 @@ mod tests {
 
     #[test]
     fn each_table_has_an_arrow_schema_with_its_columns_in_order() {
-        for table in schema::TABLES.iter().copied().chain([&schema::TILES, &schema::OPEN]) {
+        for table in schema::TABLES.iter().chain(&schema::RESULTS).copied() {
             let arrow = schema(table);
             let names: Vec<&str> = arrow.fields().iter().map(|it| it.name().as_str()).collect();
             let want: Vec<&str> = table.columns.iter().map(|it| it.name).collect();

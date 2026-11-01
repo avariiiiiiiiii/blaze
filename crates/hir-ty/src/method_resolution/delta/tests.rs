@@ -7,6 +7,7 @@
 //! it, and every slice with the arrangement made from scratch over `module_impls` and the
 //! traits' items, in the same database.
 
+mod batch;
 mod cost;
 mod random;
 

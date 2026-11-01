@@ -152,6 +152,8 @@ pub struct World<'a, S: Steps> {
 pub struct Setup {
     /// Where an agent's build of a root no checkout has is placed: `<state>/views`.
     pub views: String,
+    /// Where the standard library's builds are placed, every workspace's: `<state>/std`.
+    pub std: String,
     /// The triple of the machine the daemon runs on.
     pub host: String,
     /// The daemon's `PATH` and `HOME`: an agent's invocation's whole environment.
@@ -825,6 +827,12 @@ struct Job<S: Steps> {
     /// Views of [`Roots::plans`] it reads, which the jobs close once none reads them.
     borrowed: Vec<ViewId>,
     placing: usize,
+    /// Of `placing`, how many are in flight at each path ([`Paths`] id): a file with one is
+    /// not yet all there.
+    busy: FxHashMap<u32, u32>,
+    /// Build scripts' runs the plane started whose programs are not yet all placed: each
+    /// starts once its compile's outputs have nothing in flight ([`Jobs::run_script`]).
+    held: Vec<NodeId>,
     /// Its runs of user code that have not ended.
     runs: u32,
     over: Option<(bool, Option<ApiError>)>,
@@ -1147,6 +1155,8 @@ impl<S: Steps> Jobs<S> {
             built: None,
             borrowed: Vec::new(), // alloc: once per job
             placing: 0,
+            busy: FxHashMap::default(),
+            held: Vec::new(), // alloc: none until a run waits for its program
             runs: 0,
             over: None,
             stats: RequestStats::default(),
@@ -1242,6 +1252,7 @@ impl<S: Steps> Jobs<S> {
             mounts,
             host: self.setup.host.clone(), // clone: the config owns it, once per view
             library,
+            std: self.setup.std.clone(), // clone: the config owns it, once per view
         };
         let encoded = config.encode();
         let key = Hasher::new("blaze v2 serve last plan").id(&opened.view.root).part(&encoded).finish();
@@ -1710,9 +1721,7 @@ impl<S: Steps> Jobs<S> {
                     return;
                 }
             };
-            if let Some(job) = self.jobs.get_mut(key_of(id)) {
-                job.placing += 1;
-            }
+            self.begin_placing(id, path);
             w.effects.push(Effect::Write { file, bytes: lock.text.into_bytes(), tag });
         }
         for warning in &units.warnings {
@@ -2070,6 +2079,14 @@ impl<S: Steps> Jobs<S> {
     /// A build script's run begins, on the loop.
     fn run_script(&mut self, w: &mut World<'_, S>, node: NodeId) {
         let Some(id) = self.batches.job_of(node) else { return };
+        // The plane starts a run once its compile's node ends, before the loop has placed what
+        // it made: the run waits for its program to be all there ([`Jobs::release_held`]).
+        if let Some(job) = self.jobs.get_mut(key_of(id))
+            && waits_for_program(job, node)
+        {
+            job.held.push(node);
+            return;
+        }
         self.started_unit(w, node);
         let Some(Stage::Units(build)) = self.jobs.get(key_of(id)).map(|it| &it.stage) else { return };
         let Some(unit) = build.unit(node) else { return };
@@ -2188,9 +2205,9 @@ impl<S: Steps> Jobs<S> {
             let Some(job) = self.jobs.get_mut(key_of(id)) else { continue };
             match tag {
                 Ok(tag) => {
-                    job.placing += 1;
                     // clone: the driver's effect owns the file's name, once per output
                     let Some(file) = self.paths.files[path as usize].clone() else { continue };
+                    self.begin_placing(id, path);
                     w.effects.push(Effect::Stat { file, tag });
                 }
                 Err(error) => _ = job.over.get_or_insert((false, Some(error))),
@@ -2212,13 +2229,48 @@ impl<S: Steps> Jobs<S> {
         match w.store.place(&key, file, w.effects) {
             Some(tag) => {
                 self.placing.insert(tag, Placing { job: id, path, key, executable });
-                job.placing += 1;
+                self.begin_placing(id, path);
             }
             None => {
                 let name = self.paths.names[path as usize].to_string(); // alloc: an error, once
                 // alloc: an error, once
                 let error = ApiError::new(format!("the store has nothing under {key:?} to place at {name}"), Some(name));
                 job.over.get_or_insert((false, Some(error)));
+            }
+        }
+    }
+
+    /// An effect of job `id` at path `path` asked: the file is not all there until it ends.
+    fn begin_placing(&mut self, id: JobId, path: u32) {
+        if let Some(job) = self.jobs.get_mut(key_of(id)) {
+            job.placing += 1;
+            *job.busy.entry(path).or_default() += 1;
+        }
+    }
+
+    /// An effect of [`Jobs::begin_placing`] ended; the job, if it is still there.
+    fn end_placing(&mut self, id: JobId, path: u32) -> Option<&mut Job<S>> {
+        let job = self.jobs.get_mut(key_of(id))?;
+        job.placing -= 1;
+        if let std::collections::hash_map::Entry::Occupied(mut busy) = job.busy.entry(path) {
+            *busy.get_mut() -= 1;
+            if *busy.get() == 0 {
+                busy.remove();
+            }
+        }
+        Some(job)
+    }
+
+    /// Each run [`Jobs::run_script`] held, asked again: one whose program is all placed now
+    /// starts, the rest wait on.
+    fn release_held(&mut self, w: &mut World<'_, S>) {
+        for at in 0..self.order.len() {
+            let id = self.order[at];
+            while let Some(job) = self.jobs.get_mut(key_of(id))
+                && let Some(ready) = job.held.iter().position(|&node| !waits_for_program(job, node))
+            {
+                let node = job.held.remove(ready);
+                self.run_script(w, node);
             }
         }
     }
@@ -2239,9 +2291,7 @@ impl<S: Steps> Jobs<S> {
         let Some(file) = self.paths.files[path as usize].clone() else { return };
         match self.own_tag(Own::Record { job: id, path, key }) {
             Ok(tag) => {
-                if let Some(job) = self.jobs.get_mut(key_of(id)) {
-                    job.placing += 1;
-                }
+                self.begin_placing(id, path);
                 self.paths.placed[path as usize] = Some(Placement { key, executable, meta: None });
                 w.effects.push(Effect::Stat { file, tag });
             }
@@ -2264,21 +2314,17 @@ impl<S: Steps> Jobs<S> {
                 Ok(()) if executable => match self.own_tag(Own::Mode { job: id, path, key }) {
                     Ok(tag) => w.effects.push(Effect::Mode { file: to, mode: 0o755, tag }),
                     Err(error) => {
-                        if let Some(job) = self.jobs.get_mut(key_of(id)) {
-                            job.placing -= 1;
+                        if let Some(job) = self.end_placing(id, path) {
                             job.over.get_or_insert((false, Some(error)));
                         }
                     }
                 },
                 Ok(()) => {
-                    if let Some(job) = self.jobs.get_mut(key_of(id)) {
-                        job.placing -= 1;
-                    }
+                    self.end_placing(id, path);
                     self.record(w, id, path, key, false);
                 }
                 Err(why) => {
-                    if let Some(job) = self.jobs.get_mut(key_of(id)) {
-                        job.placing -= 1;
+                    if let Some(job) = self.end_placing(id, path) {
                         // alloc: an error, once
                         let error = ApiError::new(format!("placing /{to}: {why}"), Some(format!("/{to}")));
                         job.over.get_or_insert((false, Some(error)));
@@ -2329,9 +2375,7 @@ impl<S: Steps> Jobs<S> {
     fn completed(&mut self, w: &mut World<'_, S>, own: Own, done: Done) {
         match own {
             Own::Record { job: id, path, key } => {
-                if let Some(job) = self.jobs.get_mut(key_of(id)) {
-                    job.placing -= 1;
-                }
+                self.end_placing(id, path);
                 match (done, &mut self.paths.placed[path as usize]) {
                     (Done::Stat(Some(meta)), Some(placement)) if placement.key == key => placement.meta = Some(meta),
                     (_, placement) => *placement = None,
@@ -2342,16 +2386,13 @@ impl<S: Steps> Jobs<S> {
                     (&done, &self.paths.placed[path as usize]),
                     (Done::Stat(Some(meta)), Some(placement)) if placement.key == key && placement.meta == Some(*meta)
                 );
-                if let Some(job) = self.jobs.get_mut(key_of(id)) {
-                    job.placing -= 1;
-                }
+                self.end_placing(id, path);
                 if !unchanged {
                     self.place(w, id, path, key, executable);
                 }
             }
             Own::Write { job: id, path } | Own::Mode { job: id, path, .. } => {
-                let Some(job) = self.jobs.get_mut(key_of(id)) else { return };
-                job.placing -= 1;
+                let Some(job) = self.end_placing(id, path) else { return };
                 if let Done::Failed(error) = done {
                     let name = &self.paths.names[path as usize];
                     // alloc: an error, once
@@ -2686,6 +2727,7 @@ impl<S: Steps> Jobs<S> {
     /// Finishes every job that is over and has nothing left: its tasks, its placements and its
     /// runs; and a snapshot once all it waits for is durable.
     fn wind_up(&mut self, w: &mut World<'_, S>) {
+        self.release_held(w);
         self.apply_writes(w);
         let mut over = std::mem::take(&mut self.over);
         for &id in &self.order {
@@ -2818,6 +2860,19 @@ fn refuse_held<S: Steps>(w: &mut World<'_, S>, stage: &mut Stage<S>) {
             w.plane.refuse(w.now, task, "cancelled".to_owned()); // alloc: a cancel, once per task held
         }
     }
+}
+
+/// Whether build script run `node` of `job` waits for its program: an output of the compile of
+/// its script has an effect placing it in flight.
+fn waits_for_program<S: Steps>(job: &Job<S>, node: NodeId) -> bool {
+    if job.busy.is_empty() {
+        return false;
+    }
+    let Stage::Units(build) = &job.stage else { return false };
+    let Some(compile) = build.unit(node).and_then(|run| super::unit::script::compile_of(&build.outputs.units, run)) else {
+        return false;
+    };
+    build.outputs.of(compile).iter().any(|path| job.busy.contains_key(path))
 }
 
 fn script_ended<S: Steps>(w: &mut World<'_, S>, node: NodeId, ok: bool) {

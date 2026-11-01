@@ -91,6 +91,10 @@ pub fn main(args: impl Iterator<Item = OsString>) -> ExitCode {
     blaze_profile::began();
     // The client and `blaze serve` both: with `BLAZE_PROFILE` each records from here on.
     blaze_profile::install();
+    _ = blaze_profile::flight::count_frame_copies(|| {
+        let it = blaze_mem::tag::copied_on_thread();
+        blaze_profile::flight::FrameCopied { copies: it.copies, bytes: it.bytes }
+    });
     let words = words(args);
     if words.first().is_some_and(|it| it == "serve") {
         return crate::serve::main(words.into_iter().skip(1));

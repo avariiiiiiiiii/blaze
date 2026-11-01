@@ -172,6 +172,7 @@ struct Known<'db> {
     /// `Clone` and its `clone`.
     clone: Option<(TraitId, FunctionId)>,
     std: hashmap::Std,
+    alloc: alloc::Std,
 }
 
 impl<'db> Known<'db> {
@@ -192,6 +193,7 @@ impl<'db> Known<'db> {
             target: cx.krate().to_display_target(db),
             clone,
             std: hashmap::Std::new(cx),
+            alloc: alloc::Std::new(cx),
         }
     }
 }
@@ -268,6 +270,23 @@ fn check_body(cx: &mut Cx<'_, '_>) {
                     ),
                 };
                 push(Lint::HotAlloc, range, message, None);
+            } else if on_alloc
+                && !is_clone
+                && let Some(made) = alloc::makes_global(&k, callee, infer.expr_ty(id))
+            {
+                let made = hir::Adt::from(made).name(db);
+                let made = made.as_str();
+                let message = match macro_name(cx.snippet(range)) {
+                    Some(called) => format!("this `{called}!` makes a `{made}` of the global allocator"),
+                    None => format!(
+                        "this call to `{}` makes a `{made}` of the global allocator",
+                        hir::Function::from(callee).name(db).as_str()
+                    ),
+                };
+                let note = "it allocates from the global heap once it grows: name its allocator \
+                            (`Vec::new_in(alloc)`), grow a buffer the caller keeps, or say why it \
+                            needs the global heap with `// alloc: <why>`";
+                push(Lint::HotAlloc, range, message, Some(note.to_owned()));
             }
             if on_map
                 && let Some(message) =

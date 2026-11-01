@@ -10,7 +10,7 @@ use rustc_macros::{Decodable_NoContext, Encodable_NoContext, StableHash, StableH
 use rustc_type_ir_macros::{
     GenericTypeVisitable, Lift_Generic, TypeFoldable_Generic, TypeVisitable_Generic,
 };
-use thin_vec::ThinVec;
+use smallvec::SmallVec;
 use tracing::debug;
 
 use crate::inherent::*;
@@ -1044,13 +1044,18 @@ pub enum GoalStalledOnOpaques<I: Interner> {
     },
 }
 
+/// The variables a stalled goal waits on: inline for the one or two a goal almost always has,
+/// so stalling allocates nothing (rustc has a `ThinVec`, #160005, which allocates for one).
+pub type StalledVars = SmallVec<[TyOrConstInferVar; 2]>;
+
+/// The sub-unification roots of a stalled goal's type variables, inline as [`StalledVars`].
+pub type SubRoots = SmallVec<[TyVid; 2]>;
+
 /// The conditions that must change for a goal to warrant
 #[derive_where(Clone, Debug; I: Interner)]
 pub struct GoalStalledOn<I: Interner> {
-    // `ThinVec` is important for performance. See #160005.
-    pub stalled_vars: ThinVec<TyOrConstInferVar>,
-    // `ThinVec` is important for performance. See #160005.
-    pub sub_roots: ThinVec<TyVid>,
+    pub stalled_vars: StalledVars,
+    pub sub_roots: SubRoots,
     /// The `MaybeInfo` that will be returned on subsequent evaluations if this
     /// goal remains stalled.
     pub stalled_maybe_info: MaybeInfo,

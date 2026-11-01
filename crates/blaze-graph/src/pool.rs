@@ -715,7 +715,13 @@ fn scope_in<'env, R>(shared: &Shared, f: impl FnOnce(&Scope<'env>) -> R) -> R {
         finished: AtomicBool::new(false),
         owner: thread::current(),
     };
-    let scope = Scope { shared: ptr::from_ref(shared), pending: &pending, _env: PhantomData };
+    let scope = Scope {
+        shared: ptr::from_ref(shared),
+        pending: &pending,
+        owner: pump::current(),
+        since: pump::next_seq(),
+        _env: PhantomData,
+    };
     let result = catch_unwind(AssertUnwindSafe(|| f(&scope)));
     if pending.count.fetch_sub(1, Ordering::AcqRel) == 1 {
         pending.finished.store(true, Ordering::Release);
@@ -819,6 +825,10 @@ impl Drop for Pool {
 pub struct Scope<'env> {
     shared: *const Shared,
     pending: *const Pending,
+    /// The task that called [`Pool::scope`] and waits for every job, whoever submits it.
+    owner: u64,
+    /// When the scope began on the owner's thread (`pump::next_seq`).
+    since: u64,
     _env: PhantomData<&'env mut &'env ()>,
 }
 
@@ -873,10 +883,10 @@ impl<'env> Scope<'env> {
         // SAFETY: `Pool::scope` keeps `Pending` until every job counted in it is done.
         unsafe { &*self.pending }.count.fetch_add(1, Ordering::Relaxed);
         let left = Left(self.pending);
-        let parent = pump::current();
+        let (owner, since) = (self.owner, self.since);
         let job = move || {
             let _left = left;
-            pump::waited_by(parent);
+            pump::waited_by(owner, since);
             done(catch_unwind(AssertUnwindSafe(run)));
         };
         // SAFETY: the job borrows only what lives for `'env`, which outlives the call of

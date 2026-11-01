@@ -147,6 +147,9 @@ pub struct Frame {
     bias: Cell<usize>,
     /// The most `used()` was since the last reset.
     peak: Cell<usize>,
+    /// Blocks `grow` moved since the last reset, and the bytes it copied moving them.
+    copies: Cell<u64>,
+    copied: Cell<u64>,
     first: Cell<*mut Block>,
     current: Cell<*mut Block>,
     /// Bytes of the blocks it holds: whole chunks, spans' committed pages.
@@ -197,6 +200,8 @@ impl Frame {
             floor: Cell::new(usize::MAX),
             bias: Cell::new(0usize.wrapping_sub(EMPTY)),
             peak: Cell::new(0),
+            copies: Cell::new(0),
+            copied: Cell::new(0),
             first: Cell::new(ptr::null_mut()),
             current: Cell::new(ptr::null_mut()),
             held: Cell::new(0),
@@ -256,6 +261,11 @@ impl Frame {
     /// The most bytes in use at once since the last reset.
     pub fn peak(&self) -> usize {
         self.peak.get().max(self.used())
+    }
+
+    /// What growing blocks that were not the last copied since the last reset.
+    pub fn copied(&self) -> tag::Copied {
+        tag::Copied { copies: self.copies.get(), bytes: self.copied.get() }
     }
 
     /// Folds the bytes in use into `peak`, before the cursor moves back. An allocation never
@@ -734,9 +744,11 @@ impl Frame {
     /// Frees everything, keeping its blocks for the next task. Counts the task's peak to its
     /// tag ([`tag::task_ended`]).
     pub fn reset(&mut self) {
-        tag::task_ended(self.tag.get(), self.peak());
+        tag::task_ended(self.tag.get(), self.peak(), self.copied());
         self.rewind();
         self.peak.set(0);
+        self.copies.set(0);
+        self.copied.set(0);
     }
 
     /// Runs `f` with this frame and frees what it allocated once it returns. What `f` returns
@@ -920,6 +932,8 @@ unsafe impl Allocator for Frame {
         // SAFETY: the caller says `ptr` is a live block of `old.size()` bytes; `to` is a fresh
         // block of at least as many, so the two do not overlap.
         unsafe { ptr::copy_nonoverlapping(ptr.as_ptr(), to.as_ptr(), old.size()) };
+        self.copies.set(self.copies.get() + 1);
+        self.copied.set(self.copied.get() + old.size() as u64);
         Ok(NonNull::slice_from_raw_parts(to, new.size()))
     }
 
@@ -1240,7 +1254,7 @@ pub fn task<R>(tag: Tag, f: impl FnOnce(&Frame) -> R) -> R {
                     stack.peak.set(held);
                 }
             });
-            tag::task_ended(self.frame.tag(), self.frame.peak());
+            tag::task_ended(self.frame.tag(), self.frame.peak(), self.frame.copied());
             // Dropping the frame, after this, gives its blocks to the thread's shelves.
         }
     }
